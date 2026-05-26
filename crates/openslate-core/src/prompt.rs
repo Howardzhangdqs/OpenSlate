@@ -34,6 +34,17 @@ pub struct ResolvedPrompt {
     pub agent_id: Option<String>,
 }
 
+/// Data needed to persist a prompt snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PromptSnapshotData {
+    pub profile_name: String,
+    pub agent_id: Option<String>,
+    pub source_kind: String,
+    pub source_path: Option<String>,
+    pub content_hash: String,
+    pub rendered_prompt: String,
+}
+
 /// Errors during prompt resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum PromptError {
@@ -43,6 +54,42 @@ pub enum PromptError {
     UnknownVariable(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("Persistence error: {0}")]
+    PersistenceError(String),
+}
+
+impl ResolvedPrompt {
+    pub fn to_snapshot_data(&self) -> PromptSnapshotData {
+        use sha2::{Digest, Sha256};
+
+        let content_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(self.content.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        let (source_kind, source_path) = match &self.source {
+            PromptSource::ProfileFile { path } => (
+                "profile_file",
+                Some(path.to_str().unwrap_or("").to_owned()),
+            ),
+            PromptSource::DefaultFile { path } => (
+                "default_file",
+                Some(path.to_str().unwrap_or("").to_owned()),
+            ),
+            PromptSource::AgentDefault => ("agent_default", None),
+            PromptSource::Builtin => ("builtin", None),
+        };
+
+        PromptSnapshotData {
+            profile_name: self.profile_name.clone(),
+            agent_id: self.agent_id.clone(),
+            source_kind: source_kind.to_owned(),
+            source_path,
+            content_hash,
+            rendered_prompt: self.content.clone(),
+        }
+    }
 }
 
 const BUILTIN_PROMPT: &str = "You are a helpful AI assistant.";
@@ -406,5 +453,70 @@ mod tests {
 
         let result = apply_template(content, &vars, false).unwrap();
         assert_eq!(result, "No variables here!");
+    }
+
+    // --- Snapshot data tests ---
+
+    #[test]
+    fn test_snapshot_data_profile_file() {
+        let dir = TempDir::new().unwrap();
+        let prompts = dir.path().join("prompts");
+        write_file(&prompts.join("coding").join("prompt.md"), "Coding prompt");
+
+        let resolved = resolve_root_prompt(&prompts, "coding");
+        let snap = resolved.to_snapshot_data();
+
+        assert_eq!(snap.profile_name, "coding");
+        assert_eq!(snap.source_kind, "profile_file");
+        assert!(snap.source_path.is_some());
+        assert!(snap.source_path.as_ref().unwrap().contains("coding"));
+        assert_eq!(snap.rendered_prompt, "Coding prompt");
+        assert!(!snap.content_hash.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_data_builtin() {
+        let dir = TempDir::new().unwrap();
+        let prompts = dir.path().join("prompts");
+
+        let resolved = resolve_root_prompt(&prompts, "coding");
+        let snap = resolved.to_snapshot_data();
+
+        assert_eq!(snap.source_kind, "builtin");
+        assert!(snap.source_path.is_none());
+        assert_eq!(snap.rendered_prompt, BUILTIN_PROMPT);
+    }
+
+    #[test]
+    fn test_snapshot_data_content_hash() {
+        let dir = TempDir::new().unwrap();
+        let prompts = dir.path().join("prompts");
+        write_file(&prompts.join("a").join("prompt.md"), "hello");
+        write_file(&prompts.join("b").join("prompt.md"), "world");
+
+        let snap_a = resolve_root_prompt(&prompts, "a").to_snapshot_data();
+        let snap_a2 = resolve_root_prompt(&prompts, "a").to_snapshot_data();
+        let snap_b = resolve_root_prompt(&prompts, "b").to_snapshot_data();
+
+        assert_eq!(snap_a.content_hash, snap_a2.content_hash);
+        assert_ne!(snap_a.content_hash, snap_b.content_hash);
+    }
+
+    #[test]
+    fn test_snapshot_data_serialization() {
+        let dir = TempDir::new().unwrap();
+        let prompts = dir.path().join("prompts");
+        write_file(&prompts.join("coding").join("prompt.md"), "Test prompt");
+
+        let snap = resolve_root_prompt(&prompts, "coding").to_snapshot_data();
+        let json = serde_json::to_string(&snap).unwrap();
+        let roundtrip: PromptSnapshotData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(snap.profile_name, roundtrip.profile_name);
+        assert_eq!(snap.agent_id, roundtrip.agent_id);
+        assert_eq!(snap.source_kind, roundtrip.source_kind);
+        assert_eq!(snap.source_path, roundtrip.source_path);
+        assert_eq!(snap.content_hash, roundtrip.content_hash);
+        assert_eq!(snap.rendered_prompt, roundtrip.rendered_prompt);
     }
 }

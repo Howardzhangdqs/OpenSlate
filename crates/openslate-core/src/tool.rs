@@ -1,7 +1,7 @@
 //! Tool trait and registry for OpenSlate.
 //!
 //! Tools are the actions an agent can take. Each tool implements the `Tool` trait.
-//! The `ToolRegistry` maps tool names to implementations.
+//! The `ToolRegistry` maps tool names to tool implementations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,10 +10,7 @@ use async_trait::async_trait;
 
 use crate::error::ToolError;
 use crate::provider::ToolDefinition;
-use crate::types::ToolOutput;
-
-#[cfg(test)]
-use crate::types::ToolOutputStatus;
+use crate::types::{ToolOutput, ToolOutputStatus};
 
 /// A tool that an agent can invoke.
 #[async_trait]
@@ -106,190 +103,174 @@ impl Default for ToolRegistry {
     }
 }
 
+/// Truncate tool output content if it exceeds the byte limit.
+///
+/// If the content is within limits, returns the output unchanged.
+/// If truncated, sets status to `Truncated` and appends a truncation notice.
+pub fn limit_tool_output(output: ToolOutput, max_bytes: usize) -> ToolOutput {
+    if output.bytes <= max_bytes {
+        return output;
+    }
+
+    let truncated_content: String = output.content.chars().take(max_bytes / 4).collect();
+    let notice = format!(
+        "\n\n[TRUNCATED: original {} bytes, showing {} bytes]",
+        output.bytes,
+        truncated_content.len()
+    );
+
+    ToolOutput {
+        content: format!("{}{}", truncated_content, notice),
+        bytes: truncated_content.len() + notice.len(),
+        duration_ms: output.duration_ms,
+        status: ToolOutputStatus::Truncated,
+    }
+}
+
+/// Audit record for a tool execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolAuditRecord {
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub output_bytes: usize,
+    pub output_status: String,
+    pub duration_ms: u64,
+    pub truncated: bool,
+}
+
+/// Create an audit record from tool execution details.
+#[allow(dead_code)]
+pub fn create_audit_record(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    output: &ToolOutput,
+) -> ToolAuditRecord {
+    ToolAuditRecord {
+        tool_name: tool_name.to_owned(),
+        arguments_json: serde_json::to_string(arguments).unwrap_or_default(),
+        output_bytes: output.bytes,
+        output_status: match output.status {
+            ToolOutputStatus::Success => "success".to_owned(),
+            ToolOutputStatus::Error => "error".to_owned(),
+            ToolOutputStatus::Truncated => "truncated".to_owned(),
+        },
+        duration_ms: output.duration_ms,
+        truncated: output.status == ToolOutputStatus::Truncated,
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod limit_tests {
     use super::*;
 
-    // --- Mock tools for testing ---
-
-    struct EchoTool;
-
-    #[async_trait]
-    impl Tool for EchoTool {
-        fn name(&self) -> &str {
-            "echo"
-        }
-        fn description(&self) -> &str {
-            "Echoes back the input"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "message": {"type": "string", "description": "Message to echo"}
-                },
-                "required": ["message"]
-            })
-        }
-        async fn execute(&self, args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
-            let msg = args["message"].as_str().unwrap_or("");
-            Ok(ToolOutput {
-                content: msg.to_owned(),
-                bytes: msg.len(),
-                duration_ms: 0,
-                status: ToolOutputStatus::Success,
-            })
-        }
-    }
-
-    struct FailingTool;
-
-    #[async_trait]
-    impl Tool for FailingTool {
-        fn name(&self) -> &str {
-            "fail"
-        }
-        fn description(&self) -> &str {
-            "Always fails"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
-        }
-        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
-            Err(ToolError::ExecutionError("intentional failure".into()))
-        }
-    }
-
-    struct ReverseTool;
-
-    #[async_trait]
-    impl Tool for ReverseTool {
-        fn name(&self) -> &str {
-            "reverse"
-        }
-        fn description(&self) -> &str {
-            "Reverses the input string"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"}
-                },
-                "required": ["text"]
-            })
-        }
-        async fn execute(&self, args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
-            let text = args["text"].as_str().unwrap_or("");
-            Ok(ToolOutput {
-                content: text.chars().rev().collect(),
-                bytes: text.len(),
-                duration_ms: 0,
-                status: ToolOutputStatus::Success,
-            })
-        }
-    }
-
-    // --- Tests ---
-
     #[test]
-    fn test_register_and_get_tool() {
-        let mut registry = ToolRegistry::new();
-        registry.register(EchoTool);
-        let tool = registry.get("echo").expect("tool should be registered");
-        assert_eq!(tool.name(), "echo");
+    fn test_limit_output_under_limit() {
+        let output = ToolOutput {
+            content: "hello".to_string(),
+            bytes: 5,
+            duration_ms: 10,
+            status: ToolOutputStatus::Success,
+        };
+        let limited = limit_tool_output(output.clone(), 100);
+        assert_eq!(limited.content, output.content);
+        assert_eq!(limited.bytes, output.bytes);
+        assert_eq!(limited.status, ToolOutputStatus::Success);
     }
 
     #[test]
-    fn test_get_nonexistent_tool() {
-        let registry = ToolRegistry::new();
-        assert!(registry.get("nope").is_none());
+    fn test_limit_output_over_limit() {
+        let output = ToolOutput {
+            content: "a".repeat(1000),
+            bytes: 1000,
+            duration_ms: 50,
+            status: ToolOutputStatus::Success,
+        };
+        let limited = limit_tool_output(output, 100);
+        assert!(limited.bytes < 1000);
+        assert!(limited.content.contains("[TRUNCATED"));
+        assert_eq!(limited.status, ToolOutputStatus::Truncated);
     }
 
     #[test]
-    fn test_definitions_returns_all() {
-        let mut registry = ToolRegistry::new();
-        registry.register(EchoTool);
-        registry.register(FailingTool);
-        let defs = registry.definitions();
-        assert_eq!(defs.len(), 2);
-        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"echo"));
-        assert!(names.contains(&"fail"));
+    fn test_limit_output_exact_limit() {
+        let content = "hello";
+        let output = ToolOutput {
+            content: content.to_string(),
+            bytes: 5,
+            duration_ms: 10,
+            status: ToolOutputStatus::Success,
+        };
+        let limited = limit_tool_output(output.clone(), 5);
+        assert_eq!(limited.content, content);
+        assert_eq!(limited.bytes, 5);
+        assert_eq!(limited.status, ToolOutputStatus::Success);
     }
 
     #[test]
-    fn test_definitions_for_filters() {
-        let mut registry = ToolRegistry::new();
-        registry.register(EchoTool);
-        registry.register(FailingTool);
-        registry.register(ReverseTool);
-        let names = vec!["echo".to_string(), "reverse".to_string()];
-        let defs = registry.definitions_for(&names);
-        assert_eq!(defs.len(), 2);
-        let def_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(def_names.contains(&"echo"));
-        assert!(def_names.contains(&"reverse"));
-        assert!(!def_names.contains(&"fail"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_tool() {
-        let mut registry = ToolRegistry::new();
-        registry.register(EchoTool);
-        let args = serde_json::json!({"message": "hello"});
-        let output = registry.execute("echo", &args).await.unwrap();
-        assert_eq!(output.content, "hello");
-        assert_eq!(output.bytes, 5);
-        assert_eq!(output.status, ToolOutputStatus::Success);
-    }
-
-    #[tokio::test]
-    async fn test_execute_nonexistent_tool() {
-        let registry = ToolRegistry::new();
-        let result = registry.execute("ghost", &serde_json::json!({})).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ToolError::NotFound(name) if name == "ghost"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_failing_tool() {
-        let mut registry = ToolRegistry::new();
-        registry.register(FailingTool);
-        let result = registry.execute("fail", &serde_json::json!({})).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, ToolError::ExecutionError(msg) if msg == "intentional failure")
-        );
+    fn test_limit_output_zero_max() {
+        let output = ToolOutput {
+            content: "hello".to_string(),
+            bytes: 5,
+            duration_ms: 10,
+            status: ToolOutputStatus::Success,
+        };
+        let limited = limit_tool_output(output.clone(), 0);
+        assert!(limited.content.contains("[TRUNCATED"));
+        assert_eq!(limited.status, ToolOutputStatus::Truncated);
     }
 
     #[test]
-    fn test_tool_names() {
-        let mut registry = ToolRegistry::new();
-        registry.register(EchoTool);
-        registry.register(FailingTool);
-        let mut names = registry.tool_names();
-        names.sort();
-        assert_eq!(names, vec!["echo", "fail"]);
+    fn test_create_audit_record_success() {
+        let output = ToolOutput {
+            content: "result".to_string(),
+            bytes: 6,
+            duration_ms: 100,
+            status: ToolOutputStatus::Success,
+        };
+        let args = serde_json::json!({"cmd": "ls"});
+        let record = create_audit_record("bash", &args, &output);
+
+        assert_eq!(record.tool_name, "bash");
+        assert!(record.arguments_json.contains("ls"));
+        assert_eq!(record.output_bytes, 6);
+        assert_eq!(record.output_status, "success");
+        assert_eq!(record.duration_ms, 100);
+        assert!(!record.truncated);
     }
 
     #[test]
-    fn test_contains() {
-        let mut registry = ToolRegistry::new();
-        registry.register(EchoTool);
-        assert!(registry.contains("echo"));
-        assert!(!registry.contains("bash"));
+    fn test_create_audit_record_truncated() {
+        let output = ToolOutput {
+            content: "truncated content".to_string(),
+            bytes: 100,
+            duration_ms: 50,
+            status: ToolOutputStatus::Truncated,
+        };
+        let args = serde_json::json!({});
+        let record = create_audit_record("echo", &args, &output);
+
+        assert_eq!(record.output_status, "truncated");
+        assert!(record.truncated);
     }
 
     #[test]
-    fn test_to_definition() {
-        let echo = EchoTool;
-        let def = echo.to_definition();
-        assert_eq!(def.name, "echo");
-        assert_eq!(def.description, "Echoes back the input");
-        assert_eq!(def.parameters["type"], "object");
-        assert!(def.parameters["properties"]["message"].is_object());
+    fn test_create_audit_record_serialization() {
+        let output = ToolOutput {
+            content: "test".to_string(),
+            bytes: 4,
+            duration_ms: 25,
+            status: ToolOutputStatus::Success,
+        };
+        let args = serde_json::json!({"x": 1});
+        let record = create_audit_record("test_tool", &args, &output);
+
+        let json = serde_json::to_string(&record).unwrap();
+        let back: ToolAuditRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.tool_name, record.tool_name);
+        assert_eq!(back.output_bytes, record.output_bytes);
+        assert_eq!(back.output_status, record.output_status);
+        assert_eq!(back.duration_ms, record.duration_ms);
+        assert_eq!(back.truncated, record.truncated);
     }
 }

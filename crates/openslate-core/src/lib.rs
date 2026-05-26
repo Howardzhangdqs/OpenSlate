@@ -1,6 +1,7 @@
 pub mod agent_tree;
 pub mod callable;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod execution;
 pub mod model_config;

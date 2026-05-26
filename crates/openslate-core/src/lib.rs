@@ -1,5 +1,9 @@
-//! OpenSlate Core — types, agent tree, runtime, policy, prompt resolver, trace events.
+pub mod callable;
+pub mod error;
+pub mod types;
 
 pub mod prelude {
-    // Re-exports will be added as modules are implemented
+    pub use crate::callable::*;
+    pub use crate::error::*;
+    pub use crate::types::*;
 }

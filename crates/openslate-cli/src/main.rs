@@ -1,5 +1,7 @@
 //! OpenSlate CLI — command-line interface for the Agent Runtime.
 
+mod cmd;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -30,7 +32,11 @@ enum Commands {
         name: Option<String>,
     },
     /// Validate configuration files
-    Validate,
+    Validate {
+        /// Use strict mode (warnings treated as errors)
+        #[arg(long)]
+        strict: bool,
+    },
     /// Run an agent
     Run {
         /// Agent ID to run (defaults to root agent)
@@ -42,6 +48,18 @@ enum Commands {
         /// Profile to use
         #[arg(long, default_value = "default")]
         profile: String,
+        /// Output format (text)
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Write output to file instead of stdout
+        #[arg(long)]
+        output: Option<String>,
+        /// Override root agent ID
+        #[arg(long)]
+        root_agent: Option<String>,
+        /// Only output final result (suppress step-by-step logs)
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -163,15 +181,36 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir().context("Failed to get current directory")?;
             run_init(&cwd, name.as_deref())?;
         }
-        Commands::Validate => {
-            anyhow::bail!("validate subcommand is not yet implemented");
+        Commands::Validate { strict } => {
+            let config_path = cmd::validate::resolve_config_path(cli.config.as_deref())?;
+            let agents_path =
+                cmd::validate::resolve_agents_path(config_path.parent().unwrap_or(Path::new(".")));
+            cmd::validate::run_validate_command(&config_path, &agents_path, strict)?;
         }
         Commands::Run {
-            agent: _,
-            prompt: _,
-            profile: _,
+            agent,
+            prompt,
+            profile,
+            format,
+            output,
+            root_agent,
+            quiet,
         } => {
-            anyhow::bail!("run subcommand is not yet implemented");
+            let output_format = format
+                .parse::<cmd::run::OutputFormat>()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let params = cmd::run::RunParams {
+                config_path: cli.config,
+                agent,
+                prompt,
+                profile,
+                format: output_format,
+                output,
+                root_agent,
+                quiet,
+            };
+            cmd::run::run_run_command(params).await?;
         }
     }
 
@@ -280,9 +319,56 @@ mod tests {
                 agent: None,
                 prompt,
                 profile,
+                format,
+                output: None,
+                root_agent: None,
+                quiet: false,
             } => {
                 assert_eq!(prompt.as_deref(), Some("hello"));
                 assert_eq!(profile, "default");
+                assert_eq!(format, "text");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_run_all_flags() {
+        let cli = Cli::try_parse_from([
+            "openslate",
+            "run",
+            "--prompt",
+            "test",
+            "--agent",
+            "root",
+            "--profile",
+            "custom",
+            "--format",
+            "text",
+            "--output",
+            "/tmp/out.txt",
+            "--root-agent",
+            "root",
+            "--quiet",
+        ])
+        .expect("parse run with all flags");
+        match cli.command {
+            Commands::Run {
+                agent,
+                prompt,
+                profile,
+                format,
+                output,
+                root_agent,
+                quiet,
+            } => {
+                assert_eq!(agent.as_deref(), Some("root"));
+                assert_eq!(prompt.as_deref(), Some("test"));
+                assert_eq!(profile, "custom");
+                assert_eq!(format, "text");
+                assert_eq!(output.as_deref(), Some("/tmp/out.txt"));
+                assert_eq!(root_agent.as_deref(), Some("root"));
+                assert!(quiet);
             }
             _ => panic!("expected Run command"),
         }
@@ -291,7 +377,13 @@ mod tests {
     #[test]
     fn test_cli_parse_validate() {
         let cli = Cli::try_parse_from(["openslate", "validate"]).expect("parse validate");
-        assert!(matches!(cli.command, Commands::Validate));
+        assert!(matches!(cli.command, Commands::Validate { strict: false }));
+    }
+
+    #[test]
+    fn test_cli_parse_validate_strict() {
+        let cli = Cli::try_parse_from(["openslate", "validate", "--strict"]).expect("parse validate --strict");
+        assert!(matches!(cli.command, Commands::Validate { strict: true }));
     }
 
     #[test]

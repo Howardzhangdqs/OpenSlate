@@ -3,6 +3,8 @@
 //! Supports TOML for main config (`openslate.toml`) and YAML for agent
 //! definitions (`agents.yaml`). All structs implement `serde::Deserialize`.
 
+pub mod validation;
+
 use std::collections::HashMap;
 
 use serde::Deserialize;
@@ -314,7 +316,7 @@ model = "m"
     #[test]
     fn parse_full_example_toml() {
         let toml_content = include_str!(
-            "../../../../openslate-project-plan/plan/examples/openslate.toml"
+            "../../../../../openslate-project-plan/plan/examples/openslate.toml"
         );
         let config = parse_openslate_toml(toml_content).expect("example toml should parse");
 
@@ -426,7 +428,7 @@ agents:
     #[test]
     fn parse_full_example_agents_yaml() {
         let yaml_content = include_str!(
-            "../../../../openslate-project-plan/plan/examples/agents.yaml"
+            "../../../../../openslate-project-plan/plan/examples/agents.yaml"
         );
         let config = parse_agents_yaml(yaml_content).expect("example yaml should parse");
 

@@ -14,7 +14,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
 
 # Serialization
 serde = { version = "1.0.227", features = ["derive"] }

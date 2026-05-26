@@ -1204,6 +1204,7 @@ dependencies = [
  "openslate-store-sqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

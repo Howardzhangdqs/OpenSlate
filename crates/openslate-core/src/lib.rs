@@ -8,6 +8,7 @@ pub mod model_config;
 pub mod paths;
 pub mod prompt;
 pub mod provider;
+pub mod run_manager;
 pub mod runtime;
 pub mod tool;
 pub mod types;

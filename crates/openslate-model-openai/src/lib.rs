@@ -1,5 +1,8 @@
-//! OpenSlate OpenAI-Compatible Model Client — provider implementation for Zhipu, MiniMax, etc.
+pub mod client;
+pub mod types;
 
 pub mod prelude {
-    // Re-exports will be added as modules are implemented
+    pub use crate::client::OpenAICompatibleProvider;
+    pub use crate::client::OpenAIProviderConfig;
+    pub use crate::types::*;
 }

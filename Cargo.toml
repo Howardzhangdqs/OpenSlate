@@ -39,6 +39,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # SQLite (async)
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 
+# Async trait
+async-trait = "0.1"
+
+# Testing
+mockito = "1"
+
 # Utilities
 uuid = { version = "1.23.0", features = ["v4"] }
 chrono = { version = "0.4.43", features = ["serde"] }

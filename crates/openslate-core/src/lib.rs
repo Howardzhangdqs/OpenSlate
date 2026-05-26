@@ -3,7 +3,9 @@ pub mod config;
 pub mod error;
 pub mod model_config;
 pub mod paths;
+pub mod prompt;
 pub mod provider;
+pub mod tool;
 pub mod types;
 
 pub mod prelude {

@@ -27,6 +27,7 @@ impl SqliteStore {
     /// Create a new store with an in-memory SQLite database (for testing).
     pub async fn new_in_memory() -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
+            .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
@@ -48,6 +49,7 @@ impl SqliteStore {
     /// Create a new store connected to a file-based database.
     pub async fn new(path: &str) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
+            .max_connections(1)
             .connect(&format!("sqlite:{path}?mode=rwc"))
             .await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;

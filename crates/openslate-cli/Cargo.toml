@@ -1,0 +1,21 @@
+[package]
+name = "openslate-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "openslate"
+path = "src/main.rs"
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+openslate-model-openai = { path = "../openslate-model-openai" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }

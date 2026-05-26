@@ -5,8 +5,66 @@
 //! This is a SEQUENTIAL loop for v0.1-v0.4 (parallel execution comes later).
 
 use crate::error::OpenSlateError;
+use crate::error::RuntimeError;
 use crate::provider::{GenerateRequest, ModelProvider};
 use crate::types::*;
+
+/// Runtime limits for a single agent run.
+#[derive(Debug, Clone)]
+pub struct RuntimeLimits {
+    pub max_steps: u32,
+    pub max_depth: u32,
+    pub max_tool_calls: u32,
+    pub max_child_agent_calls: u32,
+    pub timeout_ms: u64,
+    pub max_context_bytes: u32,
+    pub max_output_bytes: u32,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: 12,
+            max_depth: 4,
+            max_tool_calls: 20,
+            max_child_agent_calls: 8,
+            timeout_ms: 60_000,
+            max_context_bytes: 64_000,
+            max_output_bytes: 65_536,
+        }
+    }
+}
+
+/// Check if runtime limits are exceeded. Returns `Ok(())` if within limits.
+pub fn check_limits(
+    limits: &RuntimeLimits,
+    current_steps: u32,
+    current_depth: u32,
+    current_tool_calls: u32,
+    current_child_calls: u32,
+) -> Result<(), RuntimeError> {
+    if current_steps >= limits.max_steps {
+        return Err(RuntimeError::MaxStepsExceeded {
+            max: limits.max_steps,
+        });
+    }
+    if current_depth >= limits.max_depth {
+        return Err(RuntimeError::MaxDepthExceeded {
+            max: limits.max_depth,
+        });
+    }
+    if current_tool_calls >= limits.max_tool_calls {
+        return Err(RuntimeError::MaxToolCallsExceeded {
+            max: limits.max_tool_calls,
+        });
+    }
+    if current_child_calls >= limits.max_child_agent_calls {
+        return Err(RuntimeError::MaxChildAgentCallsExceeded {
+            max: limits.max_child_agent_calls,
+        });
+    }
+    Ok(())
+}
 
 /// Configuration for a single agent run.
 #[derive(Debug, Clone)]
@@ -386,5 +444,56 @@ mod tests {
 
         assert_eq!(result.status, RunStatus::Failed);
         assert_eq!(result.total_steps, 1);
+    }
+
+    // -- RuntimeLimits + check_limits tests --
+
+    #[test]
+    fn test_max_steps_exceeded() {
+        let limits = RuntimeLimits::default();
+        let err = check_limits(&limits, limits.max_steps, 0, 0, 0).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::MaxStepsExceeded { max: 12 }),
+            "expected MaxStepsExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_max_depth_exceeded() {
+        let limits = RuntimeLimits::default();
+        let err = check_limits(&limits, 0, limits.max_depth, 0, 0).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::MaxDepthExceeded { max: 4 }),
+            "expected MaxDepthExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_max_tool_calls_exceeded() {
+        let limits = RuntimeLimits::default();
+        let err = check_limits(&limits, 0, 0, limits.max_tool_calls, 0).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::MaxToolCallsExceeded { max: 20 }),
+            "expected MaxToolCallsExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_within_limits() {
+        let limits = RuntimeLimits::default();
+        check_limits(&limits, 0, 0, 0, 0).expect("should be within limits");
+        check_limits(&limits, 11, 3, 19, 7).expect("should be within limits (one under each)");
+    }
+
+    #[test]
+    fn test_default_limits() {
+        let limits = RuntimeLimits::default();
+        assert_eq!(limits.max_steps, 12);
+        assert_eq!(limits.max_depth, 4);
+        assert_eq!(limits.max_tool_calls, 20);
+        assert_eq!(limits.max_child_agent_calls, 8);
+        assert_eq!(limits.timeout_ms, 60_000);
+        assert_eq!(limits.max_context_bytes, 64_000);
+        assert_eq!(limits.max_output_bytes, 65_536);
     }
 }

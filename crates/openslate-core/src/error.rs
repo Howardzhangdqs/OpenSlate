@@ -101,6 +101,9 @@ pub enum RuntimeError {
     #[error("max tool calls exceeded: {max}")]
     MaxToolCallsExceeded { max: u32 },
 
+    #[error("max child agent calls exceeded: {max}")]
+    MaxChildAgentCallsExceeded { max: u32 },
+
     #[error("timeout after {timeout_ms}ms")]
     Timeout { timeout_ms: u64 },
 
@@ -262,6 +265,10 @@ mod tests {
         assert_eq!(
             format!("{}", RuntimeError::MaxToolCallsExceeded { max: 50 }),
             "max tool calls exceeded: 50"
+        );
+        assert_eq!(
+            format!("{}", RuntimeError::MaxChildAgentCallsExceeded { max: 8 }),
+            "max child agent calls exceeded: 8"
         );
         assert_eq!(
             format!("{}", RuntimeError::Timeout { timeout_ms: 5000 }),

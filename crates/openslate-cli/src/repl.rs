@@ -20,6 +20,20 @@ use crate::wiring::AppContext;
 const PROMPT: &str = "openslate> ";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_owned()
+    } else {
+        let end = max_len.saturating_sub(1);
+        format!("{}…", &s[..end])
+    }
+}
+
+fn truncate_json(json: &str, max_len: usize) -> String {
+    let cleaned = json.trim().trim_start_matches('"').trim_end_matches('"');
+    truncate_str(cleaned, max_len)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchResult {
     Continue,
@@ -38,6 +52,8 @@ enum SlashCommand {
     Model { alias: String },
     Profile { name: String },
     Compact,
+    Resume,
+    Sessions,
     Unknown { raw: String },
 }
 
@@ -78,6 +94,8 @@ impl SlashCommand {
                 },
             },
             "/compact" => SlashCommand::Compact,
+            "/resume" | "/continue" => SlashCommand::Resume,
+            "/session" | "/sessions" => SlashCommand::Sessions,
             _ => SlashCommand::Unknown {
                 raw: command.to_owned(),
             },
@@ -220,6 +238,8 @@ impl ReplSession {
                 println!("  /model <alias>        — Switch active model");
                 println!("  /profile <name>       — Switch active profile");
                 println!("  /compact              — Compress conversation history");
+                println!("  /resume, /continue    — Resume last interrupted run");
+                println!("  /session, /sessions   — List recent runs from store");
                 println!("  //text                — Escape: treat /text as normal input");
                 Ok(DispatchResult::Continue)
             }
@@ -374,6 +394,34 @@ impl ReplSession {
                 }
                 Ok(DispatchResult::Continue)
             }
+            SlashCommand::Resume => {
+                if self.ctx.store.is_none() {
+                    println!("Store not available");
+                    return Ok(DispatchResult::Continue);
+                }
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => handle.block_on(self.handle_resume()),
+                    Err(_) => {
+                        let rt = tokio::runtime::Runtime::new()
+                            .context("Failed to create tokio runtime")?;
+                        rt.block_on(self.handle_resume())
+                    }
+                }
+            }
+            SlashCommand::Sessions => {
+                if self.ctx.store.is_none() {
+                    println!("Store not available");
+                    return Ok(DispatchResult::Continue);
+                }
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => handle.block_on(self.handle_sessions()),
+                    Err(_) => {
+                        let rt = tokio::runtime::Runtime::new()
+                            .context("Failed to create tokio runtime")?;
+                        rt.block_on(self.handle_sessions())
+                    }
+                }
+            }
             SlashCommand::Unknown { ref raw } => {
                 let cmd_part = raw.split_whitespace().next().unwrap_or(raw);
                 println!(
@@ -478,6 +526,79 @@ impl ReplSession {
                 self.print_agent_node(child, depth + 1);
             }
         }
+    }
+
+    async fn handle_resume(&mut self) -> Result<DispatchResult> {
+        let store = match self.ctx.store {
+            Some(ref s) => s,
+            None => {
+                println!("Store not available");
+                return Ok(DispatchResult::Continue);
+            }
+        };
+
+        match store.get_last_interrupted_run().await {
+            Ok(Some(run)) => {
+                let input_preview = truncate_json(&run.input_json, 80);
+                println!("Found interrupted run:");
+                println!("  ID:        {}", run.id);
+                println!("  Status:    {}", run.status);
+                println!("  Started:   {}", run.started_at);
+                println!("  Input:     {}", input_preview);
+                println!("(Resume display only — full replay not yet implemented)");
+            }
+            Ok(None) => {
+                println!("No interrupted runs found");
+            }
+            Err(e) => {
+                println!("Store query failed: {}", e);
+            }
+        }
+
+        Ok(DispatchResult::Continue)
+    }
+
+    async fn handle_sessions(&mut self) -> Result<DispatchResult> {
+        let store = match self.ctx.store {
+            Some(ref s) => s,
+            None => {
+                println!("Store not available");
+                return Ok(DispatchResult::Continue);
+            }
+        };
+
+        match store.list_runs(10, 0).await {
+            Ok(runs) => {
+                if runs.is_empty() {
+                    println!("No runs found");
+                    return Ok(DispatchResult::Continue);
+                }
+
+                println!(
+                    "{:<4} {:<20} {:<14} {:<12} {:<16} Input",
+                    "#", "Run ID", "Status", "Title", "Started"
+                );
+                println!("{}", "-".repeat(90));
+                for (i, run) in runs.iter().enumerate() {
+                    let title = run.title.as_deref().unwrap_or("-");
+                    let input_preview = truncate_json(&run.input_json, 40);
+                    println!(
+                        "{:<4} {:<20} {:<14} {:<12} {:<16} {}",
+                        i + 1,
+                        truncate_str(&run.id, 18),
+                        truncate_str(&run.status, 12),
+                        truncate_str(title, 10),
+                        run.started_at,
+                        input_preview
+                    );
+                }
+            }
+            Err(e) => {
+                println!("Store query failed: {}", e);
+            }
+        }
+
+        Ok(DispatchResult::Continue)
     }
 
     #[cfg(test)]
@@ -923,6 +1044,26 @@ agents:
         }
     }
 
+    #[test]
+    fn test_parse_resume() {
+        assert_eq!(SlashCommand::parse("/resume"), SlashCommand::Resume);
+    }
+
+    #[test]
+    fn test_parse_continue_is_resume() {
+        assert_eq!(SlashCommand::parse("/continue"), SlashCommand::Resume);
+    }
+
+    #[test]
+    fn test_parse_session() {
+        assert_eq!(SlashCommand::parse("/session"), SlashCommand::Sessions);
+    }
+
+    #[test]
+    fn test_parse_sessions() {
+        assert_eq!(SlashCommand::parse("/sessions"), SlashCommand::Sessions);
+    }
+
     // ── Welcome message tests ──
 
     #[test]
@@ -1313,5 +1454,147 @@ agents:
         let mut session = make_session_multi_model();
         let result = session.handle_slash_command("/config").unwrap();
         assert_eq!(result, DispatchResult::Continue);
+    }
+
+    // ── /resume and /session tests ──
+
+    #[test]
+    fn test_resume_no_store() {
+        let mut session = make_session();
+        let result = session.handle_slash_command("/resume").unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[test]
+    fn test_sessions_no_store() {
+        let mut session = make_session();
+        let result = session.handle_slash_command("/sessions").unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[test]
+    fn test_resume_via_continue_alias() {
+        let mut session = make_session();
+        let result = session.handle_slash_command("/continue").unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[test]
+    fn test_resume_via_dispatch() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut session = make_session();
+        let result = rt.block_on(session.dispatch("/resume")).unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[test]
+    fn test_sessions_via_dispatch() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut session = make_session();
+        let result = rt.block_on(session.dispatch("/sessions")).unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn test_resume_with_store_no_interrupted_runs() {
+        let store = openslate_store_sqlite::store::SqliteStore::new_in_memory()
+            .await
+            .expect("store");
+        store.run_migrations().await.expect("migrations");
+
+        let tmp = temp_project();
+        let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agent_tree =
+            openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
+        let manager = openslate_core::run_manager::RunManager::new(
+            config.clone(),
+            agent_tree.clone(),
+            openslate_core::tool::builtin_registry(),
+        );
+
+        let ctx = wiring::AppContext {
+            config,
+            agents,
+            store: Some(store),
+            agent_tree,
+            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
+                openslate_model_openai::client::OpenAIProviderConfig {
+                    provider_name: "zhipu".into(),
+                    base_url: "https://example.com".into(),
+                    api_key: "test-key".into(),
+                    timeout_secs: 60,
+                },
+            ),
+            manager,
+            config_path: tmp.path().join(".openslate/openslate.toml"),
+            agents_path: tmp.path().join(".openslate/agents.yaml"),
+        };
+
+        let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();
+        let result = session.handle_resume().await.unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[tokio::test]
+    async fn test_sessions_with_store_empty() {
+        let store = openslate_store_sqlite::store::SqliteStore::new_in_memory()
+            .await
+            .expect("store");
+        store.run_migrations().await.expect("migrations");
+
+        let tmp = temp_project();
+        let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agent_tree =
+            openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
+        let manager = openslate_core::run_manager::RunManager::new(
+            config.clone(),
+            agent_tree.clone(),
+            openslate_core::tool::builtin_registry(),
+        );
+
+        let ctx = wiring::AppContext {
+            config,
+            agents,
+            store: Some(store),
+            agent_tree,
+            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
+                openslate_model_openai::client::OpenAIProviderConfig {
+                    provider_name: "zhipu".into(),
+                    base_url: "https://example.com".into(),
+                    api_key: "test-key".into(),
+                    timeout_secs: 60,
+                },
+            ),
+            manager,
+            config_path: tmp.path().join(".openslate/openslate.toml"),
+            agents_path: tmp.path().join(".openslate/agents.yaml"),
+        };
+
+        let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();
+        let result = session.handle_sessions().await.unwrap();
+        assert_eq!(result, DispatchResult::Continue);
+    }
+
+    #[test]
+    fn test_truncate_str_short() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_long() {
+        let result = truncate_str("hello world this is a long string", 10);
+        assert_eq!(result, "hello wor…");
+    }
+
+    #[test]
+    fn test_truncate_json_strips_quotes() {
+        assert_eq!(truncate_json(r#""hello""#, 20), "hello");
+    }
+
+    #[test]
+    fn test_truncate_json_plain() {
+        assert_eq!(truncate_json("hello world", 20), "hello world");
     }
 }

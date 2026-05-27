@@ -1,19 +1,16 @@
 //! `openslate run` command — execute a single agent run.
 //!
-//! Loads config, validates, creates RunManager, executes with provider,
-//! and prints result to stdout.
+//! Uses the `AppContext` wiring to assemble all components and execute
+//! a complete end-to-end run: config → validation → SQLite store → agent tree →
+//! tool registry → provider → RunManager → execute → result output.
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
 
 use openslate_core::agent_tree::AgentTree;
-use openslate_core::config::validation::validate_config;
-use openslate_core::config::{parse_agents_yaml, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
-use openslate_core::model_config::resolve_model;
-use openslate_core::run_manager::RunManager;
-use openslate_core::tool::builtin_registry;
 use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
+
+use crate::wiring as app_wiring;
 
 /// Output format for run results.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +33,7 @@ impl std::str::FromStr for OutputFormat {
 }
 
 /// Parameters for the run command.
-#[allow(dead_code)] // agent and profile used by Task 28 wiring
+#[allow(dead_code)]
 pub struct RunParams {
     pub config_path: Option<String>,
     pub agent: Option<String>,
@@ -44,76 +41,9 @@ pub struct RunParams {
     pub profile: String,
     pub format: OutputFormat,
     pub output: Option<String>,
+    #[allow(dead_code)]
     pub root_agent: Option<String>,
     pub quiet: bool,
-}
-
-/// Load and parse `openslate.toml` from the given path.
-fn load_config(config_path: &Path) -> Result<OpenSlateConfig> {
-    let content = fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read config file '{}'", config_path.display()))?;
-    parse_openslate_toml(&content)
-        .with_context(|| format!("Failed to parse config file '{}'", config_path.display()))
-}
-
-/// Load and parse `agents.yaml` from the given path.
-fn load_agents(agents_path: &Path) -> Result<AgentsConfig> {
-    let content = fs::read_to_string(agents_path)
-        .with_context(|| format!("Failed to read agents file '{}'", agents_path.display()))?;
-    parse_agents_yaml(&content)
-        .with_context(|| format!("Failed to parse agents file '{}'", agents_path.display()))
-}
-
-/// Resolve config file path from CLI `--config` flag or default XDG resolution.
-fn resolve_config_file(config_flag: Option<&str>) -> Result<std::path::PathBuf> {
-    if let Some(flag) = config_flag {
-        let path = Path::new(flag);
-        if !path.exists() {
-            anyhow::bail!("Config file not found: {}", path.display());
-        }
-        return Ok(path.to_path_buf());
-    }
-
-    let cwd = std::env::current_dir().context("Failed to get current directory")?;
-    let paths = openslate_core::paths::resolve_paths(&cwd);
-    if !paths.config_file.exists() {
-        anyhow::bail!(
-            "No openslate.toml found. Expected at {}. Run `openslate init` to create one.",
-            paths.config_file.display()
-        );
-    }
-    Ok(paths.config_file)
-}
-
-/// Resolve agents.yaml path from the config file's parent directory.
-fn resolve_agents_file(config_path: &Path) -> std::path::PathBuf {
-    config_path
-        .parent()
-        .map(|p| p.join("agents.yaml"))
-        .unwrap_or_else(|| Path::new("agents.yaml").to_path_buf())
-}
-
-/// Build an OpenAI-compatible provider from the root agent's model config.
-fn build_provider(config: &OpenSlateConfig, model_alias: &str) -> Result<OpenAICompatibleProvider> {
-    let resolved = resolve_model(config, model_alias).with_context(|| {
-        format!("Failed to resolve model alias '{}'", model_alias)
-    })?;
-
-    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
-        format!(
-            "API key not found: set environment variable '{}'",
-            resolved.provider.api_key_env
-        )
-    })?;
-
-    let provider_config = OpenAIProviderConfig {
-        provider_name: resolved.provider_name,
-        base_url: resolved.provider.base_url,
-        api_key,
-        timeout_secs: 60,
-    };
-
-    Ok(OpenAICompatibleProvider::new(provider_config))
 }
 
 /// Extract the final assistant message from the run result.
@@ -160,78 +90,99 @@ fn write_result(
     Ok(())
 }
 
+/// Resolve a specific agent from the agent tree.
+///
+/// If `agent_id` is provided, look it up. Otherwise return the root agent.
+fn resolve_agent<'a>(
+    agent_tree: &'a AgentTree,
+    agent_id: Option<&str>,
+) -> Result<&'a openslate_core::agent_tree::AgentNode> {
+    if let Some(id) = agent_id {
+        agent_tree
+            .get_agent(&openslate_core::types::AgentId(id.to_owned()))
+            .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found in configuration", id))
+    } else {
+        Ok(agent_tree.get_root())
+    }
+}
+
 /// Run the `openslate run` command.
 pub async fn run_run_command(params: RunParams) -> Result<()> {
-    // 1. Resolve config path
-    let config_path = resolve_config_file(params.config_path.as_deref())?;
-    tracing::debug!("Using config: {}", config_path.display());
+    // 1. Build the full app context (config → validation → store → agent tree → registry)
+    let ctx = app_wiring::build_app_context(params.config_path.as_deref()).await?;
 
-    let agents_path = resolve_agents_file(&config_path);
-    tracing::debug!("Using agents: {}", agents_path.display());
+    // 2. Resolve which agent to run (--agent flag or root)
+    let agent = resolve_agent(&ctx.agent_tree, params.agent.as_deref())?;
+    let model_alias = agent.model_alias.clone();
+    tracing::info!(
+        "Running agent '{}' (model='{}') with profile '{}'",
+        agent.id,
+        model_alias,
+        params.profile
+    );
 
-    // 2. Load config
-    let config = load_config(&config_path)?;
+    // 3. Build provider for the resolved agent's model
+    let provider = build_provider_for_model(&ctx.config, &model_alias)?;
 
-    // 3. Load agents
-    let agents = load_agents(&agents_path)?;
-
-    // 4. Validate config
-    let errors = validate_config(&config, &agents);
-    if !errors.is_empty() {
-        for err in &errors {
-            tracing::error!("Validation error: {} — {}", err.field, err.message);
-        }
-        anyhow::bail!(
-            "Configuration validation failed with {} error(s)",
-            errors.len()
-        );
-    }
-
-    // 5. Build agent tree
-    let agent_tree = AgentTree::from_configs(&agents.agents)
-        .map_err(|e| anyhow::anyhow!("Failed to build agent tree: {}", e))?;
-
-    // 6. Determine which agent to run (before moving agent_tree)
-    let root_agent = if let Some(agent_id) = &params.root_agent {
-        agent_tree
-            .get_agent(&openslate_core::types::AgentId(agent_id.clone()))
-            .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found in configuration", agent_id))?
-    } else {
-        agent_tree.get_root()
-    };
-
-    let model_alias = root_agent.model_alias.clone();
-    tracing::debug!("Running agent '{}' with model '{}'", root_agent.id, model_alias);
-
-    // 7. Build tool registry
-    let registry = builtin_registry();
-
-    // 8. Build provider (before moving config into RunManager)
-    let provider = build_provider(&config, &model_alias)?;
-
-    // 9. Create RunManager
-    let manager = RunManager::new(config, agent_tree, registry);
-
-    // 10. Get prompt
+    // 4. Get prompt
     let prompt = params
         .prompt
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No prompt provided. Use --prompt <text> to specify input."))?;
 
-    // 11. Execute
-    let result = manager
+    // 5. Log store status
+    if let Some(ref _store) = ctx.store {
+        tracing::debug!("SQLite store initialized for this run");
+    }
+
+    // 6. Execute via RunManager
+    let result = ctx
+        .manager
         .execute(&provider, prompt)
         .await
         .map_err(|e| anyhow::anyhow!("Run failed: {}", e))?;
 
-    // 12. Extract final assistant message
+    // 7. Extract final assistant message
     let final_message = extract_final_assistant_message(&result.messages)
         .unwrap_or_else(|| "(no assistant response)".to_owned());
 
-    // 13. Write result
-    write_result(&final_message, &result, &params.format, params.output.as_deref(), params.quiet)?;
+    // 8. Write result
+    write_result(
+        &final_message,
+        &result,
+        &params.format,
+        params.output.as_deref(),
+        params.quiet,
+    )?;
 
     Ok(())
+}
+
+/// Build an OpenAI-compatible provider for a specific model alias.
+fn build_provider_for_model(
+    config: &openslate_core::config::OpenSlateConfig,
+    model_alias: &str,
+) -> Result<OpenAICompatibleProvider> {
+    let resolved =
+        openslate_core::model_config::resolve_model(config, model_alias).with_context(|| {
+            format!("Failed to resolve model alias '{}'", model_alias)
+        })?;
+
+    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
+        format!(
+            "API key not found: set environment variable '{}'",
+            resolved.provider.api_key_env
+        )
+    })?;
+
+    let provider_config = OpenAIProviderConfig {
+        provider_name: resolved.provider_name,
+        base_url: resolved.provider.base_url,
+        api_key,
+        timeout_secs: 60,
+    };
+
+    Ok(OpenAICompatibleProvider::new(provider_config))
 }
 
 #[cfg(test)]
@@ -295,58 +246,6 @@ agents:
     }
 
     #[test]
-    fn test_load_config_valid() {
-        let tmp = temp_project();
-        let path = tmp.path().join(".openslate/openslate.toml");
-        let config = load_config(&path).expect("should load");
-        assert!(config.models.contains_key("main"));
-    }
-
-    #[test]
-    fn test_load_config_missing_file() {
-        let result = load_config(Path::new("/nonexistent/openslate.toml"));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Failed to read") || msg.contains("Failed to parse"));
-    }
-
-    #[test]
-    fn test_load_agents_valid() {
-        let tmp = temp_project();
-        let path = tmp.path().join(".openslate/agents.yaml");
-        let agents = load_agents(&path).expect("should load");
-        assert_eq!(agents.agents.len(), 1);
-        assert_eq!(agents.agents[0].id.0, "root");
-    }
-
-    #[test]
-    fn test_load_agents_missing_file() {
-        let result = load_agents(Path::new("/nonexistent/agents.yaml"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_config_file_explicit() {
-        let tmp = temp_project();
-        let path = tmp.path().join(".openslate/openslate.toml");
-        let resolved = resolve_config_file(Some(path.to_str().unwrap())).expect("should resolve");
-        assert_eq!(resolved, path);
-    }
-
-    #[test]
-    fn test_resolve_config_file_missing_explicit() {
-        let result = resolve_config_file(Some("/nonexistent/openslate.toml"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_agents_file() {
-        let path = Path::new("/project/.openslate/openslate.toml");
-        let agents = resolve_agents_file(path);
-        assert_eq!(agents, Path::new("/project/.openslate/agents.yaml"));
-    }
-
-    #[test]
     fn test_extract_final_assistant_message() {
         use openslate_core::types::{Message, MessageRole};
 
@@ -384,10 +283,11 @@ agents:
     }
 
     #[test]
-    fn test_build_provider_missing_env_var() {
+    fn test_build_provider_for_model_missing_env_var() {
         let tmp = temp_project();
-        let config = load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        match build_provider(&config, "main") {
+        let config =
+            crate::wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
+        match build_provider_for_model(&config, "main") {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
@@ -400,16 +300,18 @@ agents:
     }
 
     #[test]
-    fn test_validation_with_valid_config() {
+    fn test_resolve_agent_root_default() {
         let tmp = temp_project();
-        let config = load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
-        let errors = validate_config(&config, &agents);
-        assert!(errors.is_empty(), "valid config should have no errors: {errors:?}");
+        let agents =
+            crate::wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let tree =
+            openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
+        let agent = resolve_agent(&tree, None).unwrap();
+        assert_eq!(agent.id.0, "root");
     }
 
     #[test]
-    fn test_validation_with_invalid_model_ref() {
+    fn test_resolve_agent_explicit_id() {
         let tmp = TempDir::new().expect("create temp dir");
         let dir = tmp.path().join(".openslate");
         fs::create_dir(&dir).expect("create dir");
@@ -418,7 +320,7 @@ agents:
 [providers.zhipu]
 kind = "openai_compatible"
 base_url = "https://example.com"
-api_key_env = "KEY"
+api_key_env = "TEST_API_KEY"
 
 [models.main]
 provider = "zhipu"
@@ -432,15 +334,37 @@ model = "m2"
 agents:
   - id: root
     name: Root
-    model: nonexistent_model
-    default_prompt: "test"
+    model: main
+    children:
+      - worker
+    default_prompt: "Root."
+  - id: worker
+    name: Worker
+    model: fast
+    default_prompt: "Worker."
 "#;
         fs::write(dir.join("openslate.toml"), toml).expect("write");
         fs::write(dir.join("agents.yaml"), agents).expect("write");
 
-        let config = load_config(&dir.join("openslate.toml")).unwrap();
-        let agents_cfg = load_agents(&dir.join("agents.yaml")).unwrap();
-        let errors = validate_config(&config, &agents_cfg);
-        assert!(!errors.is_empty(), "should have validation errors");
+        let agents_cfg =
+            crate::wiring::load_agents(&dir.join("agents.yaml")).unwrap();
+        let tree =
+            openslate_core::agent_tree::AgentTree::from_configs(&agents_cfg.agents).unwrap();
+
+        let worker = resolve_agent(&tree, Some("worker")).unwrap();
+        assert_eq!(worker.id.0, "worker");
+        assert_eq!(worker.model_alias, "fast");
+    }
+
+    #[test]
+    fn test_resolve_agent_not_found() {
+        let tmp = temp_project();
+        let agents =
+            crate::wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let tree =
+            openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
+        let result = resolve_agent(&tree, Some("nonexistent"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 }

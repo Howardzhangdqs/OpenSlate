@@ -3,8 +3,16 @@
 //! Manages message history accumulation with configurable context window limits.
 //! Applies truncation strategy that always preserves the system prompt and keeps
 //! the most recent messages when limits are exceeded.
+//!
+//! Also provides `/compact` context compression: when context nears limits,
+//! older messages can be replaced with a model-generated summary, preserving
+//! the system prompt and the most recent exchange.
+
+pub mod compact;
 
 use crate::types::{Message, MessageRole, ToolCallId};
+
+pub use compact::{compact, needs_compact, CompactResult};
 
 const TRUNCATED_MARKER: &str = "[TRUNCATED]";
 
@@ -202,6 +210,29 @@ impl ContextManager {
     /// Get the system prompt, if set.
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    pub fn needs_compact(&self) -> bool {
+        let system_bytes = self.system_prompt.as_deref().map(|s| s.len()).unwrap_or(0);
+        compact::needs_compact(
+            &self.messages,
+            self.max_context_messages,
+            self.max_context_bytes,
+            system_bytes,
+        )
+    }
+
+    pub fn compact<F>(&mut self, summarize: F) -> CompactResult
+    where
+        F: FnOnce(&str) -> Option<String>,
+    {
+        compact::compact(
+            &mut self.messages,
+            self.system_prompt.as_deref(),
+            self.max_context_messages,
+            self.max_context_bytes,
+            summarize,
+        )
     }
 }
 

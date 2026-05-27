@@ -18,6 +18,7 @@ use crate::wiring as app_wiring;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputFormat {
     Text,
+    Jsonl,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "text" => Ok(OutputFormat::Text),
+            "jsonl" => Ok(OutputFormat::Jsonl),
             _ => Err(format!(
-                "unsupported format '{}'; supported: text",
+                "unsupported format '{}'; supported: text, jsonl",
                 s
             )),
         }
@@ -65,18 +67,31 @@ fn write_result(
     output_path: Option<&str>,
     quiet: bool,
 ) -> Result<()> {
-    let output = match format {
-        OutputFormat::Text => content.to_owned(),
-    };
-
-    if let Some(path) = output_path {
-        fs::write(path, &output)
-            .with_context(|| format!("Failed to write output to '{}'", path))?;
-        if !quiet {
-            tracing::info!("Result written to {}", path);
+    match format {
+        OutputFormat::Text => {
+            if let Some(path) = output_path {
+                fs::write(path, content)
+                    .with_context(|| format!("Failed to write output to '{}'", path))?;
+                if !quiet {
+                    tracing::info!("Result written to {}", path);
+                }
+            } else {
+                println!("{}", content);
+            }
         }
-    } else {
-        println!("{}", output);
+        OutputFormat::Jsonl => {
+            let lines = generate_jsonl_events(result);
+            let output = lines.join("\n");
+            if let Some(path) = output_path {
+                fs::write(path, &output)
+                    .with_context(|| format!("Failed to write output to '{}'", path))?;
+                if !quiet {
+                    tracing::info!("Result written to {}", path);
+                }
+            } else {
+                println!("{}", output);
+            }
+        }
     }
 
     if !quiet {
@@ -90,6 +105,65 @@ fn write_result(
     }
 
     Ok(())
+}
+
+/// Generate JSONL event lines from a managed run result.
+fn generate_jsonl_events(result: &openslate_core::run_manager::ManagedRunResult) -> Vec<String> {
+    use openslate_core::types::MessageRole;
+
+    let mut lines = Vec::new();
+
+    // run_start event
+    let run_start = serde_json::json!({
+        "type": "run_start",
+        "run_id": result.run_id.to_string(),
+        "agent_id": result.execution_tree.root().agent_id.to_string(),
+        "model": result.model,
+    });
+    lines.push(run_start.to_string());
+
+    // step and tool_result events from messages
+    let mut step_count = 0u32;
+    for msg in &result.messages {
+        match msg.role {
+            MessageRole::Assistant => {
+                step_count += 1;
+                let step_event = serde_json::json!({
+                    "type": "step",
+                    "step": step_count,
+                    "role": "assistant",
+                    "content": msg.content,
+                    "tool_calls": [],  // tool_calls not available in Message
+                });
+                lines.push(step_event.to_string());
+            }
+            MessageRole::Tool => {
+                let tool_name = msg.name.as_deref().unwrap_or("unknown");
+                let tool_result = serde_json::json!({
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "output": msg.content,
+                });
+                lines.push(tool_result.to_string());
+            }
+            // User and System messages are not emitted as separate events
+            // in the JSONL format (they're included in step events conceptually)
+            MessageRole::User | MessageRole::System => {}
+        }
+    }
+
+    // run_end event
+    let run_end = serde_json::json!({
+        "type": "run_end",
+        "run_id": result.run_id.to_string(),
+        "status": serde_json::to_string(&result.status).unwrap().trim_matches('"'),
+        "steps": result.total_steps,
+        "input_tokens": result.total_input_tokens,
+        "output_tokens": result.total_output_tokens,
+    });
+    lines.push(run_end.to_string());
+
+    lines
 }
 
 /// Resolve a specific agent from the agent tree.
@@ -263,9 +337,14 @@ agents:
     }
 
     #[test]
+    fn test_output_format_parse_jsonl() {
+        assert_eq!("jsonl".parse::<OutputFormat>(), Ok(OutputFormat::Jsonl));
+    }
+
+    #[test]
     fn test_output_format_parse_unsupported() {
-        assert!("jsonl".parse::<OutputFormat>().is_err());
         assert!("csv".parse::<OutputFormat>().is_err());
+        assert!("xml".parse::<OutputFormat>().is_err());
     }
 
     #[test]
@@ -390,4 +469,5 @@ agents:
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
+
 }

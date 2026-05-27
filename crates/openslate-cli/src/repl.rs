@@ -37,6 +37,7 @@ enum SlashCommand {
     Agents,
     Model { alias: String },
     Profile { name: String },
+    Compact,
     Unknown { raw: String },
 }
 
@@ -76,6 +77,7 @@ impl SlashCommand {
                     raw: input.to_owned(),
                 },
             },
+            "/compact" => SlashCommand::Compact,
             _ => SlashCommand::Unknown {
                 raw: command.to_owned(),
             },
@@ -217,6 +219,7 @@ impl ReplSession {
                 println!("  /agents               — Display agent tree structure");
                 println!("  /model <alias>        — Switch active model");
                 println!("  /profile <name>       — Switch active profile");
+                println!("  /compact              — Compress conversation history");
                 println!("  //text                — Escape: treat /text as normal input");
                 Ok(DispatchResult::Continue)
             }
@@ -343,6 +346,31 @@ impl ReplSession {
                 self.profile = name.clone();
                 if !self.quiet {
                     println!("Profile switched to '{}'", name);
+                }
+                Ok(DispatchResult::Continue)
+            }
+            SlashCommand::Compact => {
+                let before = self.history.len();
+                if before == 0 {
+                    if !self.quiet {
+                        println!("Nothing to compact — history is empty.");
+                    }
+                    return Ok(DispatchResult::Continue);
+                }
+
+                let result = openslate_core::context_manager::compact(
+                    &mut self.history,
+                    None,
+                    self.ctx.config.limits.as_ref().map(|l| l.max_context_messages as usize).unwrap_or(16),
+                    self.ctx.config.limits.as_ref().map(|l| l.max_context_bytes as usize).unwrap_or(64_000),
+                    |_text| None,
+                );
+
+                if !self.quiet {
+                    println!(
+                        "Context compressed: {} messages → {} messages",
+                        result.messages_before, result.messages_after
+                    );
                 }
                 Ok(DispatchResult::Continue)
             }

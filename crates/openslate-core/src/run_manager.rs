@@ -33,6 +33,8 @@ pub struct ManagedRunResult {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub execution_tree: ExecutionTree,
+    /// The model ID used for this run (e.g., "glm-4").
+    pub model: String,
 }
 
 impl RunManager {
@@ -136,6 +138,7 @@ impl RunManager {
             total_input_tokens: result.total_input_tokens,
             total_output_tokens: result.total_output_tokens,
             execution_tree,
+            model: resolved_model.model_id,
         })
     }
 }

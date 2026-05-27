@@ -13,6 +13,7 @@ use crate::model_config::resolve_model;
 use crate::provider::ModelProvider;
 use crate::runtime::{RunConfig, RuntimeLimits, execute_run};
 use crate::tool::ToolRegistry;
+use crate::trace::TraceCollector;
 use crate::types::*;
 
 /// Orchestrates a complete agent run from start to finish.
@@ -35,6 +36,8 @@ pub struct ManagedRunResult {
     pub execution_tree: ExecutionTree,
     /// The model ID used for this run (e.g., "glm-4").
     pub model: String,
+    /// Trace collector with recorded spans for this run.
+    pub trace: TraceCollector,
 }
 
 impl RunManager {
@@ -69,14 +72,23 @@ impl RunManager {
         let run_id = RunId(uuid::Uuid::new_v4().to_string());
         let root_agent = self.agent_tree.get_root();
 
-        // Create execution tree
+        let mut trace = TraceCollector::new(std::process::id() as i32, 1);
+        let run_span = trace.begin_span("run", "runtime");
+
+        let agent_span = trace.begin_span_with_args(
+            "agent_exec",
+            "runtime",
+            std::collections::HashMap::from([(
+                "agent_id".to_owned(),
+                serde_json::Value::String(root_agent.id.0.clone()),
+            )]),
+        );
+
         let mut execution_tree =
             ExecutionTree::new(run_id.clone(), root_agent.id.clone());
 
-        // Resolve model
         let resolved_model = resolve_model(&self.config, &root_agent.model_alias)?;
 
-        // Build initial messages
         let messages = vec![Message {
             role: MessageRole::User,
             content: input.to_owned(),
@@ -84,7 +96,6 @@ impl RunManager {
             name: None,
         }];
 
-        // Build run config
         let run_config = RunConfig {
             run_id: run_id.clone(),
             agent_id: root_agent.id.clone(),
@@ -121,12 +132,13 @@ impl RunManager {
                 })
             };
 
-        // Execute
         let result =
             execute_run(provider, run_config, &resolved_model.model_id, &tool_exec)
                 .await?;
 
-        // Update execution tree
+        trace.end_span(agent_span);
+        trace.end_span(run_span);
+
         let root_en_id = execution_tree.root().id.clone();
         execution_tree.update_status(&root_en_id, ExecutionStatus::Completed);
 
@@ -139,6 +151,7 @@ impl RunManager {
             total_output_tokens: result.total_output_tokens,
             execution_tree,
             model: resolved_model.model_id,
+            trace,
         })
     }
 }

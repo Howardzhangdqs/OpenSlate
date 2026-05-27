@@ -48,6 +48,7 @@ pub struct RunParams {
     #[allow(dead_code)]
     pub root_agent: Option<String>,
     pub quiet: bool,
+    pub trace_path: Option<String>,
 }
 
 /// Extract the final assistant message from the run result.
@@ -252,6 +253,23 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         params.quiet,
     )?;
 
+    // 9. Export trace to file if requested
+    if let Some(ref trace_path) = params.trace_path {
+        let path = std::path::Path::new(trace_path);
+        result.trace.export_to_file(path)
+            .with_context(|| format!("Failed to export trace to '{}'", trace_path))?;
+        if !params.quiet {
+            tracing::info!("Trace exported to {}", trace_path);
+        }
+    }
+
+    // 10. Persist trace events to SQLite (if store available)
+    if let Some(ref store) = ctx.store {
+        if let Err(e) = persist_trace_to_store(store, &result).await {
+            tracing::warn!("Failed to persist trace events to SQLite: {}", e);
+        }
+    }
+
     Ok(())
 }
 
@@ -280,6 +298,65 @@ pub(crate) fn build_provider_for_model(
     };
 
     Ok(OpenAICompatibleProvider::new(provider_config))
+}
+
+async fn persist_trace_to_store(
+    store: &openslate_store_sqlite::store::SqliteStore,
+    result: &openslate_core::run_manager::ManagedRunResult,
+) -> Result<()> {
+    use openslate_core::trace::TraceEvent;
+
+    let run_id_str = result.run_id.to_string();
+    let mut idx: usize = 0;
+
+    for event in result.trace.events() {
+        idx += 1;
+        let event_id = format!("trace-{}-{}", run_id_str, idx);
+        let (event_name, event_kind, ts_ns, dur_ns, track, args_json) = match event {
+            TraceEvent::DurationBegin { name, ts, args, .. } => {
+                let args_str = if args.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(args).unwrap_or_default())
+                };
+                (name.clone(), "duration_begin".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), args_str)
+            }
+            TraceEvent::DurationEnd { name, ts, .. } => {
+                (name.clone(), "duration_end".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), None)
+            }
+            TraceEvent::Complete { name, ts, dur, args, .. } => {
+                let args_str = if args.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(args).unwrap_or_default())
+                };
+                (name.clone(), "complete".to_owned(), (*ts as i64) * 1000, Some((*dur as i64) * 1000), "main".to_owned(), args_str)
+            }
+            TraceEvent::Instant { name, ts, .. } => {
+                (name.clone(), "instant".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), None)
+            }
+            TraceEvent::Counter { name, ts, values, .. } => {
+                let args_str = serde_json::to_string(values).unwrap_or_default();
+                (name.clone(), "counter".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), Some(args_str))
+            }
+        };
+
+        store.insert_trace_event(
+            &event_id,
+            &run_id_str,
+            None,
+            None,
+            None,
+            &event_name,
+            &event_kind,
+            ts_ns,
+            dur_ns,
+            &track,
+            args_json.as_deref(),
+        ).await.map_err(|e| anyhow::anyhow!("Failed to insert trace event: {}", e))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

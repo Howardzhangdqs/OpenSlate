@@ -64,6 +64,9 @@ enum Commands {
         /// Only output final result (suppress step-by-step logs)
         #[arg(long)]
         quiet: bool,
+        /// Export Chrome Trace JSON to file after execution
+        #[arg(long)]
+        trace: Option<String>,
     },
     /// Start an interactive chat session
     Chat {
@@ -211,6 +214,7 @@ async fn main() -> Result<()> {
             output,
             root_agent,
             quiet,
+            trace,
         } => {
             let output_format = format
                 .parse::<cmd::run::OutputFormat>()
@@ -225,6 +229,7 @@ async fn main() -> Result<()> {
                 output,
                 root_agent,
                 quiet,
+                trace_path: trace,
             };
             cmd::run::run_run_command(params).await?;
         }
@@ -340,15 +345,16 @@ mod tests {
         let cli =
             Cli::try_parse_from(["openslate", "run", "--prompt", "hello"]).expect("parse run");
         match cli.command {
-            Commands::Run {
-                agent: None,
-                prompt,
-                profile,
-                format,
-                output: None,
-                root_agent: None,
-                quiet: false,
-            } => {
+        Commands::Run {
+            agent: None,
+            prompt,
+            profile,
+            format,
+            output: None,
+            root_agent: None,
+            quiet: false,
+            trace: None,
+        } => {
                 assert_eq!(prompt.as_deref(), Some("hello"));
                 assert_eq!(profile, "default");
                 assert_eq!(format, "text");
@@ -386,6 +392,7 @@ mod tests {
                 output,
                 root_agent,
                 quiet,
+                trace,
             } => {
                 assert_eq!(agent.as_deref(), Some("root"));
                 assert_eq!(prompt.as_deref(), Some("test"));
@@ -394,6 +401,7 @@ mod tests {
                 assert_eq!(output.as_deref(), Some("/tmp/out.txt"));
                 assert_eq!(root_agent.as_deref(), Some("root"));
                 assert!(quiet);
+                assert_eq!(trace, None);
             }
             _ => panic!("expected Run command"),
         }

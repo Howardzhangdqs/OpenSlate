@@ -292,6 +292,17 @@ impl TraceCollector {
     pub fn clear(&mut self) {
         self.events.clear();
     }
+
+    /// Export the Chrome Trace JSON to a file, creating parent directories if needed.
+    pub fn export_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let json = self.to_chrome_trace_json();
+        std::fs::write(path, json)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -530,5 +541,64 @@ mod tests {
     fn empty_collector_produces_empty_array() {
         let tc = make_collector();
         assert_eq!(tc.to_chrome_trace_json(), "[]");
+    }
+
+    #[test]
+    fn export_to_file_creates_valid_json_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("trace.json");
+
+        let mut tc = make_collector();
+        let span = tc.begin_span("agent_exec", "runtime");
+        tc.end_span(span);
+        tc.record_instant("checkpoint", "debug");
+
+        tc.export_to_file(&path).expect("export should succeed");
+
+        let content = std::fs::read_to_string(&path).expect("read file");
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert!(parsed.is_array());
+        let arr = parsed.as_array().expect("array");
+        assert_eq!(arr.len(), 3); // B, E, i
+    }
+
+    #[test]
+    fn export_to_file_creates_parent_dirs() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("nested").join("dir").join("trace.json");
+
+        let tc = make_collector();
+        tc.export_to_file(&path).expect("export should succeed");
+
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).expect("read file");
+        assert_eq!(content, "[]");
+    }
+
+    #[test]
+    fn export_to_file_chrome_trace_parseable() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("trace.json");
+
+        let mut tc = make_collector();
+        let s1 = tc.begin_span("agent", "runtime");
+        let s2 = tc.begin_span("model_call", "model");
+        tc.end_span(s2);
+        tc.end_span(s1);
+        tc.record_instant("done", "runtime");
+
+        tc.export_to_file(&path).expect("export should succeed");
+
+        let content = std::fs::read_to_string(&path).expect("read file");
+        let events: Vec<serde_json::Value> = serde_json::from_str(&content).expect("parse events");
+
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0]["ph"], "B");
+        assert_eq!(events[0]["name"], "agent");
+        assert_eq!(events[1]["ph"], "B");
+        assert_eq!(events[1]["name"], "model_call");
+        assert_eq!(events[2]["ph"], "E");
+        assert_eq!(events[3]["ph"], "E");
+        assert_eq!(events[4]["ph"], "i");
     }
 }

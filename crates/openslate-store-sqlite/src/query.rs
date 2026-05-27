@@ -81,6 +81,17 @@ pub struct PromptSnapshotRecord {
     pub created_at: i64,
 }
 
+/// An audit log entry record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogRecord {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub event_type: String,
+    pub event_json: String,
+    pub created_at: i64,
+}
+
 /// A trace event record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEventRecord {
@@ -156,6 +167,15 @@ type PromptSnapshotRow = (
     Option<String>,     // source_path
     String,             // content_hash
     String,             // rendered_prompt
+    i64,                // created_at
+);
+
+type AuditLogRow = (
+    String,             // id
+    Option<String>,     // run_id
+    Option<String>,     // agent_id
+    String,             // event_type
+    String,             // event_json
     i64,                // created_at
 );
 
@@ -242,6 +262,17 @@ fn row_to_prompt_snapshot(row: PromptSnapshotRow) -> PromptSnapshotRecord {
         content_hash: row.7,
         rendered_prompt: row.8,
         created_at: row.9,
+    }
+}
+
+fn row_to_audit_log(row: AuditLogRow) -> AuditLogRecord {
+    AuditLogRecord {
+        id: row.0,
+        run_id: row.1,
+        agent_id: row.2,
+        event_type: row.3,
+        event_json: row.4,
+        created_at: row.5,
     }
 }
 
@@ -382,6 +413,24 @@ impl SqliteStore {
         .map_err(qerr)?;
 
         Ok(row.map(row_to_prompt_snapshot))
+    }
+
+    /// List all audit log entries for a given run, ordered by `created_at`.
+    pub async fn list_audit_logs(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<AuditLogRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<AuditLogRow> = query_as(
+            "SELECT id, run_id, agent_id, event_type, event_json, created_at \
+             FROM audit_log WHERE run_id = ? ORDER BY created_at",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows.into_iter().map(row_to_audit_log).collect())
     }
 
     /// List all trace events for a given run, ordered by `ts_ns`.
@@ -805,5 +854,35 @@ mod tests {
         // Ordered by started_at DESC
         assert_eq!(results[0].id, "run-3");
         assert_eq!(results[1].id, "run-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_audit_logs() {
+        let store = setup_store().await;
+
+        store
+            .insert_audit_event("audit-1", Some("run-1"), Some("agent-a"), "tool_approved", r#"{"tool":"bash","details":{"approved":true}}"#, 1000)
+            .await
+            .expect("insert audit 1");
+        store
+            .insert_audit_event("audit-2", Some("run-1"), Some("agent-a"), "tool_denied", r#"{"tool":"rm","details":{"reason":"dangerous"}}"#, 2000)
+            .await
+            .expect("insert audit 2");
+        store
+            .insert_audit_event("audit-3", Some("run-2"), None, "tool_executed", r#"{"tool":"ls"}"#, 3000)
+            .await
+            .expect("insert audit 3");
+
+        let logs_run1 = store.list_audit_logs("run-1").await.expect("list_audit_logs run-1");
+        assert_eq!(logs_run1.len(), 2);
+        assert_eq!(logs_run1[0].event_type, "tool_approved");
+        assert_eq!(logs_run1[1].event_type, "tool_denied");
+
+        let logs_run2 = store.list_audit_logs("run-2").await.expect("list_audit_logs run-2");
+        assert_eq!(logs_run2.len(), 1);
+        assert_eq!(logs_run2[0].event_type, "tool_executed");
+
+        let logs_run3 = store.list_audit_logs("run-3").await.expect("list_audit_logs run-3");
+        assert_eq!(logs_run3.len(), 0);
     }
 }

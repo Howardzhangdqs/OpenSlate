@@ -12,6 +12,7 @@ pub mod provider;
 pub mod run_manager;
 pub mod runtime;
 pub mod tool;
+pub mod trace;
 pub mod types;
 
 pub mod prelude {

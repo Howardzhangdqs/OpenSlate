@@ -4,6 +4,7 @@
 //! The `ToolRegistry` maps tool names to tool implementations.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -232,6 +233,115 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Writes content to a file within the workspace.
+pub struct WriteFileTool {
+    workspace_root: PathBuf,
+}
+
+impl WriteFileTool {
+    /// Create a new WriteFileTool with the given workspace root.
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self { workspace_root }
+    }
+
+    /// Validate that the target path is within the workspace.
+    fn validate_path(&self, target_path: &str) -> Result<PathBuf, ToolError> {
+        if target_path.contains("..") {
+            return Err(ToolError::SecurityError(
+                "Path traversal not allowed".into(),
+            ));
+        }
+
+        let workspace_root = self.workspace_root.canonicalize().map_err(|e| {
+            ToolError::ExecutionError(format!("Failed to resolve workspace root: {}", e))
+        })?;
+
+        let full_path = if target_path.starts_with('/') {
+            PathBuf::from(target_path)
+        } else {
+            self.workspace_root.join(target_path)
+        };
+
+        let check_path = match full_path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                full_path.clone()
+            }
+            Err(e) => {
+                return Err(ToolError::ExecutionError(format!(
+                    "Failed to resolve path '{}': {}",
+                    target_path, e
+                )));
+            }
+        };
+
+        if !check_path.starts_with(&workspace_root) {
+            return Err(ToolError::SecurityError(
+                "Path is outside workspace".into(),
+            ));
+        }
+
+        Ok(full_path)
+    }
+}
+
+#[async_trait]
+impl Tool for WriteFileTool {
+    fn name(&self) -> &str {
+        "write_file"
+    }
+    fn description(&self) -> &str {
+        "Write content to a file within the workspace"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path (absolute or relative to workspace)" },
+                "content": { "type": "string", "description": "Content to write to the file" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let path = args["path"].as_str().ok_or_else(|| {
+            ToolError::ExecutionError("Missing 'path' parameter".into())
+        })?;
+        let content = args["content"].as_str().ok_or_else(|| {
+            ToolError::ExecutionError("Missing 'content' parameter".into())
+        })?;
+
+        // Validate path is within workspace
+        let _validated_path = self.validate_path(path)?;
+
+        let full_path = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            self.workspace_root.join(path)
+        };
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to create directories: {}", e))
+            })?;
+        }
+
+        // Write the file
+        tokio::fs::write(&full_path, content).await.map_err(|e| {
+            ToolError::ExecutionError(format!("Failed to write '{}': {}", path, e))
+        })?;
+
+        let bytes = content.len();
+        Ok(ToolOutput {
+            content: format!("Successfully wrote {} bytes to '{}'", bytes, path),
+            bytes,
+            duration_ms: 0,
+            status: ToolOutputStatus::Success,
+        })
+    }
+}
+
 /// Lists directory contents.
 pub struct ListDirTool;
 
@@ -284,10 +394,16 @@ impl Tool for ListDirTool {
 
 /// Create a ToolRegistry pre-loaded with all built-in tools.
 pub fn builtin_registry() -> ToolRegistry {
+    builtin_registry_with_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Create a ToolRegistry pre-loaded with all built-in tools, using the specified workspace root.
+pub fn builtin_registry_with_workspace(workspace_root: PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(CurrentTimeTool);
     registry.register(ReadFileTool);
     registry.register(ListDirTool);
+    registry.register(WriteFileTool::new(workspace_root));
     registry
 }
 
@@ -491,11 +607,144 @@ mod builtin_tests {
         assert!(reg.contains("current_time"));
         assert!(reg.contains("read_file"));
         assert!(reg.contains("list_dir"));
+        assert!(reg.contains("write_file"));
     }
 
     #[test]
     fn test_builtin_registry_definitions_count() {
         let reg = builtin_registry();
-        assert_eq!(reg.definitions().len(), 3);
+        assert_eq!(reg.definitions().len(), 4);
+    }
+
+    // ── WriteFileTool tests ──
+
+    #[tokio::test]
+    async fn test_write_file_success() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+        let file_path = "test.txt";
+        let content = "hello world";
+
+        let result = tool
+            .execute(&serde_json::json!({"path": file_path, "content": content}))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolOutputStatus::Success);
+        assert!(result.content.contains("11 bytes"));
+        assert!(result.content.contains("test.txt"));
+
+        let written = std::fs::read_to_string(workspace.path().join(file_path)).unwrap();
+        assert_eq!(written, content);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_absolute_path() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+        let file_path = workspace.path().join("subdir/test.txt");
+        let file_path_str = file_path.to_str().unwrap();
+        let content = "absolute path test";
+
+        let result = tool
+            .execute(&serde_json::json!({"path": file_path_str, "content": content}))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolOutputStatus::Success);
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(written, content);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_creates_parent_directories() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+        let file_path = "a/b/c/nested.txt";
+        let content = "nested content";
+
+        let result = tool
+            .execute(&serde_json::json!({"path": file_path, "content": content}))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolOutputStatus::Success);
+        let written = std::fs::read_to_string(workspace.path().join(file_path)).unwrap();
+        assert_eq!(written, content);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_overwrites_existing() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let file_path = workspace.path().join("existing.txt");
+        std::fs::write(&file_path, "original content").unwrap();
+
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+        let new_content = "new content";
+
+        let result = tool
+            .execute(&serde_json::json!({"path": file_path.to_str().unwrap(), "content": new_content}))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolOutputStatus::Success);
+        let written = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(written, new_content);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_missing_content_param() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "test.txt"}))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionError(msg) if msg.contains("Missing 'content'")));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_missing_path_param() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+
+        let result = tool
+            .execute(&serde_json::json!({"content": "test"}))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionError(msg) if msg.contains("Missing 'path'")));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_security_error_path_traversal() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "../escape.txt", "content": "bad"}))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::SecurityError(msg) if msg.contains("Path traversal")));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_security_error_double_dot_traversal() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = WriteFileTool::new(workspace.path().to_path_buf());
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "foo/../../bar.txt", "content": "bad"}))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::SecurityError(msg) if msg.contains("Path traversal")));
     }
 }

@@ -1,7 +1,9 @@
 //! OpenSlate CLI — command-line interface for the Agent Runtime.
 
 mod cmd;
+mod input;
 mod repl;
+mod spinner;
 mod wiring;
 
 use anyhow::{Context, Result};

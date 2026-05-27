@@ -13,8 +13,8 @@ pub struct OpenAIProviderConfig {
 }
 
 pub struct OpenAICompatibleProvider {
-    config: OpenAIProviderConfig,
-    client: reqwest::Client,
+    pub(crate) config: OpenAIProviderConfig,
+    pub(crate) client: reqwest::Client,
 }
 
 impl OpenAICompatibleProvider {
@@ -26,12 +26,12 @@ impl OpenAICompatibleProvider {
         Self { config, client }
     }
 
-    fn completions_url(&self) -> String {
+    pub fn completions_url(&self) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         format!("{}/chat/completions", base)
     }
 
-    fn convert_messages(
+    pub(crate) fn convert_messages(
         system_prompt: Option<&str>,
         messages: &[openslate_core::types::Message],
     ) -> Vec<ApiMessage> {
@@ -67,7 +67,7 @@ impl OpenAICompatibleProvider {
         api_messages
     }
 
-    fn convert_tools(tools: &[ToolDefinition]) -> Vec<ApiTool> {
+    pub(crate) fn convert_tools(tools: &[ToolDefinition]) -> Vec<ApiTool> {
         tools
             .iter()
             .map(|t| ApiTool {

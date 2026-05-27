@@ -2,6 +2,7 @@ pub mod agent_tree;
 pub mod callable;
 pub mod config;
 pub mod context;
+pub mod context_manager;
 pub mod error;
 pub mod execution;
 pub mod model_config;
@@ -16,6 +17,7 @@ pub mod types;
 pub mod prelude {
     pub use crate::callable::*;
     pub use crate::config::*;
+    pub use crate::context_manager::*;
     pub use crate::error::*;
     pub use crate::paths::*;
     pub use crate::provider::*;

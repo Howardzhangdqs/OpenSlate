@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 serde_yml = { workspace = true }
 dirs = { workspace = true }
 rustyline = "14"
+indicatif = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

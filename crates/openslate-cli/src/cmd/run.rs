@@ -10,6 +10,8 @@ use std::fs;
 use openslate_core::agent_tree::AgentTree;
 use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
 
+use crate::input::{expand_at_files, read_stdin_if_pipe, WorkspaceRoot};
+use crate::spinner::Spinner;
 use crate::wiring as app_wiring;
 
 /// Output format for run results.
@@ -124,11 +126,18 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     // 3. Build provider for the resolved agent's model
     let provider = build_provider_for_model(&ctx.config, &model_alias)?;
 
-    // 4. Get prompt
-    let prompt = params
-        .prompt
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("No prompt provided. Use --prompt <text> to specify input."))?;
+    let raw_prompt = if let Some(ref p) = params.prompt {
+        p.clone()
+    } else if let Some(stdin_content) = read_stdin_if_pipe() {
+        stdin_content
+    } else {
+        anyhow::bail!(
+            "No prompt provided. Use --prompt <text> or pipe input via stdin: echo 'hello' | openslate run"
+        )
+    };
+
+    let workspace_root = WorkspaceRoot::from_config_path(&ctx.config_path);
+    let prompt = expand_at_files(&raw_prompt, &workspace_root);
 
     // 5. Log store status
     if let Some(ref _store) = ctx.store {
@@ -136,11 +145,25 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     }
 
     // 6. Execute via RunManager
-    let result = ctx
-        .manager
-        .execute(&provider, prompt)
-        .await
-        .map_err(|e| anyhow::anyhow!("Run failed: {}", e))?;
+    let result = {
+        let mut spinner = Spinner::new(&model_alias, params.quiet);
+        let run_result = match ctx
+            .manager
+            .execute(&provider, &prompt)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                spinner.finish_with_error(&e.to_string());
+                return Err(anyhow::anyhow!("Run failed: {}", e));
+            }
+        };
+        if run_result.total_output_tokens > 0 {
+            spinner.on_usage(run_result.total_output_tokens as u32);
+        }
+        spinner.finish();
+        run_result
+    };
 
     // 7. Extract final assistant message
     let final_message = extract_final_assistant_message(&result.messages)

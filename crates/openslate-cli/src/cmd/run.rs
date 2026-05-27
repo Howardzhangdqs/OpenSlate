@@ -93,7 +93,7 @@ fn write_result(
 /// Resolve a specific agent from the agent tree.
 ///
 /// If `agent_id` is provided, look it up. Otherwise return the root agent.
-fn resolve_agent<'a>(
+pub(crate) fn resolve_agent<'a>(
     agent_tree: &'a AgentTree,
     agent_id: Option<&str>,
 ) -> Result<&'a openslate_core::agent_tree::AgentNode> {
@@ -159,7 +159,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
 }
 
 /// Build an OpenAI-compatible provider for a specific model alias.
-fn build_provider_for_model(
+pub(crate) fn build_provider_for_model(
     config: &openslate_core::config::OpenSlateConfig,
     model_alias: &str,
 ) -> Result<OpenAICompatibleProvider> {

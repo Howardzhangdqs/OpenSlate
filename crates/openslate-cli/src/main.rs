@@ -1,6 +1,7 @@
 //! OpenSlate CLI — command-line interface for the Agent Runtime.
 
 mod cmd;
+mod repl;
 mod wiring;
 
 use anyhow::{Context, Result};
@@ -59,6 +60,18 @@ enum Commands {
         #[arg(long)]
         root_agent: Option<String>,
         /// Only output final result (suppress step-by-step logs)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Start an interactive chat session
+    Chat {
+        /// Profile to use
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// Model alias to use
+        #[arg(long)]
+        model: Option<String>,
+        /// Suppress non-essential output
         #[arg(long)]
         quiet: bool,
     },
@@ -212,6 +225,15 @@ async fn main() -> Result<()> {
                 quiet,
             };
             cmd::run::run_run_command(params).await?;
+        }
+        Commands::Chat {
+            profile,
+            model: _model,
+            quiet,
+        } => {
+            let ctx = wiring::build_app_context(cli.config.as_deref()).await?;
+            let mut session = repl::ReplSession::new(ctx, profile, quiet)?;
+            session.run().await?;
         }
     }
 

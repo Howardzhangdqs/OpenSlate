@@ -1,6 +1,6 @@
 //! `openslate validate` command.
 //!
-//! Validates `openslate.toml` and `agents.yaml` configuration files,
+//! Validates `openslate.toml` and agent configuration files in the `agents/` directory,
 //! printing errors and warnings to stdout and returning an appropriate exit code.
 
 use anyhow::{Context, Result};
@@ -10,7 +10,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use openslate_core::config::validation::{validate_config, validate_strict, ValidationError};
-use openslate_core::config::{parse_agents_yaml, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
+use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
 use openslate_core::paths::resolve_paths;
 
 /// Indicates whether the terminal supports color output.
@@ -63,12 +63,13 @@ fn load_config(config_path: &Path) -> Result<OpenSlateConfig> {
         .with_context(|| format!("Failed to parse config file '{}'", config_path.display()))
 }
 
-/// Load and parse `agents.yaml` from the given path.
-fn load_agents(agents_path: &Path) -> Result<AgentsConfig> {
-    let content = fs::read_to_string(agents_path)
-        .with_context(|| format!("Failed to read agents file '{}'", agents_path.display()))?;
-    parse_agents_yaml(&content)
-        .with_context(|| format!("Failed to parse agents file '{}'", agents_path.display()))
+/// Load and parse agents from the `agents/` directory.
+fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
+    if !agents_dir.is_dir() {
+        anyhow::bail!("Agents directory not found: {}", agents_dir.display());
+    }
+    parse_agents_dir(agents_dir)
+        .with_context(|| format!("Failed to parse agents directory '{}'", agents_dir.display()))
 }
 
 /// Run the validate command.
@@ -140,9 +141,9 @@ pub fn resolve_config_path(config_flag: Option<&str>) -> Result<std::path::PathB
     Ok(config_path)
 }
 
-/// Resolve agents file path from config directory.
+/// Resolve agents directory path from config directory.
 pub fn resolve_agents_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("agents.yaml")
+    config_dir.join("agents")
 }
 
 #[cfg(test)]
@@ -150,7 +151,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // Helper: create a temp dir with valid openslate.toml and agents.yaml
+    // Helper: create a temp dir with valid openslate.toml and agents directory
     fn temp_project_with_valid_config() -> TempDir {
         let tmp = TempDir::new().expect("create temp dir");
         let openslate_dir = tmp.path().join(".openslate");
@@ -180,15 +181,11 @@ max_context_messages = 16
 max_context_bytes = 64000
 max_output_bytes = 65536
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    default_prompt: "You are the root agent."
-"#;
         std::fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        std::fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+
+        std::fs::create_dir(openslate_dir.join("agents")).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ndefault_prompt: You are the root agent.\n---\n";
+        std::fs::write(openslate_dir.join("agents").join("root.md"), agent_md).expect("write root.md");
         tmp
     }
 
@@ -208,15 +205,11 @@ api_key_env = "KEY"
 provider = "zhipu"
 model = "m2"
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    default_prompt: "You are the root agent."
-"#;
         std::fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        std::fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+
+        std::fs::create_dir(openslate_dir.join("agents")).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ndefault_prompt: You are the root agent.\n---\n";
+        std::fs::write(openslate_dir.join("agents").join("root.md"), agent_md).expect("write root.md");
         tmp
     }
 
@@ -240,19 +233,14 @@ model = "m1"
 provider = "zhipu"
 model = "m2"
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    default_prompt: "You are the root agent."
-  - id: root
-    name: Duplicate Agent
-    model: fast
-    default_prompt: "Duplicate."
-"#;
         std::fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        std::fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+
+        let agents_dir = openslate_dir.join("agents");
+        std::fs::create_dir(&agents_dir).expect("create agents dir");
+        let root_md = "---\nid: root\nname: Root Agent\nmodel: main\n---\nRoot.\n";
+        let dup_md = "---\nid: root\nname: Duplicate Agent\nmodel: fast\n---\nDuplicate.\n";
+        std::fs::write(agents_dir.join("root.md"), root_md).expect("write root.md");
+        std::fs::write(agents_dir.join("dup.md"), dup_md).expect("write dup.md");
         tmp
     }
 
@@ -265,7 +253,7 @@ agents:
     fn test_valid_config_exits_ok() {
         let tmp = temp_project_with_valid_config();
         let config_path = tmp.path().join(".openslate/openslate.toml");
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
+        let agents_path = tmp.path().join(".openslate/agents");
 
         let result = run_validate_command(&config_path, &agents_path, false);
         assert!(result.is_ok(), "valid config should pass: {:?}", result);
@@ -275,7 +263,7 @@ agents:
     fn test_missing_main_model_exits_error() {
         let tmp = temp_project_with_missing_main();
         let config_path = tmp.path().join(".openslate/openslate.toml");
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
+        let agents_path = tmp.path().join(".openslate/agents");
 
         let result = run_validate_command(&config_path, &agents_path, false);
         assert!(result.is_err(), "missing main model should fail");
@@ -285,7 +273,7 @@ agents:
     fn test_duplicate_agent_ids_exits_error() {
         let tmp = temp_project_with_duplicate_agents();
         let config_path = tmp.path().join(".openslate/openslate.toml");
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
+        let agents_path = tmp.path().join(".openslate/agents");
 
         let result = run_validate_command(&config_path, &agents_path, false);
         assert!(result.is_err(), "duplicate agent IDs should fail");
@@ -295,7 +283,7 @@ agents:
     fn test_config_file_not_found_gives_clear_error() {
         let tmp = temp_project_empty();
         let config_path = tmp.path().join("nonexistent/openslate.toml");
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
+        let agents_path = tmp.path().join(".openslate/agents");
 
         let result = run_validate_command(&config_path, &agents_path, false);
         assert!(result.is_err());
@@ -310,7 +298,7 @@ agents:
     fn test_strict_flag_warns_on_unused_model() {
         let tmp = temp_project_with_valid_config();
         let config_path = tmp.path().join(".openslate/openslate.toml");
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
+        let agents_path = tmp.path().join(".openslate/agents");
 
         // In non-strict mode, this should pass
         let result = run_validate_command(&config_path, &agents_path, false);
@@ -321,7 +309,7 @@ agents:
     fn test_strict_mode_detects_unused_model() {
         let tmp = temp_project_with_valid_config();
         let config_path = tmp.path().join(".openslate/openslate.toml");
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
+        let agents_path = tmp.path().join(".openslate/agents");
 
         // In strict mode, an unused model should produce a warning that causes failure
         let result = run_validate_command(&config_path, &agents_path, true);
@@ -352,23 +340,17 @@ model = "m1"
 provider = "zhipu"
 model = "m2"
 "#;
-        // Both main and fast are used
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    default_prompt: "Root."
-  - id: worker
-    name: Worker Agent
-    model: fast
-    default_prompt: "Worker."
-"#;
         std::fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        std::fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+
+        let agents_dir = openslate_dir.join("agents");
+        std::fs::create_dir(&agents_dir).expect("create agents dir");
+        let root_md = "---\nid: root\nname: Root Agent\nmodel: main\n---\nRoot.\n";
+        let worker_md = "---\nid: worker\nname: Worker Agent\nmodel: fast\n---\nWorker.\n";
+        std::fs::write(agents_dir.join("root.md"), root_md).expect("write root.md");
+        std::fs::write(agents_dir.join("worker.md"), worker_md).expect("write worker.md");
 
         let config_path = openslate_dir.join("openslate.toml");
-        let agents_path = openslate_dir.join("agents.yaml");
+        let agents_path = openslate_dir.join("agents");
 
         let result = run_validate_command(&config_path, &agents_path, true);
         assert!(result.is_ok(), "strict mode should pass when all models are used: {:?}", result);

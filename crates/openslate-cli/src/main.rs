@@ -115,15 +115,16 @@ enabled = true
     )
 }
 
-const DEFAULT_AGENTS_YAML: &str = r#"agents:
-  - id: root
-    name: Root Agent
-    model: main
-    tools:
-      - current_time
-      - read_file
-      - list_dir
-    default_prompt: You are a helpful AI assistant.
+const DEFAULT_ROOT_AGENT_MD: &str = r#"---
+id: root
+name: Root Agent
+model: main
+tools:
+    - current_time
+    - read_file
+    - list_dir
+---
+You are a helpful AI assistant.
 "#;
 
 const DEFAULT_PROMPT_MD: &str = "You are a helpful AI assistant.\n";
@@ -160,13 +161,14 @@ fn run_init(dir: &Path, name: Option<&str>) -> Result<()> {
         )
     })?;
 
-    // agents.yaml
-    let agents_path = openslate_dir.join("agents.yaml");
-    fs::write(&agents_path, DEFAULT_AGENTS_YAML).with_context(|| {
-        format!(
-            "Failed to write {}",
-            agents_path.display()
-        )
+    // agents/ directory + root.md
+    let agents_dir = openslate_dir.join("agents");
+    fs::create_dir(&agents_dir).with_context(|| {
+        format!("Failed to create agents directory at {}", agents_dir.display())
+    })?;
+    let root_agent_path = agents_dir.join("root.md");
+    fs::write(&root_agent_path, DEFAULT_ROOT_AGENT_MD).with_context(|| {
+        format!("Failed to write {}", root_agent_path.display())
     })?;
 
     // prompts/default/prompt.md
@@ -287,15 +289,20 @@ mod tests {
     }
 
     #[test]
-    fn test_init_creates_agents_yaml() {
+    fn test_init_creates_agents_directory() {
         let tmp = init_in_temp(None);
-        let agents_path = tmp.path().join(".openslate/agents.yaml");
-        assert!(agents_path.is_file(), "agents.yaml should exist");
+        let agents_dir = tmp.path().join(".openslate/agents");
+        assert!(agents_dir.is_dir(), "agents/ directory should exist");
+        assert!(!tmp.path().join(".openslate/agents.yaml").exists(), "agents.yaml should NOT exist");
 
-        let content = fs::read_to_string(&agents_path).expect("read agents.yaml");
+        let root_md = agents_dir.join("root.md");
+        assert!(root_md.is_file(), "agents/root.md should exist");
+
+        let content = fs::read_to_string(&root_md).expect("read root.md");
         assert!(content.contains("id: root"));
         assert!(content.contains("name: Root Agent"));
         assert!(content.contains("model: main"));
+        assert!(content.contains("You are a helpful AI assistant."));
     }
 
     #[test]

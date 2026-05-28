@@ -9,7 +9,7 @@ use std::path::Path;
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::config::validation::validate_config;
-use openslate_core::config::{parse_agents_yaml, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
+use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
 use openslate_core::model_config::resolve_model;
 use openslate_core::paths::resolve_paths;
 use openslate_core::run_manager::RunManager;
@@ -40,12 +40,13 @@ pub(crate) fn load_config(config_path: &Path) -> Result<OpenSlateConfig> {
         .with_context(|| format!("Failed to parse config file '{}'", config_path.display()))
 }
 
-/// Load and parse `agents.yaml` from the given path.
-pub(crate) fn load_agents(agents_path: &Path) -> Result<AgentsConfig> {
-    let content = fs::read_to_string(agents_path)
-        .with_context(|| format!("Failed to read agents file '{}'", agents_path.display()))?;
-    parse_agents_yaml(&content)
-        .with_context(|| format!("Failed to parse agents file '{}'", agents_path.display()))
+/// Load and parse agents from the `agents/` directory.
+pub(crate) fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
+    if !agents_dir.is_dir() {
+        anyhow::bail!("Agents directory not found: {}", agents_dir.display());
+    }
+    parse_agents_dir(agents_dir)
+        .with_context(|| format!("Failed to parse agents directory '{}'", agents_dir.display()))
 }
 
 /// Resolve config file path from CLI `--config` flag or default XDG resolution.
@@ -69,12 +70,12 @@ pub fn resolve_config_file(config_flag: Option<&str>) -> Result<std::path::PathB
     Ok(paths.config_file)
 }
 
-/// Resolve agents.yaml path from the config file's parent directory.
-pub fn resolve_agents_file(config_path: &Path) -> std::path::PathBuf {
+/// Resolve agents directory path from the config file's parent directory.
+pub fn resolve_agents_dir(config_path: &Path) -> std::path::PathBuf {
     config_path
         .parent()
-        .map(|p| p.join("agents.yaml"))
-        .unwrap_or_else(|| Path::new("agents.yaml").to_path_buf())
+        .map(|p| p.join("agents"))
+        .unwrap_or_else(|| Path::new("agents").to_path_buf())
 }
 
 /// Build an OpenAI-compatible provider from a model alias.
@@ -155,7 +156,7 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     let config_path = resolve_config_file(config_flag)?;
     tracing::debug!("Using config: {}", config_path.display());
 
-    let agents_path = resolve_agents_file(&config_path);
+    let agents_path = resolve_agents_dir(&config_path);
     tracing::debug!("Using agents: {}", agents_path.display());
 
     let config_dir = config_path
@@ -309,10 +310,10 @@ agents:
     }
 
     #[test]
-    fn test_resolve_agents_file() {
+    fn test_resolve_agents_dir() {
         let path = Path::new("/project/.openslate/openslate.toml");
-        let agents = resolve_agents_file(path);
-        assert_eq!(agents, Path::new("/project/.openslate/agents.yaml"));
+        let agents = resolve_agents_dir(path);
+        assert_eq!(agents, Path::new("/project/.openslate/agents"));
     }
 
     #[test]

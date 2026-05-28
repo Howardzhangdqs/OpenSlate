@@ -9,6 +9,9 @@ use crate::error::RuntimeError;
 use crate::provider::{GenerateRequest, ModelProvider};
 use crate::types::*;
 
+/// Default maximum number of consecutive empty turns before failing.
+pub const DEFAULT_MAX_EMPTY_TURNS: u32 = 3;
+
 /// Runtime limits for a single agent run.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimits {
@@ -19,6 +22,7 @@ pub struct RuntimeLimits {
     pub timeout_ms: u64,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    pub max_empty_turns: u32,
 }
 
 impl Default for RuntimeLimits {
@@ -31,6 +35,7 @@ impl Default for RuntimeLimits {
             timeout_ms: 60_000,
             max_context_bytes: 64_000,
             max_output_bytes: 65_536,
+            max_empty_turns: DEFAULT_MAX_EMPTY_TURNS,
         }
     }
 }
@@ -77,6 +82,8 @@ pub struct RunConfig {
     pub max_steps: u32,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    pub max_empty_turns: u32,
+    pub tool_definitions: Vec<crate::provider::ToolDefinition>,
 }
 
 /// Result of a completed agent run.
@@ -109,6 +116,14 @@ pub struct StepResult {
 /// 6. If `max_steps` reached -> `Interrupted`
 /// 7. If `finish_reason` is `"stop"` -> `Completed`
 ///
+/// Edge cases handled:
+/// - Empty model response (no content, no tool_calls) counts toward max empty turns
+/// - Unknown tool names produce a clear error message in tool output
+/// - Malformed tool arguments (non-object) produce an error message in tool output
+/// - Context exceeding max bytes is truncated to continue
+/// - Tool execution panics are caught and reported as errors
+/// - Multiple consecutive empty responses stop after max_empty_turns
+///
 /// Returns `RunResult` with final status and full conversation.
 pub async fn execute_run(
     provider: &dyn ModelProvider,
@@ -120,9 +135,9 @@ pub async fn execute_run(
     let mut total_steps = 0u32;
     let mut total_input_tokens = 0u64;
     let mut total_output_tokens = 0u64;
+    let mut consecutive_empty_turns = 0u32;
 
     loop {
-        // Check step limit
         if total_steps >= config.max_steps {
             return Ok(RunResult {
                 run_id: config.run_id,
@@ -134,20 +149,22 @@ pub async fn execute_run(
             });
         }
 
-        // Build request
+        truncate_context_if_needed(
+            &mut messages,
+            config.max_context_bytes,
+        );
+
         let request = GenerateRequest {
             model_id: model_id.to_owned(),
             system_prompt: config.system_prompt.clone(),
             messages: messages.clone(),
-            tools: vec![], // Tool definitions will be added in Task 15
+            tools: config.tool_definitions.clone(),
             max_tokens: None,
             temperature: None,
         };
 
-        // Call model
         let response = provider.generate(request).await?;
 
-        // Track usage
         if let Some(usage) = &response.usage {
             total_input_tokens += usage.input_tokens as u64;
             total_output_tokens += usage.output_tokens as u64;
@@ -155,35 +172,49 @@ pub async fn execute_run(
 
         total_steps += 1;
 
-        // Add assistant message
-        let assistant_content = response.content.clone().unwrap_or_default();
+        let has_tool_calls = !response.tool_calls.is_empty();
+        let assistant_content = if has_tool_calls {
+            String::new()
+        } else {
+            response.content.clone().unwrap_or_default()
+        };
+        let has_content = !assistant_content.is_empty();
+
         messages.push(Message {
             role: MessageRole::Assistant,
             content: assistant_content,
             tool_call_id: None,
             name: None,
+            tool_calls: if has_tool_calls {
+                Some(response.tool_calls.clone())
+            } else {
+                None
+            },
         });
 
-        // Process tool calls
-        if !response.tool_calls.is_empty() {
+        if has_tool_calls {
+            consecutive_empty_turns = 0;
             for tc in &response.tool_calls {
-                let output = tool_executor(&tc.name, &tc.arguments);
+                validate_tool_arguments(&tc.arguments)?;
+
+                let output = execute_tool_safely(
+                    &tc.name,
+                    &tc.arguments,
+                    tool_executor,
+                );
+
                 messages.push(Message {
                     role: MessageRole::Tool,
                     content: output.content,
                     tool_call_id: Some(tc.id.clone()),
                     name: Some(tc.name.clone()),
+                    tool_calls: None,
                 });
             }
-            // Continue loop to send tool results back to model
             continue;
         }
 
-        // No tool calls — check if we're done
-        let is_done = response.finish_reason.as_deref() == Some("stop")
-            || response.finish_reason.as_deref() == Some("end_turn");
-
-        if is_done || response.content.is_some() {
+        if has_content {
             return Ok(RunResult {
                 run_id: config.run_id,
                 status: RunStatus::Completed,
@@ -194,16 +225,142 @@ pub async fn execute_run(
             });
         }
 
-        // No content and no tool calls — failed
-        return Ok(RunResult {
-            run_id: config.run_id,
-            status: RunStatus::Failed,
-            messages,
-            total_steps,
-            total_input_tokens,
-            total_output_tokens,
-        });
+        let is_done = response.finish_reason.as_deref() == Some("stop")
+            || response.finish_reason.as_deref() == Some("end_turn");
+
+        if is_done {
+            return Ok(RunResult {
+                run_id: config.run_id,
+                status: RunStatus::Completed,
+                messages,
+                total_steps,
+                total_input_tokens,
+                total_output_tokens,
+            });
+        }
+
+        consecutive_empty_turns += 1;
+        if consecutive_empty_turns >= config.max_empty_turns {
+            return Err(OpenSlateError::Runtime(RuntimeError::MaxEmptyTurnsExceeded {
+                count: consecutive_empty_turns,
+                step: total_steps,
+                agent_id: config.agent_id.0.clone(),
+                model_alias: config.model_alias.clone(),
+            }));
+        }
     }
+}
+
+/// Validate that tool call arguments are a JSON object. Returns `Ok(())` if valid,
+/// or a `RuntimeError::ToolArgumentError` if the arguments are malformed.
+pub fn validate_tool_arguments(args: &serde_json::Value) -> Result<(), RuntimeError> {
+    match args {
+        serde_json::Value::Object(_) => Ok(()),
+        serde_json::Value::Null => Ok(()),
+        other => Err(RuntimeError::ToolArgumentError {
+            tool_name: String::new(),
+            step: 0,
+            agent_id: String::new(),
+            details: format!("expected object or null, got {}", json_type_name(other)),
+        }),
+    }
+}
+
+/// Get a human-readable type name for a JSON value.
+fn json_type_name(val: &serde_json::Value) -> &'static str {
+    match val {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Execute a tool with panic protection.
+///
+/// Wraps the tool executor call in `std::panic::catch_unwind` to catch panics
+/// and convert them into error `ToolOutput`s.
+fn execute_tool_safely(
+    name: &str,
+    args: &serde_json::Value,
+    executor: &(dyn Fn(&str, &serde_json::Value) -> ToolOutput + Send + Sync),
+) -> ToolOutput {
+    let name_owned = name.to_owned();
+    let args_owned = args.clone();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        executor(&name_owned, &args_owned)
+    }));
+
+    match result {
+        Ok(output) => output,
+        Err(panic_payload) => {
+            let reason = match panic_payload.downcast_ref::<&str>() {
+                Some(s) => s.to_string(),
+                None => match panic_payload.downcast_ref::<String>() {
+                    Some(s) => s.clone(),
+                    None => "unknown panic".to_string(),
+                },
+            };
+            ToolOutput {
+                content: format!("Tool '{}' panicked: {}", name, reason),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Error,
+            }
+        }
+    }
+}
+
+/// Estimate the byte size of the message context.
+fn estimate_context_bytes(messages: &[Message]) -> usize {
+    messages.iter().map(|m| m.content.len()).sum()
+}
+
+/// Truncate conversation context if it exceeds the maximum byte limit.
+///
+/// Preserves the first message (typically the user's input) and the most recent
+/// messages. Middle messages are dropped to bring the total under the limit.
+fn truncate_context_if_needed(messages: &mut Vec<Message>, max_bytes: u32) {
+    let max = max_bytes as usize;
+    if estimate_context_bytes(messages) <= max {
+        return;
+    }
+
+    if messages.len() <= 2 {
+        return;
+    }
+
+    let keep_recent = 2.min(messages.len());
+    let first = messages.first().cloned();
+
+    let mut trimmed = Vec::new();
+    if let Some(first_msg) = first {
+        trimmed.push(first_msg);
+    }
+
+    let notice = Message {
+        role: MessageRole::System,
+        content: "[Context truncated: older messages removed to stay within limit]".into(),
+        tool_call_id: None,
+        name: None,
+        tool_calls: None,
+    };
+    trimmed.push(notice);
+
+    let recent_start = messages.len().saturating_sub(keep_recent);
+    for msg in messages.iter().skip(recent_start) {
+        trimmed.push(msg.clone());
+    }
+
+    while estimate_context_bytes(&trimmed) > max && trimmed.len() > 3 {
+        let mid = 1 + (trimmed.len() - 1) / 2;
+        trimmed.remove(mid.min(trimmed.len() - 2).max(1));
+    }
+
+    *messages = trimmed;
 }
 
 #[cfg(test)]
@@ -265,10 +422,13 @@ mod tests {
                 content: "hello".into(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: None,
             }],
             max_steps: 10,
             max_context_bytes: 100_000,
             max_output_bytes: 10_000,
+            max_empty_turns: DEFAULT_MAX_EMPTY_TURNS,
+            tool_definitions: vec![],
         }
     }
 
@@ -430,20 +590,272 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_response_fails() {
-        let provider = MockProvider::new(vec![ModelResponse {
-            content: None,
-            tool_calls: vec![],
-            usage: None,
-            finish_reason: None,
-        }]);
+    async fn test_empty_response_counts_toward_max_empty_turns() {
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: None,
+            };
+            5
+        ]);
 
-        let result = execute_run(&provider, default_config(), "m1", &mock_tool_executor)
+        let mut config = default_config();
+        config.max_empty_turns = 3;
+
+        let result = execute_run(&provider, config, "m1", &mock_tool_executor).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            OpenSlateError::Runtime(RuntimeError::MaxEmptyTurnsExceeded {
+                count,
+                step,
+                agent_id,
+                model_alias,
+            }) => {
+                assert_eq!(*count, 3);
+                assert_eq!(*step, 3);
+                assert_eq!(agent_id, "test-agent");
+                assert_eq!(model_alias, "test-model");
+            }
+            other => panic!("expected MaxEmptyTurnsExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_empty_response_then_content() {
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: None,
+            },
+            ModelResponse {
+                content: Some("Finally!".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let mut config = default_config();
+        config.max_empty_turns = 3;
+
+        let result = execute_run(&provider, config, "m1", &mock_tool_executor)
             .await
             .expect("run should succeed");
 
-        assert_eq!(result.status, RunStatus::Failed);
-        assert_eq!(result.total_steps, 1);
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 2);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_tool_produces_error_output() {
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: Some("calling unknown tool".into()),
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "nonexistent_tool".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("Done after error".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let tool_exec = |name: &str, _args: &serde_json::Value| -> ToolOutput {
+            ToolOutput {
+                content: format!("Error: tool '{}' not found", name),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Error,
+            }
+        };
+
+        let result = execute_run(&provider, default_config(), "m1", &tool_exec)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 2);
+        assert_eq!(result.messages[2].role, MessageRole::Tool);
+        assert!(result.messages[2].content.contains("nonexistent_tool"));
+        assert!(result.messages[2].content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_tool_arguments() {
+        let result = validate_tool_arguments(&serde_json::json!({"key": "value"}));
+        assert!(result.is_ok());
+
+        let result = validate_tool_arguments(&serde_json::Value::Null);
+        assert!(result.is_ok());
+
+        let result = validate_tool_arguments(&serde_json::json!("not an object"));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RuntimeError::ToolArgumentError { details, .. } => {
+                assert!(details.contains("expected object or null"));
+                assert!(details.contains("string"));
+            }
+            other => panic!("expected ToolArgumentError, got {other:?}"),
+        }
+
+        let result = validate_tool_arguments(&serde_json::json!(42));
+        assert!(result.is_err());
+
+        let result = validate_tool_arguments(&serde_json::json!([1, 2, 3]));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tool_panic_caught() {
+        let panicking_executor = |_name: &str, _args: &serde_json::Value| -> ToolOutput {
+            panic!("intentional test panic");
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_tool_safely("test_tool", &serde_json::json!({}), &panicking_executor)
+        }));
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.status, ToolOutputStatus::Error);
+        assert!(output.content.contains("test_tool"));
+        assert!(output.content.contains("panicked"));
+        assert!(output.content.contains("intentional test panic"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_panic_with_string_message() {
+        let panicking_executor = |_name: &str, _args: &serde_json::Value| -> ToolOutput {
+            panic!("string panic message");
+        };
+
+        let output = execute_tool_safely("my_tool", &serde_json::json!({}), &panicking_executor);
+        assert_eq!(output.status, ToolOutputStatus::Error);
+        assert!(output.content.contains("my_tool"));
+        assert!(output.content.contains("string panic message"));
+    }
+
+    #[test]
+    fn test_context_truncation() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::User,
+                content: "hello".repeat(1000),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "response1".repeat(1000),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::User,
+                content: "followup".repeat(1000),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "response2".repeat(1000),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::User,
+                content: "final".repeat(100),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        ];
+
+        let total_before: usize = messages.iter().map(|m| m.content.len()).sum();
+        assert!(total_before > 2000);
+
+        truncate_context_if_needed(&mut messages, 2000);
+
+        let total_after: usize = messages.iter().map(|m| m.content.len()).sum();
+        assert!(total_after < total_before);
+        assert!(messages.len() >= 2);
+        assert_eq!(messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn test_context_no_truncation_when_under_limit() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::User,
+                content: "hello".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "hi".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        ];
+
+        let original_len = messages.len();
+        truncate_context_if_needed(&mut messages, 100_000);
+        assert_eq!(messages.len(), original_len);
+    }
+
+    #[test]
+    fn test_error_messages_include_context() {
+        let err = RuntimeError::EmptyResponse {
+            step: 5,
+            agent_id: "my-agent".into(),
+            model_alias: "gpt-4o".into(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("step 5"));
+        assert!(msg.contains("my-agent"));
+        assert!(msg.contains("gpt-4o"));
+
+        let err = RuntimeError::UnknownTool {
+            tool_name: "bad_tool".into(),
+            step: 3,
+            agent_id: "root".into(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("bad_tool"));
+        assert!(msg.contains("step 3"));
+        assert!(msg.contains("root"));
+
+        let err = RuntimeError::ToolExecutionError {
+            tool_name: "bash".into(),
+            step: 7,
+            agent_id: "worker".into(),
+            reason: "segfault".into(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("bash"));
+        assert!(msg.contains("step 7"));
+        assert!(msg.contains("worker"));
+        assert!(msg.contains("segfault"));
     }
 
     // -- RuntimeLimits + check_limits tests --
@@ -495,5 +907,6 @@ mod tests {
         assert_eq!(limits.timeout_ms, 60_000);
         assert_eq!(limits.max_context_bytes, 64_000);
         assert_eq!(limits.max_output_bytes, 65_536);
+        assert_eq!(limits.max_empty_turns, DEFAULT_MAX_EMPTY_TURNS);
     }
 }

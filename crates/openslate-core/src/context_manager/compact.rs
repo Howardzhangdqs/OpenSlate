@@ -70,6 +70,7 @@ where
         content: format!("{}{}{}", SUMMARY_PREFIX, summary, SUMMARY_SUFFIX),
         tool_call_id: None,
         name: Some(COMPACT_NAME.to_owned()),
+        tool_calls: None,
     };
 
     let recent = messages.split_off(split_point);
@@ -125,12 +126,14 @@ mod tests {
                         content: format!("user msg {}", i),
                         tool_call_id: None,
                         name: None,
+                        tool_calls: None,
                     },
                     Message {
                         role: MessageRole::Assistant,
                         content: format!("assistant msg {}", i),
                         tool_call_id: None,
                         name: None,
+                        tool_calls: None,
                     },
                 ]
             })
@@ -183,6 +186,7 @@ mod tests {
             content: "a".repeat(900),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }];
         assert!(needs_compact(&msgs, 100, 1000, 0));
     }
@@ -223,6 +227,7 @@ mod tests {
                 content: format!("message {} with some padding text here", i),
                 tool_call_id: None,
                 name: None,
+                tool_calls: None,
             })
             .collect();
 

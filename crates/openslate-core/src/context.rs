@@ -59,6 +59,7 @@ pub fn build_child_context(
             content: prompt.to_owned(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
     }
 
@@ -83,6 +84,7 @@ pub fn build_child_context(
             content: format!("[Parent conversation summary]\n{}", summary),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
     }
 
@@ -92,6 +94,7 @@ pub fn build_child_context(
         content: task.to_owned(),
         tool_call_id: None,
         name: None,
+        tool_calls: None,
     });
 
     messages
@@ -129,6 +132,7 @@ mod tests {
             content: content.to_owned(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }
     }
 

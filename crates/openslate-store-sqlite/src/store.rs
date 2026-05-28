@@ -77,10 +77,27 @@ impl SqliteStore {
         Ok(Self { pool })
     }
 
-    /// Run all migrations (create tables if not exist).
+    /// Run all migrations: create tables, evolve schema, create indexes.
     pub async fn run_migrations(&self) -> Result<(), StoreError> {
         for ddl in schema::ddl_statements() {
             query(ddl)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::MigrationError(e.to_string()))?;
+        }
+
+        for alter in schema::alter_statements() {
+            let result = query(alter).execute(&self.pool).await;
+            if let Err(e) = result {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(StoreError::MigrationError(msg));
+                }
+            }
+        }
+
+        for idx in schema::index_statements() {
+            query(idx)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| StoreError::MigrationError(e.to_string()))?;
@@ -233,5 +250,117 @@ mod tests {
             pragma.journal_mode, "wal",
             "file-based store should use WAL journal mode"
         );
+    }
+
+    #[tokio::test]
+    async fn test_all_indexes_created() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        store.run_migrations().await.expect("migrations run");
+
+        let indexes: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("query sqlite_master for indexes");
+
+        let mut expected: Vec<&str> = schema::INDEX_NAMES.to_vec();
+        expected.sort();
+
+        let mut actual: Vec<String> = indexes;
+        actual.sort();
+
+        assert_eq!(actual, expected, "all expected indexes should exist");
+    }
+
+    #[tokio::test]
+    async fn test_index_idempotent() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        store.run_migrations().await.expect("first migration");
+        store.run_migrations().await.expect("second migration");
+
+        let indexes: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("query sqlite_master for indexes");
+
+        assert_eq!(
+            indexes.len(),
+            schema::INDEX_NAMES.len(),
+            "should have exactly the expected number of indexes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrations_triple_run() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        store.run_migrations().await.expect("first migration");
+        store.run_migrations().await.expect("second migration");
+        store.run_migrations().await.expect("third migration");
+
+        let tables: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("query sqlite_master");
+
+        assert_eq!(tables.len(), 7, "should still have exactly 7 tables");
+
+        let indexes: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("query sqlite_master for indexes");
+
+        assert_eq!(
+            indexes.len(),
+            schema::INDEX_NAMES.len(),
+            "should have exactly the expected number of indexes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runs_table_has_cwd_column() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        store.run_migrations().await.expect("migrations run");
+
+        let columns: Vec<String> = query_scalar(
+            "SELECT name FROM pragma_table_info('runs') ORDER BY name",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("query pragma_table_info");
+
+        assert!(
+            columns.iter().any(|c| c == "cwd"),
+            "runs table should have a 'cwd' column, got: {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_pragma_synchronous_normal() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        let pragma = store.verify_pragma().await.expect("pragma verified");
+        assert_eq!(pragma.synchronous, "NORMAL");
+        assert!(pragma.foreign_keys, "foreign_keys should be ON");
+    }
+
+    #[tokio::test]
+    async fn test_file_based_pragma_all() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test_pragma_all.db");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        let store = SqliteStore::new(path_str).await.expect("store created");
+        let pragma = store.verify_pragma().await.expect("pragma verified");
+
+        assert_eq!(pragma.journal_mode, "wal", "should use WAL");
+        assert_eq!(pragma.synchronous, "NORMAL", "synchronous should be NORMAL");
+        assert!(pragma.foreign_keys, "foreign_keys should be ON");
+        assert_eq!(pragma.busy_timeout, 5000, "busy_timeout should be 5000ms");
     }
 }

@@ -74,6 +74,7 @@ impl ContextManager {
             content: content.into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
     }
 
@@ -84,6 +85,7 @@ impl ContextManager {
             content: content.into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
     }
 
@@ -94,6 +96,7 @@ impl ContextManager {
             content: content.into(),
             tool_call_id: Some(tool_call_id),
             name: None,
+            tool_calls: None,
         });
     }
 
@@ -109,6 +112,7 @@ impl ContextManager {
             content: content.into(),
             tool_call_id: Some(tool_call_id),
             name,
+            tool_calls: None,
         });
     }
 
@@ -130,6 +134,7 @@ impl ContextManager {
                 content: prompt.clone(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: None,
             };
             total_bytes += msg.content.len();
             result.push(msg);
@@ -280,6 +285,7 @@ fn truncate_message(msg: &Message, max_bytes: usize) -> Option<Message> {
         content,
         tool_call_id: msg.tool_call_id.clone(),
         name: msg.name.clone(),
+        tool_calls: msg.tool_calls.clone(),
     })
 }
 

@@ -434,12 +434,14 @@ agents:
                 content: "hello".into(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: None,
             },
             Message {
                 role: MessageRole::Assistant,
                 content: "response".into(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: None,
             },
         ];
         assert_eq!(
@@ -457,6 +459,7 @@ agents:
             content: "hello".into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }];
         assert_eq!(extract_final_assistant_message(&messages), None);
     }

@@ -439,6 +439,7 @@ impl ReplSession {
             content: input.to_owned(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
 
         let _agent = resolve_agent(&self.ctx.agent_tree, None)?;
@@ -446,7 +447,7 @@ impl ReplSession {
         let provider = build_provider_for_model(&self.ctx.config, &model_alias)?;
 
         let start = Instant::now();
-        let result = match self.ctx.manager.execute(&provider, input).await {
+        let result = match self.ctx.manager.execute_with_history(&provider, &self.history).await {
             Ok(r) => r,
             Err(e) => {
                 return Err(anyhow::anyhow!("Agent execution failed: {}", e));
@@ -482,6 +483,7 @@ impl ReplSession {
             content: final_message.clone(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
 
         if !self.quiet {
@@ -1180,6 +1182,7 @@ agents:
             content: "test".to_owned(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
         assert_eq!(session.history().len(), 1);
 
@@ -1198,6 +1201,7 @@ agents:
             content: "test".to_owned(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         });
 
         let result = rt.block_on(session.dispatch("/clear")).unwrap();

@@ -113,9 +113,7 @@ mod tests {
     use super::*;
 
     fn example_config() -> OpenSlateConfig {
-        crate::config::parse_openslate_toml(include_str!(
-            "../../../../openslate-project-plan/plan/examples/openslate.toml"
-        ))
+        crate::config::parse_openslate_toml(include_str!("../fixtures/openslate.toml"))
         .unwrap()
     }
 

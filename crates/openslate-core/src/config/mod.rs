@@ -2,6 +2,32 @@
 //!
 //! Supports TOML for main config (`openslate.toml`) and YAML for agent
 //! definitions (`agents.yaml`). All structs implement `serde::Deserialize`.
+//!
+//! # Schema Overview
+//!
+//! ## `openslate.toml` (TOML)
+//!
+//! | Section     | Type                | Required | Description                        |
+//! |-------------|---------------------|----------|------------------------------------|
+//! | `project`   | `ProjectConfig`     | no       | Project metadata                   |
+//! | `database`  | `DatabaseConfig`    | no       | SQLite database settings           |
+//! | `prompts`   | `PromptsConfig`     | no       | Prompt template paths              |
+//! | `limits`    | `LimitsConfig`      | no       | Execution limit defaults           |
+//! | `providers` | `Map<String, ProviderConfig>` | yes | LLM provider endpoints |
+//! | `models`    | `Map<String, ModelConfig>`    | yes | Named model aliases (`main`, `fast` required) |
+//! | `trace`     | `TraceConfig`       | no       | Observability settings             |
+//!
+//! ## `agents.yaml` (YAML)
+//!
+//! A single `agents` list of [`AgentConfig`](crate::types::AgentConfig) entries.
+//! Each agent requires: `id`, `name`, `model`, `default_prompt`.
+//! Optional: `children` (list of agent ids), `tools` (list of tool names).
+//!
+//! # Validation
+//!
+//! Use [`validation::validate_config`] for error-only checks,
+//! [`validation::validate_strict`] for errors + warnings, or
+//! [`validation::validate_config_full`] for a structured result.
 
 pub mod validation;
 
@@ -315,9 +341,7 @@ model = "m"
 
     #[test]
     fn parse_full_example_toml() {
-        let toml_content = include_str!(
-            "../../../../../openslate-project-plan/plan/examples/openslate.toml"
-        );
+        let toml_content = include_str!("../../fixtures/openslate.toml");
         let config = parse_openslate_toml(toml_content).expect("example toml should parse");
 
         let project = config.project.as_ref().expect("project");
@@ -427,9 +451,7 @@ agents:
 
     #[test]
     fn parse_full_example_agents_yaml() {
-        let yaml_content = include_str!(
-            "../../../../../openslate-project-plan/plan/examples/agents.yaml"
-        );
+        let yaml_content = include_str!("../../fixtures/agents.yaml");
         let config = parse_agents_yaml(yaml_content).expect("example yaml should parse");
 
         assert_eq!(config.agents.len(), 6);

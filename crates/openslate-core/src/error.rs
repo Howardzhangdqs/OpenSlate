@@ -115,6 +115,57 @@ pub enum RuntimeError {
 
     #[error("model alias not found: {0}")]
     ModelAliasNotFound(String),
+
+    /// Model returned a response with no content and no tool calls.
+    #[error("empty response at step {step}, agent {agent_id}, model {model_alias}")]
+    EmptyResponse {
+        step: u32,
+        agent_id: String,
+        model_alias: String,
+    },
+
+    /// Model requested a tool that is not registered in the tool registry.
+    #[error("unknown tool '{tool_name}' at step {step}, agent {agent_id}")]
+    UnknownTool {
+        tool_name: String,
+        step: u32,
+        agent_id: String,
+    },
+
+    /// Model returned tool call arguments that could not be parsed or are invalid.
+    #[error("malformed tool arguments for '{tool_name}' at step {step}, agent {agent_id}: {details}")]
+    ToolArgumentError {
+        tool_name: String,
+        step: u32,
+        agent_id: String,
+        details: String,
+    },
+
+    /// Tool execution failed (panic or error).
+    #[error("tool '{tool_name}' execution failed at step {step}, agent {agent_id}: {reason}")]
+    ToolExecutionError {
+        tool_name: String,
+        step: u32,
+        agent_id: String,
+        reason: String,
+    },
+
+    /// Too many consecutive empty responses from the model.
+    #[error("max empty turns exceeded ({count}) at step {step}, agent {agent_id}, model {model_alias}")]
+    MaxEmptyTurnsExceeded {
+        count: u32,
+        step: u32,
+        agent_id: String,
+        model_alias: String,
+    },
+
+    /// Context exceeded maximum bytes mid-run and was truncated.
+    #[error("context exceeded {max_bytes} bytes at step {step}, agent {agent_id}; truncated to continue")]
+    ContextOverflow {
+        max_bytes: u32,
+        step: u32,
+        agent_id: String,
+    },
 }
 
 /// Persistence store-related errors.
@@ -282,6 +333,75 @@ mod tests {
         assert_eq!(
             format!("{}", RuntimeError::ModelAliasNotFound("gpt-4".into())),
             "model alias not found: gpt-4"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::EmptyResponse {
+                    step: 3,
+                    agent_id: "agent-1".into(),
+                    model_alias: "gpt-4".into(),
+                }
+            ),
+            "empty response at step 3, agent agent-1, model gpt-4"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::UnknownTool {
+                    tool_name: "bad_tool".into(),
+                    step: 5,
+                    agent_id: "agent-2".into(),
+                }
+            ),
+            "unknown tool 'bad_tool' at step 5, agent agent-2"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::ToolArgumentError {
+                    tool_name: "bash".into(),
+                    step: 2,
+                    agent_id: "agent-1".into(),
+                    details: "expected object".into(),
+                }
+            ),
+            "malformed tool arguments for 'bash' at step 2, agent agent-1: expected object"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::ToolExecutionError {
+                    tool_name: "bash".into(),
+                    step: 7,
+                    agent_id: "agent-1".into(),
+                    reason: "panic".into(),
+                }
+            ),
+            "tool 'bash' execution failed at step 7, agent agent-1: panic"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::MaxEmptyTurnsExceeded {
+                    count: 3,
+                    step: 4,
+                    agent_id: "agent-1".into(),
+                    model_alias: "gpt-4".into(),
+                }
+            ),
+            "max empty turns exceeded (3) at step 4, agent agent-1, model gpt-4"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::ContextOverflow {
+                    max_bytes: 64000,
+                    step: 6,
+                    agent_id: "agent-1".into(),
+                }
+            ),
+            "context exceeded 64000 bytes at step 6, agent agent-1; truncated to continue"
         );
     }
 

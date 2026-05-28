@@ -68,6 +68,8 @@ pub struct Message {
     pub tool_call_id: Option<ToolCallId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Static configuration for a single agent.
@@ -224,6 +226,7 @@ mod tests {
             content: "hello".into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         };
         assert_eq!(msg.role, MessageRole::User);
         assert_eq!(msg.content, "hello");
@@ -236,6 +239,7 @@ mod tests {
             content: "result".into(),
             tool_call_id: Some(ToolCallId::from("tc-1")),
             name: Some("bash".into()),
+            tool_calls: None,
         };
         assert!(msg.tool_call_id.is_some());
         assert_eq!(msg.name.as_deref(), Some("bash"));

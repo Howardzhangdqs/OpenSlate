@@ -56,18 +56,22 @@ impl RunManager {
         }
     }
 
-    /// Execute a complete agent run.
+    /// Execute a complete agent run with prior conversation history.
+    ///
+    /// `prior_messages` is used as the `initial_messages` for the run directly —
+    /// no additional user message is prepended. The caller is responsible for
+    /// ensuring the current user message is already included in `prior_messages`.
     ///
     /// This:
     /// 1. Resolves the root agent
     /// 2. Creates an execution tree
     /// 3. Resolves the model
-    /// 4. Runs the agent loop
+    /// 4. Runs the agent loop with the provided conversation history
     /// 5. Returns the result
-    pub async fn execute(
+    pub async fn execute_with_history(
         &self,
         provider: &dyn ModelProvider,
-        input: &str,
+        prior_messages: &[Message],
     ) -> Result<ManagedRunResult, OpenSlateError> {
         let run_id = RunId(uuid::Uuid::new_v4().to_string());
         let root_agent = self.agent_tree.get_root();
@@ -89,22 +93,17 @@ impl RunManager {
 
         let resolved_model = resolve_model(&self.config, &root_agent.model_alias)?;
 
-        let messages = vec![Message {
-            role: MessageRole::User,
-            content: input.to_owned(),
-            tool_call_id: None,
-            name: None,
-        }];
-
         let run_config = RunConfig {
             run_id: run_id.clone(),
             agent_id: root_agent.id.clone(),
             model_alias: root_agent.model_alias.clone(),
             system_prompt: Some(root_agent.default_prompt.clone()),
-            initial_messages: messages,
+            initial_messages: prior_messages.to_vec(),
             max_steps: self.limits.max_steps,
             max_context_bytes: self.limits.max_context_bytes,
             max_output_bytes: self.limits.max_output_bytes,
+            max_empty_turns: self.limits.max_empty_turns,
+            tool_definitions: self.tool_registry.definitions_for(&root_agent.tools),
         };
 
         let registry = Arc::clone(&self.tool_registry);
@@ -154,6 +153,25 @@ impl RunManager {
             trace,
         })
     }
+
+    /// Execute a complete agent run with a single user message (no prior history).
+    ///
+    /// Convenience wrapper around [`execute_with_history`] that wraps `input`
+    /// into a single `User` message. Existing callers remain unchanged.
+    pub async fn execute(
+        &self,
+        provider: &dyn ModelProvider,
+        input: &str,
+    ) -> Result<ManagedRunResult, OpenSlateError> {
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: input.to_owned(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+        }];
+        self.execute_with_history(provider, &messages).await
+    }
 }
 
 impl RuntimeLimits {
@@ -167,6 +185,7 @@ impl RuntimeLimits {
             timeout_ms: l.timeout_ms,
             max_context_bytes: l.max_context_bytes,
             max_output_bytes: l.max_output_bytes,
+            max_empty_turns: crate::runtime::DEFAULT_MAX_EMPTY_TURNS,
         }).unwrap_or_default()
     }
 }

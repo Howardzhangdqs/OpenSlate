@@ -573,6 +573,7 @@ data: [DONE]\n\n";
                 content: "Hi".into(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: None,
             }],
             tools: vec![],
             max_tokens: None,

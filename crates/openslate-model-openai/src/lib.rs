@@ -5,6 +5,7 @@ pub mod types;
 pub mod prelude {
     pub use crate::client::OpenAICompatibleProvider;
     pub use crate::client::OpenAIProviderConfig;
+    pub use crate::client::RetryConfig;
     pub use crate::stream::ModelStreamEvent;
     pub use crate::types::*;
 }

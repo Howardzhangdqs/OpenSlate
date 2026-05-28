@@ -293,8 +293,6 @@ mod tests {
         let tmp = init_in_temp(None);
         let agents_dir = tmp.path().join(".openslate/agents");
         assert!(agents_dir.is_dir(), "agents/ directory should exist");
-        assert!(!tmp.path().join(".openslate/agents.yaml").exists(), "agents.yaml should NOT exist");
-
         let root_md = agents_dir.join("root.md");
         assert!(root_md.is_file(), "agents/root.md should exist");
 

@@ -191,11 +191,6 @@ pub fn parse_openslate_toml(content: &str) -> Result<OpenSlateConfig, ConfigErro
     toml::from_str(content).map_err(|e| ConfigError::ParseError(e.to_string()))
 }
 
-/// Parse the `agents.yaml` content into an `AgentsConfig`.
-pub fn parse_agents_yaml(content: &str) -> Result<AgentsConfig, ConfigError> {
-    serde_yml::from_str(content).map_err(|e| ConfigError::ParseError(e.to_string()))
-}
-
 // ── Markdown frontmatter parsing ─────────────────────────────────────────────
 
 /// Frontmatter fields deserialized from the YAML header of an agent `.md` file.

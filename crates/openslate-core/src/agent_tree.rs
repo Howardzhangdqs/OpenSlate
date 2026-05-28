@@ -1,4 +1,4 @@
-//! Static agent configuration tree built from agents.yaml.
+//! Static agent configuration tree built from agents/*.md configuration files.
 
 use std::collections::{HashMap, HashSet};
 
@@ -157,7 +157,7 @@ impl AgentTree {
 mod tests {
     use super::*;
 
-    /// Helper: build the example config from agents.yaml.
+    /// Helper: build the example config from agents/*.md.
     fn example_configs() -> Vec<AgentConfig> {
         vec![
             AgentConfig {

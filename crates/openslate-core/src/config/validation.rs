@@ -1,6 +1,6 @@
 //! Configuration validation for OpenSlate.
 //!
-//! Validates that `openslate.toml` + `agents.yaml` form a consistent,
+//! Validates that `openslate.toml` + `agents/*.md` form a consistent,
 //! complete configuration. Returns structured errors (and optional warnings)
 //! instead of panicking.
 
@@ -61,7 +61,7 @@ impl ValidationResult {
     }
 }
 
-/// Validate the complete configuration (`openslate.toml` + `agents.yaml`).
+/// Validate the complete configuration (`openslate.toml` + `agents/*.md`).
 ///
 /// Returns a list of errors — empty means valid.
 pub fn validate_config(
@@ -424,7 +424,8 @@ fn dfs_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{parse_agents_dir, parse_agents_yaml, parse_openslate_toml};
+    use crate::config::{parse_agents_dir, parse_openslate_toml};
+    use crate::types::{AgentConfig, AgentId};
     use std::path::Path;
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -459,24 +460,40 @@ max_output_bytes = 65536
     }
 
     fn valid_agents() -> AgentsConfig {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    children:
-      - worker
-    tools:
-      - read_file
-    default_prompt: "root prompt here"
-  - id: worker
-    name: Worker
-    model: fast
-    tools:
-      - write_file
-    default_prompt: "worker prompt here"
-"#;
-        parse_agents_yaml(yaml).expect("fixture should parse")
+        AgentsConfig {
+            agents: vec![
+                AgentConfig {
+                    id: AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    children: vec![AgentId("worker".into())],
+                    tools: vec!["read_file".into()],
+                    default_prompt: "root prompt here".into(),
+                },
+                AgentConfig {
+                    id: AgentId("worker".into()),
+                    name: "Worker".into(),
+                    model: "fast".into(),
+                    tools: vec!["write_file".into()],
+                    default_prompt: "worker prompt here".into(),
+                    children: vec![],
+                },
+            ],
+        }
+    }
+
+    /// Build an `AgentsConfig` with a single agent.
+    fn single_agent(id: &str, name: &str, model: &str, tools: Vec<&str>, children: Vec<&str>, prompt: &str) -> AgentsConfig {
+        AgentsConfig {
+            agents: vec![AgentConfig {
+                id: AgentId(id.into()),
+                name: name.into(),
+                model: model.into(),
+                tools: tools.into_iter().map(String::from).collect(),
+                children: children.into_iter().map(|c| AgentId(c.into())).collect(),
+                default_prompt: prompt.into(),
+            }],
+        }
     }
 
     // ── Rule 1 & 2: required model aliases ───────────────────────────────
@@ -524,18 +541,26 @@ agents:
 
     #[test]
     fn duplicate_agent_id() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    default_prompt: "p1"
-  - id: root
-    name: Root Dupe
-    model: fast
-    default_prompt: "p2"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = AgentsConfig {
+            agents: vec![
+                AgentConfig {
+                    id: AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    tools: vec![],
+                    children: vec![],
+                    default_prompt: "p1".into(),
+                },
+                AgentConfig {
+                    id: AgentId("root".into()),
+                    name: "Root Dupe".into(),
+                    model: "fast".into(),
+                    tools: vec![],
+                    children: vec![],
+                    default_prompt: "p2".into(),
+                },
+            ],
+        };
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors.iter().any(|e| e.field == "agents.root" && e.message.contains("Duplicate")),
@@ -548,22 +573,26 @@ agents:
     #[test]
     fn no_root_agent() {
         // Every agent is a child of another → no root
-        let yaml = r#"
-agents:
-  - id: a
-    name: A
-    model: main
-    children:
-      - b
-    default_prompt: "p"
-  - id: b
-    name: B
-    model: fast
-    children:
-      - a
-    default_prompt: "p"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = AgentsConfig {
+            agents: vec![
+                AgentConfig {
+                    id: AgentId("a".into()),
+                    name: "A".into(),
+                    model: "main".into(),
+                    tools: vec![],
+                    children: vec![AgentId("b".into())],
+                    default_prompt: "p".into(),
+                },
+                AgentConfig {
+                    id: AgentId("b".into()),
+                    name: "B".into(),
+                    model: "fast".into(),
+                    tools: vec![],
+                    children: vec![AgentId("a".into())],
+                    default_prompt: "p".into(),
+                },
+            ],
+        };
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors.iter().any(|e| e.field == "agents" && e.message.contains("root")),
@@ -575,16 +604,7 @@ agents:
 
     #[test]
     fn child_references_nonexistent_agent() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    children:
-      - phantom
-    default_prompt: "p"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("root", "Root", "main", vec![], vec!["phantom"], "p");
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors
@@ -598,14 +618,7 @@ agents:
 
     #[test]
     fn agent_references_nonexistent_model() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: nonexistent
-    default_prompt: "p"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("root", "Root", "nonexistent", vec![], vec![], "p");
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors
@@ -839,14 +852,7 @@ model = ""
 
     #[test]
     fn agent_id_with_spaces_rejected() {
-        let yaml = r#"
-agents:
-  - id: "has spaces"
-    name: Bad
-    model: main
-    default_prompt: "prompt here for testing"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("has spaces", "Bad", "main", vec![], vec![], "prompt here for testing");
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors
@@ -858,14 +864,7 @@ agents:
 
     #[test]
     fn agent_id_with_special_chars_rejected() {
-        let yaml = r#"
-agents:
-  - id: "bad@id!"
-    name: Bad
-    model: main
-    default_prompt: "prompt here for testing"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("bad@id!", "Bad", "main", vec![], vec![], "prompt here for testing");
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors
@@ -877,16 +876,7 @@ agents:
 
     #[test]
     fn agent_id_with_hyphen_and_underscore_accepted() {
-        let yaml = r#"
-agents:
-  - id: my-agent_v2
-    name: Good
-    model: main
-    tools:
-      - read_file
-    default_prompt: "prompt here for testing"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("my-agent_v2", "Good", "main", vec!["read_file"], vec![], "prompt here for testing");
         let errors = validate_config(&valid_config(), &agents);
         assert!(errors.is_empty(), "hyphens and underscores are valid: {errors:?}");
     }
@@ -895,30 +885,34 @@ agents:
 
     #[test]
     fn circular_children_detected() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    children:
-      - loop_a
-    tools:
-      - read_file
-    default_prompt: "prompt here for testing"
-  - id: loop_a
-    name: LoopA
-    model: fast
-    children:
-      - loop_b
-    default_prompt: "prompt here for testing"
-  - id: loop_b
-    name: LoopB
-    model: fast
-    children:
-      - loop_a
-    default_prompt: "prompt here for testing"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = AgentsConfig {
+            agents: vec![
+                AgentConfig {
+                    id: AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    tools: vec!["read_file".into()],
+                    children: vec![AgentId("loop_a".into())],
+                    default_prompt: "prompt here for testing".into(),
+                },
+                AgentConfig {
+                    id: AgentId("loop_a".into()),
+                    name: "LoopA".into(),
+                    model: "fast".into(),
+                    tools: vec![],
+                    children: vec![AgentId("loop_b".into())],
+                    default_prompt: "prompt here for testing".into(),
+                },
+                AgentConfig {
+                    id: AgentId("loop_b".into()),
+                    name: "LoopB".into(),
+                    model: "fast".into(),
+                    tools: vec![],
+                    children: vec![AgentId("loop_a".into())],
+                    default_prompt: "prompt here for testing".into(),
+                },
+            ],
+        };
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors.iter().any(|e| e.message.contains("Circular")),
@@ -993,14 +987,7 @@ path = ""
 
     #[test]
     fn full_validation_warns_agent_no_tools() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    default_prompt: "this is a reasonably long prompt"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("root", "Root", "main", vec![], vec![], "this is a reasonably long prompt");
         let result = validate_config_full(&valid_config(), &agents);
         assert!(
             result
@@ -1014,16 +1001,7 @@ agents:
 
     #[test]
     fn full_validation_warns_short_default_prompt() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    tools:
-      - read_file
-    default_prompt: "hi"
-"#;
-        let agents = parse_agents_yaml(yaml).expect("should parse");
+        let agents = single_agent("root", "Root", "main", vec!["read_file"], vec![], "hi");
         let result = validate_config_full(&valid_config(), &agents);
         assert!(
             result

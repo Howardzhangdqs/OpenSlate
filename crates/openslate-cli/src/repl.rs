@@ -216,13 +216,13 @@ impl ReplSession {
         }
 
         if trimmed.starts_with('/') {
-            return self.handle_slash_command(trimmed);
+            return self.handle_slash_command(trimmed).await;
         }
 
         self.handle_normal_input(trimmed).await
     }
 
-    fn handle_slash_command(&mut self, input: &str) -> Result<DispatchResult> {
+    async fn handle_slash_command(&mut self, input: &str) -> Result<DispatchResult> {
         let cmd = SlashCommand::parse(input);
 
         match cmd {
@@ -399,28 +399,14 @@ impl ReplSession {
                     println!("Store not available");
                     return Ok(DispatchResult::Continue);
                 }
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => handle.block_on(self.handle_resume()),
-                    Err(_) => {
-                        let rt = tokio::runtime::Runtime::new()
-                            .context("Failed to create tokio runtime")?;
-                        rt.block_on(self.handle_resume())
-                    }
-                }
+                self.handle_resume().await
             }
             SlashCommand::Sessions => {
                 if self.ctx.store.is_none() {
                     println!("Store not available");
                     return Ok(DispatchResult::Continue);
                 }
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => handle.block_on(self.handle_sessions()),
-                    Err(_) => {
-                        let rt = tokio::runtime::Runtime::new()
-                            .context("Failed to create tokio runtime")?;
-                        rt.block_on(self.handle_sessions())
-                    }
-                }
+                self.handle_sessions().await
             }
             SlashCommand::Unknown { ref raw } => {
                 let cmd_part = raw.split_whitespace().next().unwrap_or(raw);
@@ -634,6 +620,10 @@ mod tests {
     use super::*;
     use crate::wiring;
     use std::fs;
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(future)
+    }
 
     fn temp_project() -> tempfile::TempDir {
         let tmp = tempfile::TempDir::new().expect("create temp dir");
@@ -1144,31 +1134,31 @@ agents:
     #[test]
     fn test_slash_exit_returns_exit() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/exit").unwrap();
+        let result = block_on(session.handle_slash_command("/exit")).unwrap();
         assert_eq!(result, DispatchResult::Exit);
 
-        let result2 = session.handle_slash_command("/quit").unwrap();
+        let result2 = block_on(session.handle_slash_command("/quit")).unwrap();
         assert_eq!(result2, DispatchResult::Exit);
     }
 
     #[test]
     fn test_slash_q_returns_exit() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/q").unwrap();
+        let result = block_on(session.handle_slash_command("/q")).unwrap();
         assert_eq!(result, DispatchResult::Exit);
     }
 
     #[test]
     fn test_unknown_slash_command_returns_continue() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/unknown").unwrap();
+        let result = block_on(session.handle_slash_command("/unknown")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
     #[test]
     fn test_help_command_lists_all_commands() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/help").unwrap();
+        let result = block_on(session.handle_slash_command("/help")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
@@ -1217,24 +1207,24 @@ agents:
         let mut session = make_session();
         assert!(!session.verbose(), "verbose should start off");
 
-        session.handle_slash_command("/verbose on").unwrap();
+        block_on(session.handle_slash_command("/verbose on")).unwrap();
         assert!(session.verbose(), "verbose should be on");
     }
 
     #[test]
     fn test_verbose_off() {
         let mut session = make_session();
-        session.handle_slash_command("/verbose on").unwrap();
+        block_on(session.handle_slash_command("/verbose on")).unwrap();
         assert!(session.verbose());
 
-        session.handle_slash_command("/verbose off").unwrap();
+        block_on(session.handle_slash_command("/verbose off")).unwrap();
         assert!(!session.verbose(), "verbose should be off");
     }
 
     #[test]
     fn test_verbose_without_arg_is_unknown() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/verbose").unwrap();
+        let result = block_on(session.handle_slash_command("/verbose")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
         assert!(
             !session.verbose(),
@@ -1245,7 +1235,7 @@ agents:
     #[test]
     fn test_status_command() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/status").unwrap();
+        let result = block_on(session.handle_slash_command("/status")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
         assert_eq!(session.stats().turns, 0);
         assert_eq!(session.stats().total_steps, 0);
@@ -1256,21 +1246,21 @@ agents:
     #[test]
     fn test_config_command() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/config").unwrap();
+        let result = block_on(session.handle_slash_command("/config")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
     #[test]
     fn test_agents_command() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/agents").unwrap();
+        let result = block_on(session.handle_slash_command("/agents")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
     #[test]
     fn test_agents_command_with_children() {
         let mut session = make_session_with_children();
-        let result = session.handle_slash_command("/agents").unwrap();
+        let result = block_on(session.handle_slash_command("/agents")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
@@ -1279,17 +1269,17 @@ agents:
         let mut session = make_session_multi_model();
         assert!(session.model_override().is_none());
 
-        session.handle_slash_command("/model fast").unwrap();
+        block_on(session.handle_slash_command("/model fast")).unwrap();
         assert_eq!(session.model_override(), Some("fast"));
 
-        session.handle_slash_command("/model deep").unwrap();
+        block_on(session.handle_slash_command("/model deep")).unwrap();
         assert_eq!(session.model_override(), Some("deep"));
     }
 
     #[test]
     fn test_model_unknown_alias_still_switches() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/model nonexistent").unwrap();
+        let result = block_on(session.handle_slash_command("/model nonexistent")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
@@ -1298,10 +1288,10 @@ agents:
         let mut session = make_session();
         assert_eq!(session.profile(), "default");
 
-        session.handle_slash_command("/profile custom").unwrap();
+        block_on(session.handle_slash_command("/profile custom")).unwrap();
         assert_eq!(session.profile(), "custom");
 
-        session.handle_slash_command("/profile another").unwrap();
+        block_on(session.handle_slash_command("/profile another")).unwrap();
         assert_eq!(session.profile(), "another");
     }
 
@@ -1445,7 +1435,7 @@ agents:
         session.stats.turns = 5;
         session.stats.total_steps = 10;
 
-        session.handle_slash_command("/new").unwrap();
+        block_on(session.handle_slash_command("/new")).unwrap();
         assert_eq!(session.stats().turns, 0, "/new should reset turns");
         assert_eq!(
             session.stats().total_steps, 0,
@@ -1456,7 +1446,7 @@ agents:
     #[test]
     fn test_config_command_multi_model() {
         let mut session = make_session_multi_model();
-        let result = session.handle_slash_command("/config").unwrap();
+        let result = block_on(session.handle_slash_command("/config")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
@@ -1465,21 +1455,21 @@ agents:
     #[test]
     fn test_resume_no_store() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/resume").unwrap();
+        let result = block_on(session.handle_slash_command("/resume")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
     #[test]
     fn test_sessions_no_store() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/sessions").unwrap();
+        let result = block_on(session.handle_slash_command("/sessions")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 
     #[test]
     fn test_resume_via_continue_alias() {
         let mut session = make_session();
-        let result = session.handle_slash_command("/continue").unwrap();
+        let result = block_on(session.handle_slash_command("/continue")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
     }
 

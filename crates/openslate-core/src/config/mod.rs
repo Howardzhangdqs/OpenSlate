@@ -32,11 +32,12 @@
 pub mod validation;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::error::ConfigError;
-use crate::types::AgentConfig;
+use crate::types::{AgentConfig, AgentId};
 
 // ── Config structs ───────────────────────────────────────────────────────────
 
@@ -191,6 +192,134 @@ pub fn parse_openslate_toml(content: &str) -> Result<OpenSlateConfig, ConfigErro
 /// Parse the `agents.yaml` content into an `AgentsConfig`.
 pub fn parse_agents_yaml(content: &str) -> Result<AgentsConfig, ConfigError> {
     serde_yml::from_str(content).map_err(|e| ConfigError::ParseError(e.to_string()))
+}
+
+// ── Markdown frontmatter parsing ─────────────────────────────────────────────
+
+/// Frontmatter fields deserialized from the YAML header of an agent `.md` file.
+///
+/// Unlike [`AgentConfig`], the `id` is optional (falls back to the filename)
+/// and `default_prompt` is absent (it comes from the markdown body).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentFrontmatter {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    pub model: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub children: Vec<String>,
+}
+
+/// Derive an agent id from a markdown filename.
+///
+/// Strips the `.md` extension, keeps only `[a-zA-Z0-9_]`, replaces other
+/// characters with `_`, and converts to lowercase.
+pub fn derive_id_from_filename(filename: &str) -> String {
+    let stem = filename.strip_suffix(".md").unwrap_or(filename);
+    stem.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Parse a single agent markdown file (with YAML frontmatter) into an [`AgentConfig`].
+///
+/// Expected format:
+/// ```markdown
+/// ---
+/// name: My Agent
+/// model: main
+/// tools: [bash, read_file]
+/// ---
+/// You are a helpful assistant.
+/// ```
+///
+/// - The `id` field is optional in the frontmatter; if absent it is derived
+///   from `filename` via [`derive_id_from_filename`].
+/// - The body after the closing `---` becomes `default_prompt`.
+/// - UTF-8 BOM (`\u{feff}`) at the start is stripped before parsing.
+pub fn parse_agent_markdown(
+    content: &str,
+    filename: &str,
+) -> Result<AgentConfig, ConfigError> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+
+    let content = content
+        .strip_prefix("---")
+        .ok_or_else(|| ConfigError::ParseError(format!("{filename}: no frontmatter delimiter")))?;
+
+    let (yaml_str, body) = match content.find("\n---") {
+        Some(pos) => {
+            let yaml = &content[..pos];
+            let body = &content[pos + "\n---".len()..];
+            (yaml, body)
+        }
+        None => {
+            return Err(ConfigError::ParseError(format!(
+                "{filename}: unclosed frontmatter (missing closing ---)"
+            )));
+        }
+    };
+
+    let fm: AgentFrontmatter = serde_yml::from_str(yaml_str).map_err(|e| {
+        ConfigError::ParseError(format!("{filename}: invalid frontmatter YAML: {e}"))
+    })?;
+
+    let id_string = fm
+        .id
+        .unwrap_or_else(|| derive_id_from_filename(filename));
+    let id = AgentId(id_string);
+    let children = fm.children.into_iter().map(AgentId).collect();
+    let default_prompt = body.trim().to_owned();
+
+    Ok(AgentConfig {
+        id,
+        name: fm.name,
+        model: fm.model,
+        children,
+        tools: fm.tools,
+        default_prompt,
+    })
+}
+
+/// Parse all `.md` files in a directory into an [`AgentsConfig`].
+///
+/// Files are filtered by the `.md` extension, parsed individually via
+/// [`parse_agent_markdown`], and the resulting agents are sorted by `id`
+/// alphabetically for deterministic output.
+pub fn parse_agents_dir(dir: &Path) -> Result<AgentsConfig, ConfigError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        ConfigError::FileNotFound(format!("{}: {e}", dir.display()))
+    })?;
+
+    let mut agents = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            ConfigError::ParseError(format!("{}: read_dir entry: {e}", dir.display()))
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown.md");
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                ConfigError::FileNotFound(format!("{}: {e}", path.display()))
+            })?;
+            agents.push(parse_agent_markdown(&content, filename)?);
+        }
+    }
+
+    agents.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+    Ok(AgentsConfig { agents })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -525,5 +654,124 @@ supports_vision = true
         let claude = config.models.get("claude").expect("claude");
         assert!(claude.supports_tool_call);
         assert!(claude.supports_vision);
+    }
+
+    // ── Markdown frontmatter parsing tests ────────────────────────────────
+
+    #[test]
+    fn md_parse_normal_frontmatter() {
+        let md = "---\nname: Root Agent\nmodel: main\ntools:\n  - bash\n  - read_file\n---\nYou are the root agent.\n";
+        let agent = parse_agent_markdown(md, "root.md").expect("should parse");
+        assert_eq!(agent.id.0, "root");
+        assert_eq!(agent.name, "Root Agent");
+        assert_eq!(agent.model, "main");
+        assert_eq!(agent.tools, vec!["bash", "read_file"]);
+        assert!(agent.children.is_empty());
+        assert_eq!(agent.default_prompt, "You are the root agent.");
+    }
+
+    #[test]
+    fn md_parse_no_id_falls_back_to_filename() {
+        let md = "---\nname: Writer\nmodel: fast\n---\nWrite stuff.\n";
+        let agent = parse_agent_markdown(md, "my-writer.md").expect("should parse");
+        assert_eq!(agent.id.0, "my_writer");
+        assert_eq!(agent.name, "Writer");
+        assert_eq!(agent.model, "fast");
+    }
+
+    #[test]
+    fn md_parse_empty_body() {
+        let md = "---\nname: Empty\nmodel: main\n---\n";
+        let agent = parse_agent_markdown(md, "empty.md").expect("should parse");
+        assert_eq!(agent.id.0, "empty");
+        assert_eq!(agent.default_prompt, "");
+    }
+
+    #[test]
+    fn md_parse_no_frontmatter_delimiter_error() {
+        let md = "Just some plain text without frontmatter.\n";
+        let result = parse_agent_markdown(md, "plain.md");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::ParseError(_)));
+        assert!(err.to_string().contains("no frontmatter delimiter"));
+    }
+
+    #[test]
+    fn md_parse_bad_yaml_error() {
+        let md = "---\nname: [broken\nmodel: main\n---\nbody\n";
+        let result = parse_agent_markdown(md, "bad.md");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ConfigError::ParseError(_)));
+        assert!(err.to_string().contains("bad.md"));
+    }
+
+    #[test]
+    fn md_parse_thematic_break_in_body() {
+        let md = "---\nname: Agent\nmodel: main\n---\nSome prompt text.\n\n---\n\nMore text after thematic break.\n";
+        let agent = parse_agent_markdown(md, "thematic.md").expect("should parse");
+        assert_eq!(agent.id.0, "thematic");
+        assert!(agent.default_prompt.contains("---"));
+        assert!(agent.default_prompt.contains("More text after thematic break."));
+    }
+
+    #[test]
+    fn md_parse_crlf_line_endings() {
+        let md = "---\r\nname: CRLF Agent\r\nmodel: main\r\n---\r\nHello from Windows.\r\n";
+        let agent = parse_agent_markdown(md, "crlf.md").expect("should parse");
+        assert_eq!(agent.id.0, "crlf");
+        assert_eq!(agent.name, "CRLF Agent");
+    }
+
+    #[test]
+    fn md_parse_bom_prefix() {
+        let bom = "\u{feff}";
+        let md = format!("{bom}---\nname: BOM Agent\nmodel: main\n---\nBOM content.\n");
+        let agent = parse_agent_markdown(&md, "bom.md").expect("should parse");
+        assert_eq!(agent.id.0, "bom");
+        assert_eq!(agent.name, "BOM Agent");
+    }
+
+    #[test]
+    fn md_parse_explicit_id_overrides_filename() {
+        let md = "---\nid: custom-id\nname: Custom\nmodel: fast\n---\nCustom prompt.\n";
+        let agent = parse_agent_markdown(md, "some-file.md").expect("should parse");
+        assert_eq!(agent.id.0, "custom-id");
+    }
+
+    #[test]
+    fn md_parse_children_converted_to_agent_ids() {
+        let md = "---\nname: Parent\nmodel: main\nchildren:\n  - researcher\n  - writer\n---\nPrompt.\n";
+        let agent = parse_agent_markdown(md, "parent.md").expect("should parse");
+        assert_eq!(agent.children.len(), 2);
+        assert_eq!(agent.children[0].0, "researcher");
+        assert_eq!(agent.children[1].0, "writer");
+    }
+
+    #[test]
+    fn derive_id_basic() {
+        assert_eq!(derive_id_from_filename("root.md"), "root");
+    }
+
+    #[test]
+    fn derive_id_special_chars() {
+        assert_eq!(derive_id_from_filename("my-cool agent.md"), "my_cool_agent");
+    }
+
+    #[test]
+    fn derive_id_no_md_extension() {
+        assert_eq!(derive_id_from_filename("agent"), "agent");
+    }
+
+    #[test]
+    fn derive_id_uppercase() {
+        assert_eq!(derive_id_from_filename("MyAgent.md"), "myagent");
+    }
+
+    #[test]
+    fn parse_agents_dir_nonexistent() {
+        let result = parse_agents_dir(Path::new("/nonexistent/path/xyz"));
+        assert!(result.is_err());
     }
 }

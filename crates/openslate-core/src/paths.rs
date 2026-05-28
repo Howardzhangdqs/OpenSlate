@@ -15,8 +15,8 @@ pub struct OpenSlatePaths {
     pub active_data_dir: PathBuf,
     /// Path to openslate.toml.
     pub config_file: PathBuf,
-    /// Path to agents.yaml.
-    pub agents_file: PathBuf,
+    /// Path to agents directory.
+    pub agents_dir: PathBuf,
     /// Path to SQLite database.
     pub database_path: PathBuf,
     /// Path to prompts directory.
@@ -53,7 +53,7 @@ fn get_global_data_dir() -> PathBuf {
 /// 3. Active config = local if exists, else global
 /// 4. Database path prefers local over global
 /// 5. Config file: `{active_config_dir}/openslate.toml`
-/// 6. Agents file: `{active_config_dir}/agents.yaml`
+/// 6. Agents dir: `{active_config_dir}/agents/`
 /// 7. Prompts dir: `{active_config_dir}/prompts/`
 pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
     let local_config_dir = cwd.join(".openslate");
@@ -77,7 +77,7 @@ pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
     };
 
     let config_file = active_config_dir.join("openslate.toml");
-    let agents_file = active_config_dir.join("agents.yaml");
+    let agents_dir = active_config_dir.join("agents");
     let prompts_dir = active_config_dir.join("prompts");
 
     let active_data_dir = global_data_dir.clone();
@@ -93,7 +93,7 @@ pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
         active_config_dir,
         active_data_dir,
         config_file,
-        agents_file,
+        agents_dir,
         database_path,
         prompts_dir,
     }
@@ -137,7 +137,7 @@ mod tests {
 
         // config and agents files should be in active config dir
         assert_eq!(paths.config_file, expected_global_config.join("openslate.toml"));
-        assert_eq!(paths.agents_file, expected_global_config.join("agents.yaml"));
+        assert_eq!(paths.agents_dir, expected_global_config.join("agents"));
         assert_eq!(paths.prompts_dir, expected_global_config.join("prompts"));
 
         // database should be in global data dir
@@ -162,7 +162,7 @@ mod tests {
 
         // config and agents files should be in local dir
         assert_eq!(paths.config_file, local_dir.join("openslate.toml"));
-        assert_eq!(paths.agents_file, local_dir.join("agents.yaml"));
+        assert_eq!(paths.agents_dir, local_dir.join("agents"));
         assert_eq!(paths.prompts_dir, local_dir.join("prompts"));
     }
 
@@ -215,13 +215,13 @@ mod tests {
         assert!(!paths.active_config_dir.as_os_str().is_empty());
         assert!(!paths.active_data_dir.as_os_str().is_empty());
         assert!(!paths.config_file.as_os_str().is_empty());
-        assert!(!paths.agents_file.as_os_str().is_empty());
+        assert!(!paths.agents_dir.as_os_str().is_empty());
         assert!(!paths.database_path.as_os_str().is_empty());
         assert!(!paths.prompts_dir.as_os_str().is_empty());
 
         // Verify file paths have correct extensions
         assert_eq!(paths.config_file.extension().unwrap(), "toml");
-        assert_eq!(paths.agents_file.extension().unwrap(), "yaml");
+        assert_eq!(paths.agents_dir.components().last().unwrap(), std::path::Component::Normal("agents".as_ref()));
         assert_eq!(paths.database_path.extension().unwrap(), "sqlite");
     }
 }

@@ -307,6 +307,26 @@ async fn persist_trace_to_store(
     use openslate_core::trace::TraceEvent;
 
     let run_id_str = result.run_id.to_string();
+
+    // Insert the run row first so that trace_events FK constraint is satisfied.
+    let status_str = match result.status {
+        openslate_core::types::RunStatus::Running => "running",
+        openslate_core::types::RunStatus::Completed => "completed",
+        openslate_core::types::RunStatus::Failed => "failed",
+        openslate_core::types::RunStatus::Interrupted => "interrupted",
+        openslate_core::types::RunStatus::Cancelled => "cancelled",
+    };
+    let root_agent_id = result.execution_tree.root().agent_id.to_string();
+
+    store.insert_run(
+        &run_id_str,
+        None,
+        &root_agent_id,
+        status_str,
+        "{}",
+        0,
+    ).await.map_err(|e| anyhow::anyhow!("Failed to insert run: {}", e))?;
+
     let mut idx: usize = 0;
 
     for event in result.trace.events() {

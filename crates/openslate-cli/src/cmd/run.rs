@@ -414,17 +414,11 @@ max_context_messages = 16
 max_context_bytes = 64000
 max_output_bytes = 65536
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    tools:
-      - current_time
-    default_prompt: "You are the root agent."
-"#;
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+        let agents_dir = openslate_dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
+        fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
     }
 
@@ -505,7 +499,7 @@ agents:
     fn test_resolve_agent_root_default() {
         let tmp = temp_project();
         let agents =
-            crate::wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+            crate::wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let agent = resolve_agent(&tree, None).unwrap();
@@ -532,24 +526,16 @@ model = "m1"
 provider = "zhipu"
 model = "m2"
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root
-    model: main
-    children:
-      - worker
-    default_prompt: "Root."
-  - id: worker
-    name: Worker
-    model: fast
-    default_prompt: "Worker."
-"#;
         fs::write(dir.join("openslate.toml"), toml).expect("write");
-        fs::write(dir.join("agents.yaml"), agents).expect("write");
+        let agents_dir = dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
+        let root_md = "---\nid: root\nname: Root\nmodel: main\nchildren:\n  - worker\n---\nRoot.\n";
+        let worker_md = "---\nid: worker\nname: Worker\nmodel: fast\n---\nWorker.\n";
+        fs::write(agents_dir.join("root.md"), root_md).expect("write root.md");
+        fs::write(agents_dir.join("worker.md"), worker_md).expect("write worker.md");
 
         let agents_cfg =
-            crate::wiring::load_agents(&dir.join("agents.yaml")).unwrap();
+            crate::wiring::load_agents(&dir.join("agents")).unwrap();
         let tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents_cfg.agents).unwrap();
 
@@ -562,7 +548,7 @@ agents:
     fn test_resolve_agent_not_found() {
         let tmp = temp_project();
         let agents =
-            crate::wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+            crate::wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let result = resolve_agent(&tree, Some("nonexistent"));

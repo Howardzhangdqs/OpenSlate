@@ -1,7 +1,8 @@
 //! Configuration parsing for OpenSlate.
 //!
-//! Supports TOML for main config (`openslate.toml`) and YAML for agent
-//! definitions (`agents.yaml`). All structs implement `serde::Deserialize`.
+//! Supports TOML for main config (`openslate.toml`) and Markdown with YAML
+//! frontmatter for agent definitions (`agents/*.md`). All structs implement
+//! `serde::Deserialize`.
 //!
 //! # Schema Overview
 //!
@@ -17,11 +18,12 @@
 //! | `models`    | `Map<String, ModelConfig>`    | yes | Named model aliases (`main`, `fast` required) |
 //! | `trace`     | `TraceConfig`       | no       | Observability settings             |
 //!
-//! ## `agents.yaml` (YAML)
+//! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
-//! A single `agents` list of [`AgentConfig`](crate::types::AgentConfig) entries.
-//! Each agent requires: `id`, `name`, `model`, `default_prompt`.
-//! Optional: `children` (list of agent ids), `tools` (list of tool names).
+//! Each `.md` file defines one [`AgentConfig`](crate::types::AgentConfig).
+//! The YAML frontmatter requires: `name`, `model`. Optional: `id` (defaults
+//! to filename), `children` (list of agent ids), `tools` (list of tool names).
+//! The body after the closing `---` becomes `default_prompt`.
 //!
 //! # Validation
 //!
@@ -520,12 +522,12 @@ model = "m"
         assert_eq!(trace.default_export_format, "chrome-json");
     }
 
-    // ── YAML parsing tests ───────────────────────────────────────────────
+    // ── Markdown agent parsing tests ─────────────────────────────────────
 
     #[test]
-    fn parse_invalid_yaml_syntax() {
-        let yaml = "agents: [{id: broken\n missing bracket";
-        let result = parse_agents_yaml(yaml);
+    fn md_parse_invalid_frontmatter() {
+        let md = "---\nname: [broken\nmodel: main\n---\nbody\n";
+        let result = parse_agent_markdown(md, "broken.md");
         assert!(result.is_err());
         assert!(
             matches!(result.unwrap_err(), ConfigError::ParseError(_)),
@@ -533,17 +535,9 @@ model = "m"
     }
 
     #[test]
-    fn parse_agents_yaml_single_agent() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    default_prompt: "You are the root agent."
-"#;
-        let config = parse_agents_yaml(yaml).expect("should parse");
-        assert_eq!(config.agents.len(), 1);
-        let agent = &config.agents[0];
+    fn md_parse_single_agent() {
+        let md = "---\nid: root\nname: Root Agent\nmodel: main\n---\nYou are the root agent.\n";
+        let agent = parse_agent_markdown(md, "root.md").expect("should parse");
         assert_eq!(agent.id.0, "root");
         assert_eq!(agent.name, "Root Agent");
         assert_eq!(agent.model, "main");
@@ -553,23 +547,9 @@ agents:
     }
 
     #[test]
-    fn parse_agents_yaml_with_children_and_tools() {
-        let yaml = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    children:
-      - researcher
-      - writer
-    tools:
-      - current_time
-      - read_file
-    default_prompt: |
-      You are the root coordinator agent.
-"#;
-        let config = parse_agents_yaml(yaml).expect("should parse");
-        let agent = &config.agents[0];
+    fn md_parse_children_and_tools() {
+        let md = "---\nid: root\nname: Root Agent\nmodel: main\nchildren:\n  - researcher\n  - writer\ntools:\n  - current_time\n  - read_file\n---\nYou are the root coordinator agent.\n";
+        let agent = parse_agent_markdown(md, "root.md").expect("should parse");
         assert_eq!(agent.children.len(), 2);
         assert_eq!(agent.children[0].0, "researcher");
         assert_eq!(agent.children[1].0, "writer");
@@ -579,14 +559,19 @@ agents:
     }
 
     #[test]
-    fn parse_full_example_agents_yaml() {
-        let yaml_content = include_str!("../../fixtures/agents.yaml");
-        let config = parse_agents_yaml(yaml_content).expect("example yaml should parse");
+    fn parse_full_example_agents_dir() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/agents");
+        let config =
+            parse_agents_dir(Path::new(dir))
+                .expect("example agents dir should parse");
 
         assert_eq!(config.agents.len(), 6);
 
-        let root = &config.agents[0];
-        assert_eq!(root.id.0, "root");
+        let root = config
+            .agents
+            .iter()
+            .find(|a| a.id.0 == "root")
+            .expect("root agent");
         assert_eq!(root.name, "Root Agent");
         assert_eq!(root.model, "main");
         assert_eq!(root.children.len(), 2);
@@ -594,26 +579,41 @@ agents:
         assert_eq!(root.children[1].0, "writer");
         assert_eq!(root.tools.len(), 3);
 
-        let researcher = &config.agents[1];
-        assert_eq!(researcher.id.0, "researcher");
+        let researcher = config
+            .agents
+            .iter()
+            .find(|a| a.id.0 == "researcher")
+            .expect("researcher agent");
         assert_eq!(researcher.model, "fast");
         assert_eq!(researcher.children.len(), 1);
         assert_eq!(researcher.children[0].0, "verifier");
 
-        let verifier = &config.agents[2];
-        assert_eq!(verifier.id.0, "verifier");
+        let verifier = config
+            .agents
+            .iter()
+            .find(|a| a.id.0 == "verifier")
+            .expect("verifier agent");
         assert!(verifier.children.is_empty());
 
-        let writer = &config.agents[3];
-        assert_eq!(writer.id.0, "writer");
+        let writer = config
+            .agents
+            .iter()
+            .find(|a| a.id.0 == "writer")
+            .expect("writer agent");
         assert!(writer.tools.is_empty());
 
-        let analyst = &config.agents[4];
-        assert_eq!(analyst.id.0, "deep-analyst");
+        let analyst = config
+            .agents
+            .iter()
+            .find(|a| a.id.0 == "deep-analyst")
+            .expect("deep-analyst agent");
         assert_eq!(analyst.model, "deep-reasoner");
 
-        let inspector = &config.agents[5];
-        assert_eq!(inspector.id.0, "visual-inspector");
+        let inspector = config
+            .agents
+            .iter()
+            .find(|a| a.id.0 == "visual-inspector")
+            .expect("visual-inspector agent");
         assert_eq!(inspector.model, "vision");
     }
 
@@ -656,7 +656,7 @@ supports_vision = true
         assert!(claude.supports_vision);
     }
 
-    // ── Markdown frontmatter parsing tests ────────────────────────────────
+    // ── Markdown frontmatter parsing tests ───────────────────────────────
 
     #[test]
     fn md_parse_normal_frontmatter() {

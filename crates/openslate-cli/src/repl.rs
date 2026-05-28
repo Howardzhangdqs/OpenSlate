@@ -651,17 +651,11 @@ max_context_messages = 16
 max_context_bytes = 64000
 max_output_bytes = 65536
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    tools:
-      - current_time
-    default_prompt: "You are the root agent."
-"#;
+        let agents_dir = openslate_dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+        fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
     }
 
@@ -689,26 +683,12 @@ max_steps = 10
 max_depth = 3
 max_tool_calls = 20
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    children:
-      - researcher
-      - writer
-    default_prompt: "You are the root agent."
-  - id: researcher
-    name: Researcher
-    model: fast
-    default_prompt: "You are a researcher."
-  - id: writer
-    name: Writer
-    model: fast
-    default_prompt: "You are a writer."
-"#;
+        let agents_dir = openslate_dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+        fs::write(agents_dir.join("root.md"), "---\nid: root\nname: Root Agent\nmodel: main\nchildren:\n  - researcher\n  - writer\n---\nYou are the root agent.\n").expect("write root.md");
+        fs::write(agents_dir.join("researcher.md"), "---\nid: researcher\nname: Researcher\nmodel: fast\n---\nYou are a researcher.\n").expect("write researcher.md");
+        fs::write(agents_dir.join("writer.md"), "---\nid: writer\nname: Writer\nmodel: fast\n---\nYou are a writer.\n").expect("write writer.md");
         tmp
     }
 
@@ -740,24 +720,18 @@ max_steps = 10
 max_depth = 3
 max_tool_calls = 20
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    tools:
-      - current_time
-    default_prompt: "You are the root agent."
-"#;
+        let agents_dir = openslate_dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+        fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
     }
 
     fn make_session() -> ReplSession {
         let tmp = temp_project();
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let manager = openslate_core::run_manager::RunManager::new(
@@ -781,7 +755,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -790,7 +764,7 @@ agents:
     fn make_session_with_children() -> ReplSession {
         let tmp = temp_project_with_children();
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let manager = openslate_core::run_manager::RunManager::new(
@@ -814,7 +788,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -823,7 +797,7 @@ agents:
     fn make_session_multi_model() -> ReplSession {
         let tmp = temp_project_multi_model();
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let manager = openslate_core::run_manager::RunManager::new(
@@ -847,7 +821,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -857,7 +831,7 @@ agents:
         tmp: &tempfile::TempDir,
     ) -> (openslate_core::config::OpenSlateConfig, openslate_core::config::AgentsConfig, openslate_core::agent_tree::AgentTree, openslate_core::run_manager::RunManager) {
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let manager = openslate_core::run_manager::RunManager::new(
@@ -886,7 +860,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
     }
@@ -909,7 +883,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
         ReplSession::new(ctx, profile.into(), false).unwrap()
     }
@@ -932,7 +906,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
     }
@@ -1498,7 +1472,7 @@ agents:
 
         let tmp = temp_project();
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let manager = openslate_core::run_manager::RunManager::new(
@@ -1522,7 +1496,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
 
         let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();
@@ -1539,7 +1513,7 @@ agents:
 
         let tmp = temp_project();
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
             openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let manager = openslate_core::run_manager::RunManager::new(
@@ -1563,7 +1537,7 @@ agents:
             ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
-            agents_path: tmp.path().join(".openslate/agents.yaml"),
+            agents_path: tmp.path().join(".openslate/agents"),
         };
 
         let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();

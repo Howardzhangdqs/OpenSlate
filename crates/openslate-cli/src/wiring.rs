@@ -249,17 +249,11 @@ max_context_messages = 16
 max_context_bytes = 64000
 max_output_bytes = 65536
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    tools:
-      - current_time
-    default_prompt: "You are the root agent."
-"#;
+        let agents_dir = openslate_dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+        fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
     }
 
@@ -282,7 +276,7 @@ agents:
     #[test]
     fn test_load_agents_valid() {
         let tmp = temp_project();
-        let path = tmp.path().join(".openslate/agents.yaml");
+        let path = tmp.path().join(".openslate/agents");
         let agents = load_agents(&path).expect("should load");
         assert_eq!(agents.agents.len(), 1);
         assert_eq!(agents.agents[0].id.0, "root");
@@ -290,7 +284,7 @@ agents:
 
     #[test]
     fn test_load_agents_missing_file() {
-        let result = load_agents(Path::new("/nonexistent/agents.yaml"));
+        let result = load_agents(Path::new("/nonexistent/agents"));
         assert!(result.is_err());
     }
 
@@ -376,7 +370,7 @@ path = "data/test.sqlite"
     fn test_validation_with_valid_config() {
         let tmp = temp_project();
         let config = load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        let agents = load_agents(&tmp.path().join(".openslate/agents.yaml")).unwrap();
+        let agents = load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let errors = validate_config(&config, &agents);
         assert!(
             errors.is_empty(),

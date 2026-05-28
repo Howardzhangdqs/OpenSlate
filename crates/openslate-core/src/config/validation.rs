@@ -424,7 +424,8 @@ fn dfs_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{parse_agents_yaml, parse_openslate_toml};
+    use crate::config::{parse_agents_dir, parse_agents_yaml, parse_openslate_toml};
+    use std::path::Path;
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -688,8 +689,9 @@ agents:
     fn example_config_is_valid() {
         let config = parse_openslate_toml(include_str!("../../fixtures/openslate.toml"))
             .expect("example toml should parse");
-        let agents = parse_agents_yaml(include_str!("../../fixtures/agents.yaml"))
-        .expect("example yaml should parse");
+        let agents_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/agents");
+        let agents = parse_agents_dir(Path::new(agents_dir))
+            .expect("example agents dir should parse");
 
         let errors = validate_config(&config, &agents);
         assert!(errors.is_empty(), "example config should be valid: {errors:?}");

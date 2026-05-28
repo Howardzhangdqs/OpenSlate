@@ -211,15 +211,11 @@ model = "test-model-v1"
 [limits]
 max_steps = 10
 "#;
-        let agents = r#"
-agents:
-  - id: root
-    name: Root Agent
-    model: main
-    default_prompt: "You are the root agent."
-"#;
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
-        fs::write(openslate_dir.join("agents.yaml"), agents).expect("write agents.yaml");
+        let agents_dir = openslate_dir.join("agents");
+        fs::create_dir(&agents_dir).expect("create agents dir");
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\n---\nYou are the root agent.\n";
+        fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
 
         let workspace_root = WorkspaceRoot::from_config_path(&openslate_dir.join("openslate.toml"));
         (tmp, workspace_root)

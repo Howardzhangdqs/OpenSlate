@@ -108,6 +108,11 @@ provider = "zhipu"
 model = "glm-5.1"
 supports_tool_call = true
 
+[models.fast]
+provider = "zhipu"
+model = "glm-5.1"
+supports_tool_call = true
+
 [trace]
 enabled = true
 "#,

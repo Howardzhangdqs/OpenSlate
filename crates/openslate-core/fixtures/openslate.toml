@@ -1,0 +1,68 @@
+# OpenSlate Example Configuration
+# This is the canonical example used by tests.
+
+[project]
+name = "example-openslate-project"
+
+[database]
+path = ".openslate/openslate.sqlite"
+wal = true
+busy_timeout_ms = 5000
+
+[prompts]
+path = "./prompts"
+default_profile = "default"
+hot_reload = true
+
+[limits]
+max_steps = 12
+max_depth = 4
+max_tool_calls = 20
+max_child_agent_calls = 10
+timeout_ms = 60000
+max_context_messages = 64
+max_context_bytes = 64000
+max_output_bytes = 32000
+
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+
+[providers.minimax]
+kind = "openai_compatible"
+base_url = "https://api.minimax.chat/v1"
+api_key_env = "MINIMAX_API_KEY"
+
+[models.main]
+provider = "zhipu"
+model = "glm-5.1"
+max_context_tokens = 200000
+max_output_tokens = 8192
+supports_tool_call = true
+supports_reasoning = true
+
+[models.fast]
+provider = "minimax"
+model = "MiniMax-M2.7-highspeed"
+max_context_tokens = 128000
+supports_tool_call = true
+
+[models.deep-reasoner]
+provider = "zhipu"
+model = "glm-5.1"
+max_context_tokens = 200000
+supports_tool_call = true
+supports_reasoning = true
+
+[models.vision]
+provider = "zhipu"
+model = "glm-4v"
+max_context_tokens = 128000
+supports_vision = true
+supports_tool_call = true
+
+[trace]
+enabled = true
+store_sqlite = true
+default_export_format = "chrome-json"

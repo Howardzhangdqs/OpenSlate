@@ -1,14 +1,29 @@
+# Build output
 /target
+
+# Database
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Environment
 .env
 .env.*
 !.env.example
-*.trace.json
-.DS_Store
+
+# IDE / Editor
 .idea/
 .vscode/
+.omo/
+.openslate
+.opencode
+.claude
+
+# OS
+.DS_Store
+*~
 *.swp
 *.swo
-*~
+
+# Debug / Trace
+*.trace.json

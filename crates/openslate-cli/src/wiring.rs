@@ -11,7 +11,7 @@ use openslate_core::agent_tree::AgentTree;
 use openslate_core::config::validation::validate_config;
 use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
 use openslate_core::model_config::resolve_model;
-use openslate_core::paths::resolve_paths;
+use openslate_core::paths::{resolve_paths, OpenSlatePaths};
 use openslate_core::run_manager::RunManager;
 use openslate_core::tool::builtin_registry;
 use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
@@ -105,26 +105,33 @@ fn build_provider(config: &OpenSlateConfig, model_alias: &str) -> Result<OpenAIC
 ///
 /// Creates the database file (if file-based) and runs migrations.
 /// Returns `None` if store initialization should be skipped (e.g. missing config).
-async fn init_store(config: &OpenSlateConfig, config_dir: &Path) -> Result<Option<SqliteStore>> {
+async fn init_store(config: &OpenSlateConfig, paths: &OpenSlatePaths) -> Result<Option<SqliteStore>> {
     let db_path = config
         .database
         .as_ref()
         .and_then(|db| db.path.clone())
-        .unwrap_or_else(|| ".openslate/openslate.sqlite".to_owned());
-
-    // If the path is relative, resolve it relative to the config directory
-    let resolved_path = if Path::new(&db_path).is_absolute() {
-        db_path
-    } else {
-        config_dir
-            .join(&db_path)
-            .to_str()
-            .map(|s| s.to_owned())
-            .unwrap_or(db_path)
-    };
+        .map(|p| {
+            if Path::new(&p).is_absolute() {
+                p
+            } else {
+                paths
+                    .global_data_dir
+                    .join(&p)
+                    .to_str()
+                    .map(|s| s.to_owned())
+                    .unwrap_or(p)
+            }
+        })
+        .unwrap_or_else(|| {
+            paths
+                .database_path
+                .to_str()
+                .expect("database_path should be valid UTF-8")
+                .to_owned()
+        });
 
     // Ensure parent directory exists
-    if let Some(parent) = Path::new(&resolved_path).parent() {
+    if let Some(parent) = Path::new(&db_path).parent() {
         if !parent.exists() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -135,11 +142,11 @@ async fn init_store(config: &OpenSlateConfig, config_dir: &Path) -> Result<Optio
         }
     }
 
-    tracing::debug!("Initializing SQLite store at: {}", resolved_path);
+    tracing::debug!("Initializing SQLite store at: {}", db_path);
 
-    let store = SqliteStore::new(&resolved_path)
+    let store = SqliteStore::new(&db_path)
         .await
-        .with_context(|| format!("Failed to open SQLite database at '{}'", resolved_path))?;
+        .with_context(|| format!("Failed to open SQLite database at '{}'", db_path))?;
 
     store
         .run_migrations()
@@ -159,10 +166,8 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     let agents_path = resolve_agents_dir(&config_path);
     tracing::debug!("Using agents: {}", agents_path.display());
 
-    let config_dir = config_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Config file has no parent directory"))?
-        .to_path_buf();
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let paths = resolve_paths(&cwd);
 
     // 2. Load config
     let config = load_config(&config_path)?;
@@ -183,7 +188,7 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     }
 
     // 5. Initialize SQLite store
-    let store = init_store(&config, &config_dir).await?;
+    let store = init_store(&config, &paths).await?;
 
     // 6. Build agent tree
     let agent_tree = AgentTree::from_configs(&agents.agents)
@@ -344,26 +349,49 @@ provider = "zhipu"
 model = "m2"
 "#;
         let config = parse_openslate_toml(toml).expect("parse config");
-        let store = init_store(&config, tmp.path())
+        let paths = resolve_paths(tmp.path());
+        let store = init_store(&config, &paths)
             .await
             .expect("store should init");
         assert!(store.is_some(), "store should be Some");
     }
 
     #[tokio::test]
-    async fn test_init_store_with_explicit_path() {
-        let tmp = tempfile::TempDir::new().expect("create temp dir");
+    async fn test_init_store_with_explicit_relative_path() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir as data dir");
         let toml = r#"
 [database]
 path = "data/test.sqlite"
 "#;
         let config = parse_openslate_toml(toml).expect("parse");
-        let store = init_store(&config, tmp.path())
+        let mut paths = resolve_paths(tmp.path());
+        paths.global_data_dir = tmp.path().to_path_buf();
+        paths.database_path = tmp.path().join("openslate.sqlite");
+        let store = init_store(&config, &paths)
             .await
             .expect("store should init");
         assert!(store.is_some());
-        // Verify the file was created
         assert!(tmp.path().join("data/test.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn test_init_store_with_absolute_path() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let db_file = tmp.path().join("custom.db");
+        let toml = format!(
+            r#"
+[database]
+path = "{}"
+"#,
+            db_file.display()
+        );
+        let config = parse_openslate_toml(&toml).expect("parse");
+        let paths = resolve_paths(tmp.path());
+        let store = init_store(&config, &paths)
+            .await
+            .expect("store should init");
+        assert!(store.is_some());
+        assert!(db_file.exists());
     }
 
     #[test]

@@ -474,10 +474,7 @@ model = "m"
         assert_eq!(project.name.as_deref(), Some("example-openslate-project"));
 
         let db = config.database.as_ref().expect("database");
-        assert_eq!(
-            db.path.as_deref(),
-            Some(".openslate/openslate.sqlite")
-        );
+        assert_eq!(db.path, None);
         assert!(db.wal);
         assert_eq!(db.busy_timeout_ms, 5000);
 

@@ -68,13 +68,9 @@ pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
         global_config_dir.clone()
     };
 
-    // Database path: prefer local if exists, else global
-    let local_db_path = cwd.join(".openslate").join("openslate.sqlite");
-    let database_path = if local_db_path.exists() {
-        local_db_path
-    } else {
-        global_data_dir.join("openslate.sqlite")
-    };
+    // Database path: always use global data dir (never pollute project directory).
+    // Per-project data is distinguished by the `cwd` column in the runs table.
+    let database_path = global_data_dir.join("openslate.sqlite");
 
     let config_file = active_config_dir.join("openslate.toml");
     let agents_dir = active_config_dir.join("agents");
@@ -167,30 +163,29 @@ mod tests {
     }
 
     #[test]
-    fn test_database_prefers_local() {
+    fn test_database_always_global_even_with_local_config() {
         let temp_dir = TempDir::new().unwrap();
         let cwd = temp_dir.path();
         let local_dir = cwd.join(".openslate");
         fs::create_dir(&local_dir).unwrap();
-
-        // Create local database
-        let local_db = local_dir.join("openslate.sqlite");
-        fs::write(&local_db, "").unwrap();
 
         let paths = resolve_paths(cwd);
 
-        // database should be local
-        assert_eq!(paths.database_path, local_db);
+        let home = dirs::home_dir().expect("home dir should exist");
+        let expected_global_data = if std::env::var("XDG_DATA_HOME").is_ok() {
+            PathBuf::from(std::env::var("XDG_DATA_HOME").unwrap()).join("openslate")
+        } else {
+            home.join(".local").join("share").join("openslate")
+        };
+
+        assert_eq!(paths.database_path, expected_global_data.join("openslate.sqlite"));
     }
 
     #[test]
-    fn test_database_falls_back_to_global() {
+    fn test_database_always_global_without_local_config() {
         let temp_dir = TempDir::new().unwrap();
         let cwd = temp_dir.path();
-        let local_dir = cwd.join(".openslate");
-        fs::create_dir(&local_dir).unwrap();
 
-        // Don't create local database - should fall back to global
         let paths = resolve_paths(cwd);
 
         let home = dirs::home_dir().expect("home dir should exist");

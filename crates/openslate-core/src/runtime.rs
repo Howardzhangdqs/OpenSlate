@@ -4,9 +4,14 @@
 //! (text or tool_calls), and loops until completion or limits are hit.
 //! This is a SEQUENTIAL loop for v0.1-v0.4 (parallel execution comes later).
 
-use crate::error::OpenSlateError;
-use crate::error::RuntimeError;
-use crate::provider::{GenerateRequest, ModelProvider};
+use std::panic::AssertUnwindSafe;
+use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
+
+use crate::error::{OpenSlateError, ProviderError, RuntimeError};
+use crate::provider::{GenerateRequest, ModelProvider, ProgressCallback};
+use crate::tool::ToolExecutor;
 use crate::types::*;
 
 /// Default maximum number of consecutive empty turns before failing.
@@ -28,7 +33,7 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_steps: 12,
+            max_steps: 0,
             max_depth: 4,
             max_tool_calls: 20,
             max_child_agent_calls: 8,
@@ -48,7 +53,7 @@ pub fn check_limits(
     current_tool_calls: u32,
     current_child_calls: u32,
 ) -> Result<(), RuntimeError> {
-    if current_steps >= limits.max_steps {
+    if limits.max_steps > 0 && current_steps >= limits.max_steps {
         return Err(RuntimeError::MaxStepsExceeded {
             max: limits.max_steps,
         });
@@ -84,6 +89,9 @@ pub struct RunConfig {
     pub max_output_bytes: u32,
     pub max_empty_turns: u32,
     pub tool_definitions: Vec<crate::provider::ToolDefinition>,
+    /// Wall-clock timeout for the entire run in milliseconds.
+    /// If exceeded, the run returns `RuntimeError::Timeout`.
+    pub timeout_ms: u64,
 }
 
 /// Result of a completed agent run.
@@ -129,7 +137,8 @@ pub async fn execute_run(
     provider: &dyn ModelProvider,
     config: RunConfig,
     model_id: &str,
-    tool_executor: &(dyn Fn(&str, &serde_json::Value) -> ToolOutput + Send + Sync),
+    tool_executor: &dyn ToolExecutor,
+    mut progress: Option<&mut dyn ProgressCallback>,
 ) -> Result<RunResult, OpenSlateError> {
     let mut messages = config.initial_messages.clone();
     let mut total_steps = 0u32;
@@ -137,10 +146,12 @@ pub async fn execute_run(
     let mut total_output_tokens = 0u64;
     let mut consecutive_empty_turns = 0u32;
 
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(config.timeout_ms);
+
     loop {
-        if total_steps >= config.max_steps {
+        if config.max_steps > 0 && total_steps >= config.max_steps {
             return Ok(RunResult {
-                run_id: config.run_id,
+                run_id: config.run_id.clone(),
                 status: RunStatus::Interrupted,
                 messages,
                 total_steps,
@@ -148,6 +159,15 @@ pub async fn execute_run(
                 total_output_tokens,
             });
         }
+
+        // Check remaining time budget before each model call.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(OpenSlateError::Runtime(RuntimeError::Timeout {
+                timeout_ms: config.timeout_ms,
+            }));
+        }
+        let remaining = deadline - now;
 
         truncate_context_if_needed(
             &mut messages,
@@ -163,7 +183,88 @@ pub async fn execute_run(
             temperature: None,
         };
 
-        let response = provider.generate(request).await?;
+        let response = if let Some(cb) = progress.as_mut() {
+            // --- Streaming path with progress callbacks ---
+            cb.on_request_start(total_steps + 1, model_id);
+
+            let mut rx = provider.generate_stream(request).await;
+            let mut assembled: Option<ModelResponse> = None;
+
+            let timeout_result = tokio::time::timeout(remaining, async {
+                let mut first_token = true;
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        Ok(ModelStreamEvent::Delta(text)) => {
+                            if first_token {
+                                first_token = false;
+                                cb.on_first_token();
+                            }
+                            cb.on_delta(&text);
+                        }
+                        Ok(ModelStreamEvent::Usage(usage)) => {
+                            cb.on_usage(usage);
+                        }
+                        Ok(ModelStreamEvent::Done(resp)) => {
+                            assembled = Some(resp);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok::<_, ProviderError>(())
+            })
+            .await;
+
+            cb.on_request_end();
+
+            match timeout_result {
+                Ok(Ok(())) => assembled.unwrap_or(ModelResponse {
+                    content: None,
+                    tool_calls: vec![],
+                    usage: None,
+                    finish_reason: None,
+                }),
+                Ok(Err(e)) => return Err(OpenSlateError::from(e)),
+                Err(_) => {
+                    return Err(OpenSlateError::Runtime(RuntimeError::Timeout {
+                        timeout_ms: config.timeout_ms,
+                    }))
+                }
+            }
+        } else {
+            // --- Non-streaming path with tracing logs ---
+            if config.max_steps > 0 {
+                tracing::info!(
+                    "Step {}/{}: requesting {}...",
+                    total_steps + 1,
+                    config.max_steps,
+                    model_id
+                );
+            } else {
+                tracing::info!("Step {}: requesting {}...", total_steps + 1, model_id);
+            }
+
+            let call_start = Instant::now();
+            let resp = tokio::time::timeout(remaining, provider.generate(request))
+                .await
+                .map_err(|_| {
+                    OpenSlateError::Runtime(RuntimeError::Timeout {
+                        timeout_ms: config.timeout_ms,
+                    })
+                })??;
+            let call_elapsed = call_start.elapsed();
+
+            if let Some(usage) = &resp.usage {
+                tracing::info!(
+                    "  [{}ms · {}in/{}out]",
+                    call_elapsed.as_millis(),
+                    usage.input_tokens,
+                    usage.output_tokens
+                );
+            } else {
+                tracing::info!("  [{}ms]", call_elapsed.as_millis());
+            }
+            resp
+        };
 
         if let Some(usage) = &response.usage {
             total_input_tokens += usage.input_tokens as u64;
@@ -195,13 +296,36 @@ pub async fn execute_run(
         if has_tool_calls {
             consecutive_empty_turns = 0;
             for tc in &response.tool_calls {
+                let args_str = tc.arguments.to_string();
+                let args_display = truncate_str(&args_str, 120);
+
+                if let Some(cb) = progress.as_mut() {
+                    cb.on_tool_start(&tc.name, args_display);
+                } else {
+                    tracing::info!("  -> {}({})", tc.name, args_display);
+                }
+
                 validate_tool_arguments(&tc.arguments)?;
 
                 let output = execute_tool_safely(
+                    tool_executor,
                     &tc.name,
                     &tc.arguments,
-                    tool_executor,
-                );
+                )
+                .await;
+
+                let truncated = output.bytes > 80;
+                if let Some(cb) = progress.as_mut() {
+                    cb.on_tool_end(&tc.name, output.bytes, truncated);
+                } else {
+                    let result_preview = truncate_str(&output.content, 80);
+                    tracing::info!(
+                        "  <- {} [{} bytes] {}",
+                        tc.name,
+                        output.bytes,
+                        if truncated { format!("\"{}\"...", result_preview) } else { format!("\"{}\"", result_preview) }
+                    );
+                }
 
                 messages.push(Message {
                     role: MessageRole::Tool,
@@ -216,7 +340,7 @@ pub async fn execute_run(
 
         if has_content {
             return Ok(RunResult {
-                run_id: config.run_id,
+                run_id: config.run_id.clone(),
                 status: RunStatus::Completed,
                 messages,
                 total_steps,
@@ -230,7 +354,7 @@ pub async fn execute_run(
 
         if is_done {
             return Ok(RunResult {
-                run_id: config.run_id,
+                run_id: config.run_id.clone(),
                 status: RunStatus::Completed,
                 messages,
                 total_steps,
@@ -249,6 +373,18 @@ pub async fn execute_run(
             }));
         }
     }
+}
+
+/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    if s.len() <= max_chars {
+        return s;
+    }
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Validate that tool call arguments are a JSON object. Returns `Ok(())` if valid,
@@ -280,19 +416,19 @@ fn json_type_name(val: &serde_json::Value) -> &'static str {
 
 /// Execute a tool with panic protection.
 ///
-/// Wraps the tool executor call in `std::panic::catch_unwind` to catch panics
+/// Wraps the tool executor call in `catch_unwind` to catch panics
 /// and convert them into error `ToolOutput`s.
-fn execute_tool_safely(
+async fn execute_tool_safely(
+    executor: &dyn ToolExecutor,
     name: &str,
     args: &serde_json::Value,
-    executor: &(dyn Fn(&str, &serde_json::Value) -> ToolOutput + Send + Sync),
 ) -> ToolOutput {
     let name_owned = name.to_owned();
     let args_owned = args.clone();
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        executor(&name_owned, &args_owned)
-    }));
+    let result = AssertUnwindSafe(executor.execute(&name_owned, &args_owned))
+        .catch_unwind()
+        .await;
 
     match result {
         Ok(output) => output,
@@ -400,14 +536,19 @@ mod tests {
         }
     }
 
-    // -- Test helpers --
+    // -- Mock tool executor --
 
-    fn mock_tool_executor(name: &str, args: &serde_json::Value) -> ToolOutput {
-        ToolOutput {
-            content: format!("executed {name} with {args:?}"),
-            bytes: 20,
-            duration_ms: 10,
-            status: ToolOutputStatus::Success,
+    struct MockToolExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::tool::ToolExecutor for MockToolExecutor {
+        async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput {
+            ToolOutput {
+                content: format!("executed {name} with {args:?}"),
+                bytes: 20,
+                duration_ms: 10,
+                status: ToolOutputStatus::Success,
+            }
         }
     }
 
@@ -429,6 +570,7 @@ mod tests {
             max_output_bytes: 10_000,
             max_empty_turns: DEFAULT_MAX_EMPTY_TURNS,
             tool_definitions: vec![],
+            timeout_ms: 60_000,
         }
     }
 
@@ -443,7 +585,7 @@ mod tests {
             finish_reason: Some("stop".into()),
         }]);
 
-        let result = execute_run(&provider, default_config(), "m1", &mock_tool_executor)
+        let result = execute_run(&provider, default_config(), "m1", &MockToolExecutor, None)
             .await
             .expect("run should succeed");
 
@@ -480,7 +622,7 @@ mod tests {
             },
         ]);
 
-        let result = execute_run(&provider, default_config(), "m1", &mock_tool_executor)
+        let result = execute_run(&provider, default_config(), "m1", &MockToolExecutor, None)
             .await
             .expect("run should succeed");
 
@@ -515,7 +657,7 @@ mod tests {
         let mut config = default_config();
         config.max_steps = 2;
 
-        let result = execute_run(&provider, config, "m1", &mock_tool_executor)
+        let result = execute_run(&provider, config, "m1", &MockToolExecutor, None)
             .await
             .expect("run should succeed");
 
@@ -541,7 +683,7 @@ mod tests {
             }
         }
 
-        let result = execute_run(&ErrorProvider, default_config(), "m1", &mock_tool_executor).await;
+        let result = execute_run(&ErrorProvider, default_config(), "m1", &MockToolExecutor, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -580,7 +722,7 @@ mod tests {
             },
         ]);
 
-        let result = execute_run(&provider, default_config(), "m1", &mock_tool_executor)
+        let result = execute_run(&provider, default_config(), "m1", &MockToolExecutor, None)
             .await
             .expect("run should succeed");
 
@@ -604,7 +746,7 @@ mod tests {
         let mut config = default_config();
         config.max_empty_turns = 3;
 
-        let result = execute_run(&provider, config, "m1", &mock_tool_executor).await;
+        let result = execute_run(&provider, config, "m1", &MockToolExecutor, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -644,7 +786,7 @@ mod tests {
         let mut config = default_config();
         config.max_empty_turns = 3;
 
-        let result = execute_run(&provider, config, "m1", &mock_tool_executor)
+        let result = execute_run(&provider, config, "m1", &MockToolExecutor, None)
             .await
             .expect("run should succeed");
 
@@ -654,6 +796,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_tool_produces_error_output() {
+        struct ErrorToolExecutor;
+
+        #[async_trait::async_trait]
+        impl crate::tool::ToolExecutor for ErrorToolExecutor {
+            async fn execute(&self, name: &str, _args: &serde_json::Value) -> ToolOutput {
+                ToolOutput {
+                    content: format!("Error: tool '{}' not found", name),
+                    bytes: 0,
+                    duration_ms: 0,
+                    status: ToolOutputStatus::Error,
+                }
+            }
+        }
+
         let provider = MockProvider::new(vec![
             ModelResponse {
                 content: Some("calling unknown tool".into()),
@@ -673,16 +829,7 @@ mod tests {
             },
         ]);
 
-        let tool_exec = |name: &str, _args: &serde_json::Value| -> ToolOutput {
-            ToolOutput {
-                content: format!("Error: tool '{}' not found", name),
-                bytes: 0,
-                duration_ms: 0,
-                status: ToolOutputStatus::Error,
-            }
-        };
-
-        let result = execute_run(&provider, default_config(), "m1", &tool_exec)
+        let result = execute_run(&provider, default_config(), "m1", &ErrorToolExecutor, None)
             .await
             .expect("run should succeed");
 
@@ -720,16 +867,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_panic_caught() {
-        let panicking_executor = |_name: &str, _args: &serde_json::Value| -> ToolOutput {
-            panic!("intentional test panic");
-        };
+        struct PanickingExecutor;
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_tool_safely("test_tool", &serde_json::json!({}), &panicking_executor)
-        }));
+        #[async_trait::async_trait]
+        impl crate::tool::ToolExecutor for PanickingExecutor {
+            async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
+                panic!("intentional test panic");
+            }
+        }
 
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        let output = execute_tool_safely(&PanickingExecutor, "test_tool", &serde_json::json!({}))
+            .await;
         assert_eq!(output.status, ToolOutputStatus::Error);
         assert!(output.content.contains("test_tool"));
         assert!(output.content.contains("panicked"));
@@ -738,14 +886,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_panic_with_string_message() {
-        let panicking_executor = |_name: &str, _args: &serde_json::Value| -> ToolOutput {
-            panic!("string panic message");
-        };
+        struct StringPanicExecutor;
 
-        let output = execute_tool_safely("my_tool", &serde_json::json!({}), &panicking_executor);
+        #[async_trait::async_trait]
+        impl crate::tool::ToolExecutor for StringPanicExecutor {
+            async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
+                panic!("string panic message");
+            }
+        }
+
+        let output =
+            execute_tool_safely(&StringPanicExecutor, "my_tool", &serde_json::json!({})).await;
         assert_eq!(output.status, ToolOutputStatus::Error);
         assert!(output.content.contains("my_tool"));
         assert!(output.content.contains("string panic message"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_panic_with_unknown_payload() {
+        struct UnknownPanicExecutor;
+
+        #[async_trait::async_trait]
+        impl crate::tool::ToolExecutor for UnknownPanicExecutor {
+            async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
+                std::panic::panic_any(42i32); // non-string payload
+            }
+        }
+
+        let output =
+            execute_tool_safely(&UnknownPanicExecutor, "weird_tool", &serde_json::json!({})).await;
+        assert_eq!(output.status, ToolOutputStatus::Error);
+        assert!(output.content.contains("weird_tool"));
+        assert!(output.content.contains("unknown panic"));
     }
 
     #[test]
@@ -862,12 +1034,25 @@ mod tests {
 
     #[test]
     fn test_max_steps_exceeded() {
-        let limits = RuntimeLimits::default();
-        let err = check_limits(&limits, limits.max_steps, 0, 0, 0).unwrap_err();
+        let limits = RuntimeLimits {
+            max_steps: 5,
+            ..Default::default()
+        };
+        let err = check_limits(&limits, 5, 0, 0, 0).unwrap_err();
         assert!(
-            matches!(err, RuntimeError::MaxStepsExceeded { max: 12 }),
+            matches!(err, RuntimeError::MaxStepsExceeded { max: 5 }),
             "expected MaxStepsExceeded, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_max_steps_zero_means_unlimited() {
+        let limits = RuntimeLimits {
+            max_steps: 0,
+            ..Default::default()
+        };
+        // Should NOT trigger MaxStepsExceeded even with a huge step count
+        check_limits(&limits, 999_999, 0, 0, 0).expect("max_steps=0 should be unlimited");
     }
 
     #[test]
@@ -900,7 +1085,7 @@ mod tests {
     #[test]
     fn test_default_limits() {
         let limits = RuntimeLimits::default();
-        assert_eq!(limits.max_steps, 12);
+        assert_eq!(limits.max_steps, 0); // 0 = unlimited
         assert_eq!(limits.max_depth, 4);
         assert_eq!(limits.max_tool_calls, 20);
         assert_eq!(limits.max_child_agent_calls, 8);
@@ -908,5 +1093,165 @@ mod tests {
         assert_eq!(limits.max_context_bytes, 64_000);
         assert_eq!(limits.max_output_bytes, 65_536);
         assert_eq!(limits.max_empty_turns, DEFAULT_MAX_EMPTY_TURNS);
+    }
+
+    // ── Timeout enforcement tests ──
+
+    #[tokio::test]
+    async fn test_timeout_fires_on_slow_provider() {
+        struct SlowProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for SlowProvider {
+            async fn generate(
+                &self,
+                _request: GenerateRequest,
+            ) -> Result<ModelResponse, ProviderError> {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                Ok(ModelResponse {
+                    content: Some("too slow".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    finish_reason: Some("stop".into()),
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "slow"
+            }
+        }
+
+        let mut config = default_config();
+        config.timeout_ms = 50; // 50 ms budget
+
+        let result = execute_run(&SlowProvider, config, "m1", &MockToolExecutor, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            OpenSlateError::Runtime(RuntimeError::Timeout { timeout_ms }) => {
+                assert_eq!(timeout_ms, 50);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_normal_execution_within_timeout() {
+        let provider = MockProvider::new(vec![ModelResponse {
+            content: Some("fast enough".into()),
+            tool_calls: vec![],
+            usage: None,
+            finish_reason: Some("stop".into()),
+        }]);
+
+        let result = execute_run(&provider, default_config(), "m1", &MockToolExecutor, None)
+            .await
+            .expect("should complete well within timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_allows_multi_step_within_budget() {
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "step1".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        // Generous timeout — should complete both steps.
+        let mut config = default_config();
+        config.timeout_ms = 5_000;
+
+        let result = execute_run(&provider, config, "m1", &MockToolExecutor, None)
+            .await
+            .expect("should complete within timeout");
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 2);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_zero_ms_immediately_fires() {
+        let provider = MockProvider::new(vec![ModelResponse {
+            content: Some("never".into()),
+            tool_calls: vec![],
+            usage: None,
+            finish_reason: Some("stop".into()),
+        }]);
+
+        let mut config = default_config();
+        config.timeout_ms = 0; // zero → immediate timeout
+
+        let result = execute_run(&provider, config, "m1", &MockToolExecutor, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            OpenSlateError::Runtime(RuntimeError::Timeout { timeout_ms }) => {
+                assert_eq!(timeout_ms, 0);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    // ── Async tool execution tests ──
+
+    #[tokio::test]
+    async fn test_async_tool_executes_without_nested_runtime() {
+        /// A tool executor that performs real async work (sleeps).
+        /// This would deadlock/fail with the old nested-runtime approach
+        /// when called from within a multi-threaded runtime context.
+        struct AsyncSleepExecutor;
+
+        #[async_trait::async_trait]
+        impl crate::tool::ToolExecutor for AsyncSleepExecutor {
+            async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput {
+                // Perform genuine async I/O to prove we're on a real async runtime.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                ToolOutput {
+                    content: format!("async tool {name} done, args={args}"),
+                    bytes: 30,
+                    duration_ms: 5,
+                    status: ToolOutputStatus::Success,
+                }
+            }
+        }
+
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "async_op".into(),
+                    arguments: serde_json::json!({"key": "val"}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("all done".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let result =
+            execute_run(&provider, default_config(), "m1", &AsyncSleepExecutor, None)
+                .await
+                .expect("run should succeed");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 2);
+        assert_eq!(result.messages[2].role, MessageRole::Tool);
+        assert!(result.messages[2].content.contains("async_op"));
     }
 }

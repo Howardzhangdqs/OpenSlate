@@ -108,7 +108,7 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_steps: 12,
+            max_steps: 0,
             max_depth: 4,
             max_tool_calls: 20,
             max_child_agent_calls: 8,
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn default_limits_config() {
         let limits = LimitsConfig::default();
-        assert_eq!(limits.max_steps, 12);
+        assert_eq!(limits.max_steps, 0); // 0 = unlimited
         assert_eq!(limits.max_depth, 4);
         assert_eq!(limits.max_tool_calls, 20);
         assert_eq!(limits.max_child_agent_calls, 8);

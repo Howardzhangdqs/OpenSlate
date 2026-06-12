@@ -433,7 +433,7 @@ impl ReplSession {
         let provider = build_provider_for_model(&self.ctx.config, &model_alias)?;
 
         let start = Instant::now();
-        let result = match self.ctx.manager.execute_with_history(&provider, &self.history).await {
+        let result = match self.ctx.manager.execute_with_history(&provider, &self.history, None).await {
             Ok(r) => r,
             Err(e) => {
                 return Err(anyhow::anyhow!("Agent execution failed: {}", e));

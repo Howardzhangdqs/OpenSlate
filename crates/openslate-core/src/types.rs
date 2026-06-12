@@ -134,6 +134,17 @@ pub struct Usage {
     pub output_tokens: u32,
 }
 
+/// Events emitted during a streaming chat completion.
+#[derive(Debug, Clone)]
+pub enum ModelStreamEvent {
+    /// Partial content delta from the model.
+    Delta(String),
+    /// Token usage update (may arrive in final chunk).
+    Usage(Usage),
+    /// Stream has completed. Contains the full assembled response.
+    Done(ModelResponse),
+}
+
 /// The output produced by a tool execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolOutput {

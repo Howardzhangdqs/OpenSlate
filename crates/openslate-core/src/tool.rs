@@ -38,6 +38,20 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Async executor for tools — the abstraction consumed by the runtime loop.
+///
+/// `ToolRegistry` implements this trait, but tests and custom callers can
+/// provide their own implementation to mock or intercept tool execution.
+#[async_trait]
+pub trait ToolExecutor: Send + Sync {
+    /// Execute the named tool with the given JSON arguments.
+    ///
+    /// Implementations are expected to convert internal errors into a
+    /// `ToolOutput` with `ToolOutputStatus::Error` rather than returning
+    /// `Err`, so that the runtime loop can continue gracefully.
+    async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput;
+}
+
 /// Registry mapping tool names to tool implementations.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -101,6 +115,21 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ToolRegistry {
+    async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput {
+        match ToolRegistry::execute(self, name, args).await {
+            Ok(output) => output,
+            Err(e) => ToolOutput {
+                content: format!("Error: {}", e),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Error,
+            },
+        }
     }
 }
 
@@ -196,8 +225,61 @@ impl Tool for CurrentTimeTool {
     }
 }
 
-/// Reads the contents of a file.
-pub struct ReadFileTool;
+/// Validate that a target path is within the workspace root and return the resolved full path.
+///
+/// Rejects path traversal (`..`) and paths that canonicalize outside the workspace.
+/// For non-existent files the check falls back to the lexical path.
+fn resolve_workspace_path(
+    workspace_root: &std::path::Path,
+    target_path: &str,
+) -> Result<PathBuf, ToolError> {
+    if target_path.contains("..") {
+        return Err(ToolError::SecurityError(
+            "Path traversal not allowed".into(),
+        ));
+    }
+
+    let canonical_root = workspace_root.canonicalize().map_err(|e| {
+        ToolError::ExecutionError(format!("Failed to resolve workspace root: {}", e))
+    })?;
+
+    let full_path = if target_path.starts_with('/') {
+        PathBuf::from(target_path)
+    } else {
+        canonical_root.join(target_path)
+    };
+
+    let check_path = match full_path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => full_path.clone(),
+        Err(e) => {
+            return Err(ToolError::ExecutionError(format!(
+                "Failed to resolve path '{}': {}",
+                target_path, e
+            )));
+        }
+    };
+
+    if !check_path.starts_with(&canonical_root) {
+        return Err(ToolError::SecurityError(
+            "Path is outside workspace".into(),
+        ));
+    }
+
+    Ok(full_path)
+}
+
+/// Reads the contents of a file within the workspace.
+pub struct ReadFileTool {
+    workspace_root: PathBuf,
+}
+
+impl ReadFileTool {
+    /// Create a new ReadFileTool confined to the given workspace root.
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self { workspace_root }
+    }
+}
 
 #[async_trait]
 impl Tool for ReadFileTool {
@@ -205,13 +287,13 @@ impl Tool for ReadFileTool {
         "read_file"
     }
     fn description(&self) -> &str {
-        "Read the contents of a file at the given path"
+        "Read the contents of a file at the given path (within workspace)"
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Absolute or relative file path" }
+                "path": { "type": "string", "description": "File path (absolute or relative to workspace)" }
             },
             "required": ["path"]
         })
@@ -220,9 +302,14 @@ impl Tool for ReadFileTool {
         let path = args["path"].as_str().ok_or_else(|| {
             ToolError::ExecutionError("Missing 'path' parameter".into())
         })?;
-        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to read '{}': {}", path, e))
-        })?;
+
+        let full_path = resolve_workspace_path(&self.workspace_root, path)?;
+
+        let content = tokio::fs::read_to_string(&full_path)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to read '{}': {}", path, e))
+            })?;
         let bytes = content.len();
         Ok(ToolOutput {
             content,
@@ -242,46 +329,6 @@ impl WriteFileTool {
     /// Create a new WriteFileTool with the given workspace root.
     pub fn new(workspace_root: PathBuf) -> Self {
         Self { workspace_root }
-    }
-
-    /// Validate that the target path is within the workspace.
-    fn validate_path(&self, target_path: &str) -> Result<PathBuf, ToolError> {
-        if target_path.contains("..") {
-            return Err(ToolError::SecurityError(
-                "Path traversal not allowed".into(),
-            ));
-        }
-
-        let workspace_root = self.workspace_root.canonicalize().map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to resolve workspace root: {}", e))
-        })?;
-
-        let full_path = if target_path.starts_with('/') {
-            PathBuf::from(target_path)
-        } else {
-            self.workspace_root.join(target_path)
-        };
-
-        let check_path = match full_path.canonicalize() {
-            Ok(canonical) => canonical,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                full_path.clone()
-            }
-            Err(e) => {
-                return Err(ToolError::ExecutionError(format!(
-                    "Failed to resolve path '{}': {}",
-                    target_path, e
-                )));
-            }
-        };
-
-        if !check_path.starts_with(&workspace_root) {
-            return Err(ToolError::SecurityError(
-                "Path is outside workspace".into(),
-            ));
-        }
-
-        Ok(full_path)
     }
 }
 
@@ -311,14 +358,8 @@ impl Tool for WriteFileTool {
             ToolError::ExecutionError("Missing 'content' parameter".into())
         })?;
 
-        // Validate path is within workspace
-        let _validated_path = self.validate_path(path)?;
-
-        let full_path = if path.starts_with('/') {
-            PathBuf::from(path)
-        } else {
-            self.workspace_root.join(path)
-        };
+        // Validate and resolve path — single source of truth.
+        let full_path = resolve_workspace_path(&self.workspace_root, path)?;
 
         // Create parent directories if they don't exist
         if let Some(parent) = full_path.parent() {
@@ -342,8 +383,17 @@ impl Tool for WriteFileTool {
     }
 }
 
-/// Lists directory contents.
-pub struct ListDirTool;
+/// Lists directory contents within the workspace.
+pub struct ListDirTool {
+    workspace_root: PathBuf,
+}
+
+impl ListDirTool {
+    /// Create a new ListDirTool confined to the given workspace root.
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self { workspace_root }
+    }
+}
 
 #[async_trait]
 impl Tool for ListDirTool {
@@ -351,13 +401,13 @@ impl Tool for ListDirTool {
         "list_dir"
     }
     fn description(&self) -> &str {
-        "List files and directories in the given path"
+        "List files and directories at the given path (within workspace)"
     }
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Directory path to list" }
+                "path": { "type": "string", "description": "Directory path (absolute or relative to workspace)" }
             },
             "required": ["path"]
         })
@@ -366,9 +416,14 @@ impl Tool for ListDirTool {
         let path = args["path"].as_str().ok_or_else(|| {
             ToolError::ExecutionError("Missing 'path' parameter".into())
         })?;
-        let mut entries = tokio::fs::read_dir(path).await.map_err(|e| {
-            ToolError::ExecutionError(format!("Failed to read dir '{}': {}", path, e))
-        })?;
+
+        let full_path = resolve_workspace_path(&self.workspace_root, path)?;
+
+        let mut entries = tokio::fs::read_dir(&full_path)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionError(format!("Failed to read dir '{}': {}", path, e))
+            })?;
         let mut items = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(|e| {
             ToolError::ExecutionError(format!("Error reading entry: {}", e))
@@ -401,8 +456,8 @@ pub fn builtin_registry() -> ToolRegistry {
 pub fn builtin_registry_with_workspace(workspace_root: PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(CurrentTimeTool);
-    registry.register(ReadFileTool);
-    registry.register(ListDirTool);
+    registry.register(ReadFileTool::new(workspace_root.clone()));
+    registry.register(ListDirTool::new(workspace_root.clone()));
     registry.register(WriteFileTool::new(workspace_root));
     registry
 }
@@ -541,10 +596,9 @@ mod builtin_tests {
         let file_path = dir.path().join("test.txt");
         std::fs::write(&file_path, "hello world").unwrap();
 
-        let tool = ReadFileTool;
-        let path_str = file_path.to_str().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
         let result = tool
-            .execute(&serde_json::json!({"path": path_str}))
+            .execute(&serde_json::json!({"path": "test.txt"}))
             .await
             .unwrap();
         assert_eq!(result.content, "hello world");
@@ -552,8 +606,24 @@ mod builtin_tests {
     }
 
     #[tokio::test]
+    async fn test_read_file_absolute_path_in_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("abs.txt");
+        std::fs::write(&file_path, "abs content").unwrap();
+
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let path_str = file_path.to_str().unwrap();
+        let result = tool
+            .execute(&serde_json::json!({"path": path_str}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "abs content");
+    }
+
+    #[tokio::test]
     async fn test_read_file_missing_path() {
-        let tool = ReadFileTool;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
         let result = tool.execute(&serde_json::json!({})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -562,13 +632,57 @@ mod builtin_tests {
 
     #[tokio::test]
     async fn test_read_file_nonexistent() {
-        let tool = ReadFileTool;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
         let result = tool
-            .execute(&serde_json::json!({"path": "/no/such/file/ever.txt"}))
+            .execute(&serde_json::json!({"path": "nonexistent_file.txt"}))
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionError(msg) if msg.contains("Failed to read")));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_rejects_path_traversal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(&serde_json::json!({"path": "../../../etc/passwd"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::SecurityError(msg) if msg.contains("Path traversal")));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_rejects_outside_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+
+        // Absolute path outside workspace
+        let result = tool
+            .execute(&serde_json::json!({"path": "/etc/hostname"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::SecurityError(_)),
+            "expected SecurityError, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_nested_subdir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/c.txt"), "deep").unwrap();
+
+        let tool = ReadFileTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(&serde_json::json!({"path": "a/b/c.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(result.content, "deep");
     }
 
     #[tokio::test]
@@ -578,10 +692,9 @@ mod builtin_tests {
         std::fs::write(dir.path().join("b.txt"), "bbb").unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
-        let tool = ListDirTool;
-        let path_str = dir.path().to_str().unwrap();
+        let tool = ListDirTool::new(dir.path().to_path_buf());
         let result = tool
-            .execute(&serde_json::json!({"path": path_str}))
+            .execute(&serde_json::json!({"path": "."}))
             .await
             .unwrap();
         assert_eq!(result.status, ToolOutputStatus::Success);
@@ -591,14 +704,68 @@ mod builtin_tests {
     }
 
     #[tokio::test]
-    async fn test_list_dir_nonexistent() {
-        let tool = ListDirTool;
+    async fn test_list_dir_absolute_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/x.txt"), "x").unwrap();
+
+        let tool = ListDirTool::new(dir.path().to_path_buf());
+        let path_str = dir.path().join("sub").to_str().unwrap().to_string();
         let result = tool
-            .execute(&serde_json::json!({"path": "/no/such/dir/ever"}))
+            .execute(&serde_json::json!({"path": path_str}))
+            .await
+            .unwrap();
+        assert!(result.content.contains("x.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_missing_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ListDirTool::new(dir.path().to_path_buf());
+        let result = tool.execute(&serde_json::json!({})).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionError(msg) if msg.contains("Missing 'path'")));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_nonexistent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ListDirTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(&serde_json::json!({"path": "no_such_subdir"}))
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionError(msg) if msg.contains("Failed to read dir")));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_rejects_path_traversal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ListDirTool::new(dir.path().to_path_buf());
+        let result = tool
+            .execute(&serde_json::json!({"path": "../../../etc"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ToolError::SecurityError(msg) if msg.contains("Path traversal")));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_rejects_outside_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = ListDirTool::new(dir.path().to_path_buf());
+
+        let result = tool
+            .execute(&serde_json::json!({"path": "/etc"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::SecurityError(_)),
+            "expected SecurityError, got {err:?}"
+        );
     }
 
     #[test]

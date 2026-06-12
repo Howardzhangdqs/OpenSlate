@@ -154,14 +154,8 @@ pub fn validate_config(
         }
     }
 
-    // 8. Limits must have reasonable values (> 0)
+    // 8. Limits validation (0 means unlimited for max_steps/max_tool_calls)
     if let Some(limits) = &config.limits {
-        if limits.max_steps == 0 {
-            errors.push(ValidationError {
-                field: "limits.max_steps".into(),
-                message: "max_steps must be > 0".into(),
-            });
-        }
         if limits.max_depth == 0 {
             errors.push(ValidationError {
                 field: "limits.max_depth".into(),
@@ -628,18 +622,18 @@ max_output_bytes = 65536
         );
     }
 
-    // ── Rule 8: limits must be > 0 ───────────────────────────────────────
+    // ── Rule 8: limits validation ──────────────────────────────────────
 
     #[test]
-    fn limits_max_steps_zero() {
+    fn limits_max_steps_zero_means_unlimited() {
         let mut config = valid_config();
         if let Some(l) = config.limits.as_mut() {
             l.max_steps = 0;
         }
         let errors = validate_config(&config, &valid_agents());
         assert!(
-            errors.iter().any(|e| e.field == "limits.max_steps"),
-            "{errors:?}"
+            !errors.iter().any(|e| e.field == "limits.max_steps"),
+            "max_steps=0 should be valid (unlimited), got errors: {errors:?}"
         );
     }
 

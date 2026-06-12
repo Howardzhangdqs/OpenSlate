@@ -1,5 +1,5 @@
 use crate::error::ProviderError;
-use crate::types::{Message, ModelResponse};
+use crate::types::{Message, ModelResponse, ModelStreamEvent, Usage};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolDefinition {
@@ -22,7 +22,53 @@ pub struct GenerateRequest {
 pub trait ModelProvider: Send + Sync {
     async fn generate(&self, request: GenerateRequest) -> Result<ModelResponse, ProviderError>;
 
+    /// Stream a chat completion request.
+    ///
+    /// Returns a receiver that yields `ModelStreamEvent`s as they arrive.
+    /// The default implementation wraps `generate()` and returns a single
+    /// `Done` event (no real-time streaming).
+    async fn generate_stream(
+        &self,
+        request: GenerateRequest,
+    ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let result = self.generate(request).await;
+        match result {
+            Ok(response) => {
+                if let Some(usage) = response.usage {
+                    let _ = tx.send(Ok(ModelStreamEvent::Usage(usage))).await;
+                }
+                let _ = tx.send(Ok(ModelStreamEvent::Done(response))).await;
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+            }
+        }
+        rx
+    }
+
     fn provider_name(&self) -> &str;
+}
+
+/// Callback trait for real-time progress updates during agent execution.
+///
+/// The runtime calls these methods at key points during execution.
+/// The CLI implements this to update the spinner display.
+pub trait ProgressCallback: Send {
+    /// Called before a model request is sent (step number, model ID).
+    fn on_request_start(&mut self, step: u32, model_id: &str);
+    /// Called when the first content token arrives (for TTFT measurement).
+    fn on_first_token(&mut self);
+    /// Called for each content delta from the model.
+    fn on_delta(&mut self, text: &str);
+    /// Called when token usage info arrives.
+    fn on_usage(&mut self, usage: Usage);
+    /// Called after the model response is fully received.
+    fn on_request_end(&mut self);
+    /// Called before a tool is executed.
+    fn on_tool_start(&mut self, name: &str, args: &str);
+    /// Called after a tool execution completes.
+    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool);
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use crate::config::OpenSlateConfig;
 use crate::error::OpenSlateError;
 use crate::execution::{ExecutionStatus, ExecutionTree};
 use crate::model_config::resolve_model;
-use crate::provider::ModelProvider;
+use crate::provider::{ModelProvider, ProgressCallback};
 use crate::runtime::{RunConfig, RuntimeLimits, execute_run};
 use crate::tool::ToolRegistry;
 use crate::trace::TraceCollector;
@@ -72,6 +72,7 @@ impl RunManager {
         &self,
         provider: &dyn ModelProvider,
         prior_messages: &[Message],
+        progress: Option<&mut dyn ProgressCallback>,
     ) -> Result<ManagedRunResult, OpenSlateError> {
         let run_id = RunId(uuid::Uuid::new_v4().to_string());
         let root_agent = self.agent_tree.get_root();
@@ -104,35 +105,13 @@ impl RunManager {
             max_output_bytes: self.limits.max_output_bytes,
             max_empty_turns: self.limits.max_empty_turns,
             tool_definitions: self.tool_registry.definitions_for(&root_agent.tools),
+            timeout_ms: self.limits.timeout_ms,
         };
 
-        let registry = Arc::clone(&self.tool_registry);
-        let tool_exec =
-            move |name: &str, args: &serde_json::Value| -> ToolOutput {
-                let registry = Arc::clone(&registry);
-                let name = name.to_owned();
-                let args = args.clone();
-                std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("failed to create runtime");
-                        match rt.block_on(registry.execute(&name, &args)) {
-                            Ok(output) => output,
-                            Err(e) => ToolOutput {
-                                content: format!("Error: {}", e),
-                                bytes: 0,
-                                duration_ms: 0,
-                                status: ToolOutputStatus::Error,
-                            },
-                        }
-                    })
-                    .join()
-                    .expect("tool thread panicked")
-                })
-            };
-
+        // ToolRegistry implements ToolExecutor — pass it directly to the
+        // async runtime loop.  No nested runtime / thread spawning needed.
         let result =
-            execute_run(provider, run_config, &resolved_model.model_id, &tool_exec)
+            execute_run(provider, run_config, &resolved_model.model_id, self.tool_registry.as_ref(), progress)
                 .await?;
 
         trace.end_span(agent_span);
@@ -162,6 +141,7 @@ impl RunManager {
         &self,
         provider: &dyn ModelProvider,
         input: &str,
+        progress: Option<&mut dyn ProgressCallback>,
     ) -> Result<ManagedRunResult, OpenSlateError> {
         let messages = vec![Message {
             role: MessageRole::User,
@@ -170,7 +150,7 @@ impl RunManager {
             name: None,
             tool_calls: None,
         }];
-        self.execute_with_history(provider, &messages).await
+        self.execute_with_history(provider, &messages, progress).await
     }
 }
 
@@ -280,7 +260,7 @@ max_output_bytes = 10_000
 
         let manager =
             RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
-        let result = manager.execute(&provider, "hello").await.expect("run should succeed");
+        let result = manager.execute(&provider, "hello", None).await.expect("run should succeed");
 
         assert_eq!(result.status, RunStatus::Completed);
         assert_eq!(result.total_steps, 1);
@@ -358,7 +338,7 @@ max_output_bytes = 10_000
         let manager =
             RunManager::new(test_config(), test_agent_tree(), registry);
         let result =
-            manager.execute(&provider, "echo hello world").await.expect("run should succeed");
+            manager.execute(&provider, "echo hello world", None).await.expect("run should succeed");
 
         assert_eq!(result.status, RunStatus::Completed);
         assert_eq!(result.total_steps, 2);
@@ -382,7 +362,7 @@ max_output_bytes = 10_000
         let manager =
             RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
         let result =
-            manager.execute(&provider, "test").await.expect("run should succeed");
+            manager.execute(&provider, "test", None).await.expect("run should succeed");
 
         // Execution tree should have a root node for the root agent
         let root = result.execution_tree.root();
@@ -420,7 +400,7 @@ max_output_bytes = 10_000
 
         let manager =
             RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
-        let result = manager.execute(&provider, "test").await.expect("run should succeed");
+        let result = manager.execute(&provider, "test", None).await.expect("run should succeed");
 
         assert_eq!(result.total_input_tokens, 500);
         assert_eq!(result.total_output_tokens, 150);

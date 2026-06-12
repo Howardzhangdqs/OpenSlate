@@ -6,12 +6,13 @@
 
 use anyhow::{Context, Result};
 use std::fs;
+use std::time::Instant;
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
 
 use crate::input::{expand_at_files, read_stdin_if_pipe, WorkspaceRoot};
-use crate::spinner::Spinner;
+use crate::spinner::SpinnerCallback;
 use crate::wiring as app_wiring;
 
 /// Output format for run results.
@@ -67,6 +68,7 @@ fn write_result(
     format: &OutputFormat,
     output_path: Option<&str>,
     quiet: bool,
+    duration_ms: u64,
 ) -> Result<()> {
     match format {
         OutputFormat::Text => {
@@ -96,10 +98,16 @@ fn write_result(
     }
 
     if !quiet {
+        let dur_str = if duration_ms >= 1000 {
+            format!("{:.1}s", duration_ms as f64 / 1000.0)
+        } else {
+            format!("{}ms", duration_ms)
+        };
         tracing::info!(
-            "Run completed: id={}, steps={}, input_tokens={}, output_tokens={}",
+            "Run completed: id={}, steps={}, time={}, input_tokens={}, output_tokens={}",
             result.run_id,
             result.total_steps,
+            dur_str,
             result.total_input_tokens,
             result.total_output_tokens,
         );
@@ -220,24 +228,25 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     }
 
     // 6. Execute via RunManager
-    let result = {
-        let mut spinner = Spinner::new(&model_alias, params.quiet);
+    let (result, run_elapsed_ms) = {
+        // Spinner provides real-time progress via streaming callbacks.
+        // In quiet mode, the spinner is hidden.
+        let mut callback = SpinnerCallback::new(&model_alias, params.quiet);
+        let exec_start = Instant::now();
         let run_result = match ctx
             .manager
-            .execute(&provider, &prompt)
+            .execute(&provider, &prompt, Some(&mut callback))
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                spinner.finish_with_error(&e.to_string());
+                callback.finish_with_error(&e.to_string());
                 return Err(anyhow::anyhow!("Run failed: {}", e));
             }
         };
-        if run_result.total_output_tokens > 0 {
-            spinner.on_usage(run_result.total_output_tokens as u32);
-        }
-        spinner.finish();
-        run_result
+        let elapsed = exec_start.elapsed();
+        callback.finish();
+        (run_result, elapsed.as_millis() as u64)
     };
 
     // 7. Extract final assistant message
@@ -251,6 +260,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         &params.format,
         params.output.as_deref(),
         params.quiet,
+        run_elapsed_ms,
     )?;
 
     // 9. Export trace to file if requested

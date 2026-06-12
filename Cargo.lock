@@ -1322,6 +1322,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dirs",
+ "futures-util",
  "serde",
  "serde_json",
  "serde_yml",

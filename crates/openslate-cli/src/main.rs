@@ -27,6 +27,16 @@ struct Cli {
     command: Commands,
 }
 
+impl Cli {
+    /// Returns true if the selected subcommand has `--quiet` set.
+    fn is_quiet(&self) -> bool {
+        match &self.command {
+            Commands::Run { quiet, .. } | Commands::Chat { quiet, .. } => *quiet,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a new OpenSlate project
@@ -80,6 +90,80 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
+}
+
+// ── Tracing format ────────────────────────────────────────────────────────
+
+use tracing_subscriber::fmt::time::FormatTime;
+
+/// Custom log formatter: `TIMESTAMP LEVEL target: message` with ANSI colors.
+struct SimpleFormatter {
+    timer: tracing_subscriber::fmt::time::SystemTime,
+}
+
+impl Default for SimpleFormatter {
+    fn default() -> Self {
+        Self {
+            timer: tracing_subscriber::fmt::time::SystemTime,
+        }
+    }
+}
+
+/// ANSI color codes.
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
+fn level_color(level: &tracing::Level) -> &'static str {
+    match level {
+        &tracing::Level::ERROR => "\x1b[31m", // red
+        &tracing::Level::WARN => "\x1b[33m",  // yellow
+        &tracing::Level::INFO => "\x1b[32m",  // green
+        &tracing::Level::DEBUG => "\x1b[36m", // cyan
+        &tracing::Level::TRACE => "\x1b[35m", // magenta
+    }
+}
+
+fn target_color(target: &str) -> &'static str {
+    if target.contains("runtime") {
+        "\x1b[36m" // cyan for runtime step logs
+    } else if target.contains("cmd") {
+        "\x1b[35m" // magenta for command logs
+    } else {
+        "\x1b[90m" // bright-black (gray) for others
+    }
+}
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for SimpleFormatter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        record: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let meta = record.metadata();
+        let level = meta.level();
+        let lc = level_color(level);
+
+        // Timestamp (dim gray)
+        write!(writer, "{}", DIM)?;
+        self.timer.format_time(&mut writer)?;
+        write!(writer, "{} ", RESET)?;
+
+        // Level (colored)
+        write!(writer, "{}{}{} ", lc, level, RESET)?;
+
+        // Target (colored by category)
+        let tc = target_color(meta.target());
+        write!(writer, "{}{}{}: ", tc, meta.target(), RESET)?;
+
+        // Message
+        ctx.field_format().format_fields(writer.by_ref(), record)?;
+        writeln!(writer)
+    }
 }
 
 // ── Default file contents ──────────────────────────────────────────────────
@@ -195,12 +279,19 @@ fn run_init(dir: &Path, name: Option<&str>) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing subscriber
+    // Initialize tracing subscriber.
+    // When --quiet is set, suppress info-level step logs by default.
+    let default_level = if cli.is_quiet() {
+        "warn".to_owned()
+    } else {
+        cli.log_level.clone()
+    };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_level));
     tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .init();
+            .with_env_filter(env_filter)
+            .event_format(SimpleFormatter::default())
+            .init();
 
     match cli.command {
         Commands::Init { name } => {

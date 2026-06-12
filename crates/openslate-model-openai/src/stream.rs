@@ -10,16 +10,8 @@ use openslate_core::types::{ModelResponse, ToolCall, ToolCallId, Usage};
 use crate::client::OpenAICompatibleProvider;
 use crate::types::*;
 
-/// Events emitted during a streaming chat completion.
-#[derive(Debug, Clone)]
-pub enum ModelStreamEvent {
-    /// Partial content delta from the model.
-    Delta(String),
-    /// Token usage update (may arrive in final chunk).
-    Usage(Usage),
-    /// Stream has completed. Contains the full assembled response.
-    Done(ModelResponse),
-}
+// Re-export for backward compatibility
+pub use openslate_core::types::ModelStreamEvent;
 
 /// Streaming request body (same as ChatCompletionRequest but with `stream: true`).
 #[derive(Debug, serde::Serialize)]
@@ -179,7 +171,7 @@ impl OpenAICompatibleProvider {
     /// Returns a receiver that yields `ModelStreamEvent`s as they arrive.
     /// The final event will always be `ModelStreamEvent::Done(..)` containing
     /// the fully assembled response.
-    pub fn generate_stream(
+    pub fn start_stream(
         &self,
         request: GenerateRequest,
     ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
@@ -580,7 +572,7 @@ data: [DONE]\n\n";
             temperature: None,
         };
 
-        let mut rx = provider.generate_stream(request);
+        let mut rx = provider.start_stream(request);
 
         let mut deltas = Vec::new();
         let mut got_done = false;
@@ -634,7 +626,7 @@ data: [DONE]\n\n";
             temperature: None,
         };
 
-        let mut rx = provider.generate_stream(request);
+        let mut rx = provider.start_stream(request);
         let event = rx.recv().await;
         match event {
             Some(Err(ProviderError::RateLimit)) => {}

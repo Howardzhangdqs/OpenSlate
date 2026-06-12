@@ -3,6 +3,7 @@ use std::time::Duration;
 use openslate_core::error::ProviderError;
 use openslate_core::provider::{GenerateRequest, ModelProvider, ToolDefinition};
 use openslate_core::types::ModelResponse;
+use openslate_core::types::ModelStreamEvent;
 
 use crate::types::*;
 
@@ -24,12 +25,23 @@ impl Default for RetryConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAIProviderConfig {
     pub provider_name: String,
     pub base_url: String,
     pub api_key: String,
     pub timeout_secs: u64,
+}
+
+impl std::fmt::Debug for OpenAIProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIProviderConfig")
+            .field("provider_name", &self.provider_name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<REDACTED>")
+            .field("timeout_secs", &self.timeout_secs)
+            .finish()
+    }
 }
 
 pub struct OpenAICompatibleProvider {
@@ -262,14 +274,7 @@ impl ModelProvider for OpenAICompatibleProvider {
     async fn generate(&self, request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
         let api_messages =
             Self::convert_messages(request.system_prompt.as_deref(), &request.messages);
-        // If any message is a tool result (role == Tool), omit tools from the request.
-        // The MiniMax API may not recognize the tool_call_id if tools are re-sent
-        // after the model has already selected a tool to call.
-        let has_tool_result = request
-            .messages
-            .iter()
-            .any(|m| m.role == openslate_core::types::MessageRole::Tool);
-        let api_tools = if request.tools.is_empty() || has_tool_result {
+        let api_tools = if request.tools.is_empty() {
             None
         } else {
             Some(Self::convert_tools(&request.tools))
@@ -330,12 +335,19 @@ impl ModelProvider for OpenAICompatibleProvider {
     fn provider_name(&self) -> &str {
         &self.config.provider_name
     }
+
+    async fn generate_stream(
+        &self,
+        request: GenerateRequest,
+    ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+        self.start_stream(request)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openslate_core::types::{Message, MessageRole, ToolCallId};
+    use openslate_core::types::{Message, MessageRole, ToolCall, ToolCallId};
 
     // --- Test helpers ---
 
@@ -741,6 +753,87 @@ mod tests {
         let result = provider.generate(req).await.unwrap();
         assert_eq!(result.content.as_deref(), Some("Done!"));
 
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_tools_sent_even_with_tool_results() {
+        // Regression test: tools must NOT be stripped from the request when
+        // tool result messages are present. Removing tools after the first
+        // tool call breaks multi-step tool calling — the model falls back to
+        // text-based <tool_call> XML instead of proper function calls.
+        let mut server = mockito::Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex(
+                r#""tools":\["#.to_owned(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": "{\"path\":\"out.txt\",\"content\":\"hi\"}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": null
+            }"#,
+            )
+            .create_async()
+            .await;
+
+        let provider = make_provider(&server.url(), 5);
+        let req = GenerateRequest {
+            model_id: "test-model".into(),
+            system_prompt: None,
+            messages: vec![
+                Message {
+                    role: MessageRole::User,
+                    content: "list and write".into(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                },
+                Message {
+                    role: MessageRole::Assistant,
+                    content: String::new(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: ToolCallId("call_1".into()),
+                        name: "list_dir".into(),
+                        arguments: serde_json::json!({"path": "."}),
+                    }]),
+                },
+                Message {
+                    role: MessageRole::Tool,
+                    content: "file listing result".into(),
+                    tool_call_id: Some(ToolCallId("call_1".into())),
+                    name: Some("list_dir".into()),
+                    tool_calls: None,
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "write_file".into(),
+                description: "Write a file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+        let result = provider.generate(req).await.unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "write_file");
+
+        // The mock with match_body("tools") would NOT match if tools were stripped.
         mock.assert_async().await;
     }
 
@@ -1219,5 +1312,31 @@ mod tests {
     fn test_without_retry_config_is_none() {
         let provider = make_provider("http://localhost", 5);
         assert!(provider.retry_config.is_none());
+    }
+
+    #[test]
+    fn test_api_key_redacted_in_debug() {
+        let config = OpenAIProviderConfig {
+            provider_name: "test".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            api_key: "sk-super-secret-key-12345".to_string(),
+            timeout_secs: 30,
+        };
+        let debug_str = format!("{:?}", config);
+        assert!(
+            !debug_str.contains("sk-super-secret-key-12345"),
+            "API key leaked in Debug output: {}",
+            debug_str
+        );
+        assert!(
+            debug_str.contains("<REDACTED>"),
+            "Expected <REDACTED> in Debug output: {}",
+            debug_str
+        );
+        assert!(debug_str.contains("test"), "Missing provider_name");
+        assert!(
+            debug_str.contains("api.example.com"),
+            "Missing base_url"
+        );
     }
 }

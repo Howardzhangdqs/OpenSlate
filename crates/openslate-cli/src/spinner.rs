@@ -1,8 +1,15 @@
 //! Spinner display for model calls using indicatif.
 //!
 //! Shows a visual spinner during model API calls with two phases:
-//! - Waiting: `⠋ {model} {elapsed}s`
-//! - Generating: `⠋ {model} {elapsed}s · TTFT {ttft}s · ↓{tokens}tok · {tok/s}tok/s`
+//! - Waiting: `⠋ {model} {elapsed}`
+//! - Generating: `⠋ {model} {elapsed} · TTFT {ttft}s · ↓{tokens}tok · {tok/s}tok/s`
+//!
+//! On completion the spinner is replaced by a final summary line:
+//! `✓ {model} {elapsed} · TTFT {ttft}s · ↑{in}↓{out}tok · {tok/s}tok/s`
+//!
+//! The elapsed time is rendered by indicatif's built-in `{elapsed_precise}`
+//! template field, so it auto-updates on every tick — including during the
+//! waiting phase before the first token arrives.
 
 use std::time::{Duration, Instant};
 
@@ -20,6 +27,7 @@ pub struct Spinner {
     model: String,
     quiet: bool,
     total_tokens: u64,
+    input_tokens: Option<u32>,
     ttft: Option<Duration>,
 }
 
@@ -27,26 +35,36 @@ impl Spinner {
     /// Create a new spinner for the given model name.
     ///
     /// If `quiet` is true, the spinner is hidden.
+    ///
+    /// The template bakes the model name in as a literal and uses indicatif's
+    /// built-in `{elapsed_precise}` so the elapsed time auto-updates on every
+    /// steady tick — even during the waiting phase before the first token.
     pub fn new(model: &str, quiet: bool) -> Self {
         let pb = if quiet {
             ProgressBar::hidden()
         } else {
             let pb = ProgressBar::new_spinner();
+            // Template:  ⠋ {model} {elapsed}{msg}
+            //   - {elapsed_precise} auto-updates every tick (e.g. "1.23s")
+            //   - {msg} is empty during waiting, fills with token info during generation
+            let template = format!("{{spinner}} {} {{elapsed_precise}}{{msg}}", model);
             pb.set_style(
-                ProgressStyle::with_template("{spinner} {msg}")
+                ProgressStyle::with_template(&template)
                     .expect("valid template")
                     .tick_strings(TICK_CHARS),
             );
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb
         };
-        pb.set_message(model.to_owned());
+        // Empty message for the waiting phase — model + elapsed come from the template.
+        pb.set_message("");
 
         Self {
             pb,
             model: model.to_owned(),
             quiet,
             total_tokens: 0,
+            input_tokens: None,
             ttft: None,
         }
     }
@@ -54,8 +72,10 @@ impl Spinner {
     /// Reset to the waiting phase.
     pub fn set_waiting(&mut self) {
         self.total_tokens = 0;
+        self.input_tokens = None;
         self.ttft = None;
-        self.pb.set_message(self.model.clone());
+        // Empty message — model + elapsed come from the template, nothing else to show.
+        self.pb.set_message("");
     }
 
     /// Transition to the generating phase, recording TTFT.
@@ -72,9 +92,10 @@ impl Spinner {
         self.update_generating_message();
     }
 
-    /// Update with actual usage info.
-    pub fn on_usage(&mut self, output_tokens: u32) {
-        self.total_tokens = output_tokens as u64;
+    /// Update with actual usage info from the provider.
+    pub fn on_usage(&mut self, usage: Usage) {
+        self.total_tokens = usage.output_tokens as u64;
+        self.input_tokens = Some(usage.input_tokens);
         self.update_generating_message();
     }
 
@@ -83,22 +104,20 @@ impl Spinner {
         self.pb.println(msg);
     }
 
-    /// Finish the spinner, clearing it from the terminal.
+    /// Finish the spinner, replacing it with a final summary line.
+    ///
+    /// Summary format:
+    /// `✓ {model} {elapsed}s · TTFT {ttft}s · ↑{in}↓{out}tok · {tok/s}tok/s`
+    ///
+    /// Falls back gracefully when usage/ttft data is unavailable.
     pub fn finish(self) {
         if !self.quiet {
-            let elapsed = elapsed_string(&self.pb);
-            let in_tok = self.ttft.is_some();
-            self.pb.finish_with_message(format!(
-                "✓ {} {}{}",
-                self.model,
-                elapsed,
-                if self.total_tokens > 0 {
-                    format!(" · {}tok", self.total_tokens)
-                } else {
-                    String::new()
-                }
-            ));
-            let _ = in_tok; // suppress unused warning
+            let summary = self.build_summary_line(true);
+            // Switch to a plain {msg} template so the baked-in model/elapsed
+            // don't double-render on the final line.
+            self.pb
+                .set_style(ProgressStyle::with_template("{msg}").expect("valid template"));
+            self.pb.finish_with_message(summary);
         } else {
             self.pb.finish_and_clear();
         }
@@ -108,14 +127,55 @@ impl Spinner {
     pub fn finish_with_error(self, error: &str) {
         if !self.quiet {
             self.pb
+                .set_style(ProgressStyle::with_template("{msg}").expect("valid template"));
+            self.pb
                 .finish_with_message(format!("✗ {} error: {}", self.model, error));
         } else {
             self.pb.finish_and_clear();
         }
     }
 
-    fn update_generating_message(&self) {
+    /// Build the final summary line.
+    ///
+    /// When `success` is true the line is prefixed with `✓`, otherwise `✗`.
+    fn build_summary_line(&self, success: bool) -> String {
+        let mark = if success { "✓" } else { "✗" };
         let elapsed = elapsed_string(&self.pb);
+        let elapsed_secs = elapsed_secs(&self.pb);
+
+        let ttft_str = self
+            .ttft
+            .map(|t| format!(" · TTFT {:.1}s", t.as_secs_f64()))
+            .unwrap_or_default();
+
+        let tok_per_s = if elapsed_secs > 0.0 {
+            (self.total_tokens as f64 / elapsed_secs).round() as u64
+        } else {
+            0
+        };
+
+        let tokens_str = if self.total_tokens > 0 {
+            match self.input_tokens {
+                Some(in_tok) => format!(" · ↑{}↓{}tok", in_tok, self.total_tokens),
+                None => format!(" · ↓{}tok", self.total_tokens),
+            }
+        } else {
+            String::new()
+        };
+
+        let tps_str = if tok_per_s > 0 {
+            format!(" · {}tok/s", tok_per_s)
+        } else {
+            String::new()
+        };
+
+        format!(
+            "{} {} {}{}{}{}",
+            mark, self.model, elapsed, ttft_str, tokens_str, tps_str
+        )
+    }
+
+    fn update_generating_message(&self) {
         let elapsed_secs = elapsed_secs(&self.pb);
         let tok_per_s = if elapsed_secs > 0.0 {
             (self.total_tokens as f64 / elapsed_secs).round() as u64
@@ -126,9 +186,11 @@ impl Spinner {
             .ttft
             .map(|t| format!(" · TTFT {:.1}s", t.as_secs_f64()))
             .unwrap_or_default();
+        // Elapsed comes from the template ({elapsed_precise}), so the message only
+        // carries the token/throughput suffix.
         self.pb.set_message(format!(
-            "{} {}{} · ↓{}tok · {}tok/s",
-            self.model, elapsed, ttft_str, self.total_tokens, tok_per_s
+            "{} · ↓{}tok · {}tok/s",
+            ttft_str, self.total_tokens, tok_per_s
         ));
     }
 }
@@ -175,7 +237,7 @@ impl ProgressCallback for SpinnerCallback {
     }
 
     fn on_usage(&mut self, usage: Usage) {
-        self.spinner.on_usage(usage.output_tokens);
+        self.spinner.on_usage(usage);
     }
 
     fn on_request_end(&mut self) {
@@ -194,9 +256,12 @@ impl ProgressCallback for SpinnerCallback {
 }
 
 /// Format spinner for the waiting phase (exported for testing).
+///
+/// During waiting, only the model name and elapsed time are shown (both come
+/// from the template), so the message portion is empty.
 #[allow(dead_code)]
-pub fn format_waiting_message(model: &str) -> String {
-    model.to_owned()
+pub fn format_waiting_message(_model: &str) -> String {
+    String::new()
 }
 
 fn elapsed_string(pb: &ProgressBar) -> String {
@@ -237,8 +302,12 @@ mod tests {
     #[test]
     fn test_spinner_on_usage() {
         let mut spinner = Spinner::new("test", false);
-        spinner.on_usage(100);
+        spinner.on_usage(Usage {
+            input_tokens: 50,
+            output_tokens: 100,
+        });
         assert_eq!(spinner.total_tokens, 100);
+        assert_eq!(spinner.input_tokens, Some(50));
         spinner.finish();
     }
 
@@ -253,11 +322,15 @@ mod tests {
     #[test]
     fn test_spinner_set_waiting_resets() {
         let mut spinner = Spinner::new("test", false);
-        spinner.on_usage(100);
+        spinner.on_usage(Usage {
+            input_tokens: 30,
+            output_tokens: 100,
+        });
         spinner.set_generating(Duration::from_millis(200));
         spinner.set_waiting();
         assert_eq!(spinner.total_tokens, 0);
         assert!(spinner.ttft.is_none());
+        assert!(spinner.input_tokens.is_none());
         spinner.finish();
     }
 

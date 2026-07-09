@@ -15,6 +15,7 @@ use rustyline::DefaultEditor;
 use std::time::Instant;
 
 use crate::cmd::run::{build_provider_for_model, resolve_agent};
+use crate::spinner::SpinnerCallback;
 use crate::wiring::AppContext;
 
 const PROMPT: &str = "openslate> ";
@@ -433,9 +434,20 @@ impl ReplSession {
         let provider = build_provider_for_model(&self.ctx.config, &model_alias)?;
 
         let start = Instant::now();
-        let result = match self.ctx.manager.execute_with_history(&provider, &self.history, None).await {
-            Ok(r) => r,
+        let mut callback = SpinnerCallback::new(&model_alias, self.quiet);
+        let result = match self
+            .ctx
+            .manager
+            .execute_with_history(&provider, &self.history, Some(&mut callback))
+            .await
+        {
+            Ok(r) => {
+                callback.finish();
+                r
+            }
             Err(e) => {
+                let msg = e.to_string();
+                callback.finish_with_error(&msg);
                 return Err(anyhow::anyhow!("Agent execution failed: {}", e));
             }
         };

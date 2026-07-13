@@ -65,7 +65,8 @@ impl ResolvedPrompt {
         let content_hash = {
             let mut hasher = Sha256::new();
             hasher.update(self.content.as_bytes());
-            format!("{:x}", hasher.finalize())
+            let bytes = hasher.finalize();
+            bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
         };
 
         let (source_kind, source_path) = match &self.source {

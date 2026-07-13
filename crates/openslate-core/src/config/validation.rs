@@ -965,6 +965,7 @@ path = ""
                 kind: "openai_compatible".into(),
                 base_url: "https://orphan.example.com".into(),
                 api_key_env: "ORPHAN_KEY".into(),
+                adapter: None,
             },
         );
         let result = validate_config_full(&config, &valid_agents());

@@ -2,6 +2,7 @@
 
 mod cmd;
 mod input;
+mod markdown;
 mod repl;
 mod spinner;
 mod wiring;

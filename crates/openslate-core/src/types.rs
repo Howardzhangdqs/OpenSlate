@@ -137,8 +137,13 @@ pub struct Usage {
 /// Events emitted during a streaming chat completion.
 #[derive(Debug, Clone)]
 pub enum ModelStreamEvent {
-    /// Partial content delta from the model.
+    /// Partial content delta from the model (the final answer text).
     Delta(String),
+    /// Partial reasoning/thinking delta from the model (e.g. DeepSeek-style
+    /// `reasoning_content`). Surfaced separately from [`Delta`] so callers can
+    /// display it distinctly (dimmed, folded, etc.). Providers that don't expose
+    /// reasoning never emit this variant.
+    Reasoning(String),
     /// Token usage update (may arrive in final chunk).
     Usage(Usage),
     /// Stream has completed. Contains the full assembled response.

@@ -9,6 +9,7 @@ use std::fs;
 use std::time::Instant;
 
 use openslate_core::agent_tree::AgentTree;
+use openslate_core::provider::ModelProvider;
 use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
 
 use crate::input::{expand_at_files, read_stdin_if_pipe, WorkspaceRoot};
@@ -69,6 +70,8 @@ fn write_result(
     output_path: Option<&str>,
     quiet: bool,
     duration_ms: u64,
+    content_tokens: u64,
+    reasoning_tokens: u64,
 ) -> Result<()> {
     match format {
         OutputFormat::Text => {
@@ -79,7 +82,7 @@ fn write_result(
                     tracing::info!("Result written to {}", path);
                 }
             } else {
-                println!("{}", content);
+                crate::markdown::print_markdown(content);
             }
         }
         OutputFormat::Jsonl => {
@@ -103,13 +106,24 @@ fn write_result(
         } else {
             format!("{}ms", duration_ms)
         };
+        // Short id (git-style) keeps the log compact; the full id stays in the
+        // exported trace and the store. Token split matches the spinner: `↓{content}`
+        // plus `r{reasoning}` when the model produced reasoning.
+        let run_id_str = result.run_id.to_string();
+        let short_id = run_id_str.get(..8).unwrap_or(&run_id_str);
+        let token_seg = match (content_tokens, reasoning_tokens) {
+            (0, 0) => "↓0".to_string(),
+            (c, 0) => format!("↓{}", c),
+            (0, r) => format!("↓r{}", r),
+            (c, r) => format!("↓{}r{}", c, r),
+        };
         tracing::info!(
-            "Run completed: id={}, steps={}, time={}, input_tokens={}, output_tokens={}",
-            result.run_id,
+            "Run done · {} · {} step · {} · ↑{} {}",
+            short_id,
             result.total_steps,
             dur_str,
             result.total_input_tokens,
-            result.total_output_tokens,
+            token_seg,
         );
     }
 
@@ -228,14 +242,14 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     }
 
     // 6. Execute via RunManager
-    let (result, run_elapsed_ms) = {
+    let (result, run_elapsed_ms, content_tokens, reasoning_tokens) = {
         // Spinner provides real-time progress via streaming callbacks.
         // In quiet mode, the spinner is hidden.
         let mut callback = SpinnerCallback::new(&model_alias, params.quiet);
         let exec_start = Instant::now();
         let run_result = match ctx
             .manager
-            .execute(&provider, &prompt, Some(&mut callback))
+            .execute(&*provider, &prompt, Some(&mut callback))
             .await
         {
             Ok(r) => r,
@@ -244,9 +258,18 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
                 return Err(anyhow::anyhow!("Run failed: {}", e));
             }
         };
+        // Capture the streamed content/reasoning split before finish() consumes
+        // the callback (used for the "Run done" log line).
+        let content_tokens = callback.content_tokens();
+        let reasoning_tokens = callback.reasoning_tokens();
         let elapsed = exec_start.elapsed();
         callback.finish();
-        (run_result, elapsed.as_millis() as u64)
+        (
+            run_result,
+            elapsed.as_millis() as u64,
+            content_tokens,
+            reasoning_tokens,
+        )
     };
 
     // 7. Extract final assistant message
@@ -261,6 +284,8 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         params.output.as_deref(),
         params.quiet,
         run_elapsed_ms,
+        content_tokens,
+        reasoning_tokens,
     )?;
 
     // 9. Export trace to file if requested
@@ -283,16 +308,36 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     Ok(())
 }
 
-/// Build an OpenAI-compatible provider for a specific model alias.
+/// Build a provider for a specific model alias.
+///
+/// Dispatches on `ProviderConfig.kind`:
+/// - `"openai_compatible"` → the hand-rolled OpenAI Chat Completions client.
+/// - `"genai"` → the genai-backed multi-provider adapter (requires the `genai`
+///   cargo feature).
 pub(crate) fn build_provider_for_model(
     config: &openslate_core::config::OpenSlateConfig,
     model_alias: &str,
-) -> Result<OpenAICompatibleProvider> {
+) -> Result<Box<dyn ModelProvider>> {
     let resolved =
         openslate_core::model_config::resolve_model(config, model_alias).with_context(|| {
             format!("Failed to resolve model alias '{}'", model_alias)
         })?;
 
+    match resolved.provider.kind.as_str() {
+        "openai_compatible" => build_openai_provider(&resolved),
+        "genai" => build_genai_provider(&resolved),
+        other => anyhow::bail!(
+            "unknown provider kind '{}' for provider '{}'; expected 'openai_compatible' or 'genai'",
+            other,
+            resolved.provider_name
+        ),
+    }
+}
+
+/// Construct the OpenAI-compatible provider (always available, no extra deps).
+fn build_openai_provider(
+    resolved: &openslate_core::model_config::ResolvedModel,
+) -> Result<Box<dyn ModelProvider>> {
     let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
         format!(
             "API key not found: set environment variable '{}'",
@@ -301,13 +346,58 @@ pub(crate) fn build_provider_for_model(
     })?;
 
     let provider_config = OpenAIProviderConfig {
-        provider_name: resolved.provider_name,
-        base_url: resolved.provider.base_url,
+        provider_name: resolved.provider_name.clone(),
+        base_url: resolved.provider.base_url.clone(),
         api_key,
         timeout_secs: 60,
     };
 
-    Ok(OpenAICompatibleProvider::new(provider_config))
+    Ok(Box::new(OpenAICompatibleProvider::new(provider_config)))
+}
+
+/// Construct the genai-backed multi-provider adapter.
+#[cfg(feature = "genai")]
+fn build_genai_provider(
+    resolved: &openslate_core::model_config::ResolvedModel,
+) -> Result<Box<dyn ModelProvider>> {
+    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
+        format!(
+            "API key not found: set environment variable '{}'",
+            resolved.provider.api_key_env
+        )
+    })?;
+
+    let cfg = openslate_model_genai::GenaiConfig {
+        provider_name: resolved.provider_name.clone(),
+        model: resolved.model_id.clone(),
+        api_key: Some(api_key),
+        base_url: Some(resolved.provider.base_url.clone()),
+        adapter: resolved.provider.adapter.clone(),
+        timeout_secs: 60,
+    };
+
+    let provider = openslate_model_genai::GenaiProvider::new(cfg).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to build genai provider for '{}': {}",
+            resolved.provider_name,
+            e
+        )
+    })?;
+
+    Ok(Box::new(provider))
+}
+
+/// Without the `genai` feature, a `kind = "genai"` config fails with a clear
+/// rebuild instruction instead of a confusing link error.
+#[cfg(not(feature = "genai"))]
+fn build_genai_provider(
+    resolved: &openslate_core::model_config::ResolvedModel,
+) -> Result<Box<dyn ModelProvider>> {
+    anyhow::bail!(
+        "provider '{}' uses kind = \"genai\", but this openslate build was compiled without \
+         the 'genai' feature. Rebuild with: cargo run --features openslate-cli/genai",
+        resolved.provider_name
+    );
 }
 
 async fn persist_trace_to_store(
@@ -502,6 +592,85 @@ max_output_bytes = 65536
                 );
             }
             Ok(_) => panic!("expected error when env var is not set"),
+        }
+    }
+
+    /// A `kind = "genai"` config in a build compiled WITHOUT the `genai` feature
+    /// must fail with a clear rebuild instruction (not a confusing link error).
+    #[cfg(not(feature = "genai"))]
+    #[test]
+    fn test_genai_provider_without_feature_errors_clearly() {
+        let toml = r#"
+[providers.anthropic_prod]
+kind = "genai"
+base_url = "https://api.anthropic.com"
+api_key_env = "GENAI_TEST_KEY"
+adapter = "anthropic"
+
+[models.main]
+provider = "anthropic_prod"
+model = "claude-sonnet-4-5"
+"#;
+        let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
+        match build_provider_for_model(&config, "main") {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("--features") && msg.contains("genai"),
+                    "error should tell the user how to enable the feature: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected an error without the genai feature"),
+        }
+    }
+
+    /// A `kind = "genai"` config in a build compiled WITH the `genai` feature
+    /// must construct a `GenaiProvider` successfully.
+    #[cfg(feature = "genai")]
+    #[test]
+    fn test_genai_provider_constructs_with_feature() {
+        // Unique env var name to avoid races with parallel tests.
+        // SAFETY of env mutation: this var is not read by any other test.
+        std::env::set_var("GENAI_TEST_KEY", "sk-test");
+        let toml = r#"
+[providers.anthropic_prod]
+kind = "genai"
+base_url = "https://api.anthropic.com"
+api_key_env = "GENAI_TEST_KEY"
+adapter = "anthropic"
+
+[models.main]
+provider = "anthropic_prod"
+model = "claude-sonnet-4-5"
+"#;
+        let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
+        let provider = build_provider_for_model(&config, "main").expect("genai provider builds");
+        assert_eq!(provider.provider_name(), "anthropic_prod");
+    }
+
+    /// An unknown `kind` must be rejected with a clear error.
+    #[test]
+    fn test_unknown_provider_kind_is_rejected() {
+        let toml = r#"
+[providers.weird]
+kind = "something-new"
+base_url = "https://example.com"
+api_key_env = "SOME_KEY"
+
+[models.main]
+provider = "weird"
+model = "m1"
+"#;
+        let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
+        match build_provider_for_model(&config, "main") {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unknown provider kind") && msg.contains("something-new"),
+                    "error should name the unknown kind: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected an error for an unknown provider kind"),
         }
     }
 

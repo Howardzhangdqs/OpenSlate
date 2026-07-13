@@ -57,10 +57,20 @@ pub trait ModelProvider: Send + Sync {
 pub trait ProgressCallback: Send {
     /// Called before a model request is sent (step number, model ID).
     fn on_request_start(&mut self, step: u32, model_id: &str);
+    /// Called with an early estimate of the input-token count for the request,
+    /// so the UI can show `↑N` during streaming before the provider's real
+    /// usage arrives. Default is a no-op.
+    fn on_input_estimate(&mut self, _tokens: u32) {}
     /// Called when the first content token arrives (for TTFT measurement).
     fn on_first_token(&mut self);
     /// Called for each content delta from the model.
     fn on_delta(&mut self, text: &str);
+    /// Called for each reasoning/thinking delta from the model.
+    ///
+    /// Default is a no-op so existing implementations keep compiling. CLI
+    /// implementations override this to stream the model's chain-of-thought
+    /// (e.g. dimmed, above the spinner).
+    fn on_reasoning(&mut self, _text: &str) {}
     /// Called when token usage info arrives.
     fn on_usage(&mut self, usage: Usage);
     /// Called after the model response is fully received.

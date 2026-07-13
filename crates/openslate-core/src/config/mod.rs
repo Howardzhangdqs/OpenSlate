@@ -123,9 +123,19 @@ impl Default for LimitsConfig {
 /// A single LLM provider endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
+    /// Which OpenSlate adapter crate handles this provider:
+    /// `"openai_compatible"` (hand-rolled OpenAI Chat Completions client) or
+    /// `"genai"` (genai-backed multi-provider adapter, behind the `genai` cargo
+    /// feature).
     pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// For `kind = "genai"`: the genai adapter protocol
+    /// (e.g. `"anthropic"`, `"gemini"`, `"openai"`, `"ollama"`). When omitted,
+    /// genai infers the protocol from the model name (with a warning, since
+    /// unknown prefixes fall through to Ollama). Ignored for `kind = "openai_compatible"`.
+    #[serde(default)]
+    pub adapter: Option<String>,
 }
 
 /// A named model alias referencing a provider.

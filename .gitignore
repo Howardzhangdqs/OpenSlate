@@ -18,6 +18,7 @@
 .openslate
 .opencode
 .claude
+.agents/
 
 # OS
 .DS_Store

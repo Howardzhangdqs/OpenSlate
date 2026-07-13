@@ -1,7 +1,11 @@
 //! Integration wiring — assembles all components for the CLI run pipeline.
 //!
 //! Creates an `AppContext` that ties together:
-//! config loading → validation → SQLite store → agent tree → tool registry → provider → RunManager.
+//! config loading → validation → SQLite store → agent tree → tool registry → RunManager.
+//!
+//! NOTE: the LLM provider is no longer stored in `AppContext`; it is built per
+//! run/turn via `cmd::run::build_provider_for_model` (so it can be dispatched on
+//! `ProviderConfig.kind`, e.g. OpenAI-compatible vs. genai).
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -10,11 +14,9 @@ use std::path::Path;
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::config::validation::validate_config;
 use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
-use openslate_core::model_config::resolve_model;
 use openslate_core::paths::{resolve_paths, OpenSlatePaths};
 use openslate_core::run_manager::RunManager;
 use openslate_core::tool::builtin_registry;
-use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
 use openslate_store_sqlite::store::SqliteStore;
 
 /// Fully assembled application context ready for running agents.
@@ -24,7 +26,6 @@ pub struct AppContext {
     pub agents: AgentsConfig,
     pub store: Option<SqliteStore>,
     pub agent_tree: AgentTree,
-    pub provider: OpenAICompatibleProvider,
     pub manager: RunManager,
     /// Resolved config file path (for diagnostics).
     pub config_path: std::path::PathBuf,
@@ -76,29 +77,6 @@ pub fn resolve_agents_dir(config_path: &Path) -> std::path::PathBuf {
         .parent()
         .map(|p| p.join("agents"))
         .unwrap_or_else(|| Path::new("agents").to_path_buf())
-}
-
-/// Build an OpenAI-compatible provider from a model alias.
-fn build_provider(config: &OpenSlateConfig, model_alias: &str) -> Result<OpenAICompatibleProvider> {
-    let resolved = resolve_model(config, model_alias).with_context(|| {
-        format!("Failed to resolve model alias '{}'", model_alias)
-    })?;
-
-    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
-        format!(
-            "API key not found: set environment variable '{}'",
-            resolved.provider.api_key_env
-        )
-    })?;
-
-    let provider_config = OpenAIProviderConfig {
-        provider_name: resolved.provider_name,
-        base_url: resolved.provider.base_url,
-        api_key,
-        timeout_secs: 60,
-    };
-
-    Ok(OpenAICompatibleProvider::new(provider_config))
 }
 
 /// Initialize the SQLite store based on config.
@@ -197,15 +175,14 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     // 7. Build tool registry
     let registry = builtin_registry();
 
-    // 8. Resolve the root agent to determine which model to use
+    // 8. Resolve the root agent to determine which model to use (informational;
+    //    the provider itself is built per run/turn via build_provider_for_model
+    //    so it can be dispatched on ProviderConfig.kind).
     let root_agent = agent_tree.get_root();
     let model_alias = root_agent.model_alias.clone();
     tracing::debug!("Root agent '{}' uses model '{}'", root_agent.id, model_alias);
 
-    // 9. Build provider
-    let provider = build_provider(&config, &model_alias)?;
-
-    // 10. Create RunManager
+    // 9. Create RunManager
     let manager = RunManager::new(config.clone(), agent_tree.clone(), registry);
 
     Ok(AppContext {
@@ -213,7 +190,6 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         agents,
         store,
         agent_tree,
-        provider,
         manager,
         config_path,
         agents_path,
@@ -313,22 +289,6 @@ max_output_bytes = 65536
         let path = Path::new("/project/.openslate/openslate.toml");
         let agents = resolve_agents_dir(path);
         assert_eq!(agents, Path::new("/project/.openslate/agents"));
-    }
-
-    #[test]
-    fn test_build_provider_missing_env_var() {
-        let tmp = temp_project();
-        let config = load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        match build_provider(&config, "main") {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("TEST_API_KEY"),
-                    "error should mention env var name: {msg}"
-                );
-            }
-            Ok(_) => panic!("expected error when env var is not set"),
-        }
     }
 
     #[tokio::test]

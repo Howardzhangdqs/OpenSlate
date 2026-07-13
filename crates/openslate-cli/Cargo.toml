@@ -11,6 +11,9 @@ path = "src/main.rs"
 openslate-core = { path = "../openslate-core" }
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
 openslate-model-openai = { path = "../openslate-model-openai" }
+# Optional multi-provider adapter (Anthropic, Gemini, …). Default OFF to keep
+# the binary small; enable with `--features genai`.
+openslate-model-genai = { path = "../openslate-model-genai", optional = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -20,8 +23,24 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 dirs = { workspace = true }
-rustyline = "14"
+rustyline = "18"
 indicatif = { workspace = true }
+# Markdown → ANSI rendering for model output on stdout. No Ratatui dependency;
+# coexists with indicatif (spinner) and rustyline (REPL input).
+termimad = "0.35"
+# Syntax highlighting for fenced code blocks (the engine `bat` uses). Pure-Rust
+# build (fancy-regex, no oniguruma C dep) to match the project's no-native-deps
+# (rustls) philosophy.
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+
+[features]
+# genai is on by default so the configured multi-provider path works out of the
+# box. Disable with `--no-default-features` for a minimal binary (then a
+# `kind = "genai"` config will fail at run time with a clear rebuild hint).
+default = ["genai"]
+# Enable the genai-backed multi-provider adapter. Without this feature, a config
+# using `kind = "genai"` fails at run time with a clear rebuild instruction.
+genai = ["dep:openslate-model-genai"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

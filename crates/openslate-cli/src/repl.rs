@@ -438,7 +438,7 @@ impl ReplSession {
         let result = match self
             .ctx
             .manager
-            .execute_with_history(&provider, &self.history, Some(&mut callback))
+            .execute_with_history(&*provider, &self.history, Some(&mut callback))
             .await
         {
             Ok(r) => {
@@ -485,7 +485,7 @@ impl ReplSession {
         });
 
         if !self.quiet {
-            println!("{}", final_message);
+            crate::markdown::print_markdown(&final_message);
         }
 
         Ok(DispatchResult::Continue)
@@ -757,14 +757,6 @@ max_tool_calls = 20
             agents,
             store: None,
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -790,14 +782,6 @@ max_tool_calls = 20
             agents,
             store: None,
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -823,14 +807,6 @@ max_tool_calls = 20
             agents,
             store: None,
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -862,14 +838,6 @@ max_tool_calls = 20
             agents,
             store: None,
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -885,14 +853,6 @@ max_tool_calls = 20
             agents,
             store: None,
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -908,14 +868,6 @@ max_tool_calls = 20
             agents,
             store: None,
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -1498,14 +1450,6 @@ max_tool_calls = 20
             agents,
             store: Some(store),
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
@@ -1539,14 +1483,6 @@ max_tool_calls = 20
             agents,
             store: Some(store),
             agent_tree,
-            provider: openslate_model_openai::client::OpenAICompatibleProvider::new(
-                openslate_model_openai::client::OpenAIProviderConfig {
-                    provider_name: "zhipu".into(),
-                    base_url: "https://example.com".into(),
-                    api_key: "test-key".into(),
-                    timeout_secs: 60,
-                },
-            ),
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),

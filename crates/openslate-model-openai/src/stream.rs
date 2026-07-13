@@ -588,6 +588,9 @@ data: [DONE]\n\n";
                     assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
                     got_done = true;
                 }
+                // The OpenAI-compatible client never emits reasoning; ignore it
+                // if some other layer forwards one.
+                Ok(ModelStreamEvent::Reasoning(_)) => {}
                 Err(e) => panic!("Stream error: {:?}", e),
             }
         }

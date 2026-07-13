@@ -186,6 +186,9 @@ pub async fn execute_run(
         let response = if let Some(cb) = progress.as_mut() {
             // --- Streaming path with progress callbacks ---
             cb.on_request_start(total_steps + 1, model_id);
+            // Early input-token estimate so the UI can show ↑N during streaming,
+            // before the provider's real usage arrives at stream end.
+            cb.on_input_estimate(estimate_input_tokens(&request));
 
             let mut rx = provider.generate_stream(request).await;
             let mut assembled: Option<ModelResponse> = None;
@@ -200,6 +203,9 @@ pub async fn execute_run(
                                 cb.on_first_token();
                             }
                             cb.on_delta(&text);
+                        }
+                        Ok(ModelStreamEvent::Reasoning(text)) => {
+                            cb.on_reasoning(&text);
                         }
                         Ok(ModelStreamEvent::Usage(usage)) => {
                             cb.on_usage(usage);
@@ -385,6 +391,27 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Rough estimate of input tokens for a request (~4 chars/token), so the UI can
+/// show an `↑N` hint during streaming before the provider's real usage arrives.
+fn estimate_input_tokens(req: &GenerateRequest) -> u32 {
+    let mut chars: usize = req.system_prompt.as_ref().map_or(0, String::len);
+    for m in &req.messages {
+        chars += m.content.len();
+        if let Some(name) = m.name.as_ref() {
+            chars += name.len();
+        }
+        if let Some(tcs) = m.tool_calls.as_ref() {
+            for tc in tcs {
+                chars += tc.name.len() + tc.arguments.to_string().len();
+            }
+        }
+    }
+    for t in &req.tools {
+        chars += t.name.len() + t.description.len() + t.parameters.to_string().len();
+    }
+    (chars as u32).max(1) / 4
 }
 
 /// Validate that tool call arguments are a JSON object. Returns `Ok(())` if valid,

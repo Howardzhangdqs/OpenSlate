@@ -1,0 +1,40 @@
+# Build artifacts (target/ can be 25GB+ — never send to the builder)
+/target
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# VCS
+.git
+.gitignore
+
+# Local agent/tool working dirs (not part of the app)
+.agents/
+.openslate/
+.opencode/
+.claude/
+.omo/
+
+# Credentials / secrets — must never enter an image
+AGENTS.md
+.env
+.env.*
+!.env.example
+
+# SQLite databases & WAL files (runtime state)
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Debug / trace
+*.trace.json

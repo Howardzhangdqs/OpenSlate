@@ -28,3 +28,8 @@
 
 # Debug / Trace
 *.trace.json
+
+# Local
+AGENTS.md
+openslate-bin
+ca-certificates.crt

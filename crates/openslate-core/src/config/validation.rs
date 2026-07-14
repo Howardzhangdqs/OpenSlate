@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use crate::config::{AgentsConfig, OpenSlateConfig};
+use crate::config::{AgentsConfig, OpenSlateConfig, TransportConfig};
 
 /// Severity of a validation finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +234,39 @@ pub fn validate_config(
                     field: "database.path".into(),
                     message: "Database path is specified but empty".into(),
                 });
+            }
+        }
+    }
+
+    // 15. MCP server transport fields must be valid (static checks only;
+    //     reachability/collisions are handled at registry-build time).
+    if let Some(mcp) = &config.mcp {
+        for (name, server) in &mcp.servers {
+            match &server.transport {
+                TransportConfig::Stdio { command, .. } => {
+                    if command.trim().is_empty() {
+                        errors.push(ValidationError {
+                            field: format!("mcp.servers.{name}.command"),
+                            message: format!("MCP server '{}' has an empty command", name),
+                        });
+                    }
+                }
+                TransportConfig::Http { url } => {
+                    if url.trim().is_empty() {
+                        errors.push(ValidationError {
+                            field: format!("mcp.servers.{name}.url"),
+                            message: format!("MCP server '{}' has an empty url", name),
+                        });
+                    } else if !is_valid_url(url) {
+                        errors.push(ValidationError {
+                            field: format!("mcp.servers.{name}.url"),
+                            message: format!(
+                                "MCP server '{}' has an invalid url '{}'",
+                                name, url
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1071,5 +1104,201 @@ path = ""
             warnings: vec![],
         };
         assert!(!result_with_error.is_valid());
+    }
+
+    // ── Rule 15: MCP server transport validation ───────────────────────
+
+    #[test]
+    fn mcp_stdio_server_parses() {
+        let toml = r#"
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp.servers.fs]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let mcp = config.mcp.as_ref().expect("mcp section present");
+        let server = mcp.servers.get("fs").expect("fs server present");
+        assert!(server.enabled, "enabled defaults to true");
+        match &server.transport {
+            TransportConfig::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args.len(), 3);
+                assert!(env.is_none());
+            }
+            TransportConfig::Http { .. } => panic!("expected stdio"),
+        }
+        let errors = validate_config(&config, &valid_agents());
+        assert!(errors.is_empty(), "valid stdio server: {errors:?}");
+    }
+
+    #[test]
+    fn mcp_http_server_disabled_parses() {
+        let toml = r#"
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp.servers.remote]
+enabled = false
+transport = "http"
+url = "http://localhost:8000/mcp"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let server = config
+            .mcp
+            .as_ref()
+            .unwrap()
+            .servers
+            .get("remote")
+            .unwrap();
+        assert!(!server.enabled, "enabled can be overridden to false");
+        match &server.transport {
+            TransportConfig::Http { url } => assert_eq!(url, "http://localhost:8000/mcp"),
+            TransportConfig::Stdio { .. } => panic!("expected http"),
+        }
+        // A disabled server is still statically valid (connection is skipped later).
+        let errors = validate_config(&config, &valid_agents());
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn mcp_stdio_with_env_parses() {
+        let toml = r#"
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp.servers.git]
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-git"]
+
+[mcp.servers.git.env]
+GIT_AUTHOR_NAME = "openslate"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let server = config.mcp.unwrap().servers.into_values().next().unwrap();
+        match server.transport {
+            TransportConfig::Stdio { env, .. } => {
+                let env = env.expect("env present");
+                assert_eq!(env.get("GIT_AUTHOR_NAME").unwrap(), "openslate");
+            }
+            TransportConfig::Http { .. } => panic!("expected stdio"),
+        }
+    }
+
+    #[test]
+    fn mcp_stdio_empty_command_rejected() {
+        let toml = r#"
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp.servers.bad]
+transport = "stdio"
+command = ""
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "mcp.servers.bad.command" && e.message.contains("empty")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_http_invalid_url_rejected() {
+        let toml = r#"
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp.servers.bad]
+transport = "http"
+url = "not-a-url"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "mcp.servers.bad.url" && e.message.contains("invalid")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_unknown_transport_rejected_by_serde() {
+        let toml = r#"
+[providers.zhipu]
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp.servers.weird]
+transport = "carrier-pigeon"
+"#;
+        // Unknown transport variant → serde parse error (fail fast at load time).
+        assert!(parse_openslate_toml(toml).is_err());
     }
 }

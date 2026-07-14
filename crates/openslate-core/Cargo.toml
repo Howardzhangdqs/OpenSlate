@@ -17,6 +17,17 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 dirs = { workspace = true }
 futures-util = { workspace = true }
+# MCP client deps (optional). reqwest inherits the workspace declaration
+# (default-features=false, json+rustls+stream); rmcp likewise pulls only the
+# features listed in the workspace root. tokio/process is activated via the
+# `mcp` feature expression below (R2: keep process scoped to core/mcp only).
+reqwest = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
+
+[features]
+# Enable MCP (Model Context Protocol) client support. Activates rmcp + reqwest
+# and turns on tokio's process capability (needed for stdio MCP transports).
+mcp = ["dep:rmcp", "dep:reqwest", "tokio/process"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

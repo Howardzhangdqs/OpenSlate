@@ -27,6 +27,12 @@ pub struct AppContext {
     pub store: Option<SqliteStore>,
     pub agent_tree: AgentTree,
     pub manager: RunManager,
+    /// Live MCP server connections. Declared after `manager` so that on drop,
+    /// the registry (and its `McpTool`s holding `ServerSink` clones) is dropped
+    /// *before* the connections themselves are cancelled — avoiding any window
+    /// where a tool could outlive its transport.
+    #[cfg(feature = "mcp")]
+    pub mcp_connections: openslate_core::mcp::McpConnectionGuard,
     /// Resolved config file path (for diagnostics).
     pub config_path: std::path::PathBuf,
     /// Resolved agents file path.
@@ -191,7 +197,96 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         .map_err(|e| anyhow::anyhow!("Failed to build agent tree: {}", e))?;
 
     // 7. Build tool registry
-    let registry = builtin_registry();
+    #[allow(unused_mut)] // `mut` is only exercised when the `mcp` feature is on.
+    let mut registry = builtin_registry();
+
+    // 7.5 Connect MCP servers and register their tools (feature-gated).
+    //     Static config errors were already caught by validate_config; here we
+    //     handle runtime failures (spawn/handshake/list) with warn+skip so one
+    //     bad server cannot abort startup. Name collisions are a hard error.
+    #[cfg(feature = "mcp")]
+    let mut mcp_connections = openslate_core::mcp::McpConnectionGuard::new();
+    #[cfg(feature = "mcp")]
+    if let Some(mcp) = &config.mcp {
+        use tokio::sync::mpsc;
+
+        // Disabled servers: log and skip (no subprocess spawned).
+        for (name, server_cfg) in &mcp.servers {
+            if !server_cfg.enabled {
+                tracing::info!(target: "openslate_mcp", "MCP server '{name}' disabled, skipping");
+            }
+        }
+
+        // Spawn one task per enabled server to connect concurrently, and log +
+        // register each one THE MOMENT it finishes (delivered in completion order
+        // via the channel) — instead of waiting for all connects before logging.
+        // Registration still happens on this task (&mut registry, sequential),
+        // but it's pure in-memory HashMap inserts, trivially fast.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pending = 0usize;
+        for (name, cfg) in &mcp.servers {
+            if !cfg.enabled {
+                continue;
+            }
+            let name = name.clone();
+            let cfg = cfg.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let result = openslate_core::mcp::connect_mcp_server(&name, &cfg).await;
+                // `elapsed` is captured here, at this server's connect completion
+                // — independent of when sibling servers (or the registry loop) run.
+                let _ = tx.send((name, start.elapsed(), result));
+            });
+            pending += 1;
+        }
+        drop(tx);
+
+        for _ in 0..pending {
+            let (name, elapsed, result) = match rx.recv().await {
+                Some(msg) => msg,
+                None => break, // all senders dropped unexpectedly (e.g. a task panicked)
+            };
+            match result {
+                Ok((tools, service)) => {
+                    let mut names = Vec::with_capacity(tools.len());
+                    for tool in tools {
+                        names.push(tool.exposed_name().to_owned());
+                        match registry.try_register(tool) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                anyhow::bail!(
+                                    "MCP tool name conflict: tool '{}' from server '{}' collides \
+                                     with an existing tool (MCP tools are auto-namespaced as \
+                                     '{name}_*'; a collision means two servers share a name)",
+                                    e.0, name
+                                );
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        target: "openslate_mcp",
+                        "MCP server '{name}': {} tools registered in {:.2}s",
+                        names.len(),
+                        elapsed.as_secs_f32()
+                    );
+                    tracing::debug!(
+                        target: "openslate_mcp",
+                        "MCP server '{name}' tool list: [{}]",
+                        names.join(", ")
+                    );
+                    mcp_connections.push(service);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "openslate_mcp",
+                        "MCP server '{name}' failed to connect after {:.2}s, skipped: {e}",
+                        elapsed.as_secs_f32()
+                    );
+                }
+            }
+        }
+    }
 
     // 8. Resolve the root agent to determine which model to use (informational;
     //    the provider itself is built per run/turn via build_provider_for_model
@@ -209,6 +304,8 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         store,
         agent_tree,
         manager,
+        #[cfg(feature = "mcp")]
+        mcp_connections,
         config_path,
         agents_path,
     })

@@ -65,3 +65,14 @@ supports_tool_call = true
 enabled = true
 store_sqlite = true
 default_export_format = "chrome-json"
+
+# MCP (Model Context Protocol) servers — external tool providers connected at
+# startup. Each server's tools are auto-registered into the tool registry.
+[mcp.servers.filesystem]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.remote]
+transport = "http"
+url = "http://localhost:8000/mcp"

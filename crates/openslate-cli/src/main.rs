@@ -282,8 +282,14 @@ async fn main() -> Result<()> {
     } else {
         cli.log_level.clone()
     };
+    // Default directive: user's `--log-level` governs OpenSlate's own crates,
+    // but quiet the chatty `rmcp` INFO logs — its "Service initialized as
+    // client" prints the entire server InitializeResult including a multi-KB
+    // `instructions` string that swamps startup output. Per-target overrides
+    // still work via RUST_LOG (e.g. RUST_LOG="info,rmcp=debug").
+    let default_directive = format!("{default_level},rmcp=warn");
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_level));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_directive));
     tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .event_format(SimpleFormatter::default())

@@ -760,6 +760,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -785,6 +787,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -810,6 +814,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -841,6 +847,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
     }
@@ -856,6 +864,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
         ReplSession::new(ctx, profile.into(), false).unwrap()
     }
@@ -871,6 +881,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
     }
@@ -1453,6 +1465,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
         let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();
@@ -1486,6 +1500,8 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
+            #[cfg(feature = "mcp")]
+            mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
         let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();

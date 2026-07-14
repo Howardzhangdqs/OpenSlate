@@ -37,6 +37,11 @@ clap = { version = "4.5", features = ["derive"] }
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 
+# MCP client (Model Context Protocol). Only client role + stdio/HTTP transports;
+# server/macros/base64 defaults excluded. reqwest tls feature stays rustls-only
+# (see transport-streamable-http-client-reqwest: pulls __reqwest w/o tls feature).
+rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
 # SQLite (async)
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite-bundled"] }
 

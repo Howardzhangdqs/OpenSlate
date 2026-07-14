@@ -60,6 +60,9 @@ pub struct OpenSlateConfig {
     pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
     pub trace: Option<TraceConfig>,
+    /// MCP (Model Context Protocol) client servers.
+    #[serde(default)]
+    pub mcp: Option<McpConfig>,
 }
 
 /// Project metadata.
@@ -172,6 +175,53 @@ impl Default for TraceConfig {
             default_export_format: "chrome-json".to_owned(),
         }
     }
+}
+
+/// MCP (Model Context Protocol) client configuration.
+///
+/// Declares external MCP servers whose tools are registered into the
+/// `ToolRegistry` at startup. See [`TransportConfig`] for connection options.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+/// A single MCP server connection.
+///
+/// `enabled` defaults to `true`. Each tool this server exposes is automatically
+/// namespaced as `{server_name}_{tool_name}` when registered, so collisions
+/// across servers (and with builtins) are avoided without any per-server config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub transport: TransportConfig,
+}
+
+/// How to reach an MCP server.
+///
+/// Internally-tagged by the `transport` field. This enum intentionally does NOT
+/// use `#[serde(deny_unknown_fields)]` — that is incompatible with serde's
+/// internally-tagged enum representation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "transport")]
+pub enum TransportConfig {
+    /// Spawn a local subprocess speaking MCP over stdio.
+    #[serde(rename = "stdio")]
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Option<HashMap<String, String>>,
+    },
+    /// Connect to a remote MCP server via Streamable HTTP.
+    #[serde(rename = "http")]
+    Http {
+        url: String,
+    },
 }
 
 /// Wrapper for the agents YAML file.

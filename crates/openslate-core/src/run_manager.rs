@@ -104,7 +104,14 @@ impl RunManager {
             max_context_bytes: self.limits.max_context_bytes,
             max_output_bytes: self.limits.max_output_bytes,
             max_empty_turns: self.limits.max_empty_turns,
-            tool_definitions: self.tool_registry.definitions_for(&root_agent.tools),
+            tool_definitions: if root_agent.tools.is_empty() {
+                // No `tools:` whitelist in the agent frontmatter → expose every
+                // registered tool (builtins + all MCP tools). Listing tools
+                // explicitly still acts as a whitelist.
+                self.tool_registry.definitions()
+            } else {
+                self.tool_registry.definitions_for(&root_agent.tools)
+            },
             timeout_ms: self.limits.timeout_ms,
         };
 

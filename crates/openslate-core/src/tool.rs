@@ -66,8 +66,31 @@ impl ToolRegistry {
     }
 
     /// Register a tool.
+    ///
+    /// Silently overwrites any existing tool with the same name. Prefer
+    /// [`try_register`](Self::try_register) when collisions must be detected —
+    /// e.g. when mixing builtin tools with MCP-provided tools.
     pub fn register(&mut self, tool: impl Tool + 'static) {
         self.tools.insert(tool.name().to_owned(), Arc::new(tool));
+    }
+
+    /// Register a tool, returning an error if the name is already taken.
+    ///
+    /// Unlike [`register`](Self::register), this surfaces collisions — covering
+    /// both MCP↔builtin and MCP↔MCP — so an ambiguous tool identity fails loudly
+    /// at startup rather than silently shadowing a tool and confusing the LLM.
+    /// Callers that intentionally namespace tools should apply a prefix before
+    /// calling this.
+    pub fn try_register(
+        &mut self,
+        tool: impl Tool + 'static,
+    ) -> Result<(), ToolNameConflict> {
+        let name = tool.name().to_owned();
+        if self.tools.contains_key(&name) {
+            return Err(ToolNameConflict(name));
+        }
+        self.tools.insert(name, Arc::new(tool));
+        Ok(())
     }
 
     /// Get a tool by name.
@@ -80,11 +103,18 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.to_definition()).collect()
     }
 
-    /// Get definitions for specific tool names only.
-    pub fn definitions_for(&self, names: &[String]) -> Vec<ToolDefinition> {
-        names
+    /// Get definitions for tools whose name matches any of the given patterns.
+    ///
+    /// Each pattern matches literally unless it contains `*` or `?`, in which
+    /// case it is treated as a glob (`*` = any run of chars, `?` = one char).
+    /// Examples: `"read_file"` (exact), `"filesystem_*"` (prefix), `"*_echo"`,
+    /// `"*"` (all). Returned order follows the registry's internal order, not
+    /// the pattern order.
+    pub fn definitions_for(&self, patterns: &[String]) -> Vec<ToolDefinition> {
+        self.tools
             .iter()
-            .filter_map(|name| self.tools.get(name).map(|t| t.to_definition()))
+            .filter(|(name, _)| patterns.iter().any(|p| tool_name_matches(name, p)))
+            .map(|(_, t)| t.to_definition())
             .collect()
     }
 
@@ -116,6 +146,54 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Error returned by [`ToolRegistry::try_register`] when a tool name is already
+/// registered. The wrapped [`String`] is the conflicting tool name.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("tool name already registered: '{0}'")]
+pub struct ToolNameConflict(pub String);
+
+/// Match a tool name against a `tools:`-list pattern. Plain patterns (no glob
+/// metacharacters) require an exact match; patterns containing `*` or `?` are
+/// treated as globs ([`wildcard_match`]).
+fn tool_name_matches(name: &str, pattern: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return name == pattern;
+    }
+    wildcard_match(name, pattern)
+}
+
+/// Glob match: `*` matches any (possibly empty) run of characters, `?` matches
+/// exactly one. All other characters match literally.
+fn wildcard_match(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star: Option<usize> = None;
+    let mut stash = 0usize;
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star = Some(pi);
+            stash = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // backtrack: let the last `*` consume one more char
+            pi = s + 1;
+            stash += 1;
+            ti = stash;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 #[async_trait]
@@ -913,5 +991,126 @@ mod builtin_tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ToolError::SecurityError(msg) if msg.contains("Path traversal")));
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// Minimal `Tool` impl for testing registry mechanics (name is configurable).
+    struct DummyTool(&'static str);
+
+    #[async_trait]
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "dummy"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: String::new(),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Success,
+            })
+        }
+    }
+
+    #[test]
+    fn try_register_accepts_a_new_name() {
+        let mut reg = ToolRegistry::new();
+        assert!(reg.try_register(DummyTool("foo")).is_ok());
+        assert!(reg.contains("foo"));
+    }
+
+    #[test]
+    fn try_register_rejects_a_duplicate() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("dup"));
+        let err = reg
+            .try_register(DummyTool("dup"))
+            .expect_err("collision must error");
+        assert_eq!(err.0, "dup");
+    }
+
+    #[test]
+    fn register_overwrites_silently() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("x"));
+        reg.register(DummyTool("x")); // no error — silent overwrite by design
+        assert!(reg.contains("x"));
+    }
+
+    // ── definitions_for glob matching ───────────────────────────────────
+
+    #[test]
+    fn definitions_for_exact_name() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("alpha"));
+        reg.register(DummyTool("beta"));
+        let defs = reg.definitions_for(&["alpha".to_string()]);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha"]);
+    }
+
+    #[test]
+    fn definitions_for_glob_prefix() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("fs_read"));
+        reg.register(DummyTool("fs_write"));
+        reg.register(DummyTool("other"));
+        let defs = reg.definitions_for(&["fs_*".to_string()]);
+        let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["fs_read", "fs_write"]);
+    }
+
+    #[test]
+    fn definitions_for_glob_suffix_and_question() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("get_x"));
+        reg.register(DummyTool("get_y"));
+        reg.register(DummyTool("set_x"));
+        // "*_x" → get_x + set_x
+        let defs_a = reg.definitions_for(&["*_x".to_string()]);
+        let mut a: Vec<&str> = defs_a.iter().map(|d| d.name.as_str()).collect();
+        a.sort();
+        assert_eq!(a, vec!["get_x", "set_x"]);
+        // "?et_x" → get_x + set_x (? = g or s)
+        let defs_b = reg.definitions_for(&["?et_x".to_string()]);
+        let mut b: Vec<&str> = defs_b.iter().map(|d| d.name.as_str()).collect();
+        b.sort();
+        assert_eq!(b, vec!["get_x", "set_x"]);
+    }
+
+    #[test]
+    fn definitions_for_multiple_patterns_union() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("a1"));
+        reg.register(DummyTool("a2"));
+        reg.register(DummyTool("b1"));
+        let defs = reg.definitions_for(&["a*".to_string(), "b1".to_string()]);
+        assert_eq!(defs.len(), 3, "union of patterns");
+    }
+
+    #[test]
+    fn definitions_for_star_matches_all() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("a"));
+        reg.register(DummyTool("b"));
+        assert_eq!(reg.definitions_for(&["*".to_string()]).len(), 2);
+    }
+
+    #[test]
+    fn definitions_for_pattern_matching_nothing_is_empty() {
+        let mut reg = ToolRegistry::new();
+        reg.register(DummyTool("alpha"));
+        assert!(reg.definitions_for(&["zeta_*".to_string()]).is_empty());
     }
 }

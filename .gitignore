@@ -33,3 +33,6 @@
 AGENTS.md
 openslate-bin
 ca-certificates.crt
+
+# Deepwork session state
+.slim/deepwork/

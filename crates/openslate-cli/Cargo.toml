@@ -39,13 +39,18 @@ termimad = "0.35"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [features]
-# genai is on by default so the configured multi-provider path works out of the
-# box. Disable with `--no-default-features` for a minimal binary (then a
-# `kind = "genai"` config will fail at run time with a clear rebuild hint).
-default = ["genai"]
+# genai + mcp on by default so the multi-provider path and MCP tooling work
+# out of the box. Disable either with `--no-default-features` (+ `--features`)
+# for a minimal binary (then `kind = "genai"` / `[mcp.*]` config fails at run
+# time with a clear rebuild hint).
+default = ["genai", "mcp"]
 # Enable the genai-backed multi-provider adapter. Without this feature, a config
 # using `kind = "genai"` fails at run time with a clear rebuild instruction.
 genai = ["dep:openslate-model-genai"]
+# Enable MCP client support in openslate-core (rmcp + reqwest + tokio/process).
+# Propagated via the feature passthrough so `--no-default-features` cleanly
+# disables it.
+mcp = ["openslate-core/mcp"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

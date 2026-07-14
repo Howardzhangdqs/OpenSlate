@@ -183,6 +183,20 @@ pub async fn execute_run(
             temperature: None,
         };
 
+        // Log every LLM request — emitted once here so both the streaming and
+        // non-streaming paths surface it (previously only the non-streaming
+        // branch did, so `openslate run` with spinner showed no per-request line).
+        if config.max_steps > 0 {
+            tracing::info!(
+                "Step {}/{}: requesting {}...",
+                total_steps + 1,
+                config.max_steps,
+                model_id
+            );
+        } else {
+            tracing::info!("Step {}: requesting {}...", total_steps + 1, model_id);
+        }
+
         let response = if let Some(cb) = progress.as_mut() {
             // --- Streaming path with progress callbacks ---
             cb.on_request_start(total_steps + 1, model_id);
@@ -237,18 +251,8 @@ pub async fn execute_run(
                 }
             }
         } else {
-            // --- Non-streaming path with tracing logs ---
-            if config.max_steps > 0 {
-                tracing::info!(
-                    "Step {}/{}: requesting {}...",
-                    total_steps + 1,
-                    config.max_steps,
-                    model_id
-                );
-            } else {
-                tracing::info!("Step {}: requesting {}...", total_steps + 1, model_id);
-            }
-
+            // --- Non-streaming path (the per-request "Step N" log is emitted
+            //     above, before the streaming/non-streaming split) ---
             let call_start = Instant::now();
             let resp = tokio::time::timeout(remaining, provider.generate(request))
                 .await
@@ -341,10 +345,17 @@ pub async fn execute_run(
                     tool_calls: None,
                 });
             }
+            if let Some(cb) = progress.as_mut() {
+                cb.on_step_end();
+            }
             continue;
         }
 
         if has_content {
+            // Note: no on_step_end here. The final step's content is printed by
+            // `run` after the runtime returns, so the stats line would appear
+            // BEFORE the content. Instead `run` emits it after printing content
+            // (order: content → stats → Run done).
             return Ok(RunResult {
                 run_id: config.run_id.clone(),
                 status: RunStatus::Completed,

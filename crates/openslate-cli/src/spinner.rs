@@ -141,6 +141,39 @@ impl Spinner {
         self.state.lock().expect("live state lock").reasoning
     }
 
+    /// Output tokens/sec over the LLM's own elapsed time (start → now).
+    /// Returns 0 if no tokens were generated or no start was recorded.
+    pub fn tps(&self) -> u64 {
+        let s = self.state.lock().expect("live state lock");
+        let total = s.content + s.reasoning;
+        match s.start {
+            Some(st) if total > 0 => {
+                let elapsed = st.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    (total as f64 / elapsed).round() as u64
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Elapsed since the request started (zero if no start recorded).
+    pub fn elapsed(&self) -> Duration {
+        self.state
+            .lock()
+            .expect("live state lock")
+            .start
+            .map(|st| st.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Real input-token count from the provider's usage report, if any.
+    pub fn input_tokens(&self) -> Option<u32> {
+        self.state.lock().expect("live state lock").input
+    }
+
     /// Real usage from the provider. When reasoning was streamed, keep the
     /// streamed content/reasoning split (additive); otherwise use the accurate
     /// output count for the content counter.
@@ -171,6 +204,14 @@ impl Spinner {
         } else {
             self.pb.finish_and_clear();
         }
+    }
+
+    /// Finish without the `✓ model ...` summary line — for callers that emit
+    /// their own summary (e.g. `openslate run`'s "Run done" line, which now
+    /// also carries tok/s). Still tears down the renderer and clears the bar.
+    pub fn finish_silent(mut self) {
+        self.stop_renderer();
+        self.pb.finish_and_clear();
     }
 
     /// Finish with an error line.
@@ -298,6 +339,10 @@ pub struct SpinnerCallback {
     /// Whether the generating phase has begun for the current request (on the
     /// first token of ANY kind — reasoning or content). TTFT is captured once.
     started: bool,
+    /// Mirrors the spinner's `quiet` flag: when true the spinner bar is hidden
+    /// (used by `openslate run`), so reasoning/tool lines must go straight to
+    /// stderr — `pb.println` is swallowed by a hidden progress bar.
+    plain: bool,
 }
 
 impl SpinnerCallback {
@@ -308,6 +353,17 @@ impl SpinnerCallback {
             request_start: Instant::now(),
             reasoning_buf: String::new(),
             started: false,
+            plain: quiet,
+        }
+    }
+
+    /// Print a line above the spinner — or directly to stderr when `plain`
+    /// (hidden-bar mode), since indicatif drops `pb.println` for hidden bars.
+    fn emit_line(&self, msg: &str) {
+        if self.plain {
+            eprintln!("{}", msg);
+        } else {
+            self.spinner.println(msg);
         }
     }
 
@@ -331,6 +387,26 @@ impl SpinnerCallback {
         self.spinner.reasoning_tokens()
     }
 
+    /// Output tokens/sec over the LLM's own elapsed time (0 if none generated).
+    pub fn tps(&self) -> u64 {
+        self.spinner.tps()
+    }
+
+    /// Real input-token count from the provider's usage report, if any.
+    pub fn input_tokens(&self) -> Option<u32> {
+        self.spinner.input_tokens()
+    }
+
+    /// Elapsed since the (last) request started.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.spinner.elapsed()
+    }
+
+    /// Finish the spinner without emitting the per-run `✓ model ...` summary.
+    pub fn finish_silent(self) {
+        self.spinner.finish_silent();
+    }
+
     /// Enter the generating phase on the first token of any kind. Idempotent.
     fn mark_started(&mut self) {
         if !self.started {
@@ -344,7 +420,7 @@ impl SpinnerCallback {
         let remainder = std::mem::take(&mut self.reasoning_buf);
         let trimmed = remainder.trim_end();
         if !trimmed.is_empty() {
-            self.spinner.println(&format_dim_reasoning(trimmed));
+            self.emit_line(&format_dim_reasoning(trimmed));
         }
     }
 }
@@ -384,7 +460,7 @@ impl ProgressCallback for SpinnerCallback {
             let line: String = self.reasoning_buf.drain(..=idx).collect();
             let line = line.trim_end_matches('\n').trim_end();
             if !line.is_empty() {
-                self.spinner.println(&format_dim_reasoning(line));
+                self.emit_line(&format_dim_reasoning(line));
             }
         }
     }
@@ -398,14 +474,44 @@ impl ProgressCallback for SpinnerCallback {
         self.flush_reasoning();
     }
 
+    fn on_step_end(&mut self) {
+        // In plain (run) mode the spinner summary is suppressed; emit a per-step
+        // stats line as an INFO log. on_step_end fires AFTER tool calls execute,
+        // so this prints below the `-> tool / <- result` lines.
+        if self.plain {
+            let elapsed = self.spinner.elapsed();
+            let secs = elapsed.as_secs_f64();
+            let content = self.spinner.content_tokens();
+            let reasoning = self.spinner.reasoning_tokens();
+            let input = self.spinner.input_tokens();
+            let total = content + reasoning;
+            let tps = if secs > 0.0 && total > 0 {
+                (total as f64 / secs).round() as u64
+            } else {
+                0
+            };
+            let tps_seg = if tps > 0 {
+                format!(" · {}tok/s", tps)
+            } else {
+                String::new()
+            };
+            tracing::info!(
+                target: "openslate_runtime",
+                "{:.1}s · {}{}",
+                secs,
+                token_segment(&input, content, reasoning),
+                tps_seg
+            );
+        }
+    }
+
     fn on_tool_start(&mut self, name: &str, args: &str) {
-        self.spinner.println(&format!("  -> {}({})", name, args));
+        self.emit_line(&format!("  -> {}({})", name, args));
     }
 
     fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool) {
         let suffix = if truncated { " ..." } else { "" };
-        self.spinner
-            .println(&format!("  <- {} [{} bytes]{}", name, bytes, suffix));
+        self.emit_line(&format!("  <- {} [{} bytes]{}", name, bytes, suffix));
     }
 }
 

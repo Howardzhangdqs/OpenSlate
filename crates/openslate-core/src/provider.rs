@@ -79,6 +79,12 @@ pub trait ProgressCallback: Send {
     fn on_tool_start(&mut self, name: &str, args: &str);
     /// Called after a tool execution completes.
     fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool);
+
+    /// Called once a step is fully done — after the LLM response AND any tool
+    /// calls it requested have executed. Default no-op. Used to emit a per-step
+    /// stats line *below* the tool `-> .../<- ...` lines (rather than between
+    /// the response and the tool calls, which is where on_request_end fires).
+    fn on_step_end(&mut self) {}
 }
 
 #[cfg(test)]

@@ -72,7 +72,14 @@ fn write_result(
     duration_ms: u64,
     content_tokens: u64,
     reasoning_tokens: u64,
+    tps: u64,
+    input_tokens: Option<u32>,
+    llm_elapsed_secs: f64,
 ) -> Result<()> {
+    // LLM outputs (especially right after a reasoning/thinking block) often
+    // carry leading blank lines; trim them so the answer isn't pushed down by
+    // empty rows between the thinking and the reply.
+    let content = content.trim();
     match format {
         OutputFormat::Text => {
             if let Some(path) = output_path {
@@ -100,6 +107,34 @@ fn write_result(
         }
     }
 
+    // Final-step stats line, printed AFTER the assistant content and BEFORE
+    // "Run done" (so: content → stats → Run done). Tool-call steps already got
+    // their stats via on_step_end inside the runtime loop (after `-> / <-`).
+    if !quiet {
+        let in_seg = input_tokens
+            .map(|i| format!("↑{} ", i))
+            .unwrap_or_default();
+        let out_seg = match (content_tokens, reasoning_tokens) {
+            (0, 0) => "↓0".to_string(),
+            (c, 0) => format!("↓{}", c),
+            (0, r) => format!("↓r{}", r),
+            (c, r) => format!("↓{}r{}", c, r),
+        };
+        let tps_seg = if tps > 0 {
+            format!(" · {}tok/s", tps)
+        } else {
+            String::new()
+        };
+        tracing::info!(
+            target: "openslate_runtime",
+            "{:.1}s · {}{}{}",
+            llm_elapsed_secs,
+            in_seg,
+            out_seg,
+            tps_seg
+        );
+    }
+
     if !quiet {
         let dur_str = if duration_ms >= 1000 {
             format!("{:.1}s", duration_ms as f64 / 1000.0)
@@ -117,13 +152,19 @@ fn write_result(
             (0, r) => format!("↓r{}", r),
             (c, r) => format!("↓{}r{}", c, r),
         };
+        let tps_seg = if tps > 0 {
+            format!(" · {}tok/s", tps)
+        } else {
+            String::new()
+        };
         tracing::info!(
-            "Run done · {} · {} step · {} · ↑{} {}",
+            "Run done · {} · {} step · {} · ↑{} {}{}",
             short_id,
             result.total_steps,
             dur_str,
             result.total_input_tokens,
             token_seg,
+            tps_seg,
         );
     }
 
@@ -242,10 +283,14 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     }
 
     // 6. Execute via RunManager
-    let (result, run_elapsed_ms, content_tokens, reasoning_tokens) = {
+    let (result, run_elapsed_ms, content_tokens, reasoning_tokens, tps, input_tokens, llm_elapsed) = {
         // Spinner provides real-time progress via streaming callbacks.
         // In quiet mode, the spinner is hidden.
-        let mut callback = SpinnerCallback::new(&model_alias, params.quiet);
+        // `run` mode always hides the spinner animation line (`⠙ main`) — it's
+        // noise for a one-shot command. Streaming reasoning/tool lines still
+        // print above; the per-request "Step N" log + final "Run done" carry
+        // status. (params.quiet still governs the Run done line + result only.)
+        let mut callback = SpinnerCallback::new(&model_alias, true);
         let exec_start = Instant::now();
         let run_result = match ctx
             .manager
@@ -262,13 +307,21 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         // the callback (used for the "Run done" log line).
         let content_tokens = callback.content_tokens();
         let reasoning_tokens = callback.reasoning_tokens();
+        let tps = callback.tps();
+        let input_tokens = callback.input_tokens();
+        let llm_elapsed = callback.elapsed();
         let elapsed = exec_start.elapsed();
-        callback.finish();
+        // Skip the per-run `✓ model ...` spinner summary — its tok/s folds into
+        // the "Run done" line below, so we avoid a redundant stats row.
+        callback.finish_silent();
         (
             run_result,
             elapsed.as_millis() as u64,
             content_tokens,
             reasoning_tokens,
+            tps,
+            input_tokens,
+            llm_elapsed,
         )
     };
 
@@ -286,6 +339,9 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         run_elapsed_ms,
         content_tokens,
         reasoning_tokens,
+        tps,
+        input_tokens,
+        llm_elapsed.as_secs_f64(),
     )?;
 
     // 9. Export trace to file if requested

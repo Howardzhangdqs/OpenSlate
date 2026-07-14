@@ -141,6 +141,24 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     let config_path = resolve_config_file(config_flag)?;
     tracing::debug!("Using config: {}", config_path.display());
 
+    // 1.5. Auto-load .env from the config file's directory. Does NOT override
+    //      already-set env vars (so explicit shell exports win). Lets users keep
+    //      provider API keys out of the committed config without exporting them
+    //      in every shell. Missing/malformed .env is a soft warning, not fatal.
+    if let Some(dir) = config_path.parent() {
+        let env_path = dir.join(".env");
+        if env_path.is_file() {
+            match dotenvy::from_path(&env_path) {
+                Ok(()) => tracing::debug!("Loaded .env from {}", env_path.display()),
+                Err(e) => tracing::warn!(
+                    "Failed to load .env at {}: {}",
+                    env_path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
     let agents_path = resolve_agents_dir(&config_path);
     tracing::debug!("Using agents: {}", agents_path.display());
 

@@ -95,18 +95,13 @@ enum Commands {
 
 // ── Tracing format ────────────────────────────────────────────────────────
 
-use tracing_subscriber::fmt::time::FormatTime;
-
-/// Custom log formatter: `TIMESTAMP LEVEL target: message` with ANSI colors.
-struct SimpleFormatter {
-    timer: tracing_subscriber::fmt::time::SystemTime,
-}
+/// Custom log formatter: `TIME LEVEL target: message` with ANSI colors. Only
+/// the time-of-day (local, millis precision) is shown — no date, no tz suffix.
+struct SimpleFormatter;
 
 impl Default for SimpleFormatter {
     fn default() -> Self {
-        Self {
-            timer: tracing_subscriber::fmt::time::SystemTime,
-        }
+        Self
     }
 }
 
@@ -149,9 +144,9 @@ where
         let level = meta.level();
         let lc = level_color(level);
 
-        // Timestamp (dim gray)
+        // Timestamp: local time-of-day with millis precision (dim). No date/tz.
         write!(writer, "{}", DIM)?;
-        self.timer.format_time(&mut writer)?;
+        write!(writer, "{}", chrono::Local::now().format("%H:%M:%S%.3f"))?;
         write!(writer, "{} ", RESET)?;
 
         // Level (colored)

@@ -25,6 +25,11 @@ serde_yml = { workspace = true }
 dirs = { workspace = true }
 rustyline = "18"
 indicatif = { workspace = true }
+# Local-time formatting for the tracing timestamp.
+chrono = { workspace = true }
+# Auto-load .env from the openslate.toml directory (KEY=VALUE; does not override
+# existing env vars, so shell exports take precedence).
+dotenvy = "0.15"
 # Markdown → ANSI rendering for model output on stdout. No Ratatui dependency;
 # coexists with indicatif (spinner) and rustyline (REPL input).
 termimad = "0.35"

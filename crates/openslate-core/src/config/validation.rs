@@ -461,7 +461,6 @@ mod tests {
     fn valid_config() -> OpenSlateConfig {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -743,7 +742,6 @@ max_output_bytes = 65536
     fn no_limits_section_is_valid() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -771,7 +769,6 @@ model = "m2"
     fn provider_base_url_invalid() {
         let toml = r#"
 [providers.bad]
-kind = "openai_compatible"
 base_url = "not-a-url"
 api_key_env = "KEY"
 
@@ -797,7 +794,6 @@ model = "m2"
     fn provider_base_url_ftp_rejected() {
         let toml = r#"
 [providers.ftp]
-kind = "openai_compatible"
 base_url = "ftp://example.com"
 api_key_env = "KEY"
 
@@ -825,7 +821,6 @@ model = "m2"
     fn provider_api_key_env_empty() {
         let toml = r#"
 [providers.empty]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = ""
 
@@ -853,7 +848,6 @@ model = "m2"
     fn model_model_field_empty() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -953,7 +947,6 @@ model = ""
     fn database_path_empty_string_rejected() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -995,7 +988,6 @@ path = ""
         config.providers.insert(
             "orphan".into(),
             crate::config::ProviderConfig {
-                kind: "openai_compatible".into(),
                 base_url: "https://orphan.example.com".into(),
                 api_key_env: "ORPHAN_KEY".into(),
                 adapter: None,
@@ -1112,7 +1104,6 @@ path = ""
     fn mcp_stdio_server_parses() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -1149,7 +1140,6 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
     fn mcp_http_server_disabled_parses() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -1188,7 +1178,6 @@ url = "http://localhost:8000/mcp"
     fn mcp_stdio_with_env_parses() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -1223,7 +1212,6 @@ GIT_AUTHOR_NAME = "openslate"
     fn mcp_stdio_empty_command_rejected() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -1253,7 +1241,6 @@ command = ""
     fn mcp_http_invalid_url_rejected() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -1283,7 +1270,6 @@ url = "not-a-url"
     fn mcp_unknown_transport_rejected_by_serde() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 

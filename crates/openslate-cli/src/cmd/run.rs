@@ -10,7 +10,6 @@ use std::time::Instant;
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::provider::ModelProvider;
-use openslate_model_openai::client::{OpenAICompatibleProvider, OpenAIProviderConfig};
 
 use crate::input::{expand_at_files, read_stdin_if_pipe, WorkspaceRoot};
 use crate::spinner::SpinnerCallback;
@@ -70,8 +69,7 @@ fn write_result(
     output_path: Option<&str>,
     quiet: bool,
     duration_ms: u64,
-    content_tokens: u64,
-    reasoning_tokens: u64,
+    step_output: u64,
     tps: u64,
     input_tokens: Option<u32>,
     llm_elapsed_secs: f64,
@@ -114,12 +112,6 @@ fn write_result(
         let in_seg = input_tokens
             .map(|i| format!("↑{} ", i))
             .unwrap_or_default();
-        let out_seg = match (content_tokens, reasoning_tokens) {
-            (0, 0) => "↓0".to_string(),
-            (c, 0) => format!("↓{}", c),
-            (0, r) => format!("↓r{}", r),
-            (c, r) => format!("↓{}r{}", c, r),
-        };
         let tps_seg = if tps > 0 {
             format!(" · {}tok/s", tps)
         } else {
@@ -127,10 +119,10 @@ fn write_result(
         };
         tracing::info!(
             target: "openslate_runtime",
-            "{:.1}s · {}{}{}",
+            "{:.1}s · {}↓{}{}",
             llm_elapsed_secs,
             in_seg,
-            out_seg,
+            step_output,
             tps_seg
         );
     }
@@ -141,29 +133,30 @@ fn write_result(
         } else {
             format!("{}ms", duration_ms)
         };
-        // Short id (git-style) keeps the log compact; the full id stays in the
-        // exported trace and the store. Token split matches the spinner: `↓{content}`
-        // plus `r{reasoning}` when the model produced reasoning.
         let run_id_str = result.run_id.to_string();
         let short_id = run_id_str.get(..8).unwrap_or(&run_id_str);
-        let token_seg = match (content_tokens, reasoning_tokens) {
-            (0, 0) => "↓0".to_string(),
-            (c, 0) => format!("↓{}", c),
-            (0, r) => format!("↓r{}", r),
-            (c, r) => format!("↓{}r{}", c, r),
+        // "Run done" reflects the WHOLE run: total_output_tokens is the
+        // accumulated completion_tokens across all steps (accurate, includes
+        // reasoning + content + tool_call). Throughput is over the full run
+        // wall-clock.
+        let total_output = result.total_output_tokens;
+        let run_tps = if duration_ms > 0 {
+            (total_output as f64 * 1000.0 / duration_ms as f64).round() as u64
+        } else {
+            0
         };
-        let tps_seg = if tps > 0 {
-            format!(" · {}tok/s", tps)
+        let tps_seg = if run_tps > 0 {
+            format!(" · {}tok/s", run_tps)
         } else {
             String::new()
         };
         tracing::info!(
-            "Run done · {} · {} step · {} · ↑{} {}{}",
+            "Run done · {} · {} step · {} · ↑{} ↓{}{}",
             short_id,
             result.total_steps,
             dur_str,
             result.total_input_tokens,
-            token_seg,
+            total_output,
             tps_seg,
         );
     }
@@ -283,7 +276,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     }
 
     // 6. Execute via RunManager
-    let (result, run_elapsed_ms, content_tokens, reasoning_tokens, tps, input_tokens, llm_elapsed) = {
+    let (result, run_elapsed_ms, step_output, tps, input_tokens, llm_elapsed) = {
         // Spinner provides real-time progress via streaming callbacks.
         // In quiet mode, the spinner is hidden.
         // `run` mode always hides the spinner animation line (`⠙ main`) — it's
@@ -305,8 +298,10 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         };
         // Capture the streamed content/reasoning split before finish() consumes
         // the callback (used for the "Run done" log line).
-        let content_tokens = callback.content_tokens();
-        let reasoning_tokens = callback.reasoning_tokens();
+        // step_output is the provider's accurate output_tokens for the final
+        // step (includes reasoning + content + tool_call). Used for the
+        // final-step stats line.
+        let step_output = callback.real_output().unwrap_or(0) as u64;
         let tps = callback.tps();
         let input_tokens = callback.input_tokens();
         let llm_elapsed = callback.elapsed();
@@ -317,8 +312,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         (
             run_result,
             elapsed.as_millis() as u64,
-            content_tokens,
-            reasoning_tokens,
+            step_output,
             tps,
             input_tokens,
             llm_elapsed,
@@ -337,8 +331,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         params.output.as_deref(),
         params.quiet,
         run_elapsed_ms,
-        content_tokens,
-        reasoning_tokens,
+        step_output,
         tps,
         input_tokens,
         llm_elapsed.as_secs_f64(),
@@ -366,10 +359,13 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
 
 /// Build a provider for a specific model alias.
 ///
-/// Dispatches on `ProviderConfig.kind`:
-/// - `"openai_compatible"` → the hand-rolled OpenAI Chat Completions client.
-/// - `"genai"` → the genai-backed multi-provider adapter (requires the `genai`
-///   cargo feature).
+/// All providers are routed through the genai adapter — the sole provider
+/// implementation. `ProviderConfig.kind` is retained as an informational hint
+/// (e.g. `"openai_compatible"`, `"genai"`) but no longer selects an
+/// implementation. The genai `adapter` protocol (openai/anthropic/gemini/ollama)
+/// is taken from `ProviderConfig.adapter`, defaulting to `"openai"` when unset
+/// (the common case for OpenAI-compatible endpoints) to avoid genai's silent
+/// Ollama fallthrough for unrecognized model names.
 pub(crate) fn build_provider_for_model(
     config: &openslate_core::config::OpenSlateConfig,
     model_alias: &str,
@@ -379,21 +375,6 @@ pub(crate) fn build_provider_for_model(
             format!("Failed to resolve model alias '{}'", model_alias)
         })?;
 
-    match resolved.provider.kind.as_str() {
-        "openai_compatible" => build_openai_provider(&resolved),
-        "genai" => build_genai_provider(&resolved),
-        other => anyhow::bail!(
-            "unknown provider kind '{}' for provider '{}'; expected 'openai_compatible' or 'genai'",
-            other,
-            resolved.provider_name
-        ),
-    }
-}
-
-/// Construct the OpenAI-compatible provider (always available, no extra deps).
-fn build_openai_provider(
-    resolved: &openslate_core::model_config::ResolvedModel,
-) -> Result<Box<dyn ModelProvider>> {
     let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
         format!(
             "API key not found: set environment variable '{}'",
@@ -401,34 +382,21 @@ fn build_openai_provider(
         )
     })?;
 
-    let provider_config = OpenAIProviderConfig {
-        provider_name: resolved.provider_name.clone(),
-        base_url: resolved.provider.base_url.clone(),
-        api_key,
-        timeout_secs: 60,
-    };
-
-    Ok(Box::new(OpenAICompatibleProvider::new(provider_config)))
-}
-
-/// Construct the genai-backed multi-provider adapter.
-#[cfg(feature = "genai")]
-fn build_genai_provider(
-    resolved: &openslate_core::model_config::ResolvedModel,
-) -> Result<Box<dyn ModelProvider>> {
-    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
-        format!(
-            "API key not found: set environment variable '{}'",
-            resolved.provider.api_key_env
-        )
-    })?;
+    // Default to the OpenAI adapter when unset: most OpenAI-compatible
+    // providers (zhipu, minimax, internlm, …) don't set `adapter` explicitly,
+    // and genai would otherwise infer Ollama from the model name.
+    let adapter = resolved
+        .provider
+        .adapter
+        .clone()
+        .or_else(|| Some("openai".to_owned()));
 
     let cfg = openslate_model_genai::GenaiConfig {
         provider_name: resolved.provider_name.clone(),
         model: resolved.model_id.clone(),
         api_key: Some(api_key),
         base_url: Some(resolved.provider.base_url.clone()),
-        adapter: resolved.provider.adapter.clone(),
+        adapter,
         timeout_secs: 60,
     };
 
@@ -441,19 +409,6 @@ fn build_genai_provider(
     })?;
 
     Ok(Box::new(provider))
-}
-
-/// Without the `genai` feature, a `kind = "genai"` config fails with a clear
-/// rebuild instruction instead of a confusing link error.
-#[cfg(not(feature = "genai"))]
-fn build_genai_provider(
-    resolved: &openslate_core::model_config::ResolvedModel,
-) -> Result<Box<dyn ModelProvider>> {
-    anyhow::bail!(
-        "provider '{}' uses kind = \"genai\", but this openslate build was compiled without \
-         the 'genai' feature. Rebuild with: cargo run --features openslate-cli/genai",
-        resolved.provider_name
-    );
 }
 
 async fn persist_trace_to_store(
@@ -548,7 +503,6 @@ mod tests {
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 
@@ -651,38 +605,7 @@ max_output_bytes = 65536
         }
     }
 
-    /// A `kind = "genai"` config in a build compiled WITHOUT the `genai` feature
-    /// must fail with a clear rebuild instruction (not a confusing link error).
-    #[cfg(not(feature = "genai"))]
-    #[test]
-    fn test_genai_provider_without_feature_errors_clearly() {
-        let toml = r#"
-[providers.anthropic_prod]
-kind = "genai"
-base_url = "https://api.anthropic.com"
-api_key_env = "GENAI_TEST_KEY"
-adapter = "anthropic"
-
-[models.main]
-provider = "anthropic_prod"
-model = "claude-sonnet-4-5"
-"#;
-        let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
-        match build_provider_for_model(&config, "main") {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("--features") && msg.contains("genai"),
-                    "error should tell the user how to enable the feature: {msg}"
-                );
-            }
-            Ok(_) => panic!("expected an error without the genai feature"),
-        }
-    }
-
-    /// A `kind = "genai"` config in a build compiled WITH the `genai` feature
-    /// must construct a `GenaiProvider` successfully.
-    #[cfg(feature = "genai")]
+    /// A genai-backed provider config must construct a `GenaiProvider` successfully.
     #[test]
     fn test_genai_provider_constructs_with_feature() {
         // Unique env var name to avoid races with parallel tests.
@@ -690,7 +613,6 @@ model = "claude-sonnet-4-5"
         std::env::set_var("GENAI_TEST_KEY", "sk-test");
         let toml = r#"
 [providers.anthropic_prod]
-kind = "genai"
 base_url = "https://api.anthropic.com"
 api_key_env = "GENAI_TEST_KEY"
 adapter = "anthropic"
@@ -702,32 +624,6 @@ model = "claude-sonnet-4-5"
         let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
         let provider = build_provider_for_model(&config, "main").expect("genai provider builds");
         assert_eq!(provider.provider_name(), "anthropic_prod");
-    }
-
-    /// An unknown `kind` must be rejected with a clear error.
-    #[test]
-    fn test_unknown_provider_kind_is_rejected() {
-        let toml = r#"
-[providers.weird]
-kind = "something-new"
-base_url = "https://example.com"
-api_key_env = "SOME_KEY"
-
-[models.main]
-provider = "weird"
-model = "m1"
-"#;
-        let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
-        match build_provider_for_model(&config, "main") {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("unknown provider kind") && msg.contains("something-new"),
-                    "error should name the unknown kind: {msg}"
-                );
-            }
-            Ok(_) => panic!("expected an error for an unknown provider kind"),
-        }
     }
 
     #[test]
@@ -749,7 +645,6 @@ model = "m1"
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 

@@ -289,8 +289,7 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     }
 
     // 8. Resolve the root agent to determine which model to use (informational;
-    //    the provider itself is built per run/turn via build_provider_for_model
-    //    so it can be dispatched on ProviderConfig.kind).
+    //    the provider itself is built per run/turn via build_provider_for_model).
     let root_agent = agent_tree.get_root();
     let model_alias = root_agent.model_alias.clone();
     tracing::debug!("Root agent '{}' uses model '{}'", root_agent.id, model_alias);
@@ -323,7 +322,6 @@ mod tests {
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 
@@ -411,7 +409,6 @@ max_output_bytes = 65536
         let tmp = tempfile::TempDir::new().expect("create temp dir");
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 

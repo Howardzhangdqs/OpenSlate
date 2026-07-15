@@ -54,7 +54,6 @@ impl ModelProvider for ScriptedProvider {
 fn test_config() -> openslate_core::config::OpenSlateConfig {
     let toml = r#"
 [providers.mock]
-kind = "openai_compatible"
 base_url = "http://localhost"
 api_key_env = "MOCK_KEY"
 

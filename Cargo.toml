@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/openslate-core",
     "crates/openslate-store-sqlite",
-    "crates/openslate-model-openai",
     "crates/openslate-model-genai",
     "crates/openslate-cli",
 ]

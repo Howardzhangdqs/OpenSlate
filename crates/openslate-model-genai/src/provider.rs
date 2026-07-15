@@ -96,8 +96,7 @@ impl GenaiProvider {
         // RFC 3986, joining ".../v1" + "chat/completions" REPLACES "v1" (yielding
         // ".../chat/completions" — wrong), whereas ".../v1/" appends correctly.
         // genai's own default OpenAI endpoint ends with "/". Normalize here so a
-        // base_url like "https://host/api/v1" works identically for `kind =
-        // "openai_compatible"` (string concat) and `kind = "genai"` (Url::join).
+        // base_url like "https://host/api/v1" works correctly with Url::join.
         if let Some(base_url) = config.base_url.clone() {
             builder = builder.with_service_target_resolver_fn(
                 move |mut target: ServiceTarget| -> genai::resolver::Result<ServiceTarget> {

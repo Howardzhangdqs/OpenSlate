@@ -200,7 +200,6 @@ mod tests {
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 

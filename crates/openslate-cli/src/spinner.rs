@@ -31,6 +31,16 @@ struct LiveState {
     content: u64,
     reasoning: u64,
     input: Option<u32>,
+    /// Accurate output-token count from the provider's usage report for the
+    /// current step. Covers everything the model generated (reasoning + answer
+    /// text + tool_call arguments). `content` is derived from this by
+    /// subtracting the streamed reasoning estimate, so `↓` reflects tool calls
+    /// too — which the streaming `on_delta` counter never sees.
+    real_output: Option<u32>,
+    /// Cumulative reasoning tokens across all steps in this run (NOT reset by
+    /// `set_waiting`). Used for the "Run done" total split, since the provider
+    /// does not return a per-step reasoning_tokens breakdown.
+    cumulative_reasoning: u64,
     ttft: Option<Duration>,
     /// When the current request started; elapsed is measured from here.
     start: Option<Instant>,
@@ -104,8 +114,11 @@ impl Spinner {
         s.content = 0;
         s.reasoning = 0;
         s.input = None;
+        s.real_output = None;
         s.ttft = None;
         s.start = Some(Instant::now());
+        // Note: cumulative_reasoning is intentionally NOT reset — it tracks
+        // reasoning across all steps for the "Run done" total.
     }
 
     /// Record TTFT and enter the generating phase.
@@ -122,7 +135,9 @@ impl Spinner {
     /// Add a reasoning/thinking delta (counted separately, shown as `r{N}`).
     pub fn on_reasoning(&mut self, text: &str) {
         let est = (text.len() as u64).max(1) / 4;
-        self.state.lock().expect("live state lock").reasoning += est;
+        let mut s = self.state.lock().expect("live state lock");
+        s.reasoning += est;
+        s.cumulative_reasoning += est;
     }
 
     /// Early input-token estimate so `↑N` shows during streaming, before the
@@ -132,20 +147,50 @@ impl Spinner {
     }
 
     /// Streaming estimate of content (answer) tokens generated so far.
+    ///
+    /// Kept for tests; the run path now derives content from `real_output -
+    /// reasoning` (see [`on_usage`]) so that tool-call tokens are included,
+    /// rather than reading this streaming-only counter.
+    #[allow(dead_code)]
     pub fn content_tokens(&self) -> u64 {
         self.state.lock().expect("live state lock").content
     }
 
     /// Streaming estimate of reasoning tokens generated so far.
+    ///
+    /// Kept for tests; the display no longer shows a reasoning split (the
+    /// provider does not return reasoning_tokens, so the estimate would be
+    /// misleading — see `on_usage`).
+    #[allow(dead_code)]
     pub fn reasoning_tokens(&self) -> u64 {
         self.state.lock().expect("live state lock").reasoning
+    }
+
+    /// Accurate output-token count from the provider's usage report for the
+    /// current step (includes reasoning + content + tool_call). `None` until
+    /// the provider sends usage at stream end.
+    pub fn real_output(&self) -> Option<u32> {
+        self.state.lock().expect("live state lock").real_output
+    }
+
+    /// Cumulative reasoning tokens across all steps in this run (streaming
+    /// estimate). Kept for potential future use; currently unused because the
+    /// display no longer shows a reasoning split.
+    #[allow(dead_code)]
+    pub fn cumulative_reasoning_tokens(&self) -> u64 {
+        self.state.lock().expect("live state lock").cumulative_reasoning
     }
 
     /// Output tokens/sec over the LLM's own elapsed time (start → now).
     /// Returns 0 if no tokens were generated or no start was recorded.
     pub fn tps(&self) -> u64 {
         let s = self.state.lock().expect("live state lock");
-        let total = s.content + s.reasoning;
+        // Prefer the accurate provider output count (includes tool_call);
+        // fall back to the streaming estimate if usage hasn't arrived yet.
+        let total = s
+            .real_output
+            .map(|o| o as u64)
+            .unwrap_or(s.content + s.reasoning);
         match s.start {
             Some(st) if total > 0 => {
                 let elapsed = st.elapsed().as_secs_f64();
@@ -180,7 +225,16 @@ impl Spinner {
     pub fn on_usage(&mut self, usage: Usage) {
         let mut s = self.state.lock().expect("live state lock");
         s.input = Some(usage.input_tokens);
-        if s.reasoning == 0 {
+        s.real_output = Some(usage.output_tokens);
+        // `output_tokens` (completion_tokens) covers everything the model
+        // generated this step: reasoning + answer text + tool_call arguments.
+        // Subtract the streamed reasoning estimate so `↓` (content) reflects
+        // the non-reasoning portion — which includes tool_call tokens that the
+        // streaming `on_delta` counter never sees. Without this, tool-call
+        // steps would show `↓0` even though tokens were consumed.
+        if s.reasoning > 0 {
+            s.content = (usage.output_tokens as u64).saturating_sub(s.reasoning);
+        } else {
             s.content = usage.output_tokens as u64;
         }
     }
@@ -261,8 +315,8 @@ fn render_message(s: &LiveState) -> String {
     // Only show TTFT/tokens/throughput once generating has begun.
     if let Some(t) = s.ttft {
         parts.push(format!("TTFT {:.1}s", t.as_secs_f64()));
-        parts.push(token_segment(&s.input, s.content, s.reasoning));
-        let total = s.content + s.reasoning;
+        parts.push(token_segment(&s.input, s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning)));
+        let total = s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning);
         if elapsed_secs > 0.0 && total > 0 {
             let tps = (total as f64 / elapsed_secs).round() as u64;
             if tps > 0 {
@@ -282,7 +336,7 @@ fn build_summary_line(model: &str, s: &LiveState, success: bool) -> String {
     let mark = if success { "✓" } else { "✗" };
     let elapsed = s.start.map(|st| st.elapsed()).unwrap_or_default();
     let elapsed_secs = elapsed.as_secs_f64();
-    let total = s.content + s.reasoning;
+    let total = s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning);
     let tps = if elapsed_secs > 0.0 {
         (total as f64 / elapsed_secs).round() as u64
     } else {
@@ -293,7 +347,7 @@ fn build_summary_line(model: &str, s: &LiveState, success: bool) -> String {
     if let Some(t) = s.ttft {
         parts.push(format!("TTFT {:.1}s", t.as_secs_f64()));
     }
-    parts.push(token_segment(&s.input, s.content, s.reasoning));
+    parts.push(token_segment(&s.input, s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning)));
     if tps > 0 {
         parts.push(format!("{}tok/s", tps));
     }
@@ -303,25 +357,19 @@ fn build_summary_line(model: &str, s: &LiveState, success: bool) -> String {
 /// Token segment in the user's format:
 /// `↑569 ↓514r600` (content 514, reasoning 600), `↑569 ↓r600` (reasoning only),
 /// `↑569 ↓514` (content only), or `↓0` (nothing yet).
-fn token_segment(input: &Option<u32>, content: u64, reasoning: u64) -> String {
+/// Format the token segment: `↑{input} ↓{output}` (input omitted if absent).
+///
+/// `output` is the provider's accurate `completion_tokens` (includes reasoning
+/// + content + tool_call). The reasoning/content split is NOT shown because
+/// internlm (and most OpenAI-compatible providers) do not return a
+/// `reasoning_tokens` breakdown — showing a `len()/4` estimated split would be
+/// misleading (e.g. "Hello" showing 20 content tokens).
+fn token_segment(input: &Option<u32>, output: u64) -> String {
     let mut seg = String::new();
     if let Some(in_tok) = input {
         seg.push_str(&format!("↑{} ", in_tok));
     }
-    seg.push('↓');
-    match (content, reasoning) {
-        (0, 0) => seg.push('0'),
-        (c, 0) => seg.push_str(&c.to_string()),
-        (0, r) => {
-            seg.push('r');
-            seg.push_str(&r.to_string());
-        }
-        (c, r) => {
-            seg.push_str(&c.to_string());
-            seg.push('r');
-            seg.push_str(&r.to_string());
-        }
-    }
+    seg.push_str(&format!("↓{}", output));
     seg
 }
 
@@ -377,16 +425,6 @@ impl SpinnerCallback {
         self.spinner.finish_with_error(error);
     }
 
-    /// Streaming estimate of content (answer) tokens from the last run.
-    pub fn content_tokens(&self) -> u64 {
-        self.spinner.content_tokens()
-    }
-
-    /// Streaming estimate of reasoning/thinking tokens from the last run.
-    pub fn reasoning_tokens(&self) -> u64 {
-        self.spinner.reasoning_tokens()
-    }
-
     /// Output tokens/sec over the LLM's own elapsed time (0 if none generated).
     pub fn tps(&self) -> u64 {
         self.spinner.tps()
@@ -395,6 +433,11 @@ impl SpinnerCallback {
     /// Real input-token count from the provider's usage report, if any.
     pub fn input_tokens(&self) -> Option<u32> {
         self.spinner.input_tokens()
+    }
+
+    /// Accurate output-token count for the current step (provider usage).
+    pub fn real_output(&self) -> Option<u32> {
+        self.spinner.real_output()
     }
 
     /// Elapsed since the (last) request started.
@@ -481,12 +524,13 @@ impl ProgressCallback for SpinnerCallback {
         if self.plain {
             let elapsed = self.spinner.elapsed();
             let secs = elapsed.as_secs_f64();
-            let content = self.spinner.content_tokens();
-            let reasoning = self.spinner.reasoning_tokens();
+            // Use the provider's accurate output count (includes tool_call);
+            // derive content = output - reasoning so `↓` reflects tool calls
+            // too, not just streamed answer deltas.
+            let output = self.spinner.real_output().unwrap_or(0) as u64;
             let input = self.spinner.input_tokens();
-            let total = content + reasoning;
-            let tps = if secs > 0.0 && total > 0 {
-                (total as f64 / secs).round() as u64
+            let tps = if secs > 0.0 && output > 0 {
+                (output as f64 / secs).round() as u64
             } else {
                 0
             };
@@ -499,7 +543,7 @@ impl ProgressCallback for SpinnerCallback {
                 target: "openslate_runtime",
                 "{:.1}s · {}{}",
                 secs,
-                token_segment(&input, content, reasoning),
+                token_segment(&input, output),
                 tps_seg
             );
         }
@@ -527,12 +571,10 @@ mod tests {
 
     #[test]
     fn token_segment_formats() {
-        assert_eq!(token_segment(&None, 0, 0), "↓0");
-        assert_eq!(token_segment(&None, 514, 0), "↓514");
-        assert_eq!(token_segment(&None, 0, 600), "↓r600");
-        assert_eq!(token_segment(&None, 514, 600), "↓514r600");
-        assert_eq!(token_segment(&Some(569), 514, 600), "↑569 ↓514r600");
-        assert_eq!(token_segment(&Some(569), 0, 600), "↑569 ↓r600");
+        assert_eq!(token_segment(&None, 0), "↓0");
+        assert_eq!(token_segment(&None, 514), "↓514");
+        assert_eq!(token_segment(&Some(569), 514), "↑569 ↓514");
+        assert_eq!(token_segment(&Some(569), 0), "↑569 ↓0");
     }
 
     #[test]
@@ -549,13 +591,18 @@ mod tests {
     #[test]
     fn spinner_on_usage_keeps_split_when_reasoning_present() {
         let mut spinner = Spinner::new("test", true);
-        spinner.on_reasoning("some reasoning text here"); // reasoning > 0
+        spinner.on_reasoning("some reasoning text here"); // 24 chars / 4 = 6
         spinner.on_usage(Usage {
             input_tokens: 50,
             output_tokens: 100,
         });
-        // input updated from real usage; content NOT overwritten (reasoning split kept)
-        assert_eq!(spinner.content_tokens(), 0); // no content deltas, not overridden
+        // input + real_output updated from the provider; content is derived as
+        // output - reasoning so tool_call tokens in output are reflected (not
+        // just the streamed answer deltas that on_delta counted).
+        assert_eq!(spinner.real_output(), Some(100));
+        assert_eq!(spinner.reasoning_tokens(), 6);
+        assert_eq!(spinner.cumulative_reasoning_tokens(), 6);
+        assert_eq!(spinner.content_tokens(), 94); // 100 - 6
         spinner.finish();
     }
 

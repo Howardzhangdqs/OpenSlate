@@ -222,7 +222,6 @@ mod tests {
     fn test_config() -> OpenSlateConfig {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 
@@ -428,7 +427,6 @@ max_output_bytes = 10_000
     fn test_runtime_limits_default_when_no_limits_section() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 

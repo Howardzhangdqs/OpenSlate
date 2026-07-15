@@ -179,7 +179,6 @@ max_tool_calls = 20
 timeout_ms = 60000
 
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 

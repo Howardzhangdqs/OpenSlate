@@ -299,8 +299,8 @@ impl ReplSession {
                 println!("  providers:");
                 for (name, provider) in &self.ctx.config.providers {
                     println!(
-                        "    {} — kind={}, base_url={}",
-                        name, provider.kind, provider.base_url
+                        "    {} — base_url={}",
+                        name, provider.base_url
                     );
                 }
 
@@ -644,7 +644,6 @@ mod tests {
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 
@@ -678,7 +677,6 @@ max_output_bytes = 65536
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 
@@ -711,7 +709,6 @@ max_tool_calls = 20
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "TEST_API_KEY"
 

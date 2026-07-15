@@ -89,16 +89,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "assert-json-diff"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "async-compression"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -367,15 +357,6 @@ name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
-
-[[package]]
-name = "colored"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "combine"
@@ -1277,12 +1258,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
-name = "httpdate"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
 name = "hybrid-array"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1305,7 +1280,6 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
- "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -1796,31 +1770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mockito"
-version = "1.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90820618712cab19cfc46b274c6c22546a82affcb3c3bdf0f29e3db8e1bb92c0"
-dependencies = [
- "assert-json-diff",
- "bytes",
- "colored",
- "futures-core",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "log",
- "pin-project-lite",
- "rand 0.9.4",
- "regex",
- "serde_json",
- "serde_urlencoded",
- "similar",
- "tokio",
-]
-
-[[package]]
 name = "nibble_vec"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1912,7 +1861,6 @@ dependencies = [
  "indicatif",
  "openslate-core",
  "openslate-model-genai",
- "openslate-model-openai",
  "openslate-store-sqlite",
  "rustyline",
  "serde",
@@ -1957,22 +1905,6 @@ dependencies = [
  "genai",
  "openslate-core",
  "reqwest",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "openslate-model-openai"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "mockito",
- "openslate-core",
- "reqwest",
- "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -2536,12 +2468,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2668,18 +2594,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "serde_urlencoded"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
-dependencies = [
- "form_urlencoded",
- "itoa",
- "ryu",
- "serde",
 ]
 
 [[package]]
@@ -2824,12 +2738,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "similar"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"
@@ -3297,7 +3205,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

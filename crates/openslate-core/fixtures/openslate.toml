@@ -24,12 +24,10 @@ max_context_bytes = 64000
 max_output_bytes = 32000
 
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 
 [providers.minimax]
-kind = "openai_compatible"
 base_url = "https://api.minimax.chat/v1"
 api_key_env = "MINIMAX_API_KEY"
 

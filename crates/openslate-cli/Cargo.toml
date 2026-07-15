@@ -10,10 +10,9 @@ path = "src/main.rs"
 [dependencies]
 openslate-core = { path = "../openslate-core" }
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
-openslate-model-openai = { path = "../openslate-model-openai" }
-# Optional multi-provider adapter (Anthropic, Gemini, …). Default OFF to keep
-# the binary small; enable with `--features genai`.
-openslate-model-genai = { path = "../openslate-model-genai", optional = true }
+# The genai-backed multi-provider adapter — the sole provider implementation
+# (OpenAI-compatible, Anthropic, Gemini, Ollama all routed via genai).
+openslate-model-genai = { path = "../openslate-model-genai" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -39,17 +38,11 @@ termimad = "0.35"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 [features]
-# genai + mcp on by default so the multi-provider path and MCP tooling work
-# out of the box. Disable either with `--no-default-features` (+ `--features`)
-# for a minimal binary (then `kind = "genai"` / `[mcp.*]` config fails at run
-# time with a clear rebuild hint).
-default = ["genai", "mcp"]
-# Enable the genai-backed multi-provider adapter. Without this feature, a config
-# using `kind = "genai"` fails at run time with a clear rebuild instruction.
-genai = ["dep:openslate-model-genai"]
-# Enable MCP client support in openslate-core (rmcp + reqwest + tokio/process).
-# Propagated via the feature passthrough so `--no-default-features` cleanly
-# disables it.
+# MCP client support (rmcp + reqwest + tokio/process). The genai provider is
+# always enabled (sole implementation); MCP is optional so `--no-default-features`
+# yields a minimal binary (then `[mcp.*]` config fails at run time with a clear
+# rebuild hint).
+default = ["mcp"]
 mcp = ["openslate-core/mcp"]
 
 [dev-dependencies]

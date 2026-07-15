@@ -159,7 +159,6 @@ mod tests {
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -197,7 +196,6 @@ max_output_bytes = 65536
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -221,7 +219,6 @@ model = "m2"
 
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 
@@ -328,7 +325,6 @@ model = "m2"
         // Config where all models are used
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://example.com"
 api_key_env = "KEY"
 

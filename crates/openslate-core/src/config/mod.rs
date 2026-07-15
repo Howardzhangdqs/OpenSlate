@@ -126,17 +126,12 @@ impl Default for LimitsConfig {
 /// A single LLM provider endpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
-    /// Which OpenSlate adapter crate handles this provider:
-    /// `"openai_compatible"` (hand-rolled OpenAI Chat Completions client) or
-    /// `"genai"` (genai-backed multi-provider adapter, behind the `genai` cargo
-    /// feature).
-    pub kind: String,
     pub base_url: String,
     pub api_key_env: String,
-    /// For `kind = "genai"`: the genai adapter protocol
-    /// (e.g. `"anthropic"`, `"gemini"`, `"openai"`, `"ollama"`). When omitted,
-    /// genai infers the protocol from the model name (with a warning, since
-    /// unknown prefixes fall through to Ollama). Ignored for `kind = "openai_compatible"`.
+    /// The genai adapter protocol (e.g. `"anthropic"`, `"gemini"`, `"openai"`,
+    /// `"ollama"`). When omitted, defaults to `"openai"` (the common case for
+    /// OpenAI-compatible endpoints) to avoid genai's silent Ollama fallthrough
+    /// for unrecognized model names.
     #[serde(default)]
     pub adapter: Option<String>,
 }
@@ -447,13 +442,11 @@ name = "test"
     fn parse_provider_config() {
         let toml = r#"
 [providers.zhipu]
-kind = "openai_compatible"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
 "#;
         let config = parse_openslate_toml(toml).expect("should parse");
         let zhipu = config.providers.get("zhipu").expect("provider zhipu");
-        assert_eq!(zhipu.kind, "openai_compatible");
         assert_eq!(zhipu.base_url, "https://open.bigmodel.cn/api/paas/v4");
         assert_eq!(zhipu.api_key_env, "ZHIPU_API_KEY");
     }
@@ -549,9 +542,7 @@ model = "m"
 
         assert_eq!(config.providers.len(), 2);
         let zhipu = config.providers.get("zhipu").expect("zhipu provider");
-        assert_eq!(zhipu.kind, "openai_compatible");
         let minimax = config.providers.get("minimax").expect("minimax provider");
-        assert_eq!(minimax.kind, "openai_compatible");
 
         assert_eq!(config.models.len(), 4);
         let main = config.models.get("main").expect("main model");
@@ -675,12 +666,10 @@ model = "m"
     fn parse_multiple_providers_and_models() {
         let toml = r#"
 [providers.openai]
-kind = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 
 [providers.anthropic]
-kind = "anthropic"
 base_url = "https://api.anthropic.com"
 api_key_env = "ANTHROPIC_API_KEY"
 

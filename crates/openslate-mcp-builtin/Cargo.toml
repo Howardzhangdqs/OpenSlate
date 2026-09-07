@@ -1,0 +1,19 @@
+[package]
+name = "openslate-mcp-builtin"
+version.workspace = true
+# Edition 2024: this crate is new and follows the current edition; the rest of
+# the workspace stays on 2021 until a coordinated bump.
+edition = "2024"
+
+[dependencies]
+futures = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# tokio base features come from the workspace (rt-multi-thread/macros/sync/
+# time/io-util/fs); `process` is added here for the shell server.
+tokio = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

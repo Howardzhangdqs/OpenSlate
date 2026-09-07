@@ -332,12 +332,20 @@ pub async fn execute_run(
 
                 validate_tool_arguments(&tc.arguments)?;
 
-                let output = execute_tool_safely(
-                    tool_executor,
-                    &tc.name,
-                    &tc.arguments,
-                )
-                .await;
+                let output = execute_tool_safely(tool_executor, &tc.name, &tc.arguments).await;
+
+                // Global output-size backstop: cap the tool output at
+                // `max_output_bytes` before it enters the conversation, so a
+                // runaway tool (typically an external MCP server without its
+                // own truncation) cannot flood the context. Builtin tools that
+                // already truncate (e.g. shell's 64KB cap) simply end up with
+                // the smaller of the two limits. `0` disables the cap
+                // (same convention as `max_steps`).
+                let output = if config.max_output_bytes > 0 {
+                    crate::tool::limit_tool_output(output, config.max_output_bytes as usize)
+                } else {
+                    output
+                };
 
                 let truncated = output.bytes > 80;
                 if let Some(cb) = progress.as_mut() {
@@ -1336,5 +1344,141 @@ mod tests {
         assert_eq!(result.total_steps, 2);
         assert_eq!(result.messages[2].role, MessageRole::Tool);
         assert!(result.messages[2].content.contains("async_op"));
+    }
+
+    // ── max_output_bytes enforcement tests ──
+
+    /// Executor returning a configurable, potentially huge output.
+    struct HugeOutputExecutor {
+        content: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::ToolExecutor for HugeOutputExecutor {
+        async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
+            ToolOutput {
+                bytes: self.content.len(),
+                content: self.content.clone(),
+                duration_ms: 1,
+                status: ToolOutputStatus::Success,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_output_truncated_to_max_output_bytes() {
+        let executor = HugeOutputExecutor {
+            content: "x".repeat(10_000),
+        };
+        let mut config = default_config();
+        config.max_output_bytes = 200;
+
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "big".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let result = execute_run(&provider, config, "m1", &executor, None)
+            .await
+            .expect("run should succeed");
+
+        // The Tool message that entered the conversation must carry the
+        // truncation marker and stay far below the original 10_000 bytes
+        // (limit_tool_output keeps ~max/4 chars + notice).
+        let tool_msg = &result.messages[2];
+        assert_eq!(tool_msg.role, MessageRole::Tool);
+        assert!(
+            tool_msg
+                .content
+                .contains("[TRUNCATED: original 10000 bytes")
+        );
+        assert!(
+            tool_msg.content.len() < 1_000,
+            "got {} bytes",
+            tool_msg.content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_output_under_limit_passes_through() {
+        let executor = HugeOutputExecutor {
+            content: "small".repeat(10), // 50 bytes, well under default 10_000
+        };
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "small".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let result = execute_run(&provider, default_config(), "m1", &executor, None)
+            .await
+            .expect("run should succeed");
+
+        let tool_msg = &result.messages[2];
+        assert_eq!(tool_msg.content, "small".repeat(10));
+        assert!(!tool_msg.content.contains("[TRUNCATED"));
+    }
+
+    #[tokio::test]
+    async fn test_max_output_bytes_zero_disables_cap() {
+        let executor = HugeOutputExecutor {
+            content: "y".repeat(5_000),
+        };
+        let mut config = default_config();
+        config.max_output_bytes = 0; // 0 = unlimited (same convention as max_steps)
+
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "big".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let result = execute_run(&provider, config, "m1", &executor, None)
+            .await
+            .expect("run should succeed");
+
+        let tool_msg = &result.messages[2];
+        assert_eq!(tool_msg.content.len(), 5_000);
+        assert!(!tool_msg.content.contains("[TRUNCATED"));
     }
 }

@@ -410,6 +410,61 @@ async fn integration_tool_rejects_path_traversal() {
 /// message that enters the conversation (and therefore the second LLM request,
 /// which is built from these messages) carries the truncation marker defined
 /// by `limit_tool_output` instead of the full 10 KB payload.
+#[tokio::test]
+async fn integration_tool_output_capped_by_max_output_bytes() {
+    let mut registry = ToolRegistry::new();
+    registry.register(HugeOutputTool);
+
+    let provider = ScriptedProvider::new(vec![
+        ModelResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: ToolCallId("tc-huge".into()),
+                name: "huge".into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+        },
+        ModelResponse {
+            content: Some("got it".into()),
+            tool_calls: vec![],
+            usage: None,
+            finish_reason: Some("stop".into()),
+        },
+    ]);
+
+    let manager = RunManager::new(
+        test_config_small_output_cap(),
+        test_agent_tree(vec!["huge".into()]),
+        registry,
+    );
+    let result = manager
+        .execute(&provider, "call the huge tool", None)
+        .await
+        .expect("run should succeed");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.total_steps, 2);
+
+    let tool_msg = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("tool message should be present");
+    assert!(
+        tool_msg
+            .content
+            .contains("[TRUNCATED: original 10000 bytes"),
+        "expected truncation marker, got: {}",
+        tool_msg.content
+    );
+    assert!(
+        tool_msg.content.len() < 2_000,
+        "tool message must stay far below the original 10000 bytes, got {}",
+        tool_msg.content.len()
+    );
+}
 
 /// Verify execution tree is properly built and root is marked Completed.
 #[tokio::test]

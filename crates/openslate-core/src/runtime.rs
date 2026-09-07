@@ -92,6 +92,10 @@ pub struct RunConfig {
     /// Wall-clock timeout for the entire run in milliseconds.
     /// If exceeded, the run returns `RuntimeError::Timeout`.
     pub timeout_ms: u64,
+    /// Recursion depth of this agent run (0 = root). Used only to indent
+    /// tracing logs so child-agent activity is visually nested under its
+    /// parent during recursive delegation.
+    pub depth: u32,
 }
 
 /// Result of a completed agent run.
@@ -148,6 +152,11 @@ pub async fn execute_run(
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(config.timeout_ms);
 
+    // Indent per recursion depth so child-agent logs nest under their parent,
+    // and tag every line with the agent id so it's clear who is acting.
+    let log_indent = "  ".repeat(config.depth as usize);
+    let agent_tag = config.agent_id.0.clone();
+
     loop {
         if config.max_steps > 0 && total_steps >= config.max_steps {
             return Ok(RunResult {
@@ -169,10 +178,7 @@ pub async fn execute_run(
         }
         let remaining = deadline - now;
 
-        truncate_context_if_needed(
-            &mut messages,
-            config.max_context_bytes,
-        );
+        truncate_context_if_needed(&mut messages, config.max_context_bytes);
 
         let request = GenerateRequest {
             model_id: model_id.to_owned(),
@@ -188,13 +194,21 @@ pub async fn execute_run(
         // branch did, so `openslate run` with spinner showed no per-request line).
         if config.max_steps > 0 {
             tracing::info!(
-                "Step {}/{}: requesting {}...",
+                "{}Step {}/{} [{}]: requesting {}...",
+                log_indent,
                 total_steps + 1,
                 config.max_steps,
+                agent_tag,
                 model_id
             );
         } else {
-            tracing::info!("Step {}: requesting {}...", total_steps + 1, model_id);
+            tracing::info!(
+                "{}Step {} [{}]: requesting {}...",
+                log_indent,
+                total_steps + 1,
+                agent_tag,
+                model_id
+            );
         }
 
         let response = if let Some(cb) = progress.as_mut() {
@@ -265,13 +279,14 @@ pub async fn execute_run(
 
             if let Some(usage) = &resp.usage {
                 tracing::info!(
-                    "  [{}ms · {}in/{}out]",
+                    "{}  [{}ms · {}in/{}out]",
+                    log_indent,
                     call_elapsed.as_millis(),
                     usage.input_tokens,
                     usage.output_tokens
                 );
             } else {
-                tracing::info!("  [{}ms]", call_elapsed.as_millis());
+                tracing::info!("{}  [{}ms]", log_indent, call_elapsed.as_millis());
             }
             resp
         };
@@ -293,7 +308,7 @@ pub async fn execute_run(
 
         messages.push(Message {
             role: MessageRole::Assistant,
-            content: assistant_content,
+            content: assistant_content.clone(),
             tool_call_id: None,
             name: None,
             tool_calls: if has_tool_calls {
@@ -312,7 +327,7 @@ pub async fn execute_run(
                 if let Some(cb) = progress.as_mut() {
                     cb.on_tool_start(&tc.name, args_display);
                 } else {
-                    tracing::info!("  -> {}({})", tc.name, args_display);
+                    tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                 }
 
                 validate_tool_arguments(&tc.arguments)?;
@@ -330,10 +345,15 @@ pub async fn execute_run(
                 } else {
                     let result_preview = truncate_str(&output.content, 80);
                     tracing::info!(
-                        "  <- {} [{} bytes] {}",
+                        "{}  <- {} [{} bytes] {}",
+                        log_indent,
                         tc.name,
                         output.bytes,
-                        if truncated { format!("\"{}\"...", result_preview) } else { format!("\"{}\"", result_preview) }
+                        if truncated {
+                            format!("\"{}\"...", result_preview)
+                        } else {
+                            format!("\"{}\"", result_preview)
+                        }
                     );
                 }
 
@@ -352,6 +372,13 @@ pub async fn execute_run(
         }
 
         if has_content {
+            // Non-spinner path (i.e. child agents running with progress=None):
+            // print the child's actual answer so the delegation output is
+            // visible in the log. The root agent's content is streamed live by
+            // the spinner (on_delta), so we skip duplicating it here.
+            if progress.is_none() {
+                tracing::info!("{}  ┃ [{}] {}", log_indent, agent_tag, assistant_content);
+            }
             // Note: no on_step_end here. The final step's content is printed by
             // `run` after the runtime returns, so the stats line would appear
             // BEFORE the content. Instead `run` emits it after printing content
@@ -382,12 +409,14 @@ pub async fn execute_run(
 
         consecutive_empty_turns += 1;
         if consecutive_empty_turns >= config.max_empty_turns {
-            return Err(OpenSlateError::Runtime(RuntimeError::MaxEmptyTurnsExceeded {
-                count: consecutive_empty_turns,
-                step: total_steps,
-                agent_id: config.agent_id.0.clone(),
-                model_alias: config.model_alias.clone(),
-            }));
+            return Err(OpenSlateError::Runtime(
+                RuntimeError::MaxEmptyTurnsExceeded {
+                    count: consecutive_empty_turns,
+                    step: total_steps,
+                    agent_id: config.agent_id.0.clone(),
+                    model_alias: config.model_alias.clone(),
+                },
+            ));
         }
     }
 }
@@ -561,7 +590,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelProvider for MockProvider {
-        async fn generate(&self, _request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             self.responses
                 .get(idx)
@@ -609,6 +641,7 @@ mod tests {
             max_empty_turns: DEFAULT_MAX_EMPTY_TURNS,
             tool_definitions: vec![],
             timeout_ms: 60_000,
+            depth: 0,
         }
     }
 
@@ -670,7 +703,10 @@ mod tests {
         // 1 user + 1 assistant(1st) + 1 tool + 1 assistant(2nd)
         assert_eq!(result.messages.len(), 4);
         assert_eq!(result.messages[2].role, MessageRole::Tool);
-        assert_eq!(result.messages[2].tool_call_id, Some(ToolCallId("tc-1".into())));
+        assert_eq!(
+            result.messages[2].tool_call_id,
+            Some(ToolCallId("tc-1".into()))
+        );
         assert_eq!(result.messages[3].role, MessageRole::Assistant);
         assert_eq!(result.messages[3].content, "Here are the files.");
     }
@@ -721,12 +757,22 @@ mod tests {
             }
         }
 
-        let result = execute_run(&ErrorProvider, default_config(), "m1", &MockToolExecutor, None).await;
+        let result = execute_run(
+            &ErrorProvider,
+            default_config(),
+            "m1",
+            &MockToolExecutor,
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, OpenSlateError::Provider(ProviderError::ServerError(503))),
+            matches!(
+                err,
+                OpenSlateError::Provider(ProviderError::ServerError(503))
+            ),
             "expected ProviderError::ServerError(503), got {err:?}"
         );
     }
@@ -914,8 +960,8 @@ mod tests {
             }
         }
 
-        let output = execute_tool_safely(&PanickingExecutor, "test_tool", &serde_json::json!({}))
-            .await;
+        let output =
+            execute_tool_safely(&PanickingExecutor, "test_tool", &serde_json::json!({})).await;
         assert_eq!(output.status, ToolOutputStatus::Error);
         assert!(output.content.contains("test_tool"));
         assert!(output.content.contains("panicked"));
@@ -1282,10 +1328,9 @@ mod tests {
             },
         ]);
 
-        let result =
-            execute_run(&provider, default_config(), "m1", &AsyncSleepExecutor, None)
-                .await
-                .expect("run should succeed");
+        let result = execute_run(&provider, default_config(), "m1", &AsyncSleepExecutor, None)
+            .await
+            .expect("run should succeed");
 
         assert_eq!(result.status, RunStatus::Completed);
         assert_eq!(result.total_steps, 2);

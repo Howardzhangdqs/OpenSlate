@@ -8,10 +8,11 @@ use std::sync::Arc;
 use crate::agent_tree::AgentTree;
 use crate::config::OpenSlateConfig;
 use crate::error::OpenSlateError;
-use crate::execution::{ExecutionStatus, ExecutionTree};
+use crate::execution::ExecutionTree;
 use crate::model_config::resolve_model;
 use crate::provider::{ModelProvider, ProgressCallback};
-use crate::runtime::{RunConfig, RuntimeLimits, execute_run};
+use crate::runner::AgentRunner;
+use crate::runtime::RuntimeLimits;
 use crate::tool::ToolRegistry;
 use crate::trace::TraceCollector;
 use crate::types::*;
@@ -89,52 +90,35 @@ impl RunManager {
             )]),
         );
 
-        let mut execution_tree =
-            ExecutionTree::new(run_id.clone(), root_agent.id.clone());
+        // The runner is the ToolExecutor seam: it intercepts `call_agent`
+        // calls and (recursively, in later phases) runs child agents, while
+        // delegating ordinary tools to the registry. Keeping `execute_run`
+        // unmodified lets the single-agent loop stay generic.
+        let runner = AgentRunner::new(
+            provider,
+            &self.agent_tree,
+            &self.tool_registry,
+            &self.config,
+            self.limits.clone(),
+            run_id.clone(),
+        );
 
-        let resolved_model = resolve_model(&self.config, &root_agent.model_alias)?;
-
-        let run_config = RunConfig {
-            run_id: run_id.clone(),
-            agent_id: root_agent.id.clone(),
-            model_alias: root_agent.model_alias.clone(),
-            system_prompt: Some(root_agent.default_prompt.clone()),
-            initial_messages: prior_messages.to_vec(),
-            max_steps: self.limits.max_steps,
-            max_context_bytes: self.limits.max_context_bytes,
-            max_output_bytes: self.limits.max_output_bytes,
-            max_empty_turns: self.limits.max_empty_turns,
-            tool_definitions: if root_agent.tools.is_empty() {
-                // No `tools:` whitelist in the agent frontmatter → expose every
-                // registered tool (builtins + all MCP tools). Listing tools
-                // explicitly still acts as a whitelist.
-                self.tool_registry.definitions()
-            } else {
-                self.tool_registry.definitions_for(&root_agent.tools)
-            },
-            timeout_ms: self.limits.timeout_ms,
-        };
-
-        // ToolRegistry implements ToolExecutor — pass it directly to the
-        // async runtime loop.  No nested runtime / thread spawning needed.
-        let result =
-            execute_run(provider, run_config, &resolved_model.model_id, self.tool_registry.as_ref(), progress)
-                .await?;
+        let result = runner.run_root(prior_messages.to_vec(), progress).await?;
 
         trace.end_span(agent_span);
         trace.end_span(run_span);
 
-        let root_en_id = execution_tree.root().id.clone();
-        execution_tree.update_status(&root_en_id, ExecutionStatus::Completed);
+        let resolved_model = resolve_model(&self.config, &root_agent.model_alias)?;
 
         Ok(ManagedRunResult {
             run_id,
             status: result.status,
             messages: result.messages,
             total_steps: result.total_steps,
-            total_input_tokens: result.total_input_tokens,
-            total_output_tokens: result.total_output_tokens,
-            execution_tree,
+            // Tokens accumulated across all layers by the runner.
+            total_input_tokens: runner.total_input_tokens(),
+            total_output_tokens: runner.total_output_tokens(),
+            execution_tree: runner.execution_tree(),
             model: resolved_model.model_id,
             trace,
         })
@@ -157,23 +141,28 @@ impl RunManager {
             name: None,
             tool_calls: None,
         }];
-        self.execute_with_history(provider, &messages, progress).await
+        self.execute_with_history(provider, &messages, progress)
+            .await
     }
 }
 
 impl RuntimeLimits {
     /// Build `RuntimeLimits` from an `OpenSlateConfig`.
     pub fn from_config(config: &OpenSlateConfig) -> Self {
-        config.limits.as_ref().map(|l| Self {
-            max_steps: l.max_steps,
-            max_depth: l.max_depth,
-            max_tool_calls: l.max_tool_calls,
-            max_child_agent_calls: l.max_child_agent_calls,
-            timeout_ms: l.timeout_ms,
-            max_context_bytes: l.max_context_bytes,
-            max_output_bytes: l.max_output_bytes,
-            max_empty_turns: crate::runtime::DEFAULT_MAX_EMPTY_TURNS,
-        }).unwrap_or_default()
+        config
+            .limits
+            .as_ref()
+            .map(|l| Self {
+                max_steps: l.max_steps,
+                max_depth: l.max_depth,
+                max_tool_calls: l.max_tool_calls,
+                max_child_agent_calls: l.max_child_agent_calls,
+                timeout_ms: l.timeout_ms,
+                max_context_bytes: l.max_context_bytes,
+                max_output_bytes: l.max_output_bytes,
+                max_empty_turns: crate::runtime::DEFAULT_MAX_EMPTY_TURNS,
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -181,6 +170,7 @@ impl RuntimeLimits {
 mod tests {
     use super::*;
     use crate::error::ProviderError;
+    use crate::execution::ExecutionStatus;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // -- Mock provider --
@@ -264,9 +254,11 @@ max_output_bytes = 10_000
             finish_reason: Some("stop".into()),
         }]);
 
-        let manager =
-            RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
-        let result = manager.execute(&provider, "hello", None).await.expect("run should succeed");
+        let manager = RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
+        let result = manager
+            .execute(&provider, "hello", None)
+            .await
+            .expect("run should succeed");
 
         assert_eq!(result.status, RunStatus::Completed);
         assert_eq!(result.total_steps, 1);
@@ -341,10 +333,11 @@ max_output_bytes = 10_000
             },
         ]);
 
-        let manager =
-            RunManager::new(test_config(), test_agent_tree(), registry);
-        let result =
-            manager.execute(&provider, "echo hello world", None).await.expect("run should succeed");
+        let manager = RunManager::new(test_config(), test_agent_tree(), registry);
+        let result = manager
+            .execute(&provider, "echo hello world", None)
+            .await
+            .expect("run should succeed");
 
         assert_eq!(result.status, RunStatus::Completed);
         assert_eq!(result.total_steps, 2);
@@ -365,10 +358,11 @@ max_output_bytes = 10_000
             finish_reason: Some("stop".into()),
         }]);
 
-        let manager =
-            RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
-        let result =
-            manager.execute(&provider, "test", None).await.expect("run should succeed");
+        let manager = RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
+        let result = manager
+            .execute(&provider, "test", None)
+            .await
+            .expect("run should succeed");
 
         // Execution tree should have a root node for the root agent
         let root = result.execution_tree.root();
@@ -404,9 +398,11 @@ max_output_bytes = 10_000
             },
         ]);
 
-        let manager =
-            RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
-        let result = manager.execute(&provider, "test", None).await.expect("run should succeed");
+        let manager = RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
+        let result = manager
+            .execute(&provider, "test", None)
+            .await
+            .expect("run should succeed");
 
         assert_eq!(result.total_input_tokens, 500);
         assert_eq!(result.total_output_tokens, 150);
@@ -434,8 +430,7 @@ api_key_env = "KEY"
 provider = "zhipu"
 model = "m"
 "#;
-        let config =
-            crate::config::parse_openslate_toml(toml).expect("should parse");
+        let config = crate::config::parse_openslate_toml(toml).expect("should parse");
         let limits = RuntimeLimits::from_config(&config);
         let default = RuntimeLimits::default();
         assert_eq!(limits.max_steps, default.max_steps);

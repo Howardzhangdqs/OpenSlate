@@ -106,6 +106,18 @@ impl ExecutionTree {
             node.status = status;
         }
     }
+
+    /// Number of execution nodes in the tree (root + all descendants created
+    /// during the run).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// All execution nodes (root + descendants), in unspecified order. Used
+    /// for persisting the full delegation tree.
+    pub fn all_nodes(&self) -> Vec<&ExecutionNode> {
+        self.nodes.values().collect()
+    }
 }
 
 #[cfg(test)]
@@ -129,12 +141,8 @@ mod tests {
     fn test_child_depth_one() {
         let mut tree = ExecutionTree::new(make_run_id(), AgentId("root".into()));
         let root_id = tree.root_id().clone();
-        let child_id = tree.create_child(
-            make_run_id(),
-            AgentId("researcher".into()),
-            root_id,
-            None,
-        );
+        let child_id =
+            tree.create_child(make_run_id(), AgentId("researcher".into()), root_id, None);
         assert_eq!(tree.depth(&child_id), Some(1));
     }
 
@@ -142,12 +150,8 @@ mod tests {
     fn test_grandchild_depth_two() {
         let mut tree = ExecutionTree::new(make_run_id(), AgentId("root".into()));
         let root_id = tree.root_id().clone();
-        let child_id = tree.create_child(
-            make_run_id(),
-            AgentId("researcher".into()),
-            root_id,
-            None,
-        );
+        let child_id =
+            tree.create_child(make_run_id(), AgentId("researcher".into()), root_id, None);
         let grandchild_id = tree.create_child(
             make_run_id(),
             AgentId("verifier".into()),
@@ -169,14 +173,12 @@ mod tests {
             root_id.clone(),
             None,
         );
-        let exec2 = tree.create_child(
-            make_run_id(),
-            AgentId("researcher".into()),
-            root_id,
-            None,
-        );
+        let exec2 = tree.create_child(make_run_id(), AgentId("researcher".into()), root_id, None);
         assert_ne!(exec1, exec2, "two executions must have different ids");
-        assert_eq!(tree.get(&exec1).unwrap().agent_id, tree.get(&exec2).unwrap().agent_id);
+        assert_eq!(
+            tree.get(&exec1).unwrap().agent_id,
+            tree.get(&exec2).unwrap().agent_id
+        );
     }
 
     #[test]

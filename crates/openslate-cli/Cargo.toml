@@ -37,13 +37,5 @@ termimad = "0.35"
 # (rustls) philosophy.
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
-[features]
-# MCP client support (rmcp + reqwest + tokio/process). The genai provider is
-# always enabled (sole implementation); MCP is optional so `--no-default-features`
-# yields a minimal binary (then `[mcp.*]` config fails at run time with a clear
-# rebuild hint).
-default = ["mcp"]
-mcp = ["openslate-core/mcp"]
-
 [dev-dependencies]
 tempfile = { workspace = true }

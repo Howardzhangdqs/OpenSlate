@@ -438,6 +438,34 @@ async fn persist_trace_to_store(
         0,
     ).await.map_err(|e| anyhow::anyhow!("Failed to insert run: {}", e))?;
 
+    // Persist every execution node (root + delegated children) so the full
+    // delegation tree is queryable later. `parent_execution_id` links each
+    // child back to the node that spawned it.
+    for node in result.execution_tree.all_nodes() {
+        let node_status = match node.status {
+            openslate_core::execution::ExecutionStatus::Running => "running",
+            openslate_core::execution::ExecutionStatus::Completed => "completed",
+            openslate_core::execution::ExecutionStatus::Failed => "failed",
+        };
+        let parent_exec = node
+            .parent_execution_id
+            .as_ref()
+            .map(|id| id.to_string());
+        store
+            .insert_execution_node(
+                &node.id.to_string(),
+                &node.run_id.to_string(),
+                &node.agent_id.to_string(),
+                parent_exec.as_deref(),
+                node.parent_call_id.as_deref(),
+                node_status,
+                "{}",
+                0,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to insert execution node: {}", e))?;
+    }
+
     let mut idx: usize = 0;
 
     for event in result.trace.events() {
@@ -527,7 +555,7 @@ max_output_bytes = 65536
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
         let agents_dir = openslate_dir.join("agents");
         fs::create_dir(&agents_dir).expect("create agents dir");
-        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n";
         fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
     }

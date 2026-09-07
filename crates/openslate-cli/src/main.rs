@@ -95,8 +95,10 @@ enum Commands {
 
 // ── Tracing format ────────────────────────────────────────────────────────
 
-/// Custom log formatter: `TIME LEVEL target: message` with ANSI colors. Only
-/// the time-of-day (local, millis precision) is shown — no date, no tz suffix.
+/// Custom log formatter: `TIME message` (minimal). Only the time-of-day
+/// (local, seconds precision) is shown — no date, no tz, no level word, no
+/// target. ERROR/WARN tint the timestamp red/yellow so problems stand out
+/// without adding per-line noise.
 struct SimpleFormatter;
 
 impl Default for SimpleFormatter {
@@ -109,26 +111,6 @@ impl Default for SimpleFormatter {
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-fn level_color(level: &tracing::Level) -> &'static str {
-    match level {
-        &tracing::Level::ERROR => "\x1b[31m", // red
-        &tracing::Level::WARN => "\x1b[33m",  // yellow
-        &tracing::Level::INFO => "\x1b[32m",  // green
-        &tracing::Level::DEBUG => "\x1b[36m", // cyan
-        &tracing::Level::TRACE => "\x1b[35m", // magenta
-    }
-}
-
-fn target_color(target: &str) -> &'static str {
-    if target.contains("runtime") {
-        "\x1b[36m" // cyan for runtime step logs
-    } else if target.contains("cmd") {
-        "\x1b[35m" // magenta for command logs
-    } else {
-        "\x1b[90m" // bright-black (gray) for others
-    }
-}
-
 impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for SimpleFormatter
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -140,21 +122,23 @@ where
         mut writer: tracing_subscriber::fmt::format::Writer<'_>,
         record: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        let meta = record.metadata();
-        let level = meta.level();
-        let lc = level_color(level);
-
-        // Timestamp: local time-of-day with millis precision (dim). No date/tz.
-        write!(writer, "{}", DIM)?;
-        write!(writer, "{}", chrono::Local::now().format("%H:%M:%S%.3f"))?;
-        write!(writer, "{} ", RESET)?;
-
-        // Level (colored)
-        write!(writer, "{}{}{} ", lc, level, RESET)?;
-
-        // Target (colored by category)
-        let tc = target_color(meta.target());
-        write!(writer, "{}{}{}: ", tc, meta.target(), RESET)?;
+        // Minimal format: `{HH:MM:SS} message` — no level word, no target.
+        // The agent id and recursion depth already live in the message text,
+        // and almost every line is INFO, so the level/target prefix only
+        // added noise. ERROR/WARN tint the timestamp red/yellow so problems
+        // still stand out.
+        let ts_color = match record.metadata().level() {
+            &tracing::Level::ERROR => "\x1b[31m",
+            &tracing::Level::WARN => "\x1b[33m",
+            _ => DIM,
+        };
+        write!(
+            writer,
+            "{}{}{} ",
+            ts_color,
+            chrono::Local::now().format("%H:%M:%S"),
+            RESET
+        )?;
 
         // Message
         ctx.field_format().format_fields(writer.by_ref(), record)?;
@@ -204,9 +188,10 @@ id: root
 name: Root Agent
 model: main
 tools:
-    - current_time
     - read_file
-    - list_dir
+    - write_file
+    - edit_file
+    - shell
 ---
 You are a helpful AI assistant.
 "#;

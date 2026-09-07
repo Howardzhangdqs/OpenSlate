@@ -13,7 +13,6 @@ pub mod run_manager;
 pub mod runtime;
 pub mod runner;
 pub mod tool;
-#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod trace;
 pub mod types;

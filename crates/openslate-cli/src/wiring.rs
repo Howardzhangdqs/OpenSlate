@@ -16,7 +16,7 @@ use openslate_core::config::validation::validate_config;
 use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
 use openslate_core::paths::{resolve_paths, OpenSlatePaths};
 use openslate_core::run_manager::RunManager;
-use openslate_core::tool::builtin_registry;
+use openslate_core::tool::ToolRegistry;
 use openslate_store_sqlite::store::SqliteStore;
 
 /// Fully assembled application context ready for running agents.
@@ -27,11 +27,11 @@ pub struct AppContext {
     pub store: Option<SqliteStore>,
     pub agent_tree: AgentTree,
     pub manager: RunManager,
-    /// Live MCP server connections. Declared after `manager` so that on drop,
-    /// the registry (and its `McpTool`s holding `ServerSink` clones) is dropped
-    /// *before* the connections themselves are cancelled — avoiding any window
-    /// where a tool could outlive its transport.
-    #[cfg(feature = "mcp")]
+    /// Live MCP server connections (builtin in-process servers first, then
+    /// external ones). Declared after `manager` so that on drop, the registry
+    /// (and its `McpTool`s holding `ServerSink` clones) is dropped *before*
+    /// the connections themselves are cancelled — avoiding any window where a
+    /// tool could outlive its transport.
     pub mcp_connections: openslate_core::mcp::McpConnectionGuard,
     /// Resolved config file path (for diagnostics).
     pub config_path: std::path::PathBuf,
@@ -196,17 +196,46 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     let agent_tree = AgentTree::from_configs(&agents.agents)
         .map_err(|e| anyhow::anyhow!("Failed to build agent tree: {}", e))?;
 
-    // 7. Build tool registry
-    #[allow(unused_mut)] // `mut` is only exercised when the `mcp` feature is on.
-    let mut registry = builtin_registry();
+    // 7. Build tool registry.
+    let mut registry = ToolRegistry::new();
 
-    // 7.5 Connect MCP servers and register their tools (feature-gated).
+    // 7.2 Builtin tool servers: in-process MCP (fs / shell / edit), started
+    //     without any config; `[builtin_tools]` toggles gate individual tools.
+    //     Tools register under bare names; a collision (only possible with an
+    //     external MCP server claiming a builtin name) is a hard error —
+    //     unlike external servers, a builtin failing to start is a bug, not an
+    //     environment problem, so it aborts startup.
+    let mut mcp_connections = openslate_core::mcp::McpConnectionGuard::new();
+    {
+        let (builtin_tools, builtin_services) =
+            openslate_core::mcp::connect_builtin_servers(&cwd, &config.builtin_tools).await?;
+        let mut names = Vec::with_capacity(builtin_tools.len());
+        for tool in builtin_tools {
+            names.push(tool.exposed_name().to_owned());
+            if let Err(e) = registry.try_register(tool) {
+                anyhow::bail!(
+                    "builtin tool name conflict: '{}' already registered (an external MCP \
+                     server may claim a builtin tool name)",
+                    e.0
+                );
+            }
+        }
+        if !names.is_empty() {
+            tracing::info!(
+                target: "openslate_mcp",
+                "builtin tools registered: [{}]",
+                names.join(", ")
+            );
+        }
+        for service in builtin_services {
+            mcp_connections.push(service);
+        }
+    }
+
+    // 7.5 Connect external MCP servers and register their tools.
     //     Static config errors were already caught by validate_config; here we
     //     handle runtime failures (spawn/handshake/list) with warn+skip so one
     //     bad server cannot abort startup. Name collisions are a hard error.
-    #[cfg(feature = "mcp")]
-    let mut mcp_connections = openslate_core::mcp::McpConnectionGuard::new();
-    #[cfg(feature = "mcp")]
     if let Some(mcp) = &config.mcp {
         use tokio::sync::mpsc;
 
@@ -303,7 +332,6 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         store,
         agent_tree,
         manager,
-        #[cfg(feature = "mcp")]
         mcp_connections,
         config_path,
         agents_path,
@@ -345,7 +373,7 @@ max_output_bytes = 65536
 "#;
         let agents_dir = openslate_dir.join("agents");
         fs::create_dir(&agents_dir).expect("create agents dir");
-        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n";
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
         fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp

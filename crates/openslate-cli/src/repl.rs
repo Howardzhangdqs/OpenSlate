@@ -664,7 +664,7 @@ max_output_bytes = 65536
 "#;
         let agents_dir = openslate_dir.join("agents");
         fs::create_dir(&agents_dir).expect("create agents dir");
-        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n";
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
         fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
@@ -731,7 +731,7 @@ max_tool_calls = 20
 "#;
         let agents_dir = openslate_dir.join("agents");
         fs::create_dir(&agents_dir).expect("create agents dir");
-        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - current_time\n---\nYou are the root agent.\n";
+        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n";
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
         fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
         tmp
@@ -746,7 +746,7 @@ max_tool_calls = 20
         let manager = openslate_core::run_manager::RunManager::new(
             config.clone(),
             agent_tree.clone(),
-            openslate_core::tool::builtin_registry(),
+            openslate_core::tool::ToolRegistry::new(),
         );
 
         let ctx = wiring::AppContext {
@@ -757,7 +757,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
@@ -773,7 +772,7 @@ max_tool_calls = 20
         let manager = openslate_core::run_manager::RunManager::new(
             config.clone(),
             agent_tree.clone(),
-            openslate_core::tool::builtin_registry(),
+            openslate_core::tool::ToolRegistry::new(),
         );
 
         let ctx = wiring::AppContext {
@@ -784,7 +783,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
@@ -800,7 +798,7 @@ max_tool_calls = 20
         let manager = openslate_core::run_manager::RunManager::new(
             config.clone(),
             agent_tree.clone(),
-            openslate_core::tool::builtin_registry(),
+            openslate_core::tool::ToolRegistry::new(),
         );
 
         let ctx = wiring::AppContext {
@@ -811,7 +809,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
@@ -828,7 +825,7 @@ max_tool_calls = 20
         let manager = openslate_core::run_manager::RunManager::new(
             config.clone(),
             agent_tree.clone(),
-            openslate_core::tool::builtin_registry(),
+            openslate_core::tool::ToolRegistry::new(),
         );
         (config, agents, agent_tree, manager)
     }
@@ -844,7 +841,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
@@ -861,7 +857,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
         ReplSession::new(ctx, profile.into(), false).unwrap()
@@ -878,7 +873,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
@@ -1451,7 +1445,7 @@ max_tool_calls = 20
         let manager = openslate_core::run_manager::RunManager::new(
             config.clone(),
             agent_tree.clone(),
-            openslate_core::tool::builtin_registry(),
+            openslate_core::tool::ToolRegistry::new(),
         );
 
         let ctx = wiring::AppContext {
@@ -1462,7 +1456,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 
@@ -1486,7 +1479,7 @@ max_tool_calls = 20
         let manager = openslate_core::run_manager::RunManager::new(
             config.clone(),
             agent_tree.clone(),
-            openslate_core::tool::builtin_registry(),
+            openslate_core::tool::ToolRegistry::new(),
         );
 
         let ctx = wiring::AppContext {
@@ -1497,7 +1490,6 @@ max_tool_calls = 20
             manager,
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
-            #[cfg(feature = "mcp")]
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
 

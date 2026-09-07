@@ -17,6 +17,7 @@
 //! | `providers` | `Map<String, ProviderConfig>` | yes | LLM provider endpoints |
 //! | `models`    | `Map<String, ModelConfig>`    | yes | Named model aliases (`main`, `fast` required) |
 //! | `trace`     | `TraceConfig`       | no       | Observability settings             |
+//! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -63,6 +64,10 @@ pub struct OpenSlateConfig {
     /// MCP (Model Context Protocol) client servers.
     #[serde(default)]
     pub mcp: Option<McpConfig>,
+    /// In-process builtin tool servers (`read_file` / `write_file` / `shell` /
+    /// `edit_file`). Everything defaults to enabled.
+    #[serde(default)]
+    pub builtin_tools: BuiltinToolsConfig,
 }
 
 /// Project metadata.
@@ -223,6 +228,39 @@ pub enum TransportConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentsConfig {
     pub agents: Vec<AgentConfig>,
+}
+
+/// Toggles for the in-process builtin MCP tool servers.
+///
+/// `enabled` is the master switch; the per-tool flags gate individual tools
+/// (the server owning a disabled tool is still started if any of its siblings
+/// is enabled — e.g. `read_file` off, `write_file` on keeps the fs server up).
+/// All flags default to `true`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuiltinToolsConfig {
+    /// Master switch: `false` disables every builtin tool server.
+    pub enabled: bool,
+    /// Expose `read_file` (workspace-sandboxed file reading).
+    pub read_file: bool,
+    /// Expose `write_file` (workspace-sandboxed file writing).
+    pub write_file: bool,
+    /// Expose `shell` (run a command in the workspace root).
+    pub shell: bool,
+    /// Expose `edit_file` (context-patch editing of existing files).
+    pub edit_file: bool,
+}
+
+impl Default for BuiltinToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            read_file: true,
+            write_file: true,
+            shell: true,
+            edit_file: true,
+        }
+    }
 }
 
 // ── Default helpers ──────────────────────────────────────────────────────────
@@ -403,6 +441,16 @@ mod tests {
         assert_eq!(trace.default_export_format, "chrome-json");
     }
 
+    #[test]
+    fn default_builtin_tools_config_all_enabled() {
+        let bt = BuiltinToolsConfig::default();
+        assert!(bt.enabled);
+        assert!(bt.read_file);
+        assert!(bt.write_file);
+        assert!(bt.shell);
+        assert!(bt.edit_file);
+    }
+
     // ── TOML parsing tests ───────────────────────────────────────────────
 
     #[test]
@@ -516,6 +564,71 @@ model = "m"
         assert_eq!(trace.default_export_format, "chrome-json");
     }
 
+    #[test]
+    fn parse_builtin_tools_defaults_when_section_absent() {
+        let config = parse_openslate_toml("").expect("empty toml should parse");
+        assert!(config.builtin_tools.enabled);
+        assert!(config.builtin_tools.read_file);
+        assert!(config.builtin_tools.write_file);
+        assert!(config.builtin_tools.shell);
+        assert!(config.builtin_tools.edit_file);
+    }
+
+    #[test]
+    fn parse_builtin_tools_partial_override() {
+        let toml = r#"
+[builtin_tools]
+shell = false
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let bt = &config.builtin_tools;
+        assert!(bt.enabled, "unspecified flags keep their defaults");
+        assert!(bt.read_file);
+        assert!(bt.write_file);
+        assert!(!bt.shell);
+        assert!(bt.edit_file);
+    }
+
+    #[test]
+    fn parse_builtin_tools_disabled_entirely() {
+        let toml = r#"
+[builtin_tools]
+enabled = false
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(!config.builtin_tools.enabled);
+    }
+
+    #[test]
+    fn parse_builtin_tools_unknown_field_rejected() {
+        let toml = r#"
+[builtin_tools]
+teleport = true
+"#;
+        assert!(parse_openslate_toml(toml).is_err());
+    }
+
+    #[test]
+    fn parse_builtin_tools_rejects_legacy_tool_flags() {
+        // Migration foot-gun: the old builtin tools (current_time, list_dir)
+        // no longer exist. deny_unknown_fields must reject their flags with a
+        // clear "unknown field" error instead of silently ignoring them.
+        let toml = r#"
+[builtin_tools]
+current_time = false
+"#;
+        let err = parse_openslate_toml(toml).expect_err("legacy flag must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("current_time"),
+            "error should name the offending field, got: {msg}"
+        );
+    }
+
     // ── Full example TOML ────────────────────────────────────────────────
 
     #[test]
@@ -620,7 +733,13 @@ model = "m"
         assert_eq!(root.children.len(), 2);
         assert_eq!(root.children[0].0, "researcher");
         assert_eq!(root.children[1].0, "writer");
-        assert_eq!(root.tools.len(), 3);
+        // Assert the names, not just the count: these are the matching keys
+        // for the [builtin_tools] warning rule and the runtime per-tool
+        // filter, so a silent rename must not pass.
+        assert_eq!(
+            root.tools,
+            vec!["read_file", "write_file", "edit_file", "shell"]
+        );
 
         let researcher = config
             .agents
@@ -628,8 +747,10 @@ model = "m"
             .find(|a| a.id.0 == "researcher")
             .expect("researcher agent");
         assert_eq!(researcher.model, "fast");
-        assert_eq!(researcher.children.len(), 1);
+        assert_eq!(researcher.children.len(), 3);
         assert_eq!(researcher.children[0].0, "verifier");
+        assert_eq!(researcher.children[1].0, "deep-analyst");
+        assert_eq!(researcher.children[2].0, "visual-inspector");
 
         let verifier = config
             .agents

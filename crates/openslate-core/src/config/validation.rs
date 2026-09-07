@@ -295,6 +295,8 @@ pub fn validate_strict(
         }
     }
 
+    warnings.extend(disabled_builtin_tool_warnings(config, agents));
+
     (errors, warnings)
 }
 
@@ -366,10 +368,50 @@ pub fn validate_config_full(
         }
     }
 
+    // ── Warning: agent whitelists reference disabled builtin tools ───────
+    warnings.extend(disabled_builtin_tool_warnings(config, agents));
+
     ValidationResult { errors, warnings }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Warnings for agents whose `tools` whitelist references a builtin tool that
+/// `[builtin_tools]` disables. Not an error — whitelists may legitimately
+/// reference external MCP tools unknown at validation time — but the agent
+/// silently loses a capability it was configured to use, which is worth a
+/// warning. Only exact name references are checked (globs like `*` are skipped
+/// because they also match external tools).
+fn disabled_builtin_tool_warnings(
+    config: &OpenSlateConfig,
+    agents: &AgentsConfig,
+) -> Vec<ValidationError> {
+    let bt = &config.builtin_tools;
+    // (tool name, still available?) — unavailable when the master switch is
+    // off or the specific tool flag is off.
+    let availability: [(&str, bool); 4] = [
+        ("read_file", bt.enabled && bt.read_file),
+        ("write_file", bt.enabled && bt.write_file),
+        ("shell", bt.enabled && bt.shell),
+        ("edit_file", bt.enabled && bt.edit_file),
+    ];
+
+    let mut warnings = Vec::new();
+    for agent in &agents.agents {
+        for (name, available) in availability {
+            if !available && agent.tools.iter().any(|t| t == name) {
+                warnings.push(ValidationError {
+                    field: format!("agents.{}.tools", agent.id),
+                    message: format!(
+                        "Agent '{}' whitelists builtin tool '{}' but it is disabled in [builtin_tools]",
+                        agent.id, name
+                    ),
+                });
+            }
+        }
+    }
+    warnings
+}
 
 /// Check if a string is a valid HTTP(S) URL.
 fn is_valid_url(s: &str) -> bool {
@@ -1286,5 +1328,121 @@ transport = "carrier-pigeon"
 "#;
         // Unknown transport variant → serde parse error (fail fast at load time).
         assert!(parse_openslate_toml(toml).is_err());
+    }
+
+    // ── Warning: agents referencing disabled builtin tools ──────────────
+
+    #[test]
+    fn warns_when_agent_whitelists_disabled_builtin_tool() {
+        let mut config = valid_config();
+        config.builtin_tools.read_file = false;
+        let result = validate_config_full(&config, &valid_agents());
+        assert!(
+            result.is_valid(),
+            "disabled builtins are a warning, not an error"
+        );
+        // root whitelists read_file (disabled); worker whitelists write_file (still on).
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.field == "agents.root.tools" && w.message.contains("'read_file'")),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.field == "agents.worker.tools" && w.message.contains("builtin")),
+            "worker's write_file is still enabled: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn warns_when_builtins_fully_disabled_and_referenced() {
+        let mut config = valid_config();
+        config.builtin_tools.enabled = false;
+        let (errors, warnings) = validate_strict(&config, &valid_agents());
+        assert!(errors.is_empty(), "{errors:?}");
+        // Both root (read_file) and worker (write_file) reference disabled builtins.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "agents.root.tools" && w.message.contains("[builtin_tools]")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "agents.worker.tools" && w.message.contains("[builtin_tools]")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn no_builtin_tool_warnings_when_all_enabled() {
+        let result = validate_config_full(&valid_config(), &valid_agents());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("[builtin_tools]")),
+            "everything enabled → no builtin warnings: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn glob_tool_patterns_never_trigger_builtin_warnings() {
+        // A glob like "read_*" also matches external MCP tools, so it must not
+        // warn even when the builtin read_file is disabled. Guards the exact
+        // `t == name` comparison — a glob-aware match would make `--strict`
+        // exit 1 on legitimate configs.
+        let agents = single_agent("root", "Root", "main", vec!["read_*"], vec![], "prompt long enough");
+        let mut config = valid_config();
+        config.builtin_tools.read_file = false;
+
+        let result = validate_config_full(&config, &agents);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("[builtin_tools]")),
+            "glob patterns must not warn: {:?}",
+            result.warnings
+        );
+        let (_errors, warnings) = validate_strict(&config, &agents);
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.message.contains("[builtin_tools]")),
+            "glob patterns must not warn (strict): {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn master_switch_off_warns_even_with_tool_flag_on() {
+        // Contradictory combo: enabled=false but read_file=true. The master
+        // switch wins, so a whitelisted read_file is still unavailable and
+        // must warn — locks the `bt.enabled && bt.flag` conjunction.
+        let agents = single_agent("root", "Root", "main", vec!["read_file"], vec![], "prompt long enough");
+        let mut config = valid_config();
+        config.builtin_tools.enabled = false;
+        config.builtin_tools.read_file = true;
+
+        let result = validate_config_full(&config, &agents);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.field == "agents.root.tools"
+                    && w.message.contains("'read_file'")
+                    && w.message.contains("[builtin_tools]")),
+            "master switch off must warn regardless of per-tool flag: {:?}",
+            result.warnings
+        );
     }
 }

@@ -12,10 +12,12 @@ use async_trait::async_trait;
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::config::parse_openslate_toml;
+use openslate_core::config::BuiltinToolsConfig;
 use openslate_core::error::ProviderError;
+use openslate_core::mcp::connect_builtin_servers;
 use openslate_core::provider::{GenerateRequest, ModelProvider};
 use openslate_core::run_manager::RunManager;
-use openslate_core::tool::{builtin_registry_with_workspace, ToolRegistry};
+use openslate_core::tool::ToolRegistry;
 use openslate_core::types::*;
 
 // ─── Mock Provider ───────────────────────────────────────────────────────
@@ -82,6 +84,78 @@ fn test_agent_tree(tools: Vec<String>) -> AgentTree {
     AgentTree::from_configs(&agents).expect("agent tree should build")
 }
 
+/// Like [`test_config`] but with a tiny `max_output_bytes` so the global
+/// output cap kicks in on any reasonably sized tool output.
+fn test_config_small_output_cap() -> openslate_core::config::OpenSlateConfig {
+    let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "mock-model"
+
+[limits]
+max_steps = 10
+max_depth = 4
+max_context_bytes = 100_000
+max_output_bytes = 200
+"#;
+    parse_openslate_toml(toml).expect("test config should parse")
+}
+
+/// Test tool whose output (10 KB) far exceeds the configured cap.
+struct HugeOutputTool;
+
+#[async_trait]
+impl openslate_core::tool::Tool for HugeOutputTool {
+    fn name(&self) -> &str {
+        "huge"
+    }
+    fn description(&self) -> &str {
+        "Returns a huge string"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _args: &serde_json::Value,
+    ) -> Result<ToolOutput, openslate_core::error::ToolError> {
+        let content = "z".repeat(10_000);
+        let bytes = content.len();
+        Ok(ToolOutput {
+            content,
+            bytes,
+            duration_ms: 0,
+            status: ToolOutputStatus::Success,
+        })
+    }
+}
+
+/// Build a `ToolRegistry` from the in-process builtin MCP servers rooted at
+/// `root` (all builtin tools enabled). This is the production wiring in
+/// miniature — the returned connections must outlive the registry, so hold
+/// the second tuple element until the run finishes.
+async fn builtin_mcp_registry(
+    root: &std::path::Path,
+) -> (
+    ToolRegistry,
+    Vec<rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo>>,
+) {
+    let (tools, services) = connect_builtin_servers(root, &BuiltinToolsConfig::default())
+        .await
+        .expect("builtin servers should connect");
+    let mut registry = ToolRegistry::new();
+    for tool in tools {
+        registry
+            .try_register(tool)
+            .expect("builtin tool names never conflict");
+    }
+    (registry, services)
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────
 
 /// Simple single-turn: user says hello, model responds, run completes.
@@ -117,7 +191,7 @@ async fn integration_simple_single_turn() {
 #[tokio::test]
 async fn integration_run_with_real_tool() {
     let workspace = tempfile::TempDir::new().unwrap();
-    let registry = builtin_registry_with_workspace(workspace.path().to_path_buf());
+    let (registry, _mcp_services) = builtin_mcp_registry(workspace.path()).await;
 
     let provider = ScriptedProvider::new(vec![
         // Step 1: model calls write_file
@@ -154,7 +228,6 @@ async fn integration_run_with_real_tool() {
         test_agent_tree(vec![
             "write_file".into(),
             "read_file".into(),
-            "list_dir".into(),
         ]),
         registry,
     );
@@ -180,7 +253,7 @@ async fn integration_run_with_read_file_tool() {
     let workspace = tempfile::TempDir::new().unwrap();
     std::fs::write(workspace.path().join("data.txt"), "secret data").unwrap();
 
-    let registry = builtin_registry_with_workspace(workspace.path().to_path_buf());
+    let (registry, _mcp_services) = builtin_mcp_registry(workspace.path()).await;
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
@@ -218,11 +291,11 @@ async fn integration_run_with_read_file_tool() {
 }
 
 /// Verify that workspace confinement (C2) is enforced through the tool registry:
-/// a model requesting to read /etc/passwd should get an error, not the file contents.
+/// a model requesting to read /etc/hostname should get an error, not the file contents.
 #[tokio::test]
 async fn integration_tool_rejects_path_outside_workspace() {
     let workspace = tempfile::TempDir::new().unwrap();
-    let registry = builtin_registry_with_workspace(workspace.path().to_path_buf());
+    let (registry, _mcp_services) = builtin_mcp_registry(workspace.path()).await;
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
@@ -254,11 +327,14 @@ async fn integration_tool_rejects_path_outside_workspace() {
         .expect("run should succeed");
 
     assert_eq!(result.status, RunStatus::Completed);
-    // The tool output should contain an error, not the hostname
+    // The tool message must carry the fs server's sandbox rejection text —
+    // asserted on the stable message, not a broad "Error" disjunction, so a
+    // regression that swaps the is_error-with-content path for an adapter Err
+    // (or vice versa) cannot pass by accident.
     let tool_output = &result.messages[2].content;
     assert!(
-        tool_output.contains("Error") || tool_output.contains("outside workspace"),
-        "expected security error in tool output, got: {tool_output}"
+        tool_output.contains("outside workspace"),
+        "expected sandbox rejection text, got: {tool_output}"
     );
 }
 
@@ -266,7 +342,20 @@ async fn integration_tool_rejects_path_outside_workspace() {
 #[tokio::test]
 async fn integration_tool_rejects_path_traversal() {
     let workspace = tempfile::TempDir::new().unwrap();
-    let registry = builtin_registry_with_workspace(workspace.path().to_path_buf());
+    let (registry, _mcp_services) = builtin_mcp_registry(workspace.path()).await;
+
+    // Unique outside-workspace target derived from the workspace's own random
+    // temp name, so a leftover file from a previous run can never make the
+    // non-creation assertion flaky.
+    let unique = format!(
+        "evil-{}.txt",
+        workspace.path().file_name().unwrap().to_string_lossy()
+    );
+    let outside_target = workspace.path().parent().unwrap().join(&unique);
+    assert!(
+        !outside_target.exists(),
+        "precondition: target must not pre-exist"
+    );
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
@@ -275,7 +364,7 @@ async fn integration_tool_rejects_path_traversal() {
                 id: ToolCallId("tc-trav".into()),
                 name: "write_file".into(),
                 arguments: serde_json::json!({
-                    "path": "../../../tmp/evil.txt",
+                    "path": format!("../{unique}"),
                     "content": "pwned"
                 }),
             }],
@@ -301,15 +390,26 @@ async fn integration_tool_rejects_path_traversal() {
         .expect("run should succeed");
 
     assert_eq!(result.status, RunStatus::Completed);
+    // Stable rejection text from the fs server (see the outside-workspace
+    // test above for why the assertion is exact).
     let tool_output = &result.messages[2].content;
     assert!(
-        tool_output.contains("traversal") || tool_output.contains("Error"),
+        tool_output.contains("traversal"),
         "expected path traversal error, got: {tool_output}"
     );
 
     // Ensure the file was NOT created outside workspace
-    assert!(!std::path::Path::new("/tmp/evil.txt").exists());
+    assert!(
+        !outside_target.exists(),
+        "sandbox escape: {} was created",
+        outside_target.display()
+    );
 }
+
+/// Verify `limits.max_output_bytes` caps tool output end to end: the Tool
+/// message that enters the conversation (and therefore the second LLM request,
+/// which is built from these messages) carries the truncation marker defined
+/// by `limit_tool_output` instead of the full 10 KB payload.
 
 /// Verify execution tree is properly built and root is marked Completed.
 #[tokio::test]
@@ -350,4 +450,87 @@ async fn integration_model_resolved() {
         .expect("run should succeed");
 
     assert_eq!(result.model, "mock-model");
+}
+
+// ─── Multi-agent delegation (subagent / call_agent) ──────────────────────
+
+fn two_agent_tree() -> AgentTree {
+    let agents = vec![
+        AgentConfig {
+            id: AgentId("root".into()),
+            name: "Root".into(),
+            model: "main".into(),
+            children: vec![AgentId("child".into())],
+            tools: vec![],
+            default_prompt: "You coordinate and delegate.".into(),
+        },
+        AgentConfig {
+            id: AgentId("child".into()),
+            name: "Child".into(),
+            model: "main".into(),
+            children: vec![],
+            tools: vec![],
+            default_prompt: "You perform sub-tasks.".into(),
+        },
+    ];
+    AgentTree::from_configs(&agents).expect("two-agent tree should build")
+}
+
+/// End-to-end: root agent delegates to a child agent via `call_agent`, the
+/// child runs to completion, and its answer flows back through the parent.
+/// This exercises the full RunManager -> AgentRunner -> execute_run ->
+/// interception -> recursion path through the public API.
+#[tokio::test]
+async fn integration_delegates_root_to_child() {
+    let provider = ScriptedProvider::new(vec![
+        // root step 1: delegate
+        ModelResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: ToolCallId("ca-1".into()),
+                name: "call_agent".into(),
+                arguments: serde_json::json!({"agent_id": "child", "task": "compute 2+2"}),
+            }],
+            usage: Some(Usage { input_tokens: 10, output_tokens: 5 }),
+            finish_reason: Some("tool_calls".into()),
+        },
+        // child step 1: answer
+        ModelResponse {
+            content: Some("4".into()),
+            tool_calls: vec![],
+            usage: Some(Usage { input_tokens: 20, output_tokens: 3 }),
+            finish_reason: Some("stop".into()),
+        },
+        // root step 2: final summary using the child's reply
+        ModelResponse {
+            content: Some("The answer is 4".into()),
+            tool_calls: vec![],
+            usage: Some(Usage { input_tokens: 30, output_tokens: 8 }),
+            finish_reason: Some("stop".into()),
+        },
+    ]);
+
+    let manager = RunManager::new(test_config(), two_agent_tree(), ToolRegistry::new());
+    let result = manager
+        .execute(&provider, "compute via child", None)
+        .await
+        .expect("run should succeed");
+
+    assert_eq!(result.status, RunStatus::Completed);
+    // Execution tree grew a child node at depth 1.
+    assert_eq!(result.execution_tree.node_count(), 2);
+    // The child's answer surfaced back to the root as a tool message.
+    let tool_msg = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("a call_agent tool message should be present");
+    assert!(
+        tool_msg.content.contains("4"),
+        "child answer should reach root, got: {}",
+        tool_msg.content
+    );
+    // Tokens aggregated across both layers: 10+20+30 in, 5+3+8 out.
+    assert_eq!(result.total_input_tokens, 60);
+    assert_eq!(result.total_output_tokens, 16);
 }

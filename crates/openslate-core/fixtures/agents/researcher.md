@@ -4,8 +4,9 @@ name: Researcher Agent
 model: fast
 children:
   - verifier
+  - deep-analyst
+  - visual-inspector
 tools:
-  - current_time
   - read_file
 ---
 You are a research specialist. Find and verify information.

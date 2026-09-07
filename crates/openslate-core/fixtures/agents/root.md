@@ -6,8 +6,9 @@ children:
   - researcher
   - writer
 tools:
-  - current_time
   - read_file
-  - list_dir
+  - write_file
+  - edit_file
+  - shell
 ---
 You are the root coordinator agent. Delegate tasks to your children.

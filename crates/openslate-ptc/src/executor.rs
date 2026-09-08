@@ -378,7 +378,24 @@ fn sandboxed_run(code: &str, setup: &Setup<'_>) -> PtcOutcome {
     } else if let Some(script_err) = script_err {
         outcome.error = Some(script_err);
     } else {
-        outcome.result = result.map(|r| truncate_bytes(&r, setup.limits.max_output_bytes));
+        match result {
+            Some(r) => {
+                outcome.result = Some(truncate_bytes(&r, setup.limits.max_output_bytes));
+            }
+            None => {
+                // `JSON.stringify(undefined)` leaves __result undefined: the
+                // script ran but produced no value. Report it as an actionable
+                // error so models can self-heal — a bare "[result] null"
+                // success (the old behavior) made weak models conclude the
+                // sandbox itself was broken.
+                outcome.error = Some(
+                    "script returned no value (undefined) — the async arrow function \
+                     must RETURN its result, e.g. async () => { const r = await \
+                     tools.read_file({ path: \"x\" }); return r; }"
+                        .to_string(),
+                );
+            }
+        }
     }
     if !outcome.logs.is_empty() {
         let joined = outcome.logs.join("\n");
@@ -632,6 +649,24 @@ mod tests {
                 }),
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn valueless_script_reports_actionable_error() {
+        // Script-style code with no return used to surface as a bare
+        // "[result] null" success; it must become a self-heal hint instead.
+        let outcome = run_code(
+            "async () => { const sum = await tools.add({ a: 1, b: 2 }); }",
+            &bound(&["add"]),
+            &[],
+            &PtcLimits::default(),
+            mock_bridge(),
+        )
+        .await;
+        assert_eq!(outcome.result, None);
+        let err = outcome.error.expect("valueless script must error");
+        assert!(err.contains("returned no value"));
+        assert_eq!(outcome.tool_calls, 1);
     }
 
     #[tokio::test]

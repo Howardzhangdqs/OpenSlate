@@ -31,6 +31,11 @@ Execute JavaScript to orchestrate tool calls.
 Available:
 {{types}}
 
+The sandbox is plain JavaScript with NO Node.js: no require/import, no
+fs/process/fetch - only the tools object, list_tools/describe_tool,
+console, and standard JS built-ins.
+Every tool call resolves to its tool-result text as a plain string (not
+{stdout}-style objects); use JSON.parse on it when it looks like JSON.
 Write an async arrow function. Do NOT use TypeScript syntax - no type
 annotations, interfaces, or generics. Do NOT define named functions.
 Example: async () => { const r = await tools.read_file({ path: \"x\" }); return r; }
@@ -182,10 +187,12 @@ mod tests {
         ));
         assert!(desc.contains("read_file: (input: { path: string }) => Promise<any>;"));
         assert!(desc.contains("github: {\n    /** List pull requests */"));
-        // The helpers hint is present even without demotion (discoverability):
+        // The helpers hint is present even without demotion (discoverability),
+        // followed by the sandbox contract lines:
         assert!(desc.contains(&format!(
-            "}};\n\n{HELPERS_HINT}\n\nWrite an async arrow function."
+            "}};\n\n{HELPERS_HINT}\n\nThe sandbox is plain JavaScript with NO Node.js"
         )));
+        assert!(desc.contains("use JSON.parse on it when it looks like JSON."));
         assert!(desc.ends_with("and logs are shown back to you."));
     }
 
@@ -202,7 +209,7 @@ mod tests {
         assert!(!desc.contains("declare const"));
         assert!(!desc.contains("Promise<any>"));
         assert!(desc.contains(&format!(
-            "\n\n{HELPERS_HINT}\n\nWrite an async arrow function."
+            "\n\n{HELPERS_HINT}\n\nThe sandbox is plain JavaScript"
         )));
     }
 

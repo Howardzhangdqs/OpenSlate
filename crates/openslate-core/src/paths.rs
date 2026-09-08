@@ -21,6 +21,8 @@ pub struct OpenSlatePaths {
     pub database_path: PathBuf,
     /// Path to prompts directory.
     pub prompts_dir: PathBuf,
+    /// Path to skills directory (SKILL.md discovery root).
+    pub skills_dir: PathBuf,
 }
 
 /// Get the global config directory, respecting XDG_CONFIG_HOME env var.
@@ -55,6 +57,7 @@ fn get_global_data_dir() -> PathBuf {
 /// 5. Config file: `{active_config_dir}/openslate.toml`
 /// 6. Agents dir: `{active_config_dir}/agents/`
 /// 7. Prompts dir: `{active_config_dir}/prompts/`
+/// 8. Skills dir: `{active_config_dir}/skills/`
 pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
     let local_config_dir = cwd.join(".openslate");
 
@@ -75,6 +78,7 @@ pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
     let config_file = active_config_dir.join("openslate.toml");
     let agents_dir = active_config_dir.join("agents");
     let prompts_dir = active_config_dir.join("prompts");
+    let skills_dir = active_config_dir.join("skills");
 
     let active_data_dir = global_data_dir.clone();
 
@@ -92,6 +96,7 @@ pub fn resolve_paths(cwd: &Path) -> OpenSlatePaths {
         agents_dir,
         database_path,
         prompts_dir,
+        skills_dir,
     }
 }
 
@@ -132,12 +137,19 @@ mod tests {
         assert_eq!(paths.active_config_dir, expected_global_config);
 
         // config and agents files should be in active config dir
-        assert_eq!(paths.config_file, expected_global_config.join("openslate.toml"));
+        assert_eq!(
+            paths.config_file,
+            expected_global_config.join("openslate.toml")
+        );
         assert_eq!(paths.agents_dir, expected_global_config.join("agents"));
         assert_eq!(paths.prompts_dir, expected_global_config.join("prompts"));
+        assert_eq!(paths.skills_dir, expected_global_config.join("skills"));
 
         // database should be in global data dir
-        assert_eq!(paths.database_path, expected_global_data.join("openslate.sqlite"));
+        assert_eq!(
+            paths.database_path,
+            expected_global_data.join("openslate.sqlite")
+        );
     }
 
     #[test]
@@ -160,6 +172,7 @@ mod tests {
         assert_eq!(paths.config_file, local_dir.join("openslate.toml"));
         assert_eq!(paths.agents_dir, local_dir.join("agents"));
         assert_eq!(paths.prompts_dir, local_dir.join("prompts"));
+        assert_eq!(paths.skills_dir, local_dir.join("skills"));
     }
 
     #[test]
@@ -178,7 +191,10 @@ mod tests {
             home.join(".local").join("share").join("openslate")
         };
 
-        assert_eq!(paths.database_path, expected_global_data.join("openslate.sqlite"));
+        assert_eq!(
+            paths.database_path,
+            expected_global_data.join("openslate.sqlite")
+        );
     }
 
     #[test]
@@ -195,7 +211,10 @@ mod tests {
             home.join(".local").join("share").join("openslate")
         };
 
-        assert_eq!(paths.database_path, expected_global_data.join("openslate.sqlite"));
+        assert_eq!(
+            paths.database_path,
+            expected_global_data.join("openslate.sqlite")
+        );
     }
 
     #[test]
@@ -213,10 +232,15 @@ mod tests {
         assert!(!paths.agents_dir.as_os_str().is_empty());
         assert!(!paths.database_path.as_os_str().is_empty());
         assert!(!paths.prompts_dir.as_os_str().is_empty());
+        assert!(!paths.skills_dir.as_os_str().is_empty());
 
         // Verify file paths have correct extensions
         assert_eq!(paths.config_file.extension().unwrap(), "toml");
-        assert_eq!(paths.agents_dir.components().last().unwrap(), std::path::Component::Normal("agents".as_ref()));
+        assert_eq!(
+            paths.agents_dir.components().next_back().unwrap(),
+            std::path::Component::Normal("agents".as_ref())
+        );
         assert_eq!(paths.database_path.extension().unwrap(), "sqlite");
+        assert!(paths.skills_dir.ends_with("skills"));
     }
 }

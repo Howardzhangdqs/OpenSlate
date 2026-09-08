@@ -13,6 +13,7 @@ use crate::model_config::resolve_model;
 use crate::provider::{ModelProvider, ProgressCallback};
 use crate::runner::AgentRunner;
 use crate::runtime::RuntimeLimits;
+use crate::skills::SkillsCatalog;
 use crate::tool::ToolRegistry;
 use crate::trace::TraceCollector;
 use crate::types::*;
@@ -22,6 +23,7 @@ pub struct RunManager {
     pub config: OpenSlateConfig,
     pub agent_tree: AgentTree,
     pub tool_registry: Arc<ToolRegistry>,
+    pub skills: SkillsCatalog,
     pub limits: RuntimeLimits,
 }
 
@@ -47,12 +49,14 @@ impl RunManager {
         config: OpenSlateConfig,
         agent_tree: AgentTree,
         tool_registry: ToolRegistry,
+        skills: SkillsCatalog,
     ) -> Self {
         let limits = RuntimeLimits::from_config(&config);
         Self {
             config,
             agent_tree,
             tool_registry: Arc::new(tool_registry),
+            skills,
             limits,
         }
     }
@@ -98,6 +102,7 @@ impl RunManager {
             provider,
             &self.agent_tree,
             &self.tool_registry,
+            &self.skills,
             &self.config,
             self.limits.clone(),
             run_id.clone(),
@@ -254,7 +259,12 @@ max_output_bytes = 10_000
             finish_reason: Some("stop".into()),
         }]);
 
-        let manager = RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
+        let manager = RunManager::new(
+            test_config(),
+            test_agent_tree(),
+            ToolRegistry::new(),
+            SkillsCatalog::default(),
+        );
         let result = manager
             .execute(&provider, "hello", None)
             .await
@@ -333,7 +343,12 @@ max_output_bytes = 10_000
             },
         ]);
 
-        let manager = RunManager::new(test_config(), test_agent_tree(), registry);
+        let manager = RunManager::new(
+            test_config(),
+            test_agent_tree(),
+            registry,
+            SkillsCatalog::default(),
+        );
         let result = manager
             .execute(&provider, "echo hello world", None)
             .await
@@ -358,7 +373,12 @@ max_output_bytes = 10_000
             finish_reason: Some("stop".into()),
         }]);
 
-        let manager = RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
+        let manager = RunManager::new(
+            test_config(),
+            test_agent_tree(),
+            ToolRegistry::new(),
+            SkillsCatalog::default(),
+        );
         let result = manager
             .execute(&provider, "test", None)
             .await
@@ -398,7 +418,12 @@ max_output_bytes = 10_000
             },
         ]);
 
-        let manager = RunManager::new(test_config(), test_agent_tree(), ToolRegistry::new());
+        let manager = RunManager::new(
+            test_config(),
+            test_agent_tree(),
+            ToolRegistry::new(),
+            SkillsCatalog::default(),
+        );
         let result = manager
             .execute(&provider, "test", None)
             .await

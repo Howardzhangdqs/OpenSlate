@@ -33,11 +33,15 @@ use async_trait::async_trait;
 use openslate_mcp_builtin::edit::EditServer;
 use openslate_mcp_builtin::fs::FsServer;
 use openslate_mcp_builtin::shell::ShellServer;
+use openslate_mcp_builtin::skill::SkillServer;
+// Re-exported so downstream crates (CLI wiring) can name the skill snapshot
+// type without depending on openslate-mcp-builtin directly.
+pub use openslate_mcp_builtin::SkillInfo;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientInfo, ContentBlock, Implementation,
     JsonObject, Tool as RmcpTool,
 };
-use rmcp::service::{RunningService, RoleClient, RoleServer, ServerSink, ServiceExt, ServiceError};
+use rmcp::service::{RoleClient, RoleServer, RunningService, ServerSink, ServiceError, ServiceExt};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServerHandler;
 use tokio::process::Command;
@@ -82,11 +86,7 @@ fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> String {
                 ));
             }
             ContentBlock::Audio(a) => {
-                out.push_str(&format!(
-                    "[audio: {}, {} bytes]",
-                    a.mime_type,
-                    a.data.len()
-                ));
+                out.push_str(&format!("[audio: {}, {} bytes]", a.mime_type, a.data.len()));
             }
             ContentBlock::Resource(_) => {
                 tracing::warn!(
@@ -186,23 +186,22 @@ impl Tool for McpTool {
         }
 
         // Call the remote tool with a bounded timeout.
-        let result = match tokio::time::timeout(self.call_timeout, self.client.call_tool(request))
-            .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                return Err(ToolError::ExecutionError(format!(
-                    "MCP tool '{}' call failed: {e}",
-                    self.exposed_name
-                )));
-            }
-            Err(_) => {
-                return Err(ToolError::ExecutionError(format!(
-                    "MCP tool '{}' timed out after {:?}",
-                    self.exposed_name, self.call_timeout
-                )));
-            }
-        };
+        let result =
+            match tokio::time::timeout(self.call_timeout, self.client.call_tool(request)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    return Err(ToolError::ExecutionError(format!(
+                        "MCP tool '{}' call failed: {e}",
+                        self.exposed_name
+                    )));
+                }
+                Err(_) => {
+                    return Err(ToolError::ExecutionError(format!(
+                        "MCP tool '{}' timed out after {:?}",
+                        self.exposed_name, self.call_timeout
+                    )));
+                }
+            };
 
         let content = downgrade_content_blocks(result.content);
         let bytes = content.len();
@@ -335,11 +334,7 @@ pub async fn connect_mcp_server(
     // exchange internally; the awaited result is a ready-to-use service.
     // (client_info is moved into exactly one of the two mutually-exclusive arms.)
     let service = match &config.transport {
-        TransportConfig::Stdio {
-            command,
-            args,
-            env,
-        } => {
+        TransportConfig::Stdio { command, args, env } => {
             let mut cmd = Command::new(command);
             cmd.args(args);
             if let Some(env_map) = env {
@@ -470,6 +465,21 @@ where
     Ok((tools, client))
 }
 
+/// Convert a core [`Skill`](crate::skills::Skill) into the builtin skill
+/// server's [`SkillInfo`] snapshot. Only name/description/body/dir cross the
+/// boundary — the server serves the body from memory, never re-reading the
+/// SKILL.md from disk.
+impl From<&crate::skills::Skill> for SkillInfo {
+    fn from(skill: &crate::skills::Skill) -> Self {
+        SkillInfo {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            body: skill.body.clone(),
+            dir: skill.dir.clone(),
+        }
+    }
+}
+
 /// Connect the in-process builtin tool servers and return their tools under
 /// **bare** names (no `{server}_` prefix), ready to be registered into the
 /// `ToolRegistry` by the caller.
@@ -481,6 +491,9 @@ where
 ///   with the disabled sibling filtered out of the returned tools;
 /// - `shell` / `edit_file` each get their own server when enabled.
 ///
+/// The skill server is independent of `[builtin_tools]`: it is started iff
+/// `skills` is non-empty (see the comment at the call site below).
+///
 /// The returned services must outlive the registered tools (see
 /// [`McpConnectionGuard`]). Unlike external servers, a builtin failure is a
 /// hard error: these servers are in-process, so a failure indicates a bug
@@ -488,15 +501,17 @@ where
 pub async fn connect_builtin_servers(
     root: &Path,
     cfg: &BuiltinToolsConfig,
+    skills: Vec<SkillInfo>,
 ) -> anyhow::Result<(Vec<McpTool>, Vec<RunningService<RoleClient, ClientInfo>>)> {
-    if !cfg.enabled || !(cfg.read_file || cfg.write_file || cfg.shell || cfg.edit_file) {
+    let any_tool = cfg.enabled && (cfg.read_file || cfg.write_file || cfg.shell || cfg.edit_file);
+    if !any_tool && skills.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
 
     let mut tools = Vec::new();
     let mut services = Vec::new();
 
-    if cfg.read_file || cfg.write_file {
+    if cfg.enabled && (cfg.read_file || cfg.write_file) {
         let (fs_tools, service) = connect_builtin_server(FsServer::new(root)).await?;
         tools.extend(fs_tools.into_iter().filter(|t| match t.exposed_name() {
             "read_file" => cfg.read_file,
@@ -515,14 +530,23 @@ pub async fn connect_builtin_servers(
         }));
         services.push(service);
     }
-    if cfg.shell {
+    if cfg.enabled && cfg.shell {
         let (shell_tools, service) = connect_builtin_server(ShellServer::new(root)).await?;
         tools.extend(shell_tools);
         services.push(service);
     }
-    if cfg.edit_file {
+    if cfg.enabled && cfg.edit_file {
         let (edit_tools, service) = connect_builtin_server(EditServer::new(root)).await?;
         tools.extend(edit_tools);
+        services.push(service);
+    }
+    // `read_skill` deliberately does NOT get a `[builtin_tools]` switch (the
+    // deny-by-default rule for the fs server above does not apply): its gate
+    // is the skills catalog being non-empty, which upstream wiring already
+    // drives via `[skills] enabled = false` producing an empty catalog.
+    if !skills.is_empty() {
+        let (skill_tools, service) = connect_builtin_server(SkillServer::new(skills)).await?;
+        tools.extend(skill_tools);
         services.push(service);
     }
 
@@ -592,9 +616,10 @@ mod tests {
     #[tokio::test]
     async fn builtin_servers_expose_bare_names_by_default() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (tools, services) = connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default())
-            .await
-            .expect("in-process connect should succeed");
+        let (tools, services) =
+            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default(), Vec::new())
+                .await
+                .expect("in-process connect should succeed");
         let mut got = names(&tools);
         got.sort();
         assert_eq!(got, vec!["edit_file", "read_file", "shell", "write_file"]);
@@ -608,7 +633,7 @@ mod tests {
             enabled: false,
             ..BuiltinToolsConfig::default()
         };
-        let (tools, services) = connect_builtin_servers(dir.path(), &cfg)
+        let (tools, services) = connect_builtin_servers(dir.path(), &cfg, Vec::new())
             .await
             .expect("disabled → empty, not an error");
         assert!(tools.is_empty());
@@ -625,7 +650,9 @@ mod tests {
             shell: false,
             edit_file: false,
         };
-        let (tools, services) = connect_builtin_servers(dir.path(), &cfg).await.unwrap();
+        let (tools, services) = connect_builtin_servers(dir.path(), &cfg, Vec::new())
+            .await
+            .unwrap();
         assert!(tools.is_empty());
         assert!(services.is_empty());
     }
@@ -638,7 +665,9 @@ mod tests {
             read_file: false,
             ..BuiltinToolsConfig::default()
         };
-        let (tools, services) = connect_builtin_servers(dir.path(), &cfg).await.unwrap();
+        let (tools, services) = connect_builtin_servers(dir.path(), &cfg, Vec::new())
+            .await
+            .unwrap();
         let mut got = names(&tools);
         got.sort();
         assert_eq!(got, vec!["edit_file", "shell", "write_file"]);
@@ -650,7 +679,7 @@ mod tests {
     async fn builtin_read_write_work_end_to_end() {
         let dir = tempfile::TempDir::new().unwrap();
         let (tools, _services) =
-            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default())
+            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default(), Vec::new())
                 .await
                 .unwrap();
         let write = tools
@@ -679,11 +708,135 @@ mod tests {
             write_file: false,
             ..BuiltinToolsConfig::default()
         };
-        let (tools, services) = connect_builtin_servers(dir.path(), &cfg).await.unwrap();
+        let (tools, services) = connect_builtin_servers(dir.path(), &cfg, Vec::new())
+            .await
+            .unwrap();
         let mut got = names(&tools);
         got.sort();
         assert_eq!(got, vec!["edit_file", "read_file", "shell"]);
         assert_eq!(services.len(), 3, "fs + shell + edit servers");
+    }
+
+    // ── skill server (catalog-gated, not [builtin_tools]-gated) ───────────
+
+    fn skill_info(name: &str, dir: &Path) -> SkillInfo {
+        SkillInfo {
+            name: name.to_owned(),
+            description: format!("{name} description"),
+            body: format!("{name} body"),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_server_skipped_when_catalog_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tools, services) =
+            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default(), Vec::new())
+                .await
+                .unwrap();
+        assert!(
+            !tools.iter().any(|t| t.exposed_name() == "read_skill"),
+            "empty catalog → no read_skill tool"
+        );
+        assert_eq!(services.len(), 3, "fs + shell + edit only");
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_server_started_when_catalog_non_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tools, services) = connect_builtin_servers(
+            dir.path(),
+            &BuiltinToolsConfig::default(),
+            vec![skill_info("demo", dir.path())],
+        )
+        .await
+        .unwrap();
+        assert!(
+            tools.iter().any(|t| t.exposed_name() == "read_skill"),
+            "non-empty catalog → read_skill registered under its bare name"
+        );
+        assert_eq!(services.len(), 4, "fs + shell + edit + skill servers");
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_server_ignores_builtin_tools_master_switch() {
+        // read_skill's gate is the catalog, not [builtin_tools]: with every
+        // builtin tool disabled but a non-empty catalog, the skill server
+        // still starts and exposes exactly one tool.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = BuiltinToolsConfig {
+            enabled: false,
+            ..BuiltinToolsConfig::default()
+        };
+        let (tools, services) =
+            connect_builtin_servers(dir.path(), &cfg, vec![skill_info("demo", dir.path())])
+                .await
+                .unwrap();
+        let got = names(&tools);
+        assert_eq!(got, vec!["read_skill".to_owned()]);
+        assert_eq!(services.len(), 1, "skill server only");
+    }
+
+    #[tokio::test]
+    async fn builtin_skill_from_conversion_maps_all_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_md = dir.path().join("demo").join("SKILL.md");
+        std::fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        let parsed = crate::skills::parse_skill_markdown(
+            "---\nname: demo\ndescription: d\n---\nbody text\n",
+            &skill_md,
+        )
+        .unwrap();
+        let info = SkillInfo::from(&parsed);
+        assert_eq!(info.name, "demo");
+        assert_eq!(info.description, "d");
+        assert_eq!(info.body, "body text");
+        assert_eq!(info.dir, skill_md.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn builtin_read_skill_works_end_to_end_from_fixture() {
+        // Full path: discover the checked-in fixture catalog → convert →
+        // connect → the agent-visible `read_skill` tool returns the body.
+        let fixture_dir =
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/skills"));
+        let (catalog, warnings) =
+            crate::skills::discover_skills(std::slice::from_ref(&fixture_dir));
+        assert!(warnings.is_empty(), "fixture warnings: {warnings:?}");
+        assert_eq!(catalog.skills().len(), 1, "exactly the pdf fixture");
+        let infos: Vec<SkillInfo> = catalog.skills().iter().map(SkillInfo::from).collect();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (tools, _services) =
+            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default(), infos)
+                .await
+                .unwrap();
+        let read_skill = tools
+            .iter()
+            .find(|t| t.exposed_name() == "read_skill")
+            .expect("read_skill present");
+        let out = read_skill
+            .execute(&json!({"name": "pdf-processing"}))
+            .await
+            .expect("read_skill call succeeds");
+        assert_eq!(out.status, ToolOutputStatus::Success);
+        assert!(
+            out.content.contains("<skill name=\"pdf-processing\">"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("scripts/extract.py"),
+            "body should reference the bundled script: {}",
+            out.content
+        );
+        // The resource listing includes the nested stub script.
+        assert!(
+            out.content.contains("<file>scripts/extract.py</file>"),
+            "{}",
+            out.content
+        );
     }
 
     // ── from_definition namespacing (pure constructor behavior) ──────────
@@ -705,8 +858,7 @@ mod tests {
             .find(|d| d.name.as_ref() == "read_file")
             .expect("fs server exposes read_file");
 
-        let tool =
-            McpTool::from_definition(read_def.clone(), service.peer().clone(), Some("srv"));
+        let tool = McpTool::from_definition(read_def.clone(), service.peer().clone(), Some("srv"));
         // The LLM sees the namespaced form; call_tool keeps the original name.
         assert_eq!(tool.exposed_name(), "srv_read_file");
         assert_eq!(tool.definition_name, "read_file");
@@ -740,7 +892,7 @@ mod tests {
     async fn builtin_business_failure_maps_to_error_status_not_err() {
         let dir = tempfile::TempDir::new().unwrap();
         let (tools, _services) =
-            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default())
+            connect_builtin_servers(dir.path(), &BuiltinToolsConfig::default(), Vec::new())
                 .await
                 .unwrap();
         let read = tools

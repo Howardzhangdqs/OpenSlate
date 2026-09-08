@@ -161,9 +161,7 @@ impl ReplSession {
             let readline = self.editor.readline(PROMPT);
             match readline {
                 Ok(line) => {
-                    self.editor
-                        .add_history_entry(line.as_str())
-                        .ok();
+                    self.editor.add_history_entry(line.as_str()).ok();
                     let result = self.dispatch(&line).await?;
                     if result == DispatchResult::Exit {
                         break;
@@ -298,10 +296,7 @@ impl ReplSession {
 
                 println!("  providers:");
                 for (name, provider) in &self.ctx.config.providers {
-                    println!(
-                        "    {} — base_url={}",
-                        name, provider.base_url
-                    );
+                    println!("    {} — base_url={}", name, provider.base_url);
                 }
 
                 println!("  models:");
@@ -382,8 +377,18 @@ impl ReplSession {
                 let result = openslate_core::context_manager::compact(
                     &mut self.history,
                     None,
-                    self.ctx.config.limits.as_ref().map(|l| l.max_context_messages as usize).unwrap_or(16),
-                    self.ctx.config.limits.as_ref().map(|l| l.max_context_bytes as usize).unwrap_or(64_000),
+                    self.ctx
+                        .config
+                        .limits
+                        .as_ref()
+                        .map(|l| l.max_context_messages as usize)
+                        .unwrap_or(16),
+                    self.ctx
+                        .config
+                        .limits
+                        .as_ref()
+                        .map(|l| l.max_context_bytes as usize)
+                        .unwrap_or(64_000),
                     |_text| None,
                 );
 
@@ -461,10 +466,7 @@ impl ReplSession {
         if self.verbose {
             println!(
                 "[verbose] steps={}, tokens_in={}, tokens_out={}, elapsed={:?}",
-                result.total_steps,
-                result.total_input_tokens,
-                result.total_output_tokens,
-                _elapsed
+                result.total_steps, result.total_input_tokens, result.total_output_tokens, _elapsed
             );
         }
 
@@ -697,8 +699,16 @@ max_tool_calls = 20
         fs::create_dir(&agents_dir).expect("create agents dir");
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
         fs::write(agents_dir.join("root.md"), "---\nid: root\nname: Root Agent\nmodel: main\nchildren:\n  - researcher\n  - writer\n---\nYou are the root agent.\n").expect("write root.md");
-        fs::write(agents_dir.join("researcher.md"), "---\nid: researcher\nname: Researcher\nmodel: fast\n---\nYou are a researcher.\n").expect("write researcher.md");
-        fs::write(agents_dir.join("writer.md"), "---\nid: writer\nname: Writer\nmodel: fast\n---\nYou are a writer.\n").expect("write writer.md");
+        fs::write(
+            agents_dir.join("researcher.md"),
+            "---\nid: researcher\nname: Researcher\nmodel: fast\n---\nYou are a researcher.\n",
+        )
+        .expect("write researcher.md");
+        fs::write(
+            agents_dir.join("writer.md"),
+            "---\nid: writer\nname: Writer\nmodel: fast\n---\nYou are a writer.\n",
+        )
+        .expect("write writer.md");
         tmp
     }
 
@@ -747,6 +757,7 @@ max_tool_calls = 20
             config.clone(),
             agent_tree.clone(),
             openslate_core::tool::ToolRegistry::new(),
+            openslate_core::skills::SkillsCatalog::default(),
         );
 
         let ctx = wiring::AppContext {
@@ -755,6 +766,7 @@ max_tool_calls = 20
             store: None,
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -773,6 +785,7 @@ max_tool_calls = 20
             config.clone(),
             agent_tree.clone(),
             openslate_core::tool::ToolRegistry::new(),
+            openslate_core::skills::SkillsCatalog::default(),
         );
 
         let ctx = wiring::AppContext {
@@ -781,6 +794,7 @@ max_tool_calls = 20
             store: None,
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -799,6 +813,7 @@ max_tool_calls = 20
             config.clone(),
             agent_tree.clone(),
             openslate_core::tool::ToolRegistry::new(),
+            openslate_core::skills::SkillsCatalog::default(),
         );
 
         let ctx = wiring::AppContext {
@@ -807,6 +822,7 @@ max_tool_calls = 20
             store: None,
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -817,7 +833,12 @@ max_tool_calls = 20
 
     fn make_ctx_helper(
         tmp: &tempfile::TempDir,
-    ) -> (openslate_core::config::OpenSlateConfig, openslate_core::config::AgentsConfig, openslate_core::agent_tree::AgentTree, openslate_core::run_manager::RunManager) {
+    ) -> (
+        openslate_core::config::OpenSlateConfig,
+        openslate_core::config::AgentsConfig,
+        openslate_core::agent_tree::AgentTree,
+        openslate_core::run_manager::RunManager,
+    ) {
         let config = wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
         let agents = wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
         let agent_tree =
@@ -826,6 +847,7 @@ max_tool_calls = 20
             config.clone(),
             agent_tree.clone(),
             openslate_core::tool::ToolRegistry::new(),
+            openslate_core::skills::SkillsCatalog::default(),
         );
         (config, agents, agent_tree, manager)
     }
@@ -839,6 +861,7 @@ max_tool_calls = 20
             store: None,
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -855,6 +878,7 @@ max_tool_calls = 20
             store: None,
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -871,6 +895,7 @@ max_tool_calls = 20
             store: None,
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -1137,10 +1162,7 @@ max_tool_calls = 20
 
         let result = rt.block_on(session.dispatch("/clear")).unwrap();
         assert_eq!(result, DispatchResult::Continue);
-        assert!(
-            session.history().is_empty(),
-            "/clear should clear history"
-        );
+        assert!(session.history().is_empty(), "/clear should clear history");
     }
 
     #[test]
@@ -1379,7 +1401,8 @@ max_tool_calls = 20
         block_on(session.handle_slash_command("/new")).unwrap();
         assert_eq!(session.stats().turns, 0, "/new should reset turns");
         assert_eq!(
-            session.stats().total_steps, 0,
+            session.stats().total_steps,
+            0,
             "/new should reset total_steps"
         );
     }
@@ -1446,6 +1469,7 @@ max_tool_calls = 20
             config.clone(),
             agent_tree.clone(),
             openslate_core::tool::ToolRegistry::new(),
+            openslate_core::skills::SkillsCatalog::default(),
         );
 
         let ctx = wiring::AppContext {
@@ -1454,6 +1478,7 @@ max_tool_calls = 20
             store: Some(store),
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
@@ -1480,6 +1505,7 @@ max_tool_calls = 20
             config.clone(),
             agent_tree.clone(),
             openslate_core::tool::ToolRegistry::new(),
+            openslate_core::skills::SkillsCatalog::default(),
         );
 
         let ctx = wiring::AppContext {
@@ -1488,6 +1514,7 @@ max_tool_calls = 20
             store: Some(store),
             agent_tree,
             manager,
+            skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),

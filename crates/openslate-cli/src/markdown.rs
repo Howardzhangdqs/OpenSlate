@@ -111,10 +111,7 @@ fn theme() -> &'static Theme {
 
 enum Segment {
     Prose(String),
-    Code {
-        lang: Option<String>,
-        code: String,
-    },
+    Code { lang: Option<String>, code: String },
 }
 
 /// Split markdown into alternating prose / fenced-code-block segments.

@@ -52,6 +52,8 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
+    /// List discovered agent skills (SKILL.md catalogs)
+    Skills,
     /// Run an agent
     Run {
         /// Agent ID to run (defaults to root agent)
@@ -223,31 +225,25 @@ fn run_init(dir: &Path, name: Option<&str>) -> Result<()> {
 
     // openslate.toml
     let toml_path = openslate_dir.join("openslate.toml");
-    fs::write(&toml_path, default_openslate_toml(project_name)).with_context(|| {
-        format!(
-            "Failed to write {}",
-            toml_path.display()
-        )
-    })?;
+    fs::write(&toml_path, default_openslate_toml(project_name))
+        .with_context(|| format!("Failed to write {}", toml_path.display()))?;
 
     // agents/ directory + root.md
     let agents_dir = openslate_dir.join("agents");
     fs::create_dir(&agents_dir).with_context(|| {
-        format!("Failed to create agents directory at {}", agents_dir.display())
+        format!(
+            "Failed to create agents directory at {}",
+            agents_dir.display()
+        )
     })?;
     let root_agent_path = agents_dir.join("root.md");
-    fs::write(&root_agent_path, DEFAULT_ROOT_AGENT_MD).with_context(|| {
-        format!("Failed to write {}", root_agent_path.display())
-    })?;
+    fs::write(&root_agent_path, DEFAULT_ROOT_AGENT_MD)
+        .with_context(|| format!("Failed to write {}", root_agent_path.display()))?;
 
     // prompts/default/prompt.md
     let prompt_path = prompts_dir.join("prompt.md");
-    fs::write(&prompt_path, DEFAULT_PROMPT_MD).with_context(|| {
-        format!(
-            "Failed to write {}",
-            prompt_path.display()
-        )
-    })?;
+    fs::write(&prompt_path, DEFAULT_PROMPT_MD)
+        .with_context(|| format!("Failed to write {}", prompt_path.display()))?;
 
     println!("Initialized OpenSlate project in {}", dir.display());
     Ok(())
@@ -275,9 +271,9 @@ async fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_directive));
     tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .event_format(SimpleFormatter::default())
-            .init();
+        .with_env_filter(env_filter)
+        .event_format(SimpleFormatter::default())
+        .init();
 
     match cli.command {
         Commands::Init { name } => {
@@ -289,6 +285,10 @@ async fn main() -> Result<()> {
             let agents_path =
                 cmd::validate::resolve_agents_path(config_path.parent().unwrap_or(Path::new(".")));
             cmd::validate::run_validate_command(&config_path, &agents_path, strict)?;
+        }
+        Commands::Skills => {
+            let config_path = wiring::resolve_config_file(cli.config.as_deref())?;
+            cmd::skills::run_skills_command(&config_path)?;
         }
         Commands::Run {
             agent,
@@ -389,7 +389,10 @@ mod tests {
     fn test_init_creates_prompts_dir() {
         let tmp = init_in_temp(None);
         let prompt_path = tmp.path().join(".openslate/prompts/default/prompt.md");
-        assert!(prompt_path.is_file(), "prompts/default/prompt.md should exist");
+        assert!(
+            prompt_path.is_file(),
+            "prompts/default/prompt.md should exist"
+        );
 
         let content = fs::read_to_string(&prompt_path).expect("read prompt.md");
         assert!(content.contains("helpful AI assistant"));
@@ -402,15 +405,15 @@ mod tests {
         run_init(tmp.path(), None).expect("first init should succeed");
 
         // Capture the openslate.toml content before second init
-        let toml_before = fs::read_to_string(tmp.path().join(".openslate/openslate.toml"))
-            .expect("read toml");
+        let toml_before =
+            fs::read_to_string(tmp.path().join(".openslate/openslate.toml")).expect("read toml");
 
         // Second init — should print "already initialized" but not error
         run_init(tmp.path(), None).expect("second init should not error");
 
         // Verify files were NOT overwritten
-        let toml_after = fs::read_to_string(tmp.path().join(".openslate/openslate.toml"))
-            .expect("read toml");
+        let toml_after =
+            fs::read_to_string(tmp.path().join(".openslate/openslate.toml")).expect("read toml");
         assert_eq!(toml_before, toml_after, "files should not be overwritten");
     }
 
@@ -424,7 +427,9 @@ mod tests {
     fn test_cli_parse_init_with_name() {
         let cli =
             Cli::try_parse_from(["openslate", "init", "--name", "my-app"]).expect("parse init");
-        assert!(matches!(cli.command, Commands::Init { ref name } if name.as_deref() == Some("my-app")));
+        assert!(
+            matches!(cli.command, Commands::Init { ref name } if name.as_deref() == Some("my-app"))
+        );
     }
 
     #[test]
@@ -432,16 +437,16 @@ mod tests {
         let cli =
             Cli::try_parse_from(["openslate", "run", "--prompt", "hello"]).expect("parse run");
         match cli.command {
-        Commands::Run {
-            agent: None,
-            prompt,
-            profile,
-            format,
-            output: None,
-            root_agent: None,
-            quiet: false,
-            trace: None,
-        } => {
+            Commands::Run {
+                agent: None,
+                prompt,
+                profile,
+                format,
+                output: None,
+                root_agent: None,
+                quiet: false,
+                trace: None,
+            } => {
                 assert_eq!(prompt.as_deref(), Some("hello"));
                 assert_eq!(profile, "default");
                 assert_eq!(format, "text");
@@ -501,8 +506,15 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_skills() {
+        let cli = Cli::try_parse_from(["openslate", "skills"]).expect("parse skills");
+        assert!(matches!(cli.command, Commands::Skills));
+    }
+
+    #[test]
     fn test_cli_parse_validate_strict() {
-        let cli = Cli::try_parse_from(["openslate", "validate", "--strict"]).expect("parse validate --strict");
+        let cli = Cli::try_parse_from(["openslate", "validate", "--strict"])
+            .expect("parse validate --strict");
         assert!(matches!(cli.command, Commands::Validate { strict: true }));
     }
 

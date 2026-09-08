@@ -18,9 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use openslate_core::provider::ProgressCallback;
 use openslate_core::types::Usage;
 
-const TICK_CHARS: &[&str] = &[
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⏳",
-];
+const TICK_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⏳"];
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(80);
 
@@ -178,7 +176,10 @@ impl Spinner {
     /// display no longer shows a reasoning split.
     #[allow(dead_code)]
     pub fn cumulative_reasoning_tokens(&self) -> u64 {
-        self.state.lock().expect("live state lock").cumulative_reasoning
+        self.state
+            .lock()
+            .expect("live state lock")
+            .cumulative_reasoning
     }
 
     /// Output tokens/sec over the LLM's own elapsed time (start → now).
@@ -315,8 +316,16 @@ fn render_message(s: &LiveState) -> String {
     // Only show TTFT/tokens/throughput once generating has begun.
     if let Some(t) = s.ttft {
         parts.push(format!("TTFT {:.1}s", t.as_secs_f64()));
-        parts.push(token_segment(&s.input, s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning)));
-        let total = s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning);
+        parts.push(token_segment(
+            &s.input,
+            s.real_output
+                .map(|o| o as u64)
+                .unwrap_or(s.content + s.reasoning),
+        ));
+        let total = s
+            .real_output
+            .map(|o| o as u64)
+            .unwrap_or(s.content + s.reasoning);
         if elapsed_secs > 0.0 && total > 0 {
             let tps = (total as f64 / elapsed_secs).round() as u64;
             if tps > 0 {
@@ -336,7 +345,10 @@ fn build_summary_line(model: &str, s: &LiveState, success: bool) -> String {
     let mark = if success { "✓" } else { "✗" };
     let elapsed = s.start.map(|st| st.elapsed()).unwrap_or_default();
     let elapsed_secs = elapsed.as_secs_f64();
-    let total = s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning);
+    let total = s
+        .real_output
+        .map(|o| o as u64)
+        .unwrap_or(s.content + s.reasoning);
     let tps = if elapsed_secs > 0.0 {
         (total as f64 / elapsed_secs).round() as u64
     } else {
@@ -347,7 +359,12 @@ fn build_summary_line(model: &str, s: &LiveState, success: bool) -> String {
     if let Some(t) = s.ttft {
         parts.push(format!("TTFT {:.1}s", t.as_secs_f64()));
     }
-    parts.push(token_segment(&s.input, s.real_output.map(|o| o as u64).unwrap_or(s.content + s.reasoning)));
+    parts.push(token_segment(
+        &s.input,
+        s.real_output
+            .map(|o| o as u64)
+            .unwrap_or(s.content + s.reasoning),
+    ));
     if tps > 0 {
         parts.push(format!("{}tok/s", tps));
     }

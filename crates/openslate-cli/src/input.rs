@@ -43,7 +43,10 @@ impl WorkspaceRoot {
             // For relative paths, resolve from workspace root
             self.0.join(target_path).canonicalize().unwrap_or_else(|_| {
                 // If canonicalize fails (e.g., file doesn't exist), use std::fs::canonicalize on joined path
-                self.0.join(target_path).canonicalize().unwrap_or_else(|_| self.0.join(target_path))
+                self.0
+                    .join(target_path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.0.join(target_path))
             })
         };
 
@@ -213,7 +216,8 @@ max_steps = 10
         fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
         let agents_dir = openslate_dir.join("agents");
         fs::create_dir(&agents_dir).expect("create agents dir");
-        let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\n---\nYou are the root agent.\n";
+        let agent_md =
+            "---\nid: root\nname: Root Agent\nmodel: main\n---\nYou are the root agent.\n";
         fs::write(agents_dir.join("root.md"), agent_md).expect("write root.md");
 
         let workspace_root = WorkspaceRoot::from_config_path(&openslate_dir.join("openslate.toml"));
@@ -247,7 +251,10 @@ max_steps = 10
         let (_, root) = temp_project();
         let outside_path = Path::new("/etc/passwd");
         let result = root.validate_path(outside_path);
-        assert!(result.is_err(), "paths outside workspace should be rejected");
+        assert!(
+            result.is_err(),
+            "paths outside workspace should be rejected"
+        );
     }
 
     #[test]
@@ -255,7 +262,10 @@ max_steps = 10
         let (_, root) = temp_project();
         let relative = Path::new(".openslate/openslate.toml");
         let result = root.validate_path(relative);
-        assert!(result.is_ok(), "relative path inside workspace should be valid");
+        assert!(
+            result.is_ok(),
+            "relative path inside workspace should be valid"
+        );
     }
 
     // ── expand_at_files tests ──
@@ -268,7 +278,10 @@ max_steps = 10
         let test_file = tmp.path().join("test.txt");
         fs::write(&test_file, "file content here").expect("write test file");
 
-        let input = format!("Hello @{} and more", test_file.file_name().unwrap().to_str().unwrap());
+        let input = format!(
+            "Hello @{} and more",
+            test_file.file_name().unwrap().to_str().unwrap()
+        );
         let result = expand_at_files(&input, &root);
 
         assert!(result.contains("<file path="));

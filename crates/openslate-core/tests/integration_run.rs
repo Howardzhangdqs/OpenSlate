@@ -17,6 +17,7 @@ use openslate_core::error::ProviderError;
 use openslate_core::mcp::connect_builtin_servers;
 use openslate_core::provider::{GenerateRequest, ModelProvider};
 use openslate_core::run_manager::RunManager;
+use openslate_core::skills::SkillsCatalog;
 use openslate_core::tool::ToolRegistry;
 use openslate_core::types::*;
 
@@ -144,9 +145,10 @@ async fn builtin_mcp_registry(
     ToolRegistry,
     Vec<rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo>>,
 ) {
-    let (tools, services) = connect_builtin_servers(root, &BuiltinToolsConfig::default())
-        .await
-        .expect("builtin servers should connect");
+    let (tools, services) =
+        connect_builtin_servers(root, &BuiltinToolsConfig::default(), Vec::new())
+            .await
+            .expect("builtin servers should connect");
     let mut registry = ToolRegistry::new();
     for tool in tools {
         registry
@@ -171,7 +173,12 @@ async fn integration_simple_single_turn() {
         finish_reason: Some("stop".into()),
     }]);
 
-    let manager = RunManager::new(test_config(), test_agent_tree(vec![]), ToolRegistry::new());
+    let manager = RunManager::new(
+        test_config(),
+        test_agent_tree(vec![]),
+        ToolRegistry::new(),
+        SkillsCatalog::default(),
+    );
     let result = manager
         .execute(&provider, "hello", None)
         .await
@@ -225,11 +232,9 @@ async fn integration_run_with_real_tool() {
 
     let manager = RunManager::new(
         test_config(),
-        test_agent_tree(vec![
-            "write_file".into(),
-            "read_file".into(),
-        ]),
+        test_agent_tree(vec!["write_file".into(), "read_file".into()]),
         registry,
+        SkillsCatalog::default(),
     );
     let result = manager
         .execute(&provider, "write a file", None)
@@ -278,6 +283,7 @@ async fn integration_run_with_read_file_tool() {
         test_config(),
         test_agent_tree(vec!["read_file".into()]),
         registry,
+        SkillsCatalog::default(),
     );
     let result = manager
         .execute(&provider, "read the file", None)
@@ -320,6 +326,7 @@ async fn integration_tool_rejects_path_outside_workspace() {
         test_config(),
         test_agent_tree(vec!["read_file".into()]),
         registry,
+        SkillsCatalog::default(),
     );
     let result = manager
         .execute(&provider, "read /etc/hostname", None)
@@ -383,6 +390,7 @@ async fn integration_tool_rejects_path_traversal() {
         test_config(),
         test_agent_tree(vec!["write_file".into()]),
         registry,
+        SkillsCatalog::default(),
     );
     let result = manager
         .execute(&provider, "write outside workspace", None)
@@ -438,6 +446,7 @@ async fn integration_tool_output_capped_by_max_output_bytes() {
         test_config_small_output_cap(),
         test_agent_tree(vec!["huge".into()]),
         registry,
+        SkillsCatalog::default(),
     );
     let result = manager
         .execute(&provider, "call the huge tool", None)
@@ -476,7 +485,12 @@ async fn integration_execution_tree_built() {
         finish_reason: Some("stop".into()),
     }]);
 
-    let manager = RunManager::new(test_config(), test_agent_tree(vec![]), ToolRegistry::new());
+    let manager = RunManager::new(
+        test_config(),
+        test_agent_tree(vec![]),
+        ToolRegistry::new(),
+        SkillsCatalog::default(),
+    );
     let result = manager
         .execute(&provider, "test", None)
         .await
@@ -485,7 +499,10 @@ async fn integration_execution_tree_built() {
     let root = result.execution_tree.root();
     assert_eq!(root.agent_id.0, "root");
     assert_eq!(root.depth, 0);
-    assert_eq!(root.status, openslate_core::execution::ExecutionStatus::Completed);
+    assert_eq!(
+        root.status,
+        openslate_core::execution::ExecutionStatus::Completed
+    );
 }
 
 /// Verify model is correctly resolved from config.
@@ -498,7 +515,12 @@ async fn integration_model_resolved() {
         finish_reason: Some("stop".into()),
     }]);
 
-    let manager = RunManager::new(test_config(), test_agent_tree(vec![]), ToolRegistry::new());
+    let manager = RunManager::new(
+        test_config(),
+        test_agent_tree(vec![]),
+        ToolRegistry::new(),
+        SkillsCatalog::default(),
+    );
     let result = manager
         .execute(&provider, "test", None)
         .await
@@ -546,26 +568,40 @@ async fn integration_delegates_root_to_child() {
                 name: "call_agent".into(),
                 arguments: serde_json::json!({"agent_id": "child", "task": "compute 2+2"}),
             }],
-            usage: Some(Usage { input_tokens: 10, output_tokens: 5 }),
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
             finish_reason: Some("tool_calls".into()),
         },
         // child step 1: answer
         ModelResponse {
             content: Some("4".into()),
             tool_calls: vec![],
-            usage: Some(Usage { input_tokens: 20, output_tokens: 3 }),
+            usage: Some(Usage {
+                input_tokens: 20,
+                output_tokens: 3,
+            }),
             finish_reason: Some("stop".into()),
         },
         // root step 2: final summary using the child's reply
         ModelResponse {
             content: Some("The answer is 4".into()),
             tool_calls: vec![],
-            usage: Some(Usage { input_tokens: 30, output_tokens: 8 }),
+            usage: Some(Usage {
+                input_tokens: 30,
+                output_tokens: 8,
+            }),
             finish_reason: Some("stop".into()),
         },
     ]);
 
-    let manager = RunManager::new(test_config(), two_agent_tree(), ToolRegistry::new());
+    let manager = RunManager::new(
+        test_config(),
+        two_agent_tree(),
+        ToolRegistry::new(),
+        SkillsCatalog::default(),
+    );
     let result = manager
         .execute(&provider, "compute via child", None)
         .await

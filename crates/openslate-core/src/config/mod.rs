@@ -18,6 +18,7 @@
 //! | `models`    | `Map<String, ModelConfig>`    | yes | Named model aliases (`main`, `fast` required) |
 //! | `trace`     | `TraceConfig`       | no       | Observability settings             |
 //! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
+//! | `skills`    | `SkillsConfig`      | no       | Skill discovery / injection        |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -68,6 +69,9 @@ pub struct OpenSlateConfig {
     /// `edit_file`). Everything defaults to enabled.
     #[serde(default)]
     pub builtin_tools: BuiltinToolsConfig,
+    /// Skills (`SKILL.md`) discovery and prompt-injection settings.
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 /// Project metadata.
@@ -219,9 +223,7 @@ pub enum TransportConfig {
     },
     /// Connect to a remote MCP server via Streamable HTTP.
     #[serde(rename = "http")]
-    Http {
-        url: String,
-    },
+    Http { url: String },
 }
 
 /// Wrapper for the agents YAML file.
@@ -259,6 +261,26 @@ impl Default for BuiltinToolsConfig {
             write_file: true,
             shell: true,
             edit_file: true,
+        }
+    }
+}
+
+/// Skills (SKILL.md) discovery and prompt-injection settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Master switch: `false` disables skill discovery and injection.
+    pub enabled: bool,
+    /// Max characters for the skills catalog section in the system prompt.
+    /// 0 = unlimited.
+    pub max_list_chars: usize,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_list_chars: 8000,
         }
     }
 }
@@ -335,10 +357,7 @@ pub fn derive_id_from_filename(filename: &str) -> String {
 ///   from `filename` via [`derive_id_from_filename`].
 /// - The body after the closing `---` becomes `default_prompt`.
 /// - UTF-8 BOM (`\u{feff}`) at the start is stripped before parsing.
-pub fn parse_agent_markdown(
-    content: &str,
-    filename: &str,
-) -> Result<AgentConfig, ConfigError> {
+pub fn parse_agent_markdown(content: &str, filename: &str) -> Result<AgentConfig, ConfigError> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
 
     let content = content
@@ -362,9 +381,7 @@ pub fn parse_agent_markdown(
         ConfigError::ParseError(format!("{filename}: invalid frontmatter YAML: {e}"))
     })?;
 
-    let id_string = fm
-        .id
-        .unwrap_or_else(|| derive_id_from_filename(filename));
+    let id_string = fm.id.unwrap_or_else(|| derive_id_from_filename(filename));
     let id = AgentId(id_string);
     let children = fm.children.into_iter().map(AgentId).collect();
     let default_prompt = body.trim().to_owned();
@@ -385,9 +402,8 @@ pub fn parse_agent_markdown(
 /// [`parse_agent_markdown`], and the resulting agents are sorted by `id`
 /// alphabetically for deterministic output.
 pub fn parse_agents_dir(dir: &Path) -> Result<AgentsConfig, ConfigError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        ConfigError::FileNotFound(format!("{}: {e}", dir.display()))
-    })?;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| ConfigError::FileNotFound(format!("{}: {e}", dir.display())))?;
 
     let mut agents = Vec::new();
     for entry in entries {
@@ -400,9 +416,8 @@ pub fn parse_agents_dir(dir: &Path) -> Result<AgentsConfig, ConfigError> {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown.md");
-            let content = std::fs::read_to_string(&path).map_err(|e| {
-                ConfigError::FileNotFound(format!("{}: {e}", path.display()))
-            })?;
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| ConfigError::FileNotFound(format!("{}: {e}", path.display())))?;
             agents.push(parse_agent_markdown(&content, filename)?);
         }
     }
@@ -629,6 +644,64 @@ current_time = false
         );
     }
 
+    #[test]
+    fn default_skills_config() {
+        let skills = SkillsConfig::default();
+        assert!(skills.enabled);
+        assert_eq!(skills.max_list_chars, 8000);
+    }
+
+    #[test]
+    fn parse_skills_defaults_when_section_absent() {
+        let config = parse_openslate_toml("").expect("empty toml should parse");
+        assert!(config.skills.enabled);
+        assert_eq!(config.skills.max_list_chars, 8000);
+    }
+
+    #[test]
+    fn parse_skills_custom_values() {
+        let toml = r#"
+[skills]
+enabled = false
+max_list_chars = 1200
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(!config.skills.enabled);
+        assert_eq!(config.skills.max_list_chars, 1200);
+    }
+
+    #[test]
+    fn parse_skills_partial_override() {
+        let toml = r#"
+[skills]
+max_list_chars = 42
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(
+            config.skills.enabled,
+            "unspecified flags keep their defaults"
+        );
+        assert_eq!(config.skills.max_list_chars, 42);
+    }
+
+    #[test]
+    fn parse_skills_unknown_field_rejected() {
+        let toml = r#"
+[skills]
+telepathy = true
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("telepathy"),
+            "error should name the offending field, got: {msg}"
+        );
+    }
+
     // ── Full example TOML ────────────────────────────────────────────────
 
     #[test]
@@ -655,7 +728,9 @@ current_time = false
 
         assert_eq!(config.providers.len(), 2);
         let zhipu = config.providers.get("zhipu").expect("zhipu provider");
+        assert_eq!(zhipu.base_url, "https://open.bigmodel.cn/api/paas/v4");
         let minimax = config.providers.get("minimax").expect("minimax provider");
+        assert_eq!(minimax.api_key_env, "MINIMAX_API_KEY");
 
         assert_eq!(config.models.len(), 4);
         let main = config.models.get("main").expect("main model");
@@ -685,9 +760,7 @@ current_time = false
         let md = "---\nname: [broken\nmodel: main\n---\nbody\n";
         let result = parse_agent_markdown(md, "broken.md");
         assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ConfigError::ParseError(_)),
-        );
+        assert!(matches!(result.unwrap_err(), ConfigError::ParseError(_)),);
     }
 
     #[test]
@@ -717,9 +790,7 @@ current_time = false
     #[test]
     fn parse_full_example_agents_dir() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/agents");
-        let config =
-            parse_agents_dir(Path::new(dir))
-                .expect("example agents dir should parse");
+        let config = parse_agents_dir(Path::new(dir)).expect("example agents dir should parse");
 
         assert_eq!(config.agents.len(), 6);
 
@@ -875,7 +946,9 @@ supports_vision = true
         let agent = parse_agent_markdown(md, "thematic.md").expect("should parse");
         assert_eq!(agent.id.0, "thematic");
         assert!(agent.default_prompt.contains("---"));
-        assert!(agent.default_prompt.contains("More text after thematic break."));
+        assert!(agent
+            .default_prompt
+            .contains("More text after thematic break."));
     }
 
     #[test]
@@ -904,7 +977,8 @@ supports_vision = true
 
     #[test]
     fn md_parse_children_converted_to_agent_ids() {
-        let md = "---\nname: Parent\nmodel: main\nchildren:\n  - researcher\n  - writer\n---\nPrompt.\n";
+        let md =
+            "---\nname: Parent\nmodel: main\nchildren:\n  - researcher\n  - writer\n---\nPrompt.\n";
         let agent = parse_agent_markdown(md, "parent.md").expect("should parse");
         assert_eq!(agent.children.len(), 2);
         assert_eq!(agent.children[0].0, "researcher");

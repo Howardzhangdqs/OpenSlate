@@ -9,13 +9,16 @@
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::config::validation::validate_config;
-use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
+use openslate_core::config::{
+    parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig,
+};
 use openslate_core::paths::{resolve_paths, OpenSlatePaths};
 use openslate_core::run_manager::RunManager;
+use openslate_core::skills::{discover_skills, SkillsCatalog};
 use openslate_core::tool::ToolRegistry;
 use openslate_store_sqlite::store::SqliteStore;
 
@@ -27,6 +30,10 @@ pub struct AppContext {
     pub store: Option<SqliteStore>,
     pub agent_tree: AgentTree,
     pub manager: RunManager,
+    /// Discovered skills catalog (empty when `[skills] enabled = false` or
+    /// nothing was found). Inert data for diagnostics; the RunManager holds
+    /// its own copy for prompt injection.
+    pub skills: SkillsCatalog,
     /// Live MCP server connections (builtin in-process servers first, then
     /// external ones). Declared after `manager` so that on drop, the registry
     /// (and its `McpTool`s holding `ServerSink` clones) is dropped *before*
@@ -52,8 +59,12 @@ pub(crate) fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
     if !agents_dir.is_dir() {
         anyhow::bail!("Agents directory not found: {}", agents_dir.display());
     }
-    parse_agents_dir(agents_dir)
-        .with_context(|| format!("Failed to parse agents directory '{}'", agents_dir.display()))
+    parse_agents_dir(agents_dir).with_context(|| {
+        format!(
+            "Failed to parse agents directory '{}'",
+            agents_dir.display()
+        )
+    })
 }
 
 /// Resolve config file path from CLI `--config` flag or default XDG resolution.
@@ -85,11 +96,85 @@ pub fn resolve_agents_dir(config_path: &Path) -> std::path::PathBuf {
         .unwrap_or_else(|| Path::new("agents").to_path_buf())
 }
 
+/// Resolve the skill discovery source directories, ordered LOW→HIGH
+/// precedence:
+///
+/// 1. `~/.agents/skills` — user-global, agent-tool-agnostic location
+///    (skipped silently when no home directory is resolvable);
+/// 2. the XDG-aware user-native skills dir (`~/.config/openslate/skills`);
+/// 3. `cwd/.agents/skills` — project-local, tool-agnostic location;
+/// 4. `{config dir}/skills` — project-native (e.g. `.openslate/skills`).
+///
+/// Source 4 equals source 2 when running off the global config; exact
+/// duplicates are removed keeping the LATER (higher-precedence) occurrence.
+/// Missing directories are silently skipped by the discovery itself.
+pub fn skills_sources(config_path: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut sources: Vec<PathBuf> = Vec::with_capacity(4);
+    if let Some(home) = dirs::home_dir() {
+        sources.push(home.join(".agents").join("skills"));
+    }
+    sources.push(resolve_paths(cwd).global_config_dir.join("skills"));
+    sources.push(cwd.join(".agents").join("skills"));
+    if let Some(parent) = config_path.parent() {
+        sources.push(parent.join("skills"));
+    }
+
+    // Dedupe by exact path equality, keeping the later occurrence (it has
+    // higher precedence, and `discover_skills` lets later sources shadow).
+    let mut deduped: Vec<PathBuf> = Vec::with_capacity(sources.len());
+    for source in sources {
+        if let Some(pos) = deduped.iter().position(|s| s == &source) {
+            deduped.remove(pos);
+        }
+        deduped.push(source);
+    }
+    deduped
+}
+
+/// Discover skills per `config.skills` and log the outcome.
+///
+/// Enabled: runs [`discover_skills`] over [`skills_sources`], surfacing every
+/// warning via `tracing::warn!` (a broken skill never blocks startup).
+/// Disabled: returns the empty catalog and logs a debug line.
+fn load_skills(config: &OpenSlateConfig, config_path: &Path, cwd: &Path) -> SkillsCatalog {
+    if !config.skills.enabled {
+        tracing::debug!(
+            target: "openslate_skills",
+            "skills disabled ([skills] enabled = false), skipping discovery"
+        );
+        return SkillsCatalog::default();
+    }
+
+    let sources = skills_sources(config_path, cwd);
+    let (catalog, warnings) = discover_skills(&sources);
+    for warning in &warnings {
+        tracing::warn!(target: "openslate_skills", "skill warning: {warning}");
+    }
+    for skill in catalog.skills() {
+        tracing::debug!(
+            target: "openslate_skills",
+            "skill '{}' from {}",
+            skill.name,
+            skill.path.display()
+        );
+    }
+    tracing::info!(
+        target: "openslate_skills",
+        "skills loaded: {} (from {} sources)",
+        catalog.skills().len(),
+        sources.len()
+    );
+    catalog
+}
+
 /// Initialize the SQLite store based on config.
 ///
 /// Creates the database file (if file-based) and runs migrations.
 /// Returns `None` if store initialization should be skipped (e.g. missing config).
-async fn init_store(config: &OpenSlateConfig, paths: &OpenSlatePaths) -> Result<Option<SqliteStore>> {
+async fn init_store(
+    config: &OpenSlateConfig,
+    paths: &OpenSlatePaths,
+) -> Result<Option<SqliteStore>> {
     let db_path = config
         .database
         .as_ref()
@@ -118,10 +203,7 @@ async fn init_store(config: &OpenSlateConfig, paths: &OpenSlatePaths) -> Result<
     if let Some(parent) = Path::new(&db_path).parent() {
         if !parent.exists() {
             fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create database directory '{}'",
-                    parent.display()
-                )
+                format!("Failed to create database directory '{}'", parent.display())
             })?;
         }
     }
@@ -156,11 +238,7 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         if env_path.is_file() {
             match dotenvy::from_path(&env_path) {
                 Ok(()) => tracing::debug!("Loaded .env from {}", env_path.display()),
-                Err(e) => tracing::warn!(
-                    "Failed to load .env at {}: {}",
-                    env_path.display(),
-                    e
-                ),
+                Err(e) => tracing::warn!("Failed to load .env at {}: {}", env_path.display(), e),
             }
         }
     }
@@ -176,6 +254,13 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
 
     // 3. Load agents
     let agents = load_agents(&agents_path)?;
+
+    // 3.5 Discover skills ([skills] enabled gates discovery; warnings are
+    //     logged, never fatal). The catalog feeds both the RunManager (system
+    //     prompt injection) and the builtin `read_skill` MCP server below.
+    let skills = load_skills(&config, &config_path, &cwd);
+    let skill_infos: Vec<openslate_core::mcp::SkillInfo> =
+        skills.skills().iter().map(From::from).collect();
 
     // 4. Validate config
     let errors = validate_config(&config, &agents);
@@ -199,8 +284,10 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     // 7. Build tool registry.
     let mut registry = ToolRegistry::new();
 
-    // 7.2 Builtin tool servers: in-process MCP (fs / shell / edit), started
-    //     without any config; `[builtin_tools]` toggles gate individual tools.
+    // 7.2 Builtin tool servers: in-process MCP (fs / shell / edit / skills),
+    //     started without any config; `[builtin_tools]` toggles gate the
+    //     individual fs/shell/edit tools, while the skill server is gated by
+    //     the catalog being non-empty (driven by `[skills] enabled`).
     //     Tools register under bare names; a collision (only possible with an
     //     external MCP server claiming a builtin name) is a hard error —
     //     unlike external servers, a builtin failing to start is a bug, not an
@@ -208,7 +295,8 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     let mut mcp_connections = openslate_core::mcp::McpConnectionGuard::new();
     {
         let (builtin_tools, builtin_services) =
-            openslate_core::mcp::connect_builtin_servers(&cwd, &config.builtin_tools).await?;
+            openslate_core::mcp::connect_builtin_servers(&cwd, &config.builtin_tools, skill_infos)
+                .await?;
         let mut names = Vec::with_capacity(builtin_tools.len());
         for tool in builtin_tools {
             names.push(tool.exposed_name().to_owned());
@@ -288,7 +376,8 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
                                     "MCP tool name conflict: tool '{}' from server '{}' collides \
                                      with an existing tool (MCP tools are auto-namespaced as \
                                      '{name}_*'; a collision means two servers share a name)",
-                                    e.0, name
+                                    e.0,
+                                    name
                                 );
                             }
                         }
@@ -321,10 +410,14 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
     //    the provider itself is built per run/turn via build_provider_for_model).
     let root_agent = agent_tree.get_root();
     let model_alias = root_agent.model_alias.clone();
-    tracing::debug!("Root agent '{}' uses model '{}'", root_agent.id, model_alias);
+    tracing::debug!(
+        "Root agent '{}' uses model '{}'",
+        root_agent.id,
+        model_alias
+    );
 
     // 9. Create RunManager
-    let manager = RunManager::new(config.clone(), agent_tree.clone(), registry);
+    let manager = RunManager::new(config.clone(), agent_tree.clone(), registry, skills.clone());
 
     Ok(AppContext {
         config,
@@ -332,6 +425,7 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         store,
         agent_tree,
         manager,
+        skills,
         mcp_connections,
         config_path,
         agents_path,
@@ -414,8 +508,7 @@ max_output_bytes = 65536
     fn test_resolve_config_file_explicit() {
         let tmp = temp_project();
         let path = tmp.path().join(".openslate/openslate.toml");
-        let resolved =
-            resolve_config_file(Some(path.to_str().unwrap())).expect("should resolve");
+        let resolved = resolve_config_file(Some(path.to_str().unwrap())).expect("should resolve");
         assert_eq!(resolved, path);
     }
 
@@ -503,6 +596,137 @@ path = "{}"
         assert!(
             errors.is_empty(),
             "valid config should have no errors: {errors:?}"
+        );
+    }
+
+    // ── skills_sources ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_skills_sources_orders_low_to_high() {
+        let cwd = Path::new("/project");
+        let config_path = Path::new("/project/.openslate/openslate.toml");
+        let sources = skills_sources(config_path, cwd);
+        let home = dirs::home_dir().expect("home dir");
+        let global = resolve_paths(cwd).global_config_dir.join("skills");
+        assert_eq!(sources[0], home.join(".agents").join("skills"));
+        assert_eq!(sources[1], global);
+        assert_eq!(sources[2], PathBuf::from("/project/.agents/skills"));
+        assert_eq!(
+            sources[3],
+            PathBuf::from("/project/.openslate/skills"),
+            "config-parent skills dir has the highest precedence"
+        );
+    }
+
+    #[test]
+    fn test_skills_sources_dedupes_global_config_duplicates() {
+        // Running off the global config: source 2 (XDG global) and source 4
+        // (config parent) are the same directory — the LATER occurrence must
+        // be the one kept, and it appears only once.
+        let cwd = Path::new("/nowhere/.openslate-absent"); // no local config
+        let config_path = resolve_paths(cwd).global_config_dir.join("openslate.toml");
+        let sources = skills_sources(&config_path, cwd);
+        let global_skills = resolve_paths(cwd).global_config_dir.join("skills");
+        assert_eq!(
+            sources.iter().filter(|s| **s == global_skills).count(),
+            1,
+            "duplicate dir listed exactly once: {sources:?}"
+        );
+        assert_eq!(
+            *sources.last().unwrap(),
+            global_skills,
+            "the later (higher-precedence) occurrence is kept"
+        );
+    }
+
+    // ── build_app_context skills wiring ──────────────────────────────────
+
+    /// `temp_project` plus a `[database] path` inside the temp dir (so
+    /// `build_app_context` never touches the real global data dir).
+    fn temp_project_isolated_db() -> tempfile::TempDir {
+        let tmp = temp_project();
+        let toml_path = tmp.path().join(".openslate/openslate.toml");
+        let base = fs::read_to_string(&toml_path).expect("read toml");
+        let toml = format!(
+            "{base}\n[database]\npath = \"{}\"\n",
+            tmp.path().join("test.sqlite").display()
+        );
+        fs::write(&toml_path, toml).expect("write toml");
+        tmp
+    }
+
+    fn write_skill(root: &Path, dir_name: &str, frontmatter: &str, body: &str) {
+        let dir = root.join(dir_name);
+        fs::create_dir_all(&dir).expect("create skill dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n{body}"),
+        )
+        .expect("write SKILL.md");
+    }
+
+    #[tokio::test]
+    async fn test_build_app_context_discovers_project_skills() {
+        let tmp = temp_project_isolated_db();
+        write_skill(
+            &tmp.path().join(".openslate/skills"),
+            "demo",
+            "name: demo\ndescription: demo skill\n",
+            "demo body",
+        );
+
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let ctx = build_app_context(config_path.to_str()).await.expect("ctx");
+        assert!(!ctx.skills.is_empty(), "catalog should be non-empty");
+        let skill = ctx.skills.get("demo").expect("demo skill discovered");
+        assert_eq!(skill.body, "demo body");
+        // The manager carries its own copy for prompt injection.
+        assert_eq!(ctx.manager.skills.get("demo").unwrap().name, "demo");
+    }
+
+    #[tokio::test]
+    async fn test_build_app_context_disabled_skills_yield_empty_catalog() {
+        let tmp = temp_project_isolated_db();
+        write_skill(
+            &tmp.path().join(".openslate/skills"),
+            "demo",
+            "name: demo\ndescription: demo skill\n",
+            "demo body",
+        );
+        let toml_path = tmp.path().join(".openslate/openslate.toml");
+        let base = fs::read_to_string(&toml_path).expect("read toml");
+        fs::write(&toml_path, format!("{base}\n[skills]\nenabled = false\n")).expect("write");
+
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let ctx = build_app_context(config_path.to_str()).await.expect("ctx");
+        assert!(ctx.skills.is_empty(), "disabled → empty catalog");
+        assert!(ctx.manager.skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_app_context_bad_skill_warns_but_others_load() {
+        let tmp = temp_project_isolated_db();
+        let skills_dir = tmp.path().join(".openslate/skills");
+        write_skill(
+            &skills_dir,
+            "good",
+            "name: good\ndescription: g\n",
+            "good body",
+        );
+        // Malformed frontmatter (no closing delimiter): warned + skipped.
+        let bad_dir = skills_dir.join("bad");
+        fs::create_dir_all(&bad_dir).expect("create bad dir");
+        fs::write(bad_dir.join("SKILL.md"), "name: bad\n(no closing ---\n").expect("write bad");
+
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let ctx = build_app_context(config_path.to_str()).await.expect("ctx");
+        assert!(
+            ctx.skills.get("good").is_some(),
+            "valid skill still loads next to a broken one"
+        );
+        assert!(
+            ctx.skills.get("bad").is_none(),
+            "broken skill is skipped (warning logged, startup proceeds)"
         );
     }
 }

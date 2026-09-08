@@ -109,9 +109,7 @@ fn write_result(
     // "Run done" (so: content → stats → Run done). Tool-call steps already got
     // their stats via on_step_end inside the runtime loop (after `-> / <-`).
     if !quiet {
-        let in_seg = input_tokens
-            .map(|i| format!("↑{} ", i))
-            .unwrap_or_default();
+        let in_seg = input_tokens.map(|i| format!("↑{} ", i)).unwrap_or_default();
         let tps_seg = if tps > 0 {
             format!(" · {}tok/s", tps)
         } else {
@@ -340,7 +338,9 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     // 9. Export trace to file if requested
     if let Some(ref trace_path) = params.trace_path {
         let path = std::path::Path::new(trace_path);
-        result.trace.export_to_file(path)
+        result
+            .trace
+            .export_to_file(path)
             .with_context(|| format!("Failed to export trace to '{}'", trace_path))?;
         if !params.quiet {
             tracing::info!("Trace exported to {}", trace_path);
@@ -370,10 +370,8 @@ pub(crate) fn build_provider_for_model(
     config: &openslate_core::config::OpenSlateConfig,
     model_alias: &str,
 ) -> Result<Box<dyn ModelProvider>> {
-    let resolved =
-        openslate_core::model_config::resolve_model(config, model_alias).with_context(|| {
-            format!("Failed to resolve model alias '{}'", model_alias)
-        })?;
+    let resolved = openslate_core::model_config::resolve_model(config, model_alias)
+        .with_context(|| format!("Failed to resolve model alias '{}'", model_alias))?;
 
     let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
         format!(
@@ -429,14 +427,10 @@ async fn persist_trace_to_store(
     };
     let root_agent_id = result.execution_tree.root().agent_id.to_string();
 
-    store.insert_run(
-        &run_id_str,
-        None,
-        &root_agent_id,
-        status_str,
-        "{}",
-        0,
-    ).await.map_err(|e| anyhow::anyhow!("Failed to insert run: {}", e))?;
+    store
+        .insert_run(&run_id_str, None, &root_agent_id, status_str, "{}", 0)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to insert run: {}", e))?;
 
     // Persist every execution node (root + delegated children) so the full
     // delegation tree is queryable later. `parent_execution_id` links each
@@ -447,10 +441,7 @@ async fn persist_trace_to_store(
             openslate_core::execution::ExecutionStatus::Completed => "completed",
             openslate_core::execution::ExecutionStatus::Failed => "failed",
         };
-        let parent_exec = node
-            .parent_execution_id
-            .as_ref()
-            .map(|id| id.to_string());
+        let parent_exec = node.parent_execution_id.as_ref().map(|id| id.to_string());
         store
             .insert_execution_node(
                 &node.id.to_string(),
@@ -478,41 +469,83 @@ async fn persist_trace_to_store(
                 } else {
                     Some(serde_json::to_string(args).unwrap_or_default())
                 };
-                (name.clone(), "duration_begin".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), args_str)
+                (
+                    name.clone(),
+                    "duration_begin".to_owned(),
+                    (*ts as i64) * 1000,
+                    None,
+                    "main".to_owned(),
+                    args_str,
+                )
             }
-            TraceEvent::DurationEnd { name, ts, .. } => {
-                (name.clone(), "duration_end".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), None)
-            }
-            TraceEvent::Complete { name, ts, dur, args, .. } => {
+            TraceEvent::DurationEnd { name, ts, .. } => (
+                name.clone(),
+                "duration_end".to_owned(),
+                (*ts as i64) * 1000,
+                None,
+                "main".to_owned(),
+                None,
+            ),
+            TraceEvent::Complete {
+                name,
+                ts,
+                dur,
+                args,
+                ..
+            } => {
                 let args_str = if args.is_empty() {
                     None
                 } else {
                     Some(serde_json::to_string(args).unwrap_or_default())
                 };
-                (name.clone(), "complete".to_owned(), (*ts as i64) * 1000, Some((*dur as i64) * 1000), "main".to_owned(), args_str)
+                (
+                    name.clone(),
+                    "complete".to_owned(),
+                    (*ts as i64) * 1000,
+                    Some((*dur as i64) * 1000),
+                    "main".to_owned(),
+                    args_str,
+                )
             }
-            TraceEvent::Instant { name, ts, .. } => {
-                (name.clone(), "instant".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), None)
-            }
-            TraceEvent::Counter { name, ts, values, .. } => {
+            TraceEvent::Instant { name, ts, .. } => (
+                name.clone(),
+                "instant".to_owned(),
+                (*ts as i64) * 1000,
+                None,
+                "main".to_owned(),
+                None,
+            ),
+            TraceEvent::Counter {
+                name, ts, values, ..
+            } => {
                 let args_str = serde_json::to_string(values).unwrap_or_default();
-                (name.clone(), "counter".to_owned(), (*ts as i64) * 1000, None, "main".to_owned(), Some(args_str))
+                (
+                    name.clone(),
+                    "counter".to_owned(),
+                    (*ts as i64) * 1000,
+                    None,
+                    "main".to_owned(),
+                    Some(args_str),
+                )
             }
         };
 
-        store.insert_trace_event(
-            &event_id,
-            &run_id_str,
-            None,
-            None,
-            None,
-            &event_name,
-            &event_kind,
-            ts_ns,
-            dur_ns,
-            &track,
-            args_json.as_deref(),
-        ).await.map_err(|e| anyhow::anyhow!("Failed to insert trace event: {}", e))?;
+        store
+            .insert_trace_event(
+                &event_id,
+                &run_id_str,
+                None,
+                None,
+                None,
+                &event_name,
+                &event_kind,
+                ts_ns,
+                dur_ns,
+                &track,
+                args_json.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to insert trace event: {}", e))?;
     }
 
     Ok(())
@@ -657,10 +690,8 @@ model = "claude-sonnet-4-5"
     #[test]
     fn test_resolve_agent_root_default() {
         let tmp = temp_project();
-        let agents =
-            crate::wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
-        let tree =
-            openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
+        let agents = crate::wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
+        let tree = openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let agent = resolve_agent(&tree, None).unwrap();
         assert_eq!(agent.id.0, "root");
     }
@@ -692,10 +723,8 @@ model = "m2"
         fs::write(agents_dir.join("root.md"), root_md).expect("write root.md");
         fs::write(agents_dir.join("worker.md"), worker_md).expect("write worker.md");
 
-        let agents_cfg =
-            crate::wiring::load_agents(&dir.join("agents")).unwrap();
-        let tree =
-            openslate_core::agent_tree::AgentTree::from_configs(&agents_cfg.agents).unwrap();
+        let agents_cfg = crate::wiring::load_agents(&dir.join("agents")).unwrap();
+        let tree = openslate_core::agent_tree::AgentTree::from_configs(&agents_cfg.agents).unwrap();
 
         let worker = resolve_agent(&tree, Some("worker")).unwrap();
         assert_eq!(worker.id.0, "worker");
@@ -705,13 +734,10 @@ model = "m2"
     #[test]
     fn test_resolve_agent_not_found() {
         let tmp = temp_project();
-        let agents =
-            crate::wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
-        let tree =
-            openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
+        let agents = crate::wiring::load_agents(&tmp.path().join(".openslate/agents")).unwrap();
+        let tree = openslate_core::agent_tree::AgentTree::from_configs(&agents.agents).unwrap();
         let result = resolve_agent(&tree, Some("nonexistent"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
-
 }

@@ -9,6 +9,9 @@
 //!   and output truncation.
 //! - [`edit`]: `edit_file`, applies a small context patch (with `@@` anchors)
 //!   to an existing file via the pure engine in [`edit::editor`].
+//! - [`skill`]: `read_skill`, loads the full markdown body of an agent skill
+//!   (Claude/Codex-style `SKILL.md` directories) from an in-process catalog
+//!   snapshot.
 //!
 //! Each server is an `rmcp` `ServerHandler` intended to be served in-process
 //! (no stdio / HTTP transport). Everything here is a library: nothing writes
@@ -17,6 +20,9 @@
 pub mod edit;
 pub mod fs;
 pub mod shell;
+pub mod skill;
+
+pub use skill::{SkillInfo, SkillServer};
 
 #[cfg(test)]
 pub(crate) mod testing {

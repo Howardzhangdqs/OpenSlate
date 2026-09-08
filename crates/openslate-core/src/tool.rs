@@ -80,10 +80,7 @@ impl ToolRegistry {
     /// at startup rather than silently shadowing a tool and confusing the LLM.
     /// Callers that intentionally namespace tools should apply a prefix before
     /// calling this.
-    pub fn try_register(
-        &mut self,
-        tool: impl Tool + 'static,
-    ) -> Result<(), ToolNameConflict> {
+    pub fn try_register(&mut self, tool: impl Tool + 'static) -> Result<(), ToolNameConflict> {
         let name = tool.name().to_owned();
         if self.tools.contains_key(&name) {
             return Err(ToolNameConflict(name));

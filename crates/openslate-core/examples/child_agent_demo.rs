@@ -20,6 +20,7 @@ use openslate_core::error::ProviderError;
 use openslate_core::execution::ExecutionStatus;
 use openslate_core::provider::{GenerateRequest, ModelProvider};
 use openslate_core::run_manager::RunManager;
+use openslate_core::skills::SkillsCatalog;
 use openslate_core::tool::ToolRegistry;
 use openslate_core::types::*;
 
@@ -137,22 +138,32 @@ model = "fast-model"
     // --- 脚本化模型响应:确定性驱动三层委派(1 根委派 + 1 子委派 + 3 个回答/汇总)---
     let provider = DemoProvider {
         steps: vec![
-            ("root        ⇒ 委派 call_agent(researcher, '研究 2+2')",
-             delegate("1", "researcher", "研究 2+2", (30, 10))),
-            ("researcher  ⇒ 委派 call_agent(verifier, '验证 2+2=4')",
-             delegate("2", "verifier", "验证 2+2=4", (25, 12))),
-            ("verifier    ⇐ 回答:验证通过,2+2=4",
-             text("验证通过:2+2=4", (15, 8))),
-            ("researcher  ⇐ 汇总子结果:'研究完成:经验证 2+2=4'",
-             text("研究完成:经验证 2+2=4", (35, 14))),
-            ("root        ⇐ 汇总子结果:'最终答案:4'",
-             text("最终答案:4", (40, 6))),
+            (
+                "root        ⇒ 委派 call_agent(researcher, '研究 2+2')",
+                delegate("1", "researcher", "研究 2+2", (30, 10)),
+            ),
+            (
+                "researcher  ⇒ 委派 call_agent(verifier, '验证 2+2=4')",
+                delegate("2", "verifier", "验证 2+2=4", (25, 12)),
+            ),
+            (
+                "verifier    ⇐ 回答:验证通过,2+2=4",
+                text("验证通过:2+2=4", (15, 8)),
+            ),
+            (
+                "researcher  ⇐ 汇总子结果:'研究完成:经验证 2+2=4'",
+                text("研究完成:经验证 2+2=4", (35, 14)),
+            ),
+            (
+                "root        ⇐ 汇总子结果:'最终答案:4'",
+                text("最终答案:4", (40, 6)),
+            ),
         ],
         idx: AtomicUsize::new(0),
     };
 
     println!("【运行中:模型调用序列(每行 = 某一层 agent 的一次推理)】");
-    let manager = RunManager::new(config, tree, ToolRegistry::new());
+    let manager = RunManager::new(config, tree, ToolRegistry::new(), SkillsCatalog::default());
     let result = manager
         .execute(&provider, "计算 2+2", None)
         .await
@@ -195,8 +206,17 @@ model = "fast-model"
     // --- 统计 ---
     let delegations = result.execution_tree.node_count() - 1;
     println!("【统计】");
-    println!("  执行节点总数 : {}  (1 个根 + {delegations} 次委派)", result.execution_tree.node_count());
-    println!("  input tokens : {}  (跨 root/researcher/verifier 三层累计)", result.total_input_tokens);
-    println!("  output tokens: {}  (跨三层累计)", result.total_output_tokens);
+    println!(
+        "  执行节点总数 : {}  (1 个根 + {delegations} 次委派)",
+        result.execution_tree.node_count()
+    );
+    println!(
+        "  input tokens : {}  (跨 root/researcher/verifier 三层累计)",
+        result.total_input_tokens
+    );
+    println!(
+        "  output tokens: {}  (跨三层累计)",
+        result.total_output_tokens
+    );
     println!("\n演示完成。递归委派 / 执行树增长 / 结果逐层回传 / token 跨层累计 均已展示。");
 }

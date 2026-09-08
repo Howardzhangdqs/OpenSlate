@@ -27,6 +27,7 @@ use crate::execution::{ExecutionStatus, ExecutionTree};
 use crate::model_config::resolve_model;
 use crate::provider::{ModelProvider, ProgressCallback, ToolDefinition};
 use crate::runtime::{check_limits, execute_run, RunConfig, RunResult, RuntimeLimits};
+use crate::skills::SkillsCatalog;
 use crate::tool::{ToolExecutor, ToolRegistry};
 use crate::types::*;
 
@@ -63,6 +64,9 @@ pub struct AgentRunner<'a> {
     limits: RuntimeLimits,
     context_config: ContextIsolationConfig,
     run_id: RunId,
+    /// Rendered tier-1 skills catalog section (None = no skills / nothing to
+    /// inject), appended to every agent's system prompt.
+    skills_section: Option<String>,
 
     // Interior-mutable shared state across the run and recursion layers.
     execution_tree: Mutex<ExecutionTree>,
@@ -101,6 +105,7 @@ impl<'a> AgentRunner<'a> {
         provider: &'a dyn ModelProvider,
         agent_tree: &'a AgentTree,
         tool_registry: &'a ToolRegistry,
+        skills: &'a SkillsCatalog,
         config: &'a OpenSlateConfig,
         limits: RuntimeLimits,
         run_id: RunId,
@@ -108,6 +113,7 @@ impl<'a> AgentRunner<'a> {
         let root_agent = agent_tree.get_root();
         let execution_tree = ExecutionTree::new(run_id.clone(), root_agent.id.clone());
         let root_deadline = tokio::time::Instant::now() + Duration::from_millis(limits.timeout_ms);
+        let skills_section = skills.catalog_prompt(config.skills.max_list_chars);
         Self {
             provider,
             agent_tree,
@@ -116,6 +122,7 @@ impl<'a> AgentRunner<'a> {
             limits,
             context_config: ContextIsolationConfig::default(),
             run_id,
+            skills_section,
             execution_tree: Mutex::new(execution_tree),
             caller_stack: Mutex::new(Vec::new()),
             child_call_count: AtomicU32::new(0),
@@ -146,6 +153,17 @@ impl<'a> AgentRunner<'a> {
     /// Number of `call_agent` invocations that have been counted this run.
     pub fn child_call_count(&self) -> u32 {
         self.child_call_count.load(Ordering::Relaxed)
+    }
+
+    /// Append the skills catalog section (if any) to a system prompt.
+    ///
+    /// With no skills configured this is the identity function, so the
+    /// system prompt is byte-identical to the agent's `default_prompt`.
+    fn with_skills_section(&self, prompt: &str) -> String {
+        match &self.skills_section {
+            Some(section) => format!("{prompt}\n\n{section}"),
+            None => prompt.to_owned(),
+        }
     }
 
     /// Build the tool definitions exposed to a given agent: its `tools:`
@@ -243,7 +261,7 @@ impl<'a> AgentRunner<'a> {
             run_id: self.run_id.clone(),
             agent_id: root.id.clone(),
             model_alias: root.model_alias.clone(),
-            system_prompt: Some(root.default_prompt.clone()),
+            system_prompt: Some(self.with_skills_section(&root.default_prompt)),
             initial_messages: prior_messages,
             max_steps: self.limits.max_steps,
             max_context_bytes: self.limits.max_context_bytes,
@@ -444,9 +462,12 @@ impl<'a> AgentRunner<'a> {
         };
 
         // Build the child's isolated context from the caller's snapshot.
+        // Bind the augmented system prompt first so the borrow does not
+        // span the recursive `run_agent` call below.
+        let child_system = self.with_skills_section(&child_agent.default_prompt);
         let child_messages = build_child_context(
             &self.context_config,
-            Some(&child_agent.default_prompt),
+            Some(&child_system),
             &task,
             &frame.messages_snapshot,
         );
@@ -833,10 +854,12 @@ model = "mock-fast"
         let tree = root_only_tree();
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &NoopProvider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -852,10 +875,12 @@ model = "mock-fast"
         let config = test_config();
         let tree = root_only_tree();
         let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &NoopProvider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -870,10 +895,12 @@ model = "mock-fast"
         let config = test_config();
         let tree = root_child_tree();
         let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &NoopProvider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -895,10 +922,12 @@ model = "mock-fast"
         let config = test_config();
         let tree = root_only_tree();
         let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &NoopProvider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -914,10 +943,12 @@ model = "mock-fast"
         let tree = root_child_tree();
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &NoopProvider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -967,10 +998,12 @@ model = "mock-fast"
         let config = test_config();
         let tree = root_child_tree();
         let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &provider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -1020,10 +1053,12 @@ model = "mock-fast"
             max_depth: 1,
             ..RuntimeLimits::default()
         };
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &provider,
             &tree,
             &registry,
+            &skills,
             &config,
             limits,
             RunId("t".into()),
@@ -1075,10 +1110,12 @@ model = "mock-fast"
             max_child_agent_calls: 1,
             ..RuntimeLimits::default()
         };
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &provider,
             &tree,
             &registry,
+            &skills,
             &config,
             limits,
             RunId("t".into()),
@@ -1119,10 +1156,12 @@ model = "mock-fast"
         let config = test_config();
         let tree = root_child_tree();
         let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &provider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -1208,10 +1247,12 @@ model = "mock-fast"
         let config = test_config();
         let tree = root_child_grandchild_tree();
         let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
         let runner = AgentRunner::new(
             &provider,
             &tree,
             &registry,
+            &skills,
             &config,
             RuntimeLimits::default(),
             RunId("t".into()),
@@ -1239,5 +1280,103 @@ model = "mock-fast"
             "grandchild reply should reach root via child's summary, got: {}",
             tool_msgs[0].content
         );
+    }
+
+    // ── Skills catalog injection ──────────────────────────────────────────
+
+    /// Provider that records the system prompt of every request and answers
+    /// with a fixed final response.
+    struct CapturingProvider {
+        system_prompts: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ModelProvider for CapturingProvider {
+        async fn generate(&self, request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
+            self.system_prompts
+                .lock()
+                .expect("system_prompts poisoned")
+                .push(request.system_prompt.unwrap_or_default());
+            Ok(assistant_text("ok"))
+        }
+        fn provider_name(&self) -> &str {
+            "capturing"
+        }
+    }
+
+    /// Build a one-skill catalog from a real temp SKILL.md directory.
+    fn skills_catalog_with(name: &str, description: &str) -> crate::skills::SkillsCatalog {
+        let dir = tempfile::TempDir::new().unwrap();
+        let skill_dir = dir.path().join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nSkill body.\n"),
+        )
+        .unwrap();
+        let (catalog, warnings) = crate::skills::discover_skills(&[dir.path().to_path_buf()]);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        catalog
+    }
+
+    #[tokio::test]
+    async fn runner_root_system_prompt_includes_skills_section() {
+        let provider = CapturingProvider {
+            system_prompts: Mutex::new(Vec::new()),
+        };
+        let config = test_config();
+        let tree = root_only_tree();
+        let registry = ToolRegistry::new();
+        let skills = skills_catalog_with("pdf-processing", "Handle PDF files");
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let messages = vec![user_message("hi")];
+        runner.run_root(messages, None).await.expect("run ok");
+
+        let prompts = provider.system_prompts.lock().expect("prompts");
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].starts_with("root prompt\n\n# Skills"),
+            "skills section must follow the agent prompt, got: {}",
+            prompts[0]
+        );
+        assert!(prompts[0].contains("- name: pdf-processing"));
+        assert!(prompts[0].contains("  description: Handle PDF files"));
+    }
+
+    #[tokio::test]
+    async fn runner_root_system_prompt_unchanged_when_catalog_empty() {
+        let provider = CapturingProvider {
+            system_prompts: Mutex::new(Vec::new()),
+        };
+        let config = test_config();
+        let tree = root_only_tree();
+        let registry = ToolRegistry::new();
+        let skills = crate::skills::SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let messages = vec![user_message("hi")];
+        runner.run_root(messages, None).await.expect("run ok");
+
+        let prompts = provider.system_prompts.lock().expect("prompts");
+        assert_eq!(prompts.len(), 1);
+        // Byte-identical to the agent's default_prompt: empty catalog must
+        // not alter existing behavior.
+        assert_eq!(prompts[0], "root prompt");
     }
 }

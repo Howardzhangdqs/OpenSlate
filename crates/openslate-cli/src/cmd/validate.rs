@@ -10,7 +10,9 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use openslate_core::config::validation::{validate_config, validate_strict, ValidationError};
-use openslate_core::config::{parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig};
+use openslate_core::config::{
+    parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig,
+};
 use openslate_core::paths::resolve_paths;
 
 /// Indicates whether the terminal supports color output.
@@ -50,6 +52,15 @@ fn print_success(msg: &str) {
     }
 }
 
+/// Print an informational line (dim if color is supported).
+fn print_info(msg: &str) {
+    if supports_color() {
+        println!("\x1b[2mINFO\x1b[0m: {msg}");
+    } else {
+        println!("[INFO] {msg}");
+    }
+}
+
 /// Format a validation error for display.
 fn format_validation_error(err: &ValidationError) -> String {
     format!("{}: {}", err.field, err.message)
@@ -68,8 +79,12 @@ fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
     if !agents_dir.is_dir() {
         anyhow::bail!("Agents directory not found: {}", agents_dir.display());
     }
-    parse_agents_dir(agents_dir)
-        .with_context(|| format!("Failed to parse agents directory '{}'", agents_dir.display()))
+    parse_agents_dir(agents_dir).with_context(|| {
+        format!(
+            "Failed to parse agents directory '{}'",
+            agents_dir.display()
+        )
+    })
 }
 
 /// Run the validate command.
@@ -103,6 +118,40 @@ pub fn run_validate_command(config_path: &Path, agents_path: &Path, strict: bool
         (validate_config(&config, &agents), Vec::new())
     };
 
+    // Skills diagnostics: mirror the wiring's discovery so validation sees
+    // the same catalog a run would. Warnings never fail non-strict mode
+    // (lenient spec: a broken skill is skipped at runtime, not fatal).
+    let mut skills_warning_count = 0usize;
+    let mut catalog = openslate_core::skills::SkillsCatalog::default();
+    if config.skills.enabled {
+        let cwd = env::current_dir().context("Failed to get current directory")?;
+        let sources = crate::wiring::skills_sources(config_path, &cwd);
+        let (discovered, skill_warnings) = openslate_core::skills::discover_skills(&sources);
+        for warning in &skill_warnings {
+            print_warning(&format!("skills: {warning}"));
+        }
+        skills_warning_count += skill_warnings.len();
+
+        // Static check: a non-empty `tools:` whitelist without `read_skill`
+        // means the agent's system prompt will advertise skills it cannot
+        // load (an empty whitelist exposes every tool, so it is fine).
+        if !discovered.is_empty() {
+            for agent in &agents.agents {
+                if !agent.tools.is_empty() && !agent.tools.iter().any(|t| t == "read_skill") {
+                    print_warning(&format!(
+                        "skills: agent '{}' tool whitelist excludes 'read_skill' but skills \
+                         are enabled — its system prompt will advertise skills it cannot load",
+                        agent.id.0
+                    ));
+                    skills_warning_count += 1;
+                }
+            }
+        }
+        catalog = discovered;
+    } else {
+        print_info("skills disabled, skipping");
+    }
+
     // Print errors
     let has_errors = !errors.is_empty();
     for err in &errors {
@@ -118,11 +167,18 @@ pub fn run_validate_command(config_path: &Path, agents_path: &Path, strict: bool
     // Exit code logic
     if has_errors {
         Err(anyhow::anyhow!("Configuration validation failed"))
-    } else if strict && has_warnings {
-        // In strict mode, warnings cause exit 1
-        Err(anyhow::anyhow!("Configuration validation failed (warnings treated as errors in --strict mode)"))
+    } else if strict && (has_warnings || skills_warning_count > 0) {
+        // In strict mode, warnings (including skill diagnostics) cause exit 1
+        Err(anyhow::anyhow!(
+            "Configuration validation failed (warnings treated as errors in --strict mode)"
+        ))
     } else {
-        print_success("Configuration is valid");
+        print_success(&format!(
+            "Configuration is valid: {} agents, {} skills, {} warning(s)",
+            agents.agents.len(),
+            catalog.skills().len(),
+            warnings.len() + skills_warning_count,
+        ));
         Ok(())
     }
 }
@@ -184,7 +240,8 @@ max_output_bytes = 65536
 
         std::fs::create_dir(openslate_dir.join("agents")).expect("create agents dir");
         let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ndefault_prompt: You are the root agent.\n---\n";
-        std::fs::write(openslate_dir.join("agents").join("root.md"), agent_md).expect("write root.md");
+        std::fs::write(openslate_dir.join("agents").join("root.md"), agent_md)
+            .expect("write root.md");
         tmp
     }
 
@@ -207,7 +264,8 @@ model = "m2"
 
         std::fs::create_dir(openslate_dir.join("agents")).expect("create agents dir");
         let agent_md = "---\nid: root\nname: Root Agent\nmodel: main\ndefault_prompt: You are the root agent.\n---\n";
-        std::fs::write(openslate_dir.join("agents").join("root.md"), agent_md).expect("write root.md");
+        std::fs::write(openslate_dir.join("agents").join("root.md"), agent_md)
+            .expect("write root.md");
         tmp
     }
 
@@ -313,7 +371,11 @@ model = "m2"
         // The valid config has unused models (main is used but fast is not), so strict mode should warn
         // But we need to check: in our fixture, 'main' is used but 'fast' is not
         // Actually wait - in valid config we create, main is used by root agent, but fast is not used
-        assert!(result.is_err(), "strict mode with unused model should warn and fail: {:?}", result);
+        assert!(
+            result.is_err(),
+            "strict mode with unused model should warn and fail: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -349,6 +411,124 @@ model = "m2"
         let agents_path = openslate_dir.join("agents");
 
         let result = run_validate_command(&config_path, &agents_path, true);
-        assert!(result.is_ok(), "strict mode should pass when all models are used: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "strict mode should pass when all models are used: {:?}",
+            result
+        );
+    }
+
+    // ── skills diagnostics ────────────────────────────────────────────────
+
+    /// Temp project with one skill (`.openslate/skills/demo/SKILL.md`), a
+    /// single model used by the root agent (so strict mode's unused-model
+    /// check stays quiet), and a configurable root tool whitelist.
+    fn temp_project_with_skill(toml_extra: &str, tools_yaml: &str) -> TempDir {
+        let tmp = TempDir::new().expect("create temp dir");
+        let openslate_dir = tmp.path().join(".openslate");
+        std::fs::create_dir_all(openslate_dir.join("skills/demo")).expect("create dirs");
+        std::fs::write(
+            openslate_dir.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\ndemo body\n",
+        )
+        .expect("write SKILL.md");
+
+        let toml = format!(
+            r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+{toml_extra}"#
+        );
+        std::fs::write(openslate_dir.join("openslate.toml"), toml).expect("write toml");
+
+        let agents_dir = openslate_dir.join("agents");
+        std::fs::create_dir(&agents_dir).expect("create agents dir");
+        let root_md =
+            format!("---\nid: root\nname: Root Agent\nmodel: main\n{tools_yaml}---\nRoot.\n");
+        std::fs::write(agents_dir.join("root.md"), root_md).expect("write root.md");
+        // fast is used by the worker so strict mode's unused-model check
+        // stays quiet and the tests isolate the skills diagnostics.
+        let worker_md = "---\nid: worker\nname: Worker Agent\nmodel: fast\n---\nWorker.\n";
+        std::fs::write(agents_dir.join("worker.md"), worker_md).expect("write worker.md");
+        tmp
+    }
+
+    #[test]
+    fn test_skills_whitelist_excluding_read_skill_warns() {
+        // Warn path: skills are enabled and discovered, but the root agent's
+        // whitelist lacks `read_skill`. Non-strict passes (WARN only)...
+        let tmp = temp_project_with_skill("", "tools:\n  - read_file\n");
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let agents_path = tmp.path().join(".openslate/agents");
+        assert!(
+            run_validate_command(&config_path, &agents_path, false).is_ok(),
+            "non-strict treats skill warnings as WARN only"
+        );
+        // ...while strict escalates them to a failure.
+        assert!(
+            run_validate_command(&config_path, &agents_path, true).is_err(),
+            "strict mode escalates the whitelist warning to an error"
+        );
+    }
+
+    #[test]
+    fn test_skills_whitelist_including_read_skill_is_clean() {
+        // Clean path: whitelist includes `read_skill` → no warning, strict
+        // passes (single model, used).
+        let tmp = temp_project_with_skill("", "tools:\n  - read_file\n  - read_skill\n");
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let agents_path = tmp.path().join(".openslate/agents");
+        let result = run_validate_command(&config_path, &agents_path, true);
+        assert!(
+            result.is_ok(),
+            "clean path should pass strict: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_skills_disabled_skips_diagnostics() {
+        // Disabled: no discovery, no whitelist check — an offending whitelist
+        // is fine because no skills will be advertised.
+        let tmp = temp_project_with_skill("[skills]\nenabled = false\n", "tools:\n  - read_file\n");
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let agents_path = tmp.path().join(".openslate/agents");
+        let result = run_validate_command(&config_path, &agents_path, true);
+        assert!(
+            result.is_ok(),
+            "disabled skills skip all checks: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_skills_parse_warning_is_non_fatal_by_default() {
+        // A broken SKILL.md warns but never blocks (lenient spec); strict
+        // escalates it like any other warning.
+        let tmp = temp_project_with_skill("", "tools:\n  - read_file\n  - read_skill\n");
+        let bad_dir = tmp.path().join(".openslate/skills/bad");
+        std::fs::create_dir_all(&bad_dir).expect("create bad dir");
+        std::fs::write(bad_dir.join("SKILL.md"), "name: bad\n(no closing ---\n")
+            .expect("write bad");
+
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let agents_path = tmp.path().join(".openslate/agents");
+        assert!(
+            run_validate_command(&config_path, &agents_path, false).is_ok(),
+            "non-strict: parse warnings are WARN, skill skipped at runtime"
+        );
+        assert!(
+            run_validate_command(&config_path, &agents_path, true).is_err(),
+            "strict escalates skill parse warnings"
+        );
     }
 }

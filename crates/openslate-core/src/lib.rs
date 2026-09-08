@@ -5,15 +5,16 @@ pub mod context;
 pub mod context_manager;
 pub mod error;
 pub mod execution;
+pub mod mcp;
 pub mod model_config;
 pub mod paths;
 pub mod prompt;
 pub mod provider;
 pub mod run_manager;
-pub mod runtime;
 pub mod runner;
+pub mod runtime;
+pub mod skills;
 pub mod tool;
-pub mod mcp;
 pub mod trace;
 pub mod types;
 

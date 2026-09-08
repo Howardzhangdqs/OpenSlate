@@ -37,23 +37,23 @@ pub(crate) fn map_error(e: genai::Error) -> ProviderError {
         // Mid-stream HTTP error event (constructed by the SSE parser).
         genai::Error::HttpError { status, body, .. } => map_status(status, body),
 
-            // Stream-level errors.
-            //
-            // genai's SSE streamer boxes HTTP-status errors (web_stream.rs) into a
-            // `WebStream { cause, error }`, so a mid-stream 401/429/5xx would
-            // otherwise lose its status code. Try to recover it via downcast
-            // before falling back to a generic connection error.
-            genai::Error::WebStream { cause, error, .. } => {
-                if let Some(inner) = error.downcast_ref::<genai::Error>() {
-                    if let genai::Error::HttpError { status, body, .. } = inner {
-                        return map_status(*status, body.clone());
-                    }
-                }
-                ProviderError::ConnectionError(cause)
+        // Stream-level errors.
+        //
+        // genai's SSE streamer boxes HTTP-status errors (web_stream.rs) into a
+        // `WebStream { cause, error }`, so a mid-stream 401/429/5xx would
+        // otherwise lose its status code. Try to recover it via downcast
+        // before falling back to a generic connection error.
+        genai::Error::WebStream { cause, error, .. } => {
+            if let Some(genai::Error::HttpError { status, body, .. }) =
+                error.downcast_ref::<genai::Error>()
+            {
+                return map_status(*status, body.clone());
             }
-            genai::Error::StreamParse { serde_error, .. } => {
-                ProviderError::MalformedResponse(serde_error.to_string())
-            }
+            ProviderError::ConnectionError(cause)
+        }
+        genai::Error::StreamParse { serde_error, .. } => {
+            ProviderError::MalformedResponse(serde_error.to_string())
+        }
 
         // Auth.
         genai::Error::RequiresApiKey { .. }

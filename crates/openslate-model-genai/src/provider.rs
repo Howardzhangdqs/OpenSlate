@@ -7,6 +7,7 @@ use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatOptions, ChatStreamEvent};
 use genai::resolver::{AuthData, Endpoint};
+use genai::Headers;
 use genai::{Client, ModelIden, ServiceTarget};
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -17,6 +18,15 @@ use openslate_core::types::{ModelResponse, ModelStreamEvent};
 
 use crate::convert::{from_chat_response, from_stream_end, to_chat_request};
 use crate::error::{map_error, GenaiBuildError};
+
+/// `User-Agent` sent with every model request. Stamped twice, deliberately:
+/// as a default header on the injected reqwest client (covers the
+/// non-streaming `exec_chat` path) AND via `ChatOptions::extra_headers`
+/// (merged in both `exec_chat` and `exec_chat_stream`). The double stamp
+/// exists because genai 0.6.5's streaming path drops the reqwest client's
+/// default headers — without `extra_headers` the UA vanishes from streaming
+/// requests on the wire.
+const USER_AGENT: &str = concat!("openslate/", env!("CARGO_PKG_VERSION"));
 
 /// Configuration for constructing a [`GenaiProvider`].
 #[derive(Debug, Clone)]
@@ -58,8 +68,10 @@ impl GenaiProvider {
     pub fn new(config: GenaiConfig) -> Result<Self, GenaiBuildError> {
         // Inject a custom reqwest client: genai's default has no timeout, and it
         // honors proxy env vars by default (OpenSlate's OpenAI provider uses
-        // `.no_proxy()`). Match that behaviour and add the timeout.
+        // `.no_proxy()`). Match that behaviour, add the timeout, and stamp the
+        // project User-Agent on every model request.
         let reqwest_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(config.timeout_secs))
             .no_proxy()
             .build()
@@ -116,6 +128,11 @@ impl GenaiProvider {
             capture_content: Some(true),
             capture_tool_calls: Some(true),
             capture_usage: Some(true),
+            // genai's streaming path drops the reqwest client's default
+            // headers, so the UA must ALSO travel as an explicit per-request
+            // header — `extra_headers` is merged in both exec_chat and
+            // exec_chat_stream (genai client_impl).
+            extra_headers: Some(Headers::from(("user-agent", USER_AGENT))),
             ..Default::default()
         };
 
@@ -181,9 +198,7 @@ impl ModelProvider for GenaiProvider {
             while let Some(ev) = stream.next().await {
                 let mapped: Option<Result<ModelStreamEvent, ProviderError>> = match ev {
                     Ok(ChatStreamEvent::Start) => None,
-                    Ok(ChatStreamEvent::Chunk(c)) => {
-                        Some(Ok(ModelStreamEvent::Delta(c.content)))
-                    }
+                    Ok(ChatStreamEvent::Chunk(c)) => Some(Ok(ModelStreamEvent::Delta(c.content))),
                     // Stream the model's chain-of-thought (e.g. DeepSeek-style
                     // `reasoning_content`) as Reasoning events so callers can
                     // display it distinctly from the answer.
@@ -267,5 +282,67 @@ mod tests {
                 assert!(err.to_string().contains("not-a-real-adapter"));
             }
         }
+    }
+
+    #[test]
+    fn user_agent_is_project_name_plus_version() {
+        assert_eq!(
+            USER_AGENT,
+            format!("openslate/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// E2E: the reqwest client's default User-Agent (`openslate/<version>`) and
+    /// the adapter's Bearer auth actually reach the wire through the full genai
+    /// stack. Mockito only matches when BOTH headers are present, so a missing
+    /// User-Agent makes the request unmatched and `generate` fails.
+    #[tokio::test]
+    async fn model_request_carries_openslate_user_agent() {
+        use openslate_core::provider::GenerateRequest;
+
+        let mut server = mockito::Server::new_async().await;
+
+        let expected_ua = format!("openslate/{}", env!("CARGO_PKG_VERSION"));
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .match_header("user-agent", mockito::Matcher::Exact(expected_ua))
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"chatcmpl-1","object":"chat.completion","created":0,
+                    "model":"test-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+                    "finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+            )
+            .create_async()
+            .await;
+
+        let provider = GenaiProvider::new(GenaiConfig {
+            provider_name: "test".into(),
+            model: "test-model".into(),
+            api_key: Some("test-key".into()),
+            base_url: Some(server.url()),
+            adapter: Some("openai".into()),
+            timeout_secs: 30,
+        })
+        .expect("constructs");
+
+        let res = provider
+            .generate(GenerateRequest {
+                model_id: "test-model".into(),
+                system_prompt: None,
+                messages: vec![],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect("request matched the mock (UA + Bearer present)");
+
+        assert_eq!(res.content.as_deref(), Some("hi"));
+
+        _mock.assert_async().await;
     }
 }

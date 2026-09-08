@@ -193,10 +193,10 @@ and logs are shown back to you.
 
 | 项 | 值 | 机制 |
 |---|---|---|
-| isolate | 每次 run_code 新建，用完即弃 | rquickjs AsyncRuntime per call |
-| 硬超时 | `timeout_ms`（默认 60s） | interrupt handler（AtomicBool + 计时线程；**非** CF 的 Promise.race 协作式） |
+| isolate | 每次 run_code 新建，用完即弃 | rquickjs Runtime per call |
+| 硬超时 | `timeout_ms`（默认 60s） | interrupt handler（AtomicBool + 计时线程；**非** CF 的 Promise.race 协作式）。host 桥阻塞等待工具 future 时同样受限：每次桥调用按「deadline - now」剩余预算包 `tokio::time::timeout`，never-resolving 的工具无法拖过预算（超限回 `{error: … run_code budget is exhausted}` envelope） |
 | 内存 | `memory_limit_bytes`（默认 64MB） | QuickJS memory limit，超限返回错误而非进程 OOM |
-| 工具调用数 | `max_tool_calls_per_run`（默认 16） | host 桥计数；同时并入全局 `max_tool_calls`（顺带修复主循环不递增计数的缺口，runtime.rs check_limits） |
+| 工具调用数 | `max_tool_calls_per_run`（默认 16） | host 桥计数；同时并入全局 `max_tool_calls` —— 主循环在每次工具执行前（executor 拦截层 = 每个 step 边界）预检 `current >= max`，超限返回 `max tool calls exceeded` 错误且不再执行，经桥超出同样使后续调用（含下一次 run_code）立即失败。`[ptc]` 数值下限在配置加载与 validate 时强校验（timeout_ms ≥ 100 等），零值直接拒绝 |
 | 网络 | 无 | QuickJS 无网络内建，「binding 即权限」 |
 
 ### 6.3 工具桥（host ↔ 沙箱）
@@ -220,8 +220,8 @@ hi from script
 
 ### 6.5 审计与可观测
 
-- 复用 `ToolAuditRecord`（tool.rs:238），嵌套调用记 `caller: run_code`，trace 折叠展示（对标 Anthropic `caller` 字段）；
-- 沙箱内工具调用照常走 `execute_tool_safely` panic 防护与 `limit_tool_output` 截断。
+- 已落地（runner 侧 per-run 审计日志）：复用 `ToolAuditRecord`（tool.rs），新增 `caller` 字段做归因 —— 直调记 `caller: "direct"`，沙箱桥调用记 `caller: "run_code"`（对标 Anthropic `caller` 字段）；`AgentRunner::tool_audit_records()` 可取全量记录。trace UI 折叠展示仍为后续项。
+- 沙箱桥调用的输出截断复用 `tool::limit_tool_output`（与直调路径同一引擎级截断，`[TRUNCATED: original N bytes]` 标记），panic 防护由执行链路继承。
 
 ---
 
@@ -265,7 +265,7 @@ hi from script
 4. **注入面**：tool result 字符串进沙箱（Anthropic 明示风险）；v1 仅截断不消毒，记为已知限制。
 5. **glob 优先级语义**（最长匹配）P1 定稿并写进 validate 提示。
 6. **token 双份问题**：both 工具同时出现在直调列表与 TS 类型块 → auto 档降级为目录行解决。
-7. **命名空间分层**：内置工具固定在 `tools` 根级、MCP server 工具固定在二级组（`tools.<server>.<tool>`），互不同层天然不撞名；JS 标识符 sanitize 后的撞名由 registry 现有 `try_register` 冲突检查兜底。沙箱侧名字 → 注册名的反向映射在绑定 host 函数时以闭包捕获注册名（如 `tools.github.list_prs` → `"github_list_prs"`）实现，dispatch 与直调完全共用 `AgentRunner::execute` 链路（超时/截断/审计/计数自动继承）。
+7. **命名空间分层**：内置工具固定在 `tools` 根级、MCP server 工具固定在二级组（`tools.<server>.<tool>`），互不同层天然不撞名；JS 标识符 sanitize 后的撞名（如 `my.git` vs `my_git`、平铺工具 vs 同名命名空间组、与保留的 `list_tools`/`describe_tool` 撞名）由共享去撞名 planner（`ts_types::plan_tool_bindings`）确定性改名（`_2`、`_3`…）并在 TS 声明与沙箱 prelude 中以 `// renamed from X (collision)` 注释明示，注册层另有 `try_register` 冲突检查兜底。沙箱侧名字 → 注册名的反向映射在绑定 host 函数时以闭包捕获注册名（如 `tools.github.list_prs` → `"github_list_prs"`）实现；未知 ns 成员也按 `{server}_{tool}` 组合名分发，不会越命名空间触达同名平铺工具；dispatch 与直调共用 `AgentRunner::execute` 链路（超时/截断/审计/计数自动继承）。
 
 ---
 

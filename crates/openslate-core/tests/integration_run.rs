@@ -106,6 +106,92 @@ max_output_bytes = 200
     parse_openslate_toml(toml).expect("test config should parse")
 }
 
+/// End-to-end enforcement of `limits.max_tool_calls` in the main agent
+/// loop: with a budget of 2 and a model that keeps calling tools, calls
+/// beyond the budget return the limit error (never executing), and the run
+/// ends on the model's final answer rather than by hitting max_steps.
+#[tokio::test]
+async fn integration_max_tool_calls_enforced_in_main_loop() {
+    fn huge_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(id.into()),
+            name: "huge".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+    let tool_step = |id: &str| ModelResponse {
+        content: None,
+        tool_calls: vec![huge_call(id)],
+        usage: None,
+        finish_reason: Some("tool_calls".into()),
+    };
+
+    let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "mock-model"
+
+[limits]
+max_steps = 30
+max_depth = 4
+max_context_bytes = 100_000
+max_output_bytes = 10_000
+max_tool_calls = 2
+"#;
+    let config = parse_openslate_toml(toml).expect("test config should parse");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(HugeOutputTool);
+
+    let provider = ScriptedProvider::new(vec![
+        tool_step("tc-1"),
+        tool_step("tc-2"),
+        tool_step("tc-3"),
+        ModelResponse {
+            content: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            finish_reason: Some("stop".into()),
+        },
+    ]);
+
+    let manager = RunManager::new(
+        config,
+        test_agent_tree(vec!["huge".into()]),
+        registry,
+        SkillsCatalog::default(),
+    );
+    let result = manager
+        .execute(&provider, "keep calling the tool", None)
+        .await
+        .expect("run should succeed");
+
+    // Terminated by the final answer (4 steps), not by max_steps (30).
+    assert_eq!(result.status, RunStatus::Completed);
+    assert_eq!(result.total_steps, 4);
+
+    let tool_msgs: Vec<&Message> = result
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(tool_msgs.len(), 3);
+    // First two calls executed (z-payload), the third was refused.
+    assert!(tool_msgs[0].content.starts_with('z'));
+    assert!(tool_msgs[1].content.starts_with('z'));
+    assert!(
+        tool_msgs[2]
+            .content
+            .contains("max tool calls exceeded (2/2)"),
+        "expected the limit error on the third call, got: {}",
+        tool_msgs[2].content
+    );
+}
+
 /// Test tool whose output (10 KB) far exceeds the configured cap.
 struct HugeOutputTool;
 

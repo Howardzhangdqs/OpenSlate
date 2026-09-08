@@ -11,9 +11,12 @@
 //! - unknown or over-nested schema constructs degrade to `any` instead of
 //!   failing, so a weird schema never breaks the whole tool list.
 //!
-//! Output is fully deterministic: same input orderings (tools sorted by
-//! name, namespace groups sorted by name) produce byte-identical strings —
-//! tests use exact-string ("snapshot") assertions on purpose.
+//! Output is fully deterministic: same input orderings produce
+//! byte-identical strings — tests use exact-string ("snapshot") assertions
+//! on purpose. Sanitization alone is not injective (`my.git` and `my_git`
+//! collide), so [`plan_tool_bindings`] de-collides identifiers
+//! deterministically (`_2`, `_3`, …) and is the single source shared by
+//! the TS declarations here and the sandbox prelude in `executor.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,33 +66,207 @@ const RESERVED: &[&str] = &[
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// Reserved member names on the `tools` object: the discovery helper
+/// aliases always win over real tools — a tool literally named
+/// `list_tools`/`describe_tool` is renamed, never shadowed.
+const RESERVED_HELPER_KEYS: [&str; 2] = ["list_tools", "describe_tool"];
+
+/// A collision-free placement for one tool (see [`plan_tool_bindings`]).
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedTool {
+    /// Registry (dispatch) name.
+    pub name: String,
+    /// Effective identifier the tool is reachable under (root key for flat
+    /// tools, member key inside its group for namespaced tools).
+    pub key: String,
+    /// Sanitized identifier before de-collision; differs from `key` only
+    /// when a collision forced a deterministic rename.
+    pub base: String,
+}
+
+/// A collision-free namespace group (see [`plan_tool_bindings`]).
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedGroup {
+    /// Effective object key for the group.
+    pub key: String,
+    /// Sanitized group key before de-collision; differs from `key` only
+    /// when a collision forced a deterministic rename.
+    pub base: String,
+    /// Raw namespace — also the registry-name prefix of the group's
+    /// members (e.g. server alias `my.git` → registry `my.git_status`).
+    pub raw_ns: String,
+    /// Member placements, sorted by effective key.
+    pub members: Vec<PlannedTool>,
+}
+
+/// Deterministic, collision-free binding plan for a tool set — the single
+/// source both the sandbox prelude (executor) and the generated TS
+/// declarations consume, so the model-visible paths and the runtime
+/// bindings can never drift.
+pub(crate) struct ToolBindings {
+    /// Flat (namespace-less) tools, sorted by effective key.
+    pub roots: Vec<PlannedTool>,
+    /// Namespace groups, sorted by effective key.
+    pub groups: Vec<PlannedGroup>,
+}
+
+/// Resolve the next free identifier for `base`: `base` itself when free,
+/// else `base_2`, `base_3`, … (first free suffix wins).
+fn unique_key(taken: &mut BTreeSet<String>, base: &str) -> String {
+    if taken.insert(base.to_owned()) {
+        return base.to_owned();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Plan how a set of `(registry_name, namespace)` items binds onto the
+/// sandbox `tools` object and the TS declarations.
+///
+/// Sanitization alone is not injective (`my.git` and `my_git` both map to
+/// `my_git`), so keys are de-collided deterministically: the reserved
+/// discovery-helper names are taken up front and always win; namespace
+/// groups allocate their sanitized keys next in first-seen order (a
+/// colliding *flat* tool is the one that gets renamed — the finding's
+/// contract); member identifiers are deduped within their group.
+/// Renames append `_2`, `_3`, …; consumers surface them as
+/// `// renamed from X (collision)` comments. Output lists are sorted by
+/// effective key for byte-deterministic rendering.
+pub(crate) fn plan_tool_bindings(items: &[(String, Option<String>)]) -> ToolBindings {
+    let mut taken: BTreeSet<String> = RESERVED_HELPER_KEYS
+        .iter()
+        .map(|k| (*k).to_owned())
+        .collect();
+
+    let mut roots_in: Vec<&str> = Vec::new();
+    let mut group_order: Vec<String> = Vec::new();
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, ns) in items {
+        match ns {
+            None => roots_in.push(name.as_str()),
+            Some(raw_ns) => {
+                if !grouped.contains_key(raw_ns) {
+                    group_order.push(raw_ns.clone());
+                }
+                grouped
+                    .entry(raw_ns.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
+
+    let mut groups: Vec<PlannedGroup> = Vec::new();
+    for raw_ns in group_order {
+        let names = grouped.remove(&raw_ns).unwrap_or_default();
+        let base = sanitize_ident(&raw_ns);
+        let key = unique_key(&mut taken, &base);
+        let prefix = format!("{raw_ns}_");
+        let mut member_taken: BTreeSet<String> = BTreeSet::new();
+        let mut members: Vec<PlannedTool> = names
+            .iter()
+            .map(|name| {
+                let member_base =
+                    sanitize_ident(name.strip_prefix(&prefix).unwrap_or(name.as_str()));
+                let key = unique_key(&mut member_taken, &member_base);
+                PlannedTool {
+                    name: name.clone(),
+                    key,
+                    base: member_base,
+                }
+            })
+            .collect();
+        members.sort_by(|a, b| a.key.cmp(&b.key));
+        groups.push(PlannedGroup {
+            key,
+            base,
+            raw_ns,
+            members,
+        });
+    }
+    groups.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let mut roots: Vec<PlannedTool> = roots_in
+        .iter()
+        .map(|name| {
+            let base = sanitize_ident(name);
+            let key = unique_key(&mut taken, &base);
+            PlannedTool {
+                name: (*name).to_owned(),
+                key,
+                base,
+            }
+        })
+        .collect();
+    roots.sort_by(|a, b| a.key.cmp(&b.key));
+
+    ToolBindings { roots, groups }
+}
+
+/// Effective access path for every tool in the set (registry name →
+/// `github.list_prs` / `read_file`), computed from a full binding plan so
+/// collision renames are consistent everywhere the model sees a path.
+pub(crate) fn effective_paths(tools: &[PtcToolInfo]) -> BTreeMap<String, String> {
+    let pairs: Vec<(String, Option<String>)> = tools
+        .iter()
+        .map(|t| (t.name.clone(), t.namespace.clone()))
+        .collect();
+    let plan = plan_tool_bindings(&pairs);
+    let mut out = BTreeMap::new();
+    for root in plan.roots {
+        out.insert(root.name, root.key);
+    }
+    for group in plan.groups {
+        for member in group.members {
+            out.insert(member.name, format!("{}.{}", group.key, member.key));
+        }
+    }
+    out
+}
+
 /// Generate the TypeScript declarations for the given tools.
 ///
 /// Tools with a namespace become a nested group (`tools.github.list_prs`),
 /// namespace-less tools sit at the root level. Both levels are sorted by
-/// name for deterministic output.
+/// effective key for deterministic output; collision-forced renames carry a
+/// `// renamed from X (collision)` comment so the model sees the effective
+/// path.
 pub fn generate_declarations(tools: &[PtcToolInfo]) -> String {
-    let mut root: Vec<&PtcToolInfo> = Vec::new();
-    let mut groups: BTreeMap<String, Vec<&PtcToolInfo>> = BTreeMap::new();
-    for tool in tools {
-        match &tool.namespace {
-            None => root.push(tool),
-            Some(ns) => groups.entry(sanitize_ident(ns)).or_default().push(tool),
-        }
-    }
-    root.sort_by_key(|t| method_name(t));
-    for members in groups.values_mut() {
-        members.sort_by_key(|t| method_name(t));
-    }
+    let plan = plan_for_infos(tools);
+    let by_name = infos_by_name(tools);
 
     let mut out = String::from("declare const tools: {\n");
-    for tool in root {
-        out.push_str(&tool_block(tool, 2));
+    for root in &plan.roots {
+        let info = by_name
+            .get(root.name.as_str())
+            .expect("plan names come from tools");
+        if root.key != root.base {
+            out.push_str(&format!("  // renamed from {} (collision)\n", root.base));
+        }
+        out.push_str(&tool_block_at(info, &root.key, 2));
     }
-    for (ns, members) in &groups {
-        out.push_str(&format!("  {ns}: {{\n"));
-        for tool in members {
-            out.push_str(&tool_block(tool, 4));
+    for group in &plan.groups {
+        if group.key != group.base {
+            out.push_str(&format!("  // renamed from {} (collision)\n", group.base));
+        }
+        out.push_str(&format!("  {}: {{\n", group.key));
+        for member in &group.members {
+            let info = by_name
+                .get(member.name.as_str())
+                .expect("plan names come from tools");
+            if member.key != member.base {
+                out.push_str(&format!(
+                    "    // renamed from {} (collision)\n",
+                    member.base
+                ));
+            }
+            out.push_str(&tool_block_at(info, &member.key, 4));
         }
         out.push_str("  };\n");
     }
@@ -97,16 +274,37 @@ pub fn generate_declarations(tools: &[PtcToolInfo]) -> String {
     out
 }
 
+/// Plan bindings for a `PtcToolInfo` slice.
+fn plan_for_infos(tools: &[PtcToolInfo]) -> ToolBindings {
+    let pairs: Vec<(String, Option<String>)> = tools
+        .iter()
+        .map(|t| (t.name.clone(), t.namespace.clone()))
+        .collect();
+    plan_tool_bindings(&pairs)
+}
+
+/// Registry-name → info lookup for zipping a plan back onto its tools.
+fn infos_by_name(tools: &[PtcToolInfo]) -> BTreeMap<&str, &PtcToolInfo> {
+    tools.iter().map(|t| (t.name.as_str(), t)).collect()
+}
+
 /// Generate a declaration block for a single tool. For a namespaced tool
 /// this nests the method inside its namespace group — byte-identical to
 /// what [`generate_declarations`] would render for a one-tool catalog.
 pub fn single_declaration(info: &PtcToolInfo) -> String {
+    single_declaration_at(info, &tool_path(info))
+}
+
+/// [`single_declaration`] with an explicit effective access path
+/// (`read_file` or `github.list_prs`), e.g. from a full-set
+/// [`effective_paths`] map. `pub(crate)` for the sandbox `describe_tool`.
+pub(crate) fn single_declaration_at(info: &PtcToolInfo, path: &str) -> String {
     let mut out = String::from("declare const tools: {\n");
-    match &info.namespace {
-        None => out.push_str(&tool_block(info, 2)),
-        Some(ns) => {
-            out.push_str(&format!("  {}: {{\n", sanitize_ident(ns)));
-            out.push_str(&tool_block(info, 4));
+    match path.split_once('.') {
+        None => out.push_str(&tool_block_at(info, path, 2)),
+        Some((group, member)) => {
+            out.push_str(&format!("  {group}: {{\n"));
+            out.push_str(&tool_block_at(info, member, 4));
             out.push_str("  };\n");
         }
     }
@@ -115,14 +313,19 @@ pub fn single_declaration(info: &PtcToolInfo) -> String {
 }
 
 /// Generate catalog lines for the given tools (one per line, sorted by
-/// path): `github.list_prs: List pull requests`. Used by the `catalog`
-/// disclosure tier; line format shared with [`crate::describe::list`].
+/// effective path): `github.list_prs: List pull requests`. Used by the
+/// `catalog` disclosure tier; line format shared with
+/// [`crate::describe::list`].
 pub fn catalog_lines(tools: &[PtcToolInfo]) -> String {
-    let mut sorted: Vec<&PtcToolInfo> = tools.iter().collect();
-    sorted.sort_by_key(|t| tool_path(t));
+    let paths = effective_paths(tools);
+    let mut sorted: Vec<(&PtcToolInfo, &String)> = tools
+        .iter()
+        .map(|t| (t, paths.get(&t.name).expect("path for tool")))
+        .collect();
+    sorted.sort_by(|a, b| a.1.cmp(b.1));
     sorted
         .iter()
-        .map(|t| crate::describe::catalog_line(t))
+        .map(|(t, p)| crate::describe::catalog_line_at(t, p))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -135,47 +338,68 @@ pub(crate) fn generate_declarations_mixed(
     tools: &[PtcToolInfo],
     demote: &std::collections::HashSet<&str>,
 ) -> (String, usize) {
-    let mut root: Vec<&PtcToolInfo> = Vec::new();
-    let mut groups: BTreeMap<String, Vec<&PtcToolInfo>> = BTreeMap::new();
-    for tool in tools {
-        match &tool.namespace {
-            None => root.push(tool),
-            Some(ns) => groups.entry(sanitize_ident(ns)).or_default().push(tool),
-        }
-    }
-    root.sort_by_key(|t| method_name(t));
-    for members in groups.values_mut() {
-        members.sort_by_key(|t| method_name(t));
-    }
+    let plan = plan_for_infos(tools);
+    let by_name = infos_by_name(tools);
+    let paths = effective_paths(tools);
 
     let mut out = String::from("declare const tools: {\n");
     let mut demoted_lines: Vec<String> = Vec::new();
     let mut demoted_count = 0usize;
-    for tool in root {
-        if demote.contains(tool.name.as_str()) {
-            demoted_lines.push(format!("  // {}", crate::describe::catalog_line(tool)));
+    for root in &plan.roots {
+        let info = by_name
+            .get(root.name.as_str())
+            .expect("plan names come from tools");
+        if demote.contains(info.name.as_str()) {
+            let path = paths.get(&info.name).expect("path for tool");
+            demoted_lines.push(format!(
+                "  // {}",
+                crate::describe::catalog_line_at(info, path)
+            ));
             demoted_count += 1;
         } else {
-            out.push_str(&tool_block(tool, 2));
+            if root.key != root.base {
+                out.push_str(&format!("  // renamed from {} (collision)\n", root.base));
+            }
+            out.push_str(&tool_block_at(info, &root.key, 2));
         }
     }
-    for (ns, members) in &groups {
-        let full: Vec<&&PtcToolInfo> = members
+    for group in &plan.groups {
+        let full: Vec<&PlannedTool> = group
+            .members
             .iter()
-            .filter(|t| !demote.contains(t.name.as_str()))
+            .filter(|m| !demote.contains(m.name.as_str()))
             .collect();
-        for tool in members {
-            if demote.contains(tool.name.as_str()) {
-                demoted_lines.push(format!("  // {}", crate::describe::catalog_line(tool)));
+        for member in &group.members {
+            let info = by_name
+                .get(member.name.as_str())
+                .expect("plan names come from tools");
+            if demote.contains(info.name.as_str()) {
+                let path = paths.get(&info.name).expect("path for tool");
+                demoted_lines.push(format!(
+                    "  // {}",
+                    crate::describe::catalog_line_at(info, path)
+                ));
                 demoted_count += 1;
             }
         }
         if full.is_empty() {
             continue; // whole group demoted: no empty braces
         }
-        out.push_str(&format!("  {ns}: {{\n"));
-        for tool in full {
-            out.push_str(&tool_block(tool, 4));
+        if group.key != group.base {
+            out.push_str(&format!("  // renamed from {} (collision)\n", group.base));
+        }
+        out.push_str(&format!("  {}: {{\n", group.key));
+        for member in full {
+            let info = by_name
+                .get(member.name.as_str())
+                .expect("plan names come from tools");
+            if member.key != member.base {
+                out.push_str(&format!(
+                    "    // renamed from {} (collision)\n",
+                    member.base
+                ));
+            }
+            out.push_str(&tool_block_at(info, &member.key, 4));
         }
         out.push_str("  };\n");
     }
@@ -188,9 +412,15 @@ pub(crate) fn generate_declarations_mixed(
 }
 
 /// Render the method block (JSDoc + signature) for a single tool at the
-/// given indent width. `pub(crate)` so `prompt.rs` can count how many tools
-/// survive declaration truncation.
+/// given indent width under its single-tool (unplanned) method name.
+/// `pub(crate)` so `prompt.rs` can count how many tools survive declaration
+/// truncation.
 pub(crate) fn tool_block(tool: &PtcToolInfo, indent: usize) -> String {
+    tool_block_at(tool, &method_name(tool), indent)
+}
+
+/// [`tool_block`] with an explicit effective key (from a binding plan).
+fn tool_block_at(tool: &PtcToolInfo, key: &str, indent: usize) -> String {
     let pad = " ".repeat(indent);
     let mut out = String::new();
     if let Some(doc) = jsdoc(&tool.description) {
@@ -205,7 +435,7 @@ pub(crate) fn tool_block(tool: &PtcToolInfo, indent: usize) -> String {
     );
     out.push_str(&format!(
         "{pad}{}: (input: {input}) => Promise<any>;\n",
-        method_name(tool)
+        key
     ));
     out
 }
@@ -226,12 +456,14 @@ fn method_name(tool: &PtcToolInfo) -> String {
 
 /// The dotted access path a tool is exposed under inside the sandbox and in
 /// catalog lines: `tools.<path>` — `github.list_prs` for namespaced tools,
-/// the sanitized registry name for root tools.
+/// the sanitized registry name for root tools. Single-tool view (reserved
+/// helper-name collisions accounted for); use [`effective_paths`] when a
+/// whole tool set is available so cross-tool collisions rename consistently.
 pub(crate) fn tool_path(tool: &PtcToolInfo) -> String {
-    match &tool.namespace {
-        Some(ns) => format!("{}.{}", sanitize_ident(ns), method_name(tool)),
-        None => sanitize_ident(&tool.name),
-    }
+    effective_paths(std::slice::from_ref(tool))
+        .get(&tool.name)
+        .cloned()
+        .unwrap_or_else(|| sanitize_ident(&tool.name))
 }
 
 // ── Identifier and JSDoc helpers ─────────────────────────────────────────────
@@ -782,6 +1014,85 @@ t: (input: any) => Promise<any>;\n\
         assert_eq!(sanitize_ident("a.b c"), "a_b_c");
         assert_eq!(sanitize_ident("weird:name!"), "weirdname");
         assert_eq!(sanitize_ident("for"), "for_");
+    }
+
+    #[test]
+    fn declarations_decollide_sanitizing_namespace_collision() {
+        // `my.git` and `my_git` both sanitize to `my_git`: the second group
+        // is renamed and flagged — no duplicate keys in the TS block.
+        let git = namespaced("my.git", "my.git_status", "git status", Value::Null);
+        let git_ = namespaced("my_git", "my_git_log", "git log", Value::Null);
+        let out = generate_declarations(&[git, git_]);
+        assert_eq!(
+            out,
+            "declare const tools: {\n  \
+my_git: {\n    \
+/** git status */\n    \
+status: (input: any) => Promise<any>;\n  \
+};\n  \
+// renamed from my_git (collision)\n  \
+my_git_2: {\n    \
+/** git log */\n    \
+log: (input: any) => Promise<any>;\n  \
+};\n\
+};"
+        );
+    }
+
+    #[test]
+    fn declarations_rename_flat_tool_colliding_with_group() {
+        // The namespace group keeps `github`; the flat tool becomes
+        // `github_2` with a rename comment.
+        let flat = tool("github", "flat github", Value::Null);
+        let member = namespaced("github", "github_list_prs", "List PRs", Value::Null);
+        let out = generate_declarations(&[flat, member]);
+        assert!(out.contains("github: {"), "group keeps the base key: {out}");
+        assert!(
+            out.contains("// renamed from github (collision)")
+                && out.contains("github_2: (input: any)"),
+            "flat tool renamed with comment: {out}"
+        );
+        // Exactly one occurrence of each key line (no duplicate TS keys).
+        assert_eq!(out.matches("github: {").count(), 1);
+        assert_eq!(out.matches("github_2:").count(), 1);
+    }
+
+    #[test]
+    fn declarations_rename_tool_named_like_helper() {
+        // Reserved helper names always win: a real `list_tools` tool is
+        // renamed, never shadowed by the helper aliases.
+        let t = tool(
+            "list_tools",
+            "a tool unlucky enough to hit a reserved name",
+            Value::Null,
+        );
+        let out = generate_declarations(&[t]);
+        assert!(
+            out.contains("// renamed from list_tools (collision)")
+                && out.contains("list_tools_2: (input: any)"),
+            "renamed with comment: {out}"
+        );
+        assert!(
+            !out.contains("\n  list_tools:"),
+            "no bare list_tools key: {out}"
+        );
+    }
+
+    #[test]
+    fn effective_paths_and_catalog_lines_follow_renames() {
+        let flat = tool("github", "flat github", Value::Null);
+        let member = namespaced("github", "github_list_prs", "List PRs.", Value::Null);
+        let paths = effective_paths(&[flat.clone(), member.clone()]);
+        assert_eq!(paths.get("github").map(String::as_str), Some("github_2"));
+        assert_eq!(
+            paths.get("github_list_prs").map(String::as_str),
+            Some("github.list_prs")
+        );
+        // Catalog lines use the effective paths (sorted by path):
+        assert_eq!(
+            catalog_lines(&[flat, member]),
+            "github.list_prs: List PRs\ngithub_2: flat github"
+        );
     }
 
     #[test]

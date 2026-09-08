@@ -33,7 +33,10 @@ use crate::model_config::resolve_model;
 use crate::provider::{ModelProvider, ProgressCallback, ToolDefinition};
 use crate::runtime::{check_limits, execute_run, RunConfig, RunResult, RuntimeLimits};
 use crate::skills::SkillsCatalog;
-use crate::tool::{Tool, ToolExecutor, ToolRegistry};
+use crate::tool::{
+    create_audit_record, limit_tool_output, Tool, ToolAuditRecord, ToolExecutor, ToolRegistry,
+    TOOL_CALLER_DIRECT, TOOL_CALLER_RUN_CODE,
+};
 use crate::types::*;
 
 /// Snapshot of the currently-executing agent pushed onto the runner's call
@@ -85,9 +88,14 @@ pub struct AgentRunner<'a> {
     /// model makes (including `run_code` itself) plus every bridge call a
     /// `run_code` script makes. `call_agent` is excluded — it has its own
     /// budget (`max_child_agent_calls`). Consulted by `check_limits` at
-    /// delegation boundaries (best-effort fix for the exp-1 gap: the main
-    /// loop itself never increments the `max_tool_calls` budget).
+    /// delegation boundaries and by `execute` before every tool call
+    /// (main-loop enforcement of `max_tool_calls`).
     tool_call_count: AtomicU32,
+    /// Audit records for every tool execution in this run (direct model
+    /// calls and sandbox bridge calls alike), with caller attribution —
+    /// PTC_PLAN.md §6.5. `Arc` so the `run_code` bridge closure (which must
+    /// be 'static) can record into the same log.
+    tool_audit_log: Arc<Mutex<Vec<ToolAuditRecord>>>,
     total_input_tokens: AtomicU64,
     total_output_tokens: AtomicU64,
     /// Wall-clock deadline shared by the whole run. Each child layer gets
@@ -144,6 +152,7 @@ impl<'a> AgentRunner<'a> {
             caller_stack: Mutex::new(Vec::new()),
             child_call_count: AtomicU32::new(0),
             tool_call_count: AtomicU32::new(0),
+            tool_audit_log: Arc::new(Mutex::new(Vec::new())),
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
             root_deadline,
@@ -178,6 +187,29 @@ impl<'a> AgentRunner<'a> {
     /// made. `call_agent` calls are counted separately.
     pub fn tool_call_count(&self) -> u32 {
         self.tool_call_count.load(Ordering::Relaxed)
+    }
+
+    /// Audit records for every tool execution this run, in execution order,
+    /// with caller attribution (`direct` / `run_code`, PTC_PLAN.md §6.5).
+    pub fn tool_audit_records(&self) -> Vec<ToolAuditRecord> {
+        self.tool_audit_log
+            .lock()
+            .expect("tool_audit_log poisoned")
+            .clone()
+    }
+
+    /// Append an audit record for a tool execution.
+    fn record_tool_audit(
+        &self,
+        name: &str,
+        caller: &str,
+        args: &serde_json::Value,
+        output: &ToolOutput,
+    ) {
+        self.tool_audit_log
+            .lock()
+            .expect("tool_audit_log poisoned")
+            .push(create_audit_record(name, caller, args, output));
     }
 
     /// Append the skills catalog section (if any) to a system prompt.
@@ -702,13 +734,17 @@ impl<'a> AgentRunner<'a> {
         // Host-side bridge (errors-as-data protocol): every outcome — lookup
         // failure, bad arguments, tool Err, or an error-status ToolOutput —
         // comes back as an error envelope the sandbox turns into a JS
-        // exception the code can try/catch.
+        // exception the code can try/catch. Every execution is audited with
+        // `caller: run_code` attribution (PTC_PLAN.md §6.5) and truncated
+        // through the same engine-level cap the direct path uses.
         let max_output = self.ptc.max_output_bytes;
+        let audit_log = Arc::clone(&self.tool_audit_log);
         let bridge: ToolBridge = Arc::new(
             move |name: &str, args_json: &str| -> BoxFuture<'static, String> {
                 let name = name.to_owned();
                 let args_json = args_json.to_owned();
                 let tool = bridge_tools.get(&name).cloned();
+                let audit_log = Arc::clone(&audit_log);
                 Box::pin(async move {
                     let tool = match tool {
                         Some(t) => t,
@@ -732,13 +768,31 @@ impl<'a> AgentRunner<'a> {
                         ));
                     }
                     match tool.execute(&parsed).await {
-                        Err(e) => openslate_ptc::envelope_error(e),
+                        Err(e) => {
+                            // No ToolOutput on Err; audit a synthetic error
+                            // record so the failed bridge call stays visible.
+                            let failed = ToolOutput {
+                                content: format!("Error: {e}"),
+                                bytes: 0,
+                                duration_ms: 0,
+                                status: ToolOutputStatus::Error,
+                            };
+                            audit_log.lock().expect("tool_audit_log poisoned").push(
+                                create_audit_record(&name, TOOL_CALLER_RUN_CODE, &parsed, &failed),
+                            );
+                            openslate_ptc::envelope_error(e)
+                        }
                         Ok(out) => {
-                            let content = truncate_bridge_output(&out.content, max_output);
-                            match out.status {
-                                ToolOutputStatus::Error => openslate_ptc::envelope_error(content),
+                            let limited = truncate_bridge_output(out, max_output);
+                            audit_log.lock().expect("tool_audit_log poisoned").push(
+                                create_audit_record(&name, TOOL_CALLER_RUN_CODE, &parsed, &limited),
+                            );
+                            match limited.status {
+                                ToolOutputStatus::Error => {
+                                    openslate_ptc::envelope_error(limited.content)
+                                }
                                 _ => openslate_ptc::envelope_result(serde_json::Value::String(
-                                    content,
+                                    limited.content,
                                 )),
                             }
                         }
@@ -759,9 +813,13 @@ impl<'a> AgentRunner<'a> {
 
         // Fold the script's bridge calls into the global tool-call budget
         // (the run_code invocation itself is already counted in execute()).
-        if outcome.tool_calls > 0 {
+        // usize → u32 with an explicit saturating fallback: a pathological
+        // count beyond u32::MAX clamps instead of silently truncating via
+        // `as` (unreachable in practice — the per-run budget is far smaller).
+        let bridge_calls = u32::try_from(outcome.tool_calls).unwrap_or(u32::MAX);
+        if bridge_calls > 0 {
             self.tool_call_count
-                .fetch_add(outcome.tool_calls as u32, Ordering::Relaxed);
+                .fetch_add(bridge_calls, Ordering::Relaxed);
         }
 
         let logs = outcome.logs.join("\n");
@@ -793,22 +851,14 @@ impl<'a> AgentRunner<'a> {
     }
 }
 
-/// Cut PTC bridge tool content to `max` bytes on a UTF-8 char boundary,
-/// appending a truncation marker noting the original size (same style as
-/// `tool::limit_tool_output` and the ptc executor's `truncate_bytes`).
-fn truncate_bridge_output(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
-    }
-    let mut cut = max;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!(
-        "{}\n--- TRUNCATED (original {} bytes) ---",
-        &s[..cut],
-        s.len()
-    )
+/// Apply the engine-level output cap ([`limit_tool_output`]) to a PTC
+/// bridge tool output — the same truncation the direct path applies in the
+/// runtime loop (PTC_PLAN.md §6.5), instead of an ad-hoc slice. The byte
+/// count is taken from the actual content so tools that report
+/// `bytes = 0` with a large payload are still capped.
+fn truncate_bridge_output(output: ToolOutput, max: usize) -> ToolOutput {
+    let bytes = output.content.len();
+    limit_tool_output(ToolOutput { bytes, ..output }, max)
 }
 
 /// Pull all leading system-role messages out of a message list and join them
@@ -971,22 +1021,45 @@ impl<'a> ToolExecutor for AgentRunner<'a> {
         if name == "call_agent" {
             return self.handle_call_agent(args).await;
         }
+        // Main-loop enforcement of the global `max_tool_calls` budget
+        // (PTC_PLAN.md §6.2): this runs before every tool execution — i.e.
+        // at each step boundary of the run loop — with the same
+        // pre-check-then-reserve semantics as `check_limits`
+        // (current >= max rejects). A run_code script folding its bridge
+        // calls over the budget makes subsequent calls (direct or another
+        // run_code) fail here too, so exceeding via the bridge also stops
+        // the run coherently.
+        let current_tool_calls = self.tool_call_count.load(Ordering::Relaxed);
+        if self.limits.max_tool_calls > 0 && current_tool_calls >= self.limits.max_tool_calls {
+            return self.error_output(format!(
+                "max tool calls exceeded ({current_tool_calls}/{}): \
+                 tool '{name}' not executed — finish with your final answer",
+                self.limits.max_tool_calls
+            ));
+        }
         // Count every (attempted) direct tool call toward the global
-        // max_tool_calls budget, consulted at delegation boundaries; a
-        // run_code script folds its inner bridge calls in via
-        // handle_run_code. call_agent is excluded (own budget, above).
+        // max_tool_calls budget; a run_code script folds its inner bridge
+        // calls in via handle_run_code. call_agent is excluded (own budget,
+        // above).
         self.tool_call_count.fetch_add(1, Ordering::Relaxed);
         // PTC interception (PTC_PLAN.md §3, 收口②): run_code executes the
         // model's code in the sandbox instead of dispatching to the registry.
         // Only when PTC is enabled; disabled, it falls through to the
         // registry's unknown-tool error.
         if name == RUN_CODE_TOOL && self.ptc.enabled {
-            return self.handle_run_code(args).await;
+            let output = self.handle_run_code(args).await;
+            self.record_tool_audit(RUN_CODE_TOOL, TOOL_CALLER_DIRECT, args, &output);
+            return output;
         }
         // Hallucination guard (收口④): the model may still emit a direct
         // call to a ptc-only tool it saw in an earlier turn or invented —
-        // reject it with an actionable message instead of executing.
-        if self.ptc.enabled && !resolve_tool_mode(&self.ptc.tool_modes, name, true).direct_visible()
+        // reject it with an actionable message instead of executing. Only a
+        // REGISTERED tool gets the ptc-only hint; an unregistered name that
+        // merely matches a ptc-only glob must surface the unknown-tool
+        // error below.
+        if self.ptc.enabled
+            && !resolve_tool_mode(&self.ptc.tool_modes, name, true).direct_visible()
+            && self.tool_registry.contains(name)
         {
             return self.error_output(format!(
                 "tool '{name}' is ptc-only: call it from code inside {RUN_CODE_TOOL}"
@@ -994,8 +1067,9 @@ impl<'a> ToolExecutor for AgentRunner<'a> {
         }
         // Delegate all other tools to the shared registry, converting errors
         // into error ToolOutputs exactly as ToolRegistry's own ToolExecutor
-        // impl does (so the runtime loop keeps going gracefully).
-        match self.tool_registry.execute(name, args).await {
+        // impl does (so the runtime loop keeps going gracefully). Every
+        // dispatched execution is audited with direct-caller attribution.
+        let output = match self.tool_registry.execute(name, args).await {
             Ok(output) => output,
             Err(e) => ToolOutput {
                 content: format!("Error: {}", e),
@@ -1003,7 +1077,9 @@ impl<'a> ToolExecutor for AgentRunner<'a> {
                 duration_ms: 0,
                 status: ToolOutputStatus::Error,
             },
-        }
+        };
+        self.record_tool_audit(name, TOOL_CALLER_DIRECT, args, &output);
+        output
     }
 }
 
@@ -2311,6 +2387,217 @@ enabled = true
             calls.load(Ordering::SeqCst),
             0,
             "lookups must not consume the tool-call budget"
+        );
+    }
+
+    // ── Global max_tool_calls enforcement in the main loop (A7) ──────────
+
+    fn echo_tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(id.into()),
+            name: "mock_echo".into(),
+            arguments: serde_json::json!({"x": 1}),
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_max_tool_calls_enforced_in_main_loop() {
+        // max_tool_calls = 2 while the model keeps calling tools: calls
+        // beyond the budget must return the limit error (and not execute),
+        // so the run finishes with the limit feedback long before
+        // max_steps instead of burning the step budget.
+        let provider = ScriptedProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![echo_tool_call("tc-1")],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: None,
+                tool_calls: vec![echo_tool_call("tc-2")],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: None,
+                tool_calls: vec![echo_tool_call("tc-3")],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: None,
+                tool_calls: vec![echo_tool_call("tc-4")],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            assistant_text("done after limits"),
+        ]);
+
+        let config = test_config();
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let limits = RuntimeLimits {
+            max_tool_calls: 2,
+            max_steps: 50,
+            ..RuntimeLimits::default()
+        };
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            limits,
+            RunId("t".into()),
+        );
+
+        let result = runner
+            .run_root(vec![user_message("keep calling tools")], None)
+            .await
+            .expect("run ok");
+
+        // The run terminated on the model's final answer (5 steps), far
+        // below max_steps = 50 — not by running out of steps.
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 5);
+
+        let tool_msgs: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 4, "four tool-call turns happened");
+        assert!(tool_msgs[0].content.contains("echo:1"));
+        assert!(tool_msgs[1].content.contains("echo:1"));
+        // Calls 3 and 4 hit the limit error instead of executing.
+        for msg in &tool_msgs[2..] {
+            assert!(
+                msg.content.contains("max tool calls exceeded"),
+                "expected limit error, got: {}",
+                msg.content
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "only 2 executions");
+        assert_eq!(runner.tool_call_count(), 2);
+    }
+
+    // ── Audit records + shared bridge truncation (A8) ────────────────────
+
+    #[tokio::test]
+    async fn run_code_bridge_calls_are_audited_with_caller_attribution() {
+        let config = ptc_config("");
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "async () => { const r = await tools.mock_echo({x:1}); return r; }"
+                }),
+            )
+            .await;
+        assert_eq!(out.status, ToolOutputStatus::Success, "{}", out.content);
+
+        let records = runner.tool_audit_records();
+        // The sandbox-originated tool call must produce an audit record
+        // attributed to run_code…
+        let bridge = records
+            .iter()
+            .find(|r| r.tool_name == "mock_echo")
+            .expect("bridge call audited");
+        assert_eq!(bridge.caller, "run_code");
+        assert!(bridge.arguments_json.contains("\"x\":1"));
+        assert_eq!(bridge.output_status, "success");
+        // …and the model-facing run_code invocation is audited as direct.
+        let direct = records
+            .iter()
+            .find(|r| r.tool_name == "run_code")
+            .expect("run_code invocation audited");
+        assert_eq!(direct.caller, "direct");
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn truncate_bridge_output_under_limit_passes_through() {
+        let output = ToolOutput {
+            content: "small".into(),
+            bytes: 0, // tools that misreport bytes must not dodge the cap
+            duration_ms: 7,
+            status: ToolOutputStatus::Success,
+        };
+        let limited = truncate_bridge_output(output.clone(), 100);
+        assert_eq!(limited.content, "small");
+        assert_eq!(limited.status, ToolOutputStatus::Success);
+        assert_eq!(limited.duration_ms, 7);
+    }
+
+    #[test]
+    fn truncate_bridge_output_over_limit_shares_engine_truncation() {
+        let output = ToolOutput {
+            content: "z".repeat(10_000),
+            bytes: 0,
+            duration_ms: 3,
+            status: ToolOutputStatus::Success,
+        };
+        let limited = truncate_bridge_output(output, 200);
+        assert_eq!(limited.status, ToolOutputStatus::Truncated);
+        assert!(
+            limited.content.contains("[TRUNCATED: original 10000 bytes"),
+            "marker: {}",
+            limited.content
+        );
+        assert!(limited.content.len() < 1_000);
+        assert_eq!(limited.status, ToolOutputStatus::Truncated);
+    }
+
+    // ── Hallucination guard: unknown tool vs ptc-only (A10) ──────────────
+
+    #[tokio::test]
+    async fn unregistered_tool_matching_ptc_glob_reports_unknown_tool() {
+        // `github_*` is ptc-only, but `github_nope` is not registered: the
+        // model must see the unknown-tool error, not a misleading
+        // "is ptc-only" hint.
+        let config = ptc_config("\n[ptc.tool_modes]\n\"github_*\" = \"ptc\"\n");
+        let tree = root_only_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner.execute("github_nope", &serde_json::json!({})).await;
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("not found") && !out.content.contains("ptc-only"),
+            "expected unknown-tool error, got: {}",
+            out.content
         );
     }
 }

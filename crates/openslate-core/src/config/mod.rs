@@ -355,8 +355,20 @@ fn default_profile() -> String {
 // ── Parsing functions ────────────────────────────────────────────────────────
 
 /// Parse the main `openslate.toml` content into an `OpenSlateConfig`.
+///
+/// `[ptc]` numeric floors (see `validation::ptc_floor_errors`) are enforced
+/// here too, so a value that would brick the `run_code` sandbox (e.g.
+/// `timeout_ms = 0`) fails at load time instead of at first use.
 pub fn parse_openslate_toml(content: &str) -> Result<OpenSlateConfig, ConfigError> {
-    toml::from_str(content).map_err(|e| ConfigError::ParseError(e.to_string()))
+    let config: OpenSlateConfig =
+        toml::from_str(content).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+    if let Some(first) = validation::ptc_floor_errors(&config.ptc).first() {
+        return Err(ConfigError::ParseError(format!(
+            "invalid [ptc] settings: {}: {}",
+            first.field, first.message
+        )));
+    }
+    Ok(config)
 }
 
 // ── Markdown frontmatter parsing ─────────────────────────────────────────────
@@ -900,6 +912,56 @@ disclosure = "everything"
             msg.contains("disclosure"),
             "error should name the offending field, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_ptc_zero_timeout_ms_rejected() {
+        // Zero/near-zero budgets brick the sandbox — fail at load time.
+        let toml = r#"
+[ptc]
+enabled = true
+timeout_ms = 0
+"#;
+        let err = parse_openslate_toml(toml).expect_err("timeout_ms = 0 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ptc.timeout_ms"), "msg: {msg}");
+        assert!(msg.contains(">= 100"), "floor must be stated, msg: {msg}");
+    }
+
+    #[test]
+    fn parse_ptc_zero_max_output_bytes_rejected() {
+        let toml = r#"
+[ptc]
+enabled = true
+max_output_bytes = 0
+"#;
+        let err = parse_openslate_toml(toml).expect_err("max_output_bytes = 0 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ptc.max_output_bytes"), "msg: {msg}");
+        assert!(msg.contains(">= 1024"), "floor must be stated, msg: {msg}");
+    }
+
+    #[test]
+    fn parse_ptc_floor_boundary_values_accepted() {
+        // Happy path: every numeric exactly at its floor passes.
+        let toml = r#"
+[ptc]
+enabled = true
+timeout_ms = 100
+memory_limit_bytes = 1048576
+max_output_bytes = 1024
+max_tool_calls_per_run = 1
+max_lookup_calls = 1
+max_list_chars = 0
+"#;
+        let config = parse_openslate_toml(toml).expect("floor values must parse");
+        assert_eq!(config.ptc.timeout_ms, 100);
+        assert_eq!(config.ptc.memory_limit_bytes, 1_048_576);
+        assert_eq!(config.ptc.max_output_bytes, 1024);
+        assert_eq!(config.ptc.max_tool_calls_per_run, 1);
+        assert_eq!(config.ptc.max_lookup_calls, 1);
+        // max_list_chars = 0 keeps its documented "unlimited" meaning.
+        assert_eq!(config.ptc.max_list_chars, 0);
     }
 
     // ── Full example TOML ────────────────────────────────────────────────

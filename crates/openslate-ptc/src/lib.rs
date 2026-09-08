@@ -100,23 +100,46 @@ pub fn resolve_tool_mode(
 
 /// Glob match with the same semantics as core's tool whitelist matching
 /// (`tool.rs::tool_name_matches`): plain patterns (no metacharacters) require
-/// an exact match; otherwise `*` matches any run of characters and `?`
-/// matches exactly one. Keep in sync with the core implementation.
+/// an exact match; otherwise `*` matches any run of characters (including
+/// empty) and `?` matches exactly one. Keep in sync with the core
+/// implementation.
+///
+/// Implementation is the classic two-pointer scan with single-star
+/// backtracking (same as core's): linear time, no exponential blowup on
+/// adversarial patterns — important because `list_tools(pattern)` feeds
+/// model-controlled patterns into this matcher from inside a host callback
+/// where the QuickJS interrupt handler cannot preempt it.
 pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
     if !pattern.contains('*') && !pattern.contains('?') {
         return text == pattern;
     }
-    fn rec(t: &[char], p: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| rec(&t[i..], &p[1..])),
-            Some('?') => !t.is_empty() && rec(&t[1..], &p[1..]),
-            Some(&c) => !t.is_empty() && t[0] == c && rec(&t[1..], &p[1..]),
-        }
-    }
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
-    rec(&t, &p)
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star: Option<usize> = None;
+    let mut stash = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            stash = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // backtrack: let the last `*` consume one more char
+            pi = s + 1;
+            stash += 1;
+            ti = stash;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // ── Disclosure tiers ─────────────────────────────────────────────────────────
@@ -299,6 +322,47 @@ mod tests {
         assert!(!wildcard_match("write_file", "read_*"));
         assert!(wildcard_match("read_fi_e", "read_fi?e"));
         assert!(wildcard_match("aXBc", "*X*"));
+    }
+
+    #[test]
+    fn wildcard_pathological_patterns_are_linear() {
+        // ReDoS-style patterns that made the old recursive matcher
+        // exponential (reachable via model-controlled `list_tools` args,
+        // inside a host callback the interrupt handler cannot preempt).
+        // These must complete instantly and answer correctly.
+        let text = "a".repeat(60);
+        assert!(!wildcard_match(&text, "*a*a*a*a*a*a*a*b"));
+        // Positive twin: same shape ending in `a` must match.
+        assert!(wildcard_match(&text, "*a*a*a*a*a*a*a*a"));
+        let longer = "a".repeat(1000);
+        assert!(!wildcard_match(&longer, "*a*a*a*a*a*a*a*a*a*b"));
+    }
+
+    #[test]
+    fn wildcard_boundary_cases() {
+        // Empty text / pattern.
+        assert!(wildcard_match("", ""));
+        assert!(wildcard_match("", "*"));
+        assert!(wildcard_match("", "**"));
+        assert!(!wildcard_match("", "?"));
+        assert!(!wildcard_match("", "a"));
+        assert!(!wildcard_match("a", ""));
+        // Leading / trailing stars.
+        assert!(wildcard_match("abc", "*c"));
+        assert!(wildcard_match("abc", "a*"));
+        assert!(wildcard_match("abc", "*abc*"));
+        assert!(wildcard_match("abc", "*b*"));
+        assert!(!wildcard_match("abc", "*d*"));
+        // `?` at the end requires exactly one char.
+        assert!(wildcard_match("abc", "ab?"));
+        assert!(!wildcard_match("ab", "ab?"));
+        assert!(!wildcard_match("abc", "abc?"));
+        // `?` must not match zero chars mid-pattern.
+        assert!(!wildcard_match("ac", "a?c"));
+        assert!(wildcard_match("abc", "a?c"));
+        // Multiple stars collapsing to empty runs.
+        assert!(wildcard_match("abc", "a**b**c"));
+        assert!(wildcard_match("abc", "***"));
     }
 
     #[test]

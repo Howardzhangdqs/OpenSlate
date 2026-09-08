@@ -76,6 +76,9 @@ transport = "http"
 url = "http://localhost:8000/mcp"
 
 # Programmatic Tool Calling (PTC) — disabled by default. See PTC_PLAN.md.
+# Numeric floors (enforced at load + validate): timeout_ms >= 100,
+# memory_limit_bytes >= 1048576, max_output_bytes >= 1024,
+# max_tool_calls_per_run >= 1, max_lookup_calls >= 1 (max_list_chars 0 = unlimited).
 # [ptc]
 # enabled = true
 # timeout_ms = 60000

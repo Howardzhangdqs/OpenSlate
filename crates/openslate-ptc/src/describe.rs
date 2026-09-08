@@ -8,25 +8,33 @@
 
 use serde_json::Value;
 
-use crate::ts_types::{literal, single_declaration, tool_path};
+use crate::ts_types::{effective_paths, literal, sanitize_ident, single_declaration_at, tool_path};
 use crate::{wildcard_match, PtcToolInfo};
 
 /// Render catalog lines for the catalog entries matching `pattern` (glob,
-/// same semantics as the agent tool whitelist), sorted by path and joined
-/// with newlines. A tool matches when either its composed access path
+/// same semantics as the agent tool whitelist), sorted by effective path and
+/// joined with newlines. A tool matches when either its composed access path
 /// (`github.list_prs`) or its registry name (`github_list_prs`) matches.
+/// Paths come from a full-set binding plan, so collision renames are
+/// consistent with what the sandbox actually binds.
 ///
 /// Each line is `path: first sentence of the description` (empty string
 /// when nothing matches).
 pub fn list(catalog: &[PtcToolInfo], pattern: &str) -> String {
-    let mut matched: Vec<&PtcToolInfo> = catalog
+    let paths = effective_paths(catalog);
+    let mut matched: Vec<(&PtcToolInfo, &String)> = catalog
         .iter()
-        .filter(|t| wildcard_match(&tool_path(t), pattern) || wildcard_match(&t.name, pattern))
+        .filter(|t| {
+            paths
+                .get(&t.name)
+                .is_some_and(|p| wildcard_match(p, pattern) || wildcard_match(&t.name, pattern))
+        })
+        .map(|t| (t, paths.get(&t.name).expect("path for tool")))
         .collect();
-    matched.sort_by_key(|t| tool_path(t));
+    matched.sort_by(|a, b| a.1.cmp(b.1));
     matched
         .iter()
-        .map(|t| catalog_line(t))
+        .map(|(t, p)| catalog_line_at(t, p))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -34,24 +42,40 @@ pub fn list(catalog: &[PtcToolInfo], pattern: &str) -> String {
 /// One catalog line: `github.list_prs: List pull requests`. The description
 /// is cut at the first sentence boundary (first `.` or newline) and
 /// newlines are collapsed, so the line stays a single line. Tools without
-/// a description render as just the path.
+/// a description render as just the path. Single-tool path; prefer
+/// [`catalog_line_at`] when a full-set plan is available.
 pub(crate) fn catalog_line(info: &PtcToolInfo) -> String {
+    catalog_line_at(info, &tool_path(info))
+}
+
+/// [`catalog_line`] with an explicit effective access path.
+pub(crate) fn catalog_line_at(info: &PtcToolInfo, path: &str) -> String {
     let sentence = first_sentence(&info.description);
     if sentence.is_empty() {
-        tool_path(info)
+        path.to_string()
     } else {
-        format!("{}: {}", tool_path(info), sentence)
+        format!("{}: {}", path, sentence)
     }
 }
 
 /// Full description of a single tool: its TypeScript declaration block,
 /// a blank line, and a synthesized example call. Self-contained — suitable
 /// for returning from `describe_tool` without any surrounding context.
+/// Uses the tool's single-tool path; pass a full-set path via
+/// [`describe_at`] when the binding set is known.
 pub fn describe(info: &PtcToolInfo) -> String {
+    describe_at(info, &tool_path(info))
+}
+
+/// [`describe`] with an explicit effective access path (e.g. from
+/// [`crate::ts_types::effective_paths`]) so the shown path matches the
+/// sandbox binding even under collision renames. `pub(crate)` for the
+/// sandbox `describe_tool` host function.
+pub(crate) fn describe_at(info: &PtcToolInfo, path: &str) -> String {
     format!(
         "{}\n\n{}",
-        single_declaration(info),
-        synthesize_example(info)
+        single_declaration_at(info, path),
+        synthesize_example_at(info, path)
     )
 }
 
@@ -74,8 +98,10 @@ fn first_sentence(description: &str) -> String {
 /// enum → first value (quoted when a string), array → `[]`, object → `{}`,
 /// anything unrecognized → `"..."`. Rendered as
 /// `// Example: await tools.github.list_prs({ state: "open", limit: 0 })`
-/// using the composed (or flat) access path.
-fn synthesize_example(info: &PtcToolInfo) -> String {
+/// using the composed (or flat) access path. Property keys are sanitized
+/// into identifiers (same rule as the TS declarations) so a key containing
+/// newlines/quotes cannot break out of the comment line.
+fn synthesize_example_at(info: &PtcToolInfo, path: &str) -> String {
     let args: Vec<String> = info
         .parameters
         .get("properties")
@@ -83,7 +109,7 @@ fn synthesize_example(info: &PtcToolInfo) -> String {
         .map(|props| {
             props
                 .iter()
-                .map(|(key, schema)| format!("{key}: {}", example_value(schema)))
+                .map(|(key, schema)| format!("{}: {}", sanitize_ident(key), example_value(schema)))
                 .collect()
         })
         .unwrap_or_default();
@@ -93,7 +119,7 @@ fn synthesize_example(info: &PtcToolInfo) -> String {
     } else {
         format!(" {} ", args.join(", "))
     };
-    format!("// Example: await tools.{}({{{}}})", tool_path(info), body)
+    format!("// Example: await tools.{path}({{{}}})", body)
 }
 
 /// Map a first-level property schema to a literal example value.
@@ -259,8 +285,34 @@ u?: any;\n  \
     fn example_without_properties_is_empty_object() {
         let info = tool("ping", "Ping something", Value::Null);
         assert_eq!(
-            synthesize_example(&info),
+            synthesize_example_at(&info, &tool_path(&info)),
             "// Example: await tools.ping({})"
+        );
+    }
+
+    #[test]
+    fn example_sanitizes_hostile_property_keys() {
+        // A key containing newlines/quotes must not break out of the
+        // `// Example:` comment line (keys are sanitized into identifiers,
+        // same rule as the TS declarations).
+        let info = tool(
+            "t",
+            "hostile schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "evil\nkey\"q": { "type": "string" },
+                    "ok": { "type": "integer" }
+                }
+            }),
+        );
+        let rendered = describe(&info);
+        let example_line = rendered.lines().last().unwrap();
+        // Exact match: the key is sanitized into an identifier and the
+        // example stays a single comment line.
+        assert_eq!(
+            example_line,
+            "// Example: await tools.t({ evilkeyq: \"...\", ok: 0 })"
         );
     }
 }

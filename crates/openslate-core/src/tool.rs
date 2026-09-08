@@ -244,6 +244,11 @@ pub fn limit_tool_output(output: ToolOutput, max_bytes: usize) -> ToolOutput {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolAuditRecord {
     pub tool_name: String,
+    /// Who initiated the execution: [`TOOL_CALLER_DIRECT`] for a model
+    /// tool call, or [`TOOL_CALLER_RUN_CODE`] for a bridge call made from
+    /// a `run_code` sandbox (PTC_PLAN.md §6.5 — Anthropic-style `caller`
+    /// attribution).
+    pub caller: String,
     pub arguments_json: String,
     pub output_bytes: usize,
     pub output_status: String,
@@ -251,15 +256,22 @@ pub struct ToolAuditRecord {
     pub truncated: bool,
 }
 
+/// Caller attribution for [`ToolAuditRecord`]: a direct model tool call.
+pub const TOOL_CALLER_DIRECT: &str = "direct";
+/// Caller attribution for [`ToolAuditRecord`]: a bridge call issued from
+/// inside a `run_code` sandbox.
+pub const TOOL_CALLER_RUN_CODE: &str = "run_code";
+
 /// Create an audit record from tool execution details.
-#[allow(dead_code)]
 pub fn create_audit_record(
     tool_name: &str,
+    caller: &str,
     arguments: &serde_json::Value,
     output: &ToolOutput,
 ) -> ToolAuditRecord {
     ToolAuditRecord {
         tool_name: tool_name.to_owned(),
+        caller: caller.to_owned(),
         arguments_json: serde_json::to_string(arguments).unwrap_or_default(),
         output_bytes: output.bytes,
         output_status: match output.status {
@@ -341,9 +353,10 @@ mod limit_tests {
             status: ToolOutputStatus::Success,
         };
         let args = serde_json::json!({"cmd": "ls"});
-        let record = create_audit_record("bash", &args, &output);
+        let record = create_audit_record("bash", TOOL_CALLER_DIRECT, &args, &output);
 
         assert_eq!(record.tool_name, "bash");
+        assert_eq!(record.caller, "direct");
         assert!(record.arguments_json.contains("ls"));
         assert_eq!(record.output_bytes, 6);
         assert_eq!(record.output_status, "success");
@@ -360,8 +373,9 @@ mod limit_tests {
             status: ToolOutputStatus::Truncated,
         };
         let args = serde_json::json!({});
-        let record = create_audit_record("echo", &args, &output);
+        let record = create_audit_record("echo", TOOL_CALLER_RUN_CODE, &args, &output);
 
+        assert_eq!(record.caller, "run_code");
         assert_eq!(record.output_status, "truncated");
         assert!(record.truncated);
     }
@@ -375,12 +389,13 @@ mod limit_tests {
             status: ToolOutputStatus::Success,
         };
         let args = serde_json::json!({"x": 1});
-        let record = create_audit_record("test_tool", &args, &output);
+        let record = create_audit_record("test_tool", TOOL_CALLER_DIRECT, &args, &output);
 
         let json = serde_json::to_string(&record).unwrap();
         let back: ToolAuditRecord = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back.tool_name, record.tool_name);
+        assert_eq!(back.caller, record.caller);
         assert_eq!(back.output_bytes, record.output_bytes);
         assert_eq!(back.output_status, record.output_status);
         assert_eq!(back.duration_ms, record.duration_ms);

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use crate::config::{AgentsConfig, OpenSlateConfig, TransportConfig};
+use crate::config::{AgentsConfig, OpenSlateConfig, PtcConfig, TransportConfig};
 
 /// Severity of a validation finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,10 +64,7 @@ impl ValidationResult {
 /// Validate the complete configuration (`openslate.toml` + `agents/*.md`).
 ///
 /// Returns a list of errors — empty means valid.
-pub fn validate_config(
-    config: &OpenSlateConfig,
-    agents: &AgentsConfig,
-) -> Vec<ValidationError> {
+pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
     // 1. models.main must exist
@@ -111,7 +108,11 @@ pub fn validate_config(
     }
 
     // 5. Must have at least one root agent
-    let all_children: HashSet<_> = agents.agents.iter().flat_map(|a| a.children.iter()).collect();
+    let all_children: HashSet<_> = agents
+        .agents
+        .iter()
+        .flat_map(|a| a.children.iter())
+        .collect();
     let root_agents: Vec<_> = agents
         .agents
         .iter()
@@ -260,10 +261,7 @@ pub fn validate_config(
                     } else if !is_valid_url(url) {
                         errors.push(ValidationError {
                             field: format!("mcp.servers.{name}.url"),
-                            message: format!(
-                                "MCP server '{}' has an invalid url '{}'",
-                                name, url
-                            ),
+                            message: format!("MCP server '{}' has an invalid url '{}'", name, url),
                         });
                     }
                 }
@@ -271,6 +269,70 @@ pub fn validate_config(
         }
     }
 
+    // 16. `[ptc]` numeric floors: zero/absurd values brick the feature
+    //     (0 ms timeout, 0-byte heap, 0 tool calls per run), so they are
+    //     rejected with the floor stated in the message. Enforced both
+    //     here and at config load (`parse_openslate_toml`).
+    errors.extend(ptc_floor_errors(&config.ptc));
+
+    errors
+}
+
+/// Numeric floors for `[ptc]` values (PTC_PLAN.md §6.2). `max_list_chars`
+/// is exempt: 0 is its documented "unlimited" meaning (same convention as
+/// `limits.max_steps`). `pub(crate)` so config parsing can fail fast at
+/// load time with the same messages.
+pub(crate) fn ptc_floor_errors(ptc: &PtcConfig) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if ptc.timeout_ms < 100 {
+        errors.push(ValidationError {
+            field: "ptc.timeout_ms".into(),
+            message: format!(
+                "timeout_ms must be >= 100 ms (got {}); smaller budgets fire \
+                 before the sandbox can even start",
+                ptc.timeout_ms
+            ),
+        });
+    }
+    if ptc.memory_limit_bytes < 1_048_576 {
+        errors.push(ValidationError {
+            field: "ptc.memory_limit_bytes".into(),
+            message: format!(
+                "memory_limit_bytes must be >= 1048576 (1 MiB) (got {}); \
+                 the QuickJS isolate cannot start below that",
+                ptc.memory_limit_bytes
+            ),
+        });
+    }
+    if ptc.max_output_bytes < 1024 {
+        errors.push(ValidationError {
+            field: "ptc.max_output_bytes".into(),
+            message: format!(
+                "max_output_bytes must be >= 1024 (got {})",
+                ptc.max_output_bytes
+            ),
+        });
+    }
+    if ptc.max_tool_calls_per_run < 1 {
+        errors.push(ValidationError {
+            field: "ptc.max_tool_calls_per_run".into(),
+            message: format!(
+                "max_tool_calls_per_run must be >= 1 (got {}); 0 would make \
+                 every run_code script useless",
+                ptc.max_tool_calls_per_run
+            ),
+        });
+    }
+    if ptc.max_lookup_calls < 1 {
+        errors.push(ValidationError {
+            field: "ptc.max_lookup_calls".into(),
+            message: format!(
+                "max_lookup_calls must be >= 1 (got {}); 0 would make \
+                 list_tools/describe_tool useless",
+                ptc.max_lookup_calls
+            ),
+        });
+    }
     errors
 }
 
@@ -305,10 +367,7 @@ pub fn validate_strict(
 ///
 /// This runs all error-level checks from [`validate_config`] plus the extended
 /// warning checks from [`validate_strict`] and additional warning rules.
-pub fn validate_config_full(
-    config: &OpenSlateConfig,
-    agents: &AgentsConfig,
-) -> ValidationResult {
+pub fn validate_config_full(config: &OpenSlateConfig, agents: &AgentsConfig) -> ValidationResult {
     let errors = validate_config(config, agents);
     let mut warnings = Vec::new();
 
@@ -324,19 +383,12 @@ pub fn validate_config_full(
     }
 
     // ── Warning: unused provider configurations ──────────────────────────
-    let used_providers: HashSet<_> = config
-        .models
-        .values()
-        .map(|m| &m.provider)
-        .collect();
+    let used_providers: HashSet<_> = config.models.values().map(|m| &m.provider).collect();
     for name in config.providers.keys() {
         if !used_providers.contains(&name) {
             warnings.push(ValidationError {
                 field: format!("providers.{name}"),
-                message: format!(
-                    "Provider '{}' is not referenced by any model",
-                    name
-                ),
+                message: format!("Provider '{}' is not referenced by any model", name),
             });
         }
     }
@@ -346,10 +398,7 @@ pub fn validate_config_full(
         if agent.tools.is_empty() {
             warnings.push(ValidationError {
                 field: format!("agents.{}.tools", agent.id),
-                message: format!(
-                    "Agent '{}' has no tools configured",
-                    agent.id
-                ),
+                message: format!("Agent '{}' has no tools configured", agent.id),
             });
         }
     }
@@ -423,7 +472,8 @@ fn is_valid_agent_id(id: &str) -> bool {
     if id.is_empty() {
         return false;
     }
-    id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Detect circular children references using DFS cycle detection.
@@ -434,7 +484,12 @@ fn detect_circular_children(agents: &AgentsConfig) -> Vec<ValidationError> {
     let adj: std::collections::HashMap<String, Vec<String>> = agents
         .agents
         .iter()
-        .map(|a| (a.id.0.clone(), a.children.iter().map(|c| c.0.clone()).collect()))
+        .map(|a| {
+            (
+                a.id.0.clone(),
+                a.children.iter().map(|c| c.0.clone()).collect(),
+            )
+        })
         .collect();
 
     let mut visited = HashSet::new();
@@ -551,7 +606,14 @@ max_output_bytes = 65536
     }
 
     /// Build an `AgentsConfig` with a single agent.
-    fn single_agent(id: &str, name: &str, model: &str, tools: Vec<&str>, children: Vec<&str>, prompt: &str) -> AgentsConfig {
+    fn single_agent(
+        id: &str,
+        name: &str,
+        model: &str,
+        tools: Vec<&str>,
+        children: Vec<&str>,
+        prompt: &str,
+    ) -> AgentsConfig {
         AgentsConfig {
             agents: vec![AgentConfig {
                 id: AgentId(id.into()),
@@ -577,7 +639,10 @@ max_output_bytes = 65536
         let mut config = valid_config();
         config.models.remove("main");
         let errors = validate_config(&config, &valid_agents());
-        assert!(errors.iter().any(|e| e.field == "models.main"), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.field == "models.main"),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -585,7 +650,10 @@ max_output_bytes = 65536
         let mut config = valid_config();
         config.models.remove("fast");
         let errors = validate_config(&config, &valid_agents());
-        assert!(errors.iter().any(|e| e.field == "models.fast"), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.field == "models.fast"),
+            "{errors:?}"
+        );
     }
 
     // ── Rule 3: model → provider reference ───────────────────────────────
@@ -631,7 +699,9 @@ max_output_bytes = 65536
         };
         let errors = validate_config(&valid_config(), &agents);
         assert!(
-            errors.iter().any(|e| e.field == "agents.root" && e.message.contains("Duplicate")),
+            errors
+                .iter()
+                .any(|e| e.field == "agents.root" && e.message.contains("Duplicate")),
             "{errors:?}"
         );
     }
@@ -663,7 +733,9 @@ max_output_bytes = 65536
         };
         let errors = validate_config(&valid_config(), &agents);
         assert!(
-            errors.iter().any(|e| e.field == "agents" && e.message.contains("root")),
+            errors
+                .iter()
+                .any(|e| e.field == "agents" && e.message.contains("root")),
             "{errors:?}"
         );
     }
@@ -771,11 +843,14 @@ max_output_bytes = 65536
         let config = parse_openslate_toml(include_str!("../../fixtures/openslate.toml"))
             .expect("example toml should parse");
         let agents_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/agents");
-        let agents = parse_agents_dir(Path::new(agents_dir))
-            .expect("example agents dir should parse");
+        let agents =
+            parse_agents_dir(Path::new(agents_dir)).expect("example agents dir should parse");
 
         let errors = validate_config(&config, &agents);
-        assert!(errors.is_empty(), "example config should be valid: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "example config should be valid: {errors:?}"
+        );
     }
 
     // ── No limits section is fine (limits is optional) ───────────────────
@@ -915,7 +990,14 @@ model = ""
 
     #[test]
     fn agent_id_with_spaces_rejected() {
-        let agents = single_agent("has spaces", "Bad", "main", vec![], vec![], "prompt here for testing");
+        let agents = single_agent(
+            "has spaces",
+            "Bad",
+            "main",
+            vec![],
+            vec![],
+            "prompt here for testing",
+        );
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors
@@ -927,7 +1009,14 @@ model = ""
 
     #[test]
     fn agent_id_with_special_chars_rejected() {
-        let agents = single_agent("bad@id!", "Bad", "main", vec![], vec![], "prompt here for testing");
+        let agents = single_agent(
+            "bad@id!",
+            "Bad",
+            "main",
+            vec![],
+            vec![],
+            "prompt here for testing",
+        );
         let errors = validate_config(&valid_config(), &agents);
         assert!(
             errors
@@ -939,9 +1028,19 @@ model = ""
 
     #[test]
     fn agent_id_with_hyphen_and_underscore_accepted() {
-        let agents = single_agent("my-agent_v2", "Good", "main", vec!["read_file"], vec![], "prompt here for testing");
+        let agents = single_agent(
+            "my-agent_v2",
+            "Good",
+            "main",
+            vec!["read_file"],
+            vec![],
+            "prompt here for testing",
+        );
         let errors = validate_config(&valid_config(), &agents);
-        assert!(errors.is_empty(), "hyphens and underscores are valid: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "hyphens and underscores are valid: {errors:?}"
+        );
     }
 
     // ── Rule 13: circular children detection ────────────────────────────
@@ -1018,8 +1117,16 @@ path = ""
     #[test]
     fn full_valid_config_has_no_errors_or_warnings() {
         let result = validate_config_full(&valid_config(), &valid_agents());
-        assert!(result.errors.is_empty(), "no errors expected: {:?}", result.errors);
-        assert!(result.warnings.is_empty(), "no warnings expected: {:?}", result.warnings);
+        assert!(
+            result.errors.is_empty(),
+            "no errors expected: {:?}",
+            result.errors
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "no warnings expected: {:?}",
+            result.warnings
+        );
         assert!(result.is_valid());
     }
 
@@ -1036,7 +1143,10 @@ path = ""
             },
         );
         let result = validate_config_full(&config, &valid_agents());
-        assert!(result.is_valid(), "unused provider is a warning, not an error");
+        assert!(
+            result.is_valid(),
+            "unused provider is a warning, not an error"
+        );
         assert!(
             result
                 .warnings
@@ -1049,7 +1159,14 @@ path = ""
 
     #[test]
     fn full_validation_warns_agent_no_tools() {
-        let agents = single_agent("root", "Root", "main", vec![], vec![], "this is a reasonably long prompt");
+        let agents = single_agent(
+            "root",
+            "Root",
+            "main",
+            vec![],
+            vec![],
+            "this is a reasonably long prompt",
+        );
         let result = validate_config_full(&valid_config(), &agents);
         assert!(
             result
@@ -1093,10 +1210,7 @@ path = ""
         let result = validate_config_full(&config, &valid_agents());
         assert!(result.is_valid());
         assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.field == "models.extra"),
+            result.warnings.iter().any(|w| w.field == "models.extra"),
             "{:?}",
             result.warnings
         );
@@ -1140,7 +1254,60 @@ path = ""
         assert!(!result_with_error.is_valid());
     }
 
-    // ── Rule 15: MCP server transport validation ───────────────────────
+    // ── Rule 16: [ptc] numeric floors ──────────────────────────────────
+
+    #[test]
+    fn ptc_zero_values_are_validation_errors() {
+        let mut config = valid_config();
+        config.ptc.timeout_ms = 0;
+        config.ptc.max_output_bytes = 0;
+        config.ptc.max_tool_calls_per_run = 0;
+        config.ptc.max_lookup_calls = 0;
+        config.ptc.memory_limit_bytes = 0;
+        let errors = validate_config(&config, &valid_agents());
+        for field in [
+            "ptc.timeout_ms",
+            "ptc.max_output_bytes",
+            "ptc.max_tool_calls_per_run",
+            "ptc.max_lookup_calls",
+            "ptc.memory_limit_bytes",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.field == field),
+                "expected error for {field}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ptc_floor_boundary_values_pass_validation() {
+        let mut config = valid_config();
+        config.ptc.enabled = true;
+        config.ptc.timeout_ms = 100;
+        config.ptc.memory_limit_bytes = 1_048_576;
+        config.ptc.max_output_bytes = 1024;
+        config.ptc.max_tool_calls_per_run = 1;
+        config.ptc.max_lookup_calls = 1;
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors.iter().all(|e| !e.field.starts_with("ptc.")),
+            "floor-boundary values must pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ptc_sub_floor_memory_limit_error_names_the_floor() {
+        let mut config = valid_config();
+        config.ptc.memory_limit_bytes = 1024;
+        let errors = validate_config(&config, &valid_agents());
+        let err = errors
+            .iter()
+            .find(|e| e.field == "ptc.memory_limit_bytes")
+            .expect("memory floor error");
+        assert!(err.message.contains("1048576"), "message: {}", err.message);
+    }
+
+    // ── Rule 15: MCP server transport validation ────────────────────────
 
     #[test]
     fn mcp_stdio_server_parses() {
@@ -1199,13 +1366,7 @@ transport = "http"
 url = "http://localhost:8000/mcp"
 "#;
         let config = parse_openslate_toml(toml).expect("should parse");
-        let server = config
-            .mcp
-            .as_ref()
-            .unwrap()
-            .servers
-            .get("remote")
-            .unwrap();
+        let server = config.mcp.as_ref().unwrap().servers.get("remote").unwrap();
         assert!(!server.enabled, "enabled can be overridden to false");
         match &server.transport {
             TransportConfig::Http { url } => assert_eq!(url, "http://localhost:8000/mcp"),
@@ -1400,7 +1561,14 @@ transport = "carrier-pigeon"
         // warn even when the builtin read_file is disabled. Guards the exact
         // `t == name` comparison — a glob-aware match would make `--strict`
         // exit 1 on legitimate configs.
-        let agents = single_agent("root", "Root", "main", vec!["read_*"], vec![], "prompt long enough");
+        let agents = single_agent(
+            "root",
+            "Root",
+            "main",
+            vec!["read_*"],
+            vec![],
+            "prompt long enough",
+        );
         let mut config = valid_config();
         config.builtin_tools.read_file = false;
 
@@ -1428,7 +1596,14 @@ transport = "carrier-pigeon"
         // Contradictory combo: enabled=false but read_file=true. The master
         // switch wins, so a whitelisted read_file is still unavailable and
         // must warn — locks the `bt.enabled && bt.flag` conjunction.
-        let agents = single_agent("root", "Root", "main", vec!["read_file"], vec![], "prompt long enough");
+        let agents = single_agent(
+            "root",
+            "Root",
+            "main",
+            vec!["read_file"],
+            vec![],
+            "prompt long enough",
+        );
         let mut config = valid_config();
         config.builtin_tools.enabled = false;
         config.builtin_tools.read_file = true;

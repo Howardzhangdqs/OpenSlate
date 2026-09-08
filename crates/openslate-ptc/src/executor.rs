@@ -27,27 +27,39 @@
 //!    `Runtime::set_memory_limit`, a per-run tool-call budget counted in
 //!    the host bridge, and a separate lookup budget for the discovery
 //!    helpers (errors-as-data: budget/availability failures return values,
-//!    never throw).
+//!    never throw). The timeout is hard even while a bridge tool call is
+//!    in flight: the host bridge bounds its `block_on` by the remaining
+//!    wall-clock budget, so a never-resolving tool future cannot outlive
+//!    the run.
 //! 6. Discovery helpers `list_tools(pattern)` / `describe_tool(name)` are
 //!    host functions over the passed catalog: they bypass the bridge, do
 //!    not count against the tool-call budget, and have their own
 //!    `max_lookup_calls` limit. They are reachable both as top-level
 //!    functions and as `tools.list_tools` / `tools.describe_tool` members
 //!    (models naturally write the latter; both spellings share one budget).
+//! 7. Tool bindings come from the shared de-collision planner
+//!    (`ts_types::plan_tool_bindings`): sanitized keys that collide
+//!    (another tool, a namespace group, or the reserved helper names) are
+//!    renamed deterministically and surfaced as
+//!    `// renamed from X (collision)` comments in the prelude. Unknown
+//!    namespace members dispatch under their composed registry name
+//!    (`{server}_{tool}`), mirroring how real members are composed, so the
+//!    host allow-list yields the canonical "tool not available" error
+//!    instead of cross-namespace reach.
 //!
 //! Host errors never cross the FFI as panics: the bridge call is wrapped in
 //! `catch_unwind` and converted to an error envelope.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rquickjs::{CatchResultExt, CaughtError, Context, Function, Runtime, Value};
 
-use crate::ts_types::{sanitize_ident, tool_path};
+use crate::ts_types::{effective_paths, plan_tool_bindings};
 use crate::{
     describe, envelope_error, normalize, PtcBoundTool, PtcLimits, PtcOutcome, PtcToolInfo,
     ToolBridge,
@@ -57,9 +69,11 @@ use crate::{
 /// (warn/error get prefixes) plus the wrapper factories. `__mkTool(display,
 /// registry)` builds the `(input) => …` callable that talks to
 /// `__call_tool_raw` and turns error envelopes into JS exceptions (the
-/// errors-as-data protocol); `__mkNs(entries)` builds a namespace object
-/// whose unknown members fall through to the bridge (so unlisted tools get
-/// the canonical "not available" envelope instead of a bare `undefined`).
+/// errors-as-data protocol); `__mkNs(entries, nsDisplay, nsPrefix)` builds
+/// a namespace object whose unknown members fall through to the bridge
+/// under their *composed* registry name `nsPrefix + "_" + member` (how
+/// `McpTool` composes real members), so unlisted tools get the canonical
+/// "not available" envelope instead of dispatching a same-named flat tool.
 const PRELUDE_HEAD: &str = r#"
 globalThis.__logs = [];
 globalThis.console = {
@@ -74,11 +88,11 @@ globalThis.__mkTool = (display, registry) => (input) => {
   }
   return out.result;
 };
-globalThis.__mkNs = (entries, nsDisplay) => new Proxy({}, {
+globalThis.__mkNs = (entries, nsDisplay, nsPrefix) => new Proxy({}, {
   get: (_, name) => {
     const k = String(name);
     if (Object.prototype.hasOwnProperty.call(entries, k)) return entries[k];
-    return globalThis.__mkTool(nsDisplay + "." + k, k);
+    return globalThis.__mkTool(nsDisplay + "." + k, nsPrefix + "_" + k);
   },
 });
 "#;
@@ -175,6 +189,12 @@ fn execute_blocking(
     let tool_call_count = Arc::new(AtomicUsize::new(0));
     let lookup_count = Arc::new(AtomicUsize::new(0));
 
+    // Wall-clock deadline for the whole execution: the guard thread flips
+    // the interrupt flag at it (for JS-side loops), and the host bridge
+    // bounds each blocked tool wait by the remaining budget (for
+    // never-resolving tool futures the interrupt handler cannot reach).
+    let deadline = Instant::now() + Duration::from_millis(limits.timeout_ms);
+
     // Timeout guard thread: sleeps for `timeout_ms`, then raises the
     // interrupt flag. A `done` signal lets us join the thread immediately
     // after execution instead of waiting out the full timeout.
@@ -202,6 +222,7 @@ fn execute_blocking(
             interrupt: &interrupt,
             tool_call_count: &tool_call_count,
             lookup_count: &lookup_count,
+            deadline,
         },
     );
 
@@ -222,61 +243,71 @@ struct Setup<'a> {
     interrupt: &'a Arc<AtomicBool>,
     tool_call_count: &'a Arc<AtomicUsize>,
     lookup_count: &'a Arc<AtomicUsize>,
+    /// Wall-clock deadline of this execution (start + `timeout_ms`). The
+    /// host bridge bounds each blocked tool wait by the time left until it.
+    deadline: Instant,
 }
 
 /// Build the dynamic middle of the prelude: the `__tools` object literal
-/// binding every tool to its wrapper. Namespace-less tools sit at the root;
-/// namespaced tools nest under `__mkNs(...)` groups keyed by the sanitized
-/// namespace. Display names use the composed access path
+/// binding every tool to its wrapper. Keys come from the shared
+/// de-collision planner (`ts_types::plan_tool_bindings`): the reserved
+/// discovery-helper names always win, namespace groups keep their
+/// sanitized keys, and any colliding flat tool / group / member is renamed
+/// deterministically (`_2`, `_3`, …) with a
+/// `// renamed from X (collision)` comment so the effective path is
+/// visible. Display names use the composed access path
 /// (`github.list_prs`); dispatch names are the full registry names
 /// (`github_list_prs`). The two discovery helpers are registered last as
 /// plain members, so `tools.list_tools` / `tools.describe_tool` resolve to
-/// them instead of the "tool not available" fallback (and win over any
-/// real tool unlucky enough to share those names).
+/// them (real tools with those names were renamed by the planner).
 fn build_tools_prelude(tools: &[PtcBoundTool]) -> String {
-    let mut roots: Vec<&PtcBoundTool> = Vec::new();
-    let mut groups: BTreeMap<String, (String, Vec<&PtcBoundTool>)> = BTreeMap::new();
-    for tool in tools {
-        match &tool.namespace {
-            None => roots.push(tool),
-            Some(ns) => groups
-                .entry(sanitize_ident(ns))
-                .or_insert_with(|| (ns.clone(), Vec::new()))
-                .1
-                .push(tool),
-        }
-    }
+    let pairs: Vec<(String, Option<String>)> = tools
+        .iter()
+        .map(|t| (t.name.clone(), t.namespace.clone()))
+        .collect();
+    let plan = plan_tool_bindings(&pairs);
 
     let mut out = String::from("globalThis.__tools = {");
-    for tool in roots {
-        let key = sanitize_ident(&tool.name);
+    for root in &plan.roots {
+        if root.key != root.base {
+            out.push_str(&format!("\n  // renamed from {} (collision)", root.base));
+        }
         out.push_str(&format!(
             "\n  {}: __mkTool({}, {}),",
-            js_str(&key),
-            js_str(&key),
-            js_str(&tool.name)
+            js_str(&root.key),
+            js_str(&root.key),
+            js_str(&root.name)
         ));
     }
-    for (ns_key, (raw_ns, members)) in &groups {
-        out.push_str(&format!("\n  {}: __mkNs({{", js_str(ns_key)));
-        for tool in members {
-            let method = sanitize_ident(
-                tool.name
-                    .strip_prefix(&format!("{raw_ns}_"))
-                    .unwrap_or(tool.name.as_str()),
-            );
-            let display = format!("{ns_key}.{method}");
+    for group in &plan.groups {
+        if group.key != group.base {
+            out.push_str(&format!("\n  // renamed from {} (collision)", group.base));
+        }
+        out.push_str(&format!("\n  {}: __mkNs({{", js_str(&group.key)));
+        for member in &group.members {
+            if member.key != member.base {
+                out.push_str(&format!(
+                    "\n    // renamed from {} (collision)",
+                    member.base
+                ));
+            }
+            let display = format!("{}.{}", group.key, member.key);
             out.push_str(&format!(
                 "\n    {}: __mkTool({}, {}),",
-                js_str(&method),
+                js_str(&member.key),
                 js_str(&display),
-                js_str(&tool.name)
+                js_str(&member.name)
             ));
         }
-        out.push_str(&format!("\n  }}, {}),", js_str(ns_key)));
+        out.push_str(&format!(
+            "\n  }}, {}, {}),",
+            js_str(&group.key),
+            js_str(&group.raw_ns)
+        ));
     }
     // Discovery helper aliases on `tools` (same host functions as the
-    // top-level globals; registered last so they take precedence).
+    // top-level globals; registered last so they take precedence — the
+    // planner guarantees no real tool kept these keys).
     out.push_str("\n  \"list_tools\": __list_tools,");
     out.push_str("\n  \"describe_tool\": __describe_tool,");
     out.push_str("\n};\n");
@@ -351,14 +382,26 @@ fn sandboxed_run(code: &str, setup: &Setup<'_>) -> PtcOutcome {
         TriggerResult::Failed(msg) => failure = Some(msg),
     }
 
-    // Collect __result / __err / __logs from the isolate.
-    let (result, script_err, logs_json) = ctx.with(|c| {
-        let result: Option<String> = c.globals().get("__result").unwrap_or(None);
+    // Collect __result / __err / __logs from the isolate. `__result` is
+    // read by type first: the Symbol sentinel (never settled) cannot be
+    // converted to a Rust string, and `undefined` (JSON.stringify of a
+    // valueless script) is distinct from both.
+    let (result, script_err, logs_json, never_settled) = ctx.with(|c| {
+        let result_type: String = c
+            .eval("typeof globalThis.__result")
+            .unwrap_or_else(|_| "undefined".to_string());
+        let result: Option<String> = if result_type == "string" {
+            c.globals()
+                .get::<_, Option<String>>("__result")
+                .unwrap_or(None)
+        } else {
+            None
+        };
         let err: Option<String> = c.globals().get("__err").unwrap_or(None);
         let logs_json: String = c
             .eval("JSON.stringify(__logs)")
             .unwrap_or_else(|_| "[]".into());
-        (result, err, logs_json)
+        (result, err, logs_json, result_type == "symbol")
     });
     let logs: Vec<String> = serde_json::from_str(&logs_json).unwrap_or_default();
 
@@ -377,6 +420,15 @@ fn sandboxed_run(code: &str, setup: &Setup<'_>) -> PtcOutcome {
         outcome.error = Some(failure);
     } else if let Some(script_err) = script_err {
         outcome.error = Some(script_err);
+    } else if never_settled {
+        // The sentinel survived: every job ran but the async function's
+        // promise never settled (e.g. `await new Promise(() => {})`).
+        outcome.error = Some(
+            "the script never finished: a pending Promise never settled \
+             (deadlock or missing resolve); ensure all awaits complete and \
+             RETURN the result"
+                .to_string(),
+        );
     } else {
         match result {
             Some(r) => {
@@ -422,6 +474,7 @@ fn install_and_trigger<'js>(c: rquickjs::Ctx<'js>, code: &str, setup: &Setup<'_>
         interrupt,
         tool_call_count,
         lookup_count,
+        deadline: setup_deadline,
     } = setup;
     let host_fn = {
         // Fully-qualified clones: `.clone()` on a `&T` would clone the
@@ -432,6 +485,7 @@ fn install_and_trigger<'js>(c: rquickjs::Ctx<'js>, code: &str, setup: &Setup<'_>
         let handle: tokio::runtime::Handle = tokio::runtime::Handle::clone(handle);
         let counter: Arc<AtomicUsize> = Arc::clone(tool_call_count);
         let budget = limits.max_tool_calls_per_run;
+        let deadline = *setup_deadline;
         match Function::new(c.clone(), move |name: String, args: String| -> String {
             let attempt = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if attempt > budget {
@@ -440,9 +494,29 @@ fn install_and_trigger<'js>(c: rquickjs::Ctx<'js>, code: &str, setup: &Setup<'_>
             if !allowed.contains(&name) {
                 return envelope_error(format!("tool not available in code mode: {name}"));
             }
+            // The interrupt handler only fires when QuickJS is executing;
+            // while we block on the host-side tool future nothing else
+            // enforces the wall-clock budget. Bound the wait by the time
+            // left until the run deadline so a never-resolving tool future
+            // cannot hang the run (hard timeout, PTC_PLAN.md §6.2).
+            let Some(remaining) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+            else {
+                return envelope_error(format!(
+                    "run_code deadline exceeded before calling tool {name}; \
+                     the run_code budget is exhausted"
+                ));
+            };
             let future = (bridge)(&name, &args);
-            match catch_unwind(AssertUnwindSafe(|| handle.block_on(future))) {
-                Ok(envelope) => envelope,
+            match catch_unwind(AssertUnwindSafe(|| {
+                handle.block_on(tokio::time::timeout(remaining, future))
+            })) {
+                Ok(Ok(envelope)) => envelope,
+                Ok(Err(_elapsed)) => envelope_error(format!(
+                    "tool call exceeded run_code timeout while waiting for \
+                     tool {name}; the run_code budget is exhausted"
+                )),
                 Err(_) => envelope_error("bridge panicked"),
             }
         }) {
@@ -478,6 +552,11 @@ fn install_and_trigger<'js>(c: rquickjs::Ctx<'js>, code: &str, setup: &Setup<'_>
         let catalog: Arc<Vec<PtcToolInfo>> = Arc::clone(catalog);
         let lookups: Arc<AtomicUsize> = Arc::clone(lookup_count);
         let budget = limits.max_lookup_calls;
+        // Effective paths from the full-catalog binding plan: lookups by
+        // dotted path resolve the same (collision-renamed) path the sandbox
+        // actually binds, and the rendered declaration matches it.
+        let paths: Arc<std::collections::BTreeMap<String, String>> =
+            Arc::new(effective_paths(&catalog));
         match Function::new(c.clone(), move |name: String| -> String {
             let attempt = lookups.fetch_add(1, Ordering::Relaxed) + 1;
             if attempt > budget {
@@ -485,9 +564,9 @@ fn install_and_trigger<'js>(c: rquickjs::Ctx<'js>, code: &str, setup: &Setup<'_>
             }
             match catalog
                 .iter()
-                .find(|t| t.name == name || tool_path(t) == name)
+                .find(|t| t.name == name || paths.get(&t.name).is_some_and(|p| p == &name))
             {
-                Some(info) => describe::describe(info),
+                Some(info) => describe::describe_at(info, &paths[&info.name]),
                 None => format!("unknown tool: {name}"),
             }
         }) {
@@ -509,8 +588,13 @@ fn install_and_trigger<'js>(c: rquickjs::Ctx<'js>, code: &str, setup: &Setup<'_>
 
     let mut last_syntax_error: Option<String> = None;
     for candidate in normalize::prepare(code) {
+        // `__result` starts as a Symbol sentinel: scripts cannot produce a
+        // symbol through the JSON.stringify path, so a symbol left after
+        // the job queue drains means the async function never settled
+        // (distinct from settling on `undefined`, which JSON.stringify
+        // leaves as `undefined` and reports as "returned no value").
         let trigger_expr = format!(
-            "(async () => {{ globalThis.__result = null; globalThis.__err = null; \
+            "(async () => {{ globalThis.__result = Symbol(\"unsettled\"); globalThis.__err = null; \
              try {{ globalThis.__result = JSON.stringify(await ({candidate})()); }} \
              catch (e) {{ globalThis.__err = String(e && e.message || e); }} }})()"
         );
@@ -740,11 +824,48 @@ mod tests {
         let outcome = run_code(code, &tools, &[], &PtcLimits::default(), mock_bridge()).await;
         assert_eq!(outcome.error, None);
         let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
+        // Unknown ns members dispatch under their COMPOSED registry name
+        // (`{server}_{tool}`, mirroring McpTool), never the bare member —
+        // a flat `nope` tool elsewhere must not become reachable.
         assert_eq!(
             result.as_str().unwrap(),
-            "tool github.nope failed: tool not available in code mode: nope"
+            "tool github.nope failed: tool not available in code mode: github_nope"
         );
         assert_eq!(outcome.tool_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_ns_member_cannot_reach_same_named_flat_tool() {
+        // The `github` group exists (list_prs is bound) and flat `read_file`
+        // is bound: `tools.github.read_file` must dispatch under the
+        // composed name `github_read_file` and be rejected — it may NOT
+        // fall through to the flat `read_file` binding.
+        let tools = vec![
+            PtcBoundTool {
+                name: "github_list_prs".to_string(),
+                namespace: Some("github".to_string()),
+            },
+            PtcBoundTool {
+                name: "read_file".to_string(),
+                namespace: None,
+            },
+        ];
+        let code = r#"async () => {
+            let caught = null;
+            try { await tools.github.read_file({ path: "x" }); } catch (e) { caught = String(e.message); }
+            const flat = await tools.read_file({ path: "x" });
+            return { caught, flat };
+        }"#;
+        let outcome = run_code(code, &tools, &[], &PtcLimits::default(), mock_bridge()).await;
+        assert_eq!(outcome.error, None, "outcome: {outcome:?}");
+        let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
+        assert_eq!(
+            result["caught"].as_str().unwrap(),
+            "tool github.read_file failed: tool not available in code mode: github_read_file"
+        );
+        // The genuine flat path still works.
+        assert_eq!(result["flat"], "content");
+        assert_eq!(outcome.tool_calls, 2);
     }
 
     #[tokio::test]
@@ -1118,5 +1239,222 @@ mod tests {
             outcome.logs
         );
         assert_eq!(outcome.result.as_deref(), Some("1"));
+    }
+
+    // ── Hard timeout while a bridge tool call is in flight (A2) ──────────
+
+    #[tokio::test]
+    async fn bridge_tool_that_never_resolves_times_out_promptly() {
+        // The interrupt handler cannot fire while the host callback is
+        // blocked on the tool future; the remaining-budget bound must make
+        // the timeout hard anyway (PTC_PLAN.md §6.2).
+        let bridge: ToolBridge =
+            Arc::new(|_name: &str, _args: &str| Box::pin(std::future::pending::<String>()));
+        let limits = PtcLimits {
+            timeout_ms: 200,
+            ..PtcLimits::default()
+        };
+        let start = Instant::now();
+        let outcome = run_code(
+            r#"async () => { const r = await tools.add({ a: 1, b: 2 }); return r; }"#,
+            &bound(&["add"]),
+            &[],
+            &limits,
+            bridge,
+        )
+        .await;
+        assert!(
+            start.elapsed().as_millis() < 2000,
+            "took too long: {:?}",
+            start.elapsed()
+        );
+        // Either the bounded bridge wait surfaces the actionable envelope
+        // as a JS exception, or (same instant, usually wins) the interrupt
+        // handler terminates the run — both are hard-timeout outcomes; the
+        // pre-fix behavior hung forever on `block_on(pending)`.
+        let err = outcome
+            .error
+            .clone()
+            .expect("never-resolving tool must error");
+        assert!(
+            outcome.timed_out || err.contains("exceeded run_code timeout"),
+            "outcome: {outcome:?}"
+        );
+        assert!(
+            err.to_lowercase().contains("timeout") || err.contains("timed out"),
+            "error: {err}"
+        );
+        assert!(
+            err.contains("tool add") || outcome.timed_out,
+            "error: {err}"
+        );
+    }
+
+    // ── Never-settling scripts vs valueless scripts (A6) ─────────────────
+
+    #[tokio::test]
+    async fn never_settling_script_reports_pending_promise_error() {
+        let outcome = run_code(
+            r#"async () => { await new Promise(() => {}); }"#,
+            &[],
+            &[],
+            &PtcLimits::default(),
+            mock_bridge(),
+        )
+        .await;
+        assert!(!outcome.timed_out, "outcome: {outcome:?}");
+        let err = outcome.error.expect("never-settled script must error");
+        assert!(err.contains("never settled"), "error: {err}");
+        // Not the 07f9145 return-hint: the script HAS no result to return.
+        assert!(!err.contains("returned no value"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn explicit_null_return_succeeds_as_null() {
+        let outcome = run_code(
+            r#"async () => { return null; }"#,
+            &[],
+            &[],
+            &PtcLimits::default(),
+            mock_bridge(),
+        )
+        .await;
+        assert_eq!(outcome.error, None, "outcome: {outcome:?}");
+        assert_eq!(outcome.result.as_deref(), Some("null"));
+    }
+
+    // ── Deterministic de-collision of sandbox bindings (A4) ──────────────
+
+    /// Bridge that reports the registry name it was invoked under.
+    fn dispatch_probe_bridge() -> ToolBridge {
+        Arc::new(|name: &str, _args: &str| {
+            let out = envelope_result(json!({ "dispatched_as": name }));
+            Box::pin(async move { out })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>
+        })
+    }
+
+    #[tokio::test]
+    async fn sanitizing_namespace_collision_renames_deterministically() {
+        // `my.git` and `my_git` both sanitize to `my_git`: the first-seen
+        // group keeps the base key, the second becomes `my_git_2`; both
+        // stay reachable and dispatch under their full registry names.
+        let tools = vec![
+            PtcBoundTool {
+                name: "my.git_status".to_string(),
+                namespace: Some("my.git".to_string()),
+            },
+            PtcBoundTool {
+                name: "my_git_log".to_string(),
+                namespace: Some("my_git".to_string()),
+            },
+        ];
+        let code = r#"async () => {
+            const a = await tools.my_git.status({});
+            const b = await tools.my_git_2.log({});
+            return { a: a.dispatched_as, b: b.dispatched_as };
+        }"#;
+        let outcome = run_code(
+            code,
+            &tools,
+            &[],
+            &PtcLimits::default(),
+            dispatch_probe_bridge(),
+        )
+        .await;
+        assert_eq!(outcome.error, None, "outcome: {outcome:?}");
+        let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
+        assert_eq!(result["a"], "my.git_status");
+        assert_eq!(result["b"], "my_git_log");
+    }
+
+    #[tokio::test]
+    async fn flat_tool_colliding_with_namespace_group_is_renamed() {
+        // The namespace group keeps `github`; the flat tool `github` is
+        // renamed to `github_2` — both reachable, no silent shadowing.
+        let tools = vec![
+            PtcBoundTool {
+                name: "github".to_string(),
+                namespace: None,
+            },
+            PtcBoundTool {
+                name: "github_list_prs".to_string(),
+                namespace: Some("github".to_string()),
+            },
+        ];
+        let code = r#"async () => {
+            const flat = await tools.github_2({});
+            const prs = await tools.github.list_prs({});
+            return { flat: flat.dispatched_as, prs: prs.dispatched_as };
+        }"#;
+        let outcome = run_code(
+            code,
+            &tools,
+            &[],
+            &PtcLimits::default(),
+            dispatch_probe_bridge(),
+        )
+        .await;
+        assert_eq!(outcome.error, None, "outcome: {outcome:?}");
+        let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
+        assert_eq!(result["flat"], "github");
+        assert_eq!(result["prs"], "github_list_prs");
+    }
+
+    #[tokio::test]
+    async fn tool_named_list_tools_is_renamed_helpers_win() {
+        // Reserved helper names always win: the real `list_tools` tool is
+        // renamed to `list_tools_2` while `tools.list_tools` stays the
+        // discovery helper.
+        let bridge: ToolBridge = Arc::new(|name: &str, _args: &str| {
+            let out = envelope_result(json!(format!("real tool {name}")));
+            Box::pin(async move { out })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send>>
+        });
+        let outcome = run_code(
+            r#"async () => {
+                const real = await tools.list_tools_2({});
+                const listed = await tools.list_tools("github.*");
+                return { real, listed };
+            }"#,
+            &bound(&["list_tools"]),
+            &catalog(),
+            &PtcLimits::default(),
+            bridge,
+        )
+        .await;
+        assert_eq!(outcome.error, None, "outcome: {outcome:?}");
+        let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
+        assert_eq!(result["real"], "real tool list_tools");
+        assert_eq!(
+            result["listed"], "github.list_prs: List pull requests",
+            "tools.list_tools must remain the discovery helper"
+        );
+        assert_eq!(outcome.tool_calls, 1, "the helper bypasses the bridge");
+    }
+
+    // ── list_tools must survive pathological glob patterns (A1) ──────────
+
+    #[tokio::test]
+    async fn list_tools_with_pathological_pattern_returns_promptly() {
+        // Wrapped in a hard tokio timeout so a regression to the
+        // exponential matcher fails fast instead of hanging the suite.
+        let start = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_code(
+                r#"async () => { return await list_tools("*a*a*a*a*a*a*a*b"); }"#,
+                &[],
+                &catalog(),
+                &PtcLimits::default(),
+                mock_bridge(),
+            ),
+        )
+        .await
+        .expect("list_tools must not hang on an adversarial pattern");
+        assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+        assert_eq!(outcome.error, None, "outcome: {outcome:?}");
+        let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
+        assert_eq!(result.as_str().unwrap(), "", "nothing matches");
     }
 }

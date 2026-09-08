@@ -120,6 +120,10 @@ fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> String {
 pub struct McpTool {
     exposed_name: String,
     definition_name: String,
+    /// Server alias the exposed name is prefixed with (`None` for the
+    /// builtin in-process servers). Drives [`Tool::namespace`] so PTC
+    /// exposes the tool as `tools.<server>_<tool>` → `tools.<server>.<tool>`.
+    server_alias: Option<String>,
     description: String,
     schema: serde_json::Value,
     client: ServerSink,
@@ -148,6 +152,7 @@ impl McpTool {
         Self {
             exposed_name,
             definition_name,
+            server_alias: server_name.map(str::to_owned),
             description,
             schema,
             client,
@@ -165,6 +170,10 @@ impl McpTool {
 impl Tool for McpTool {
     fn name(&self) -> &str {
         &self.exposed_name
+    }
+
+    fn namespace(&self) -> Option<String> {
+        self.server_alias.clone()
     }
 
     fn description(&self) -> &str {
@@ -863,6 +872,8 @@ mod tests {
         assert_eq!(tool.exposed_name(), "srv_read_file");
         assert_eq!(tool.definition_name, "read_file");
         assert_eq!(tool.name(), "srv_read_file");
+        // PTC sandbox exposure follows the server alias (tools.srv.read_file).
+        assert_eq!(tool.namespace().as_deref(), Some("srv"));
     }
 
     #[tokio::test]
@@ -884,6 +895,8 @@ mod tests {
         let tool = McpTool::from_definition(read_def, service.peer().clone(), None);
         assert_eq!(tool.exposed_name(), "read_file");
         assert_eq!(tool.definition_name, "read_file");
+        // Builtin tools stay flat in the PTC sandbox (no namespace).
+        assert_eq!(tool.namespace(), None);
     }
 
     // ── is_error → ToolOutputStatus::Error e2e (agent-loop feeding contract) ──

@@ -1,0 +1,18 @@
+[package]
+name = "openslate-ptc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rquickjs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+# run_code needs the ambient runtime handle + spawn_blocking; sync QuickJS
+# execution must happen off the async workers (see executor.rs docs).
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

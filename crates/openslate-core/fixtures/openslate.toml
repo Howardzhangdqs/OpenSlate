@@ -74,3 +74,18 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 [mcp.servers.remote]
 transport = "http"
 url = "http://localhost:8000/mcp"
+
+# Programmatic Tool Calling (PTC) — disabled by default. See PTC_PLAN.md.
+# [ptc]
+# enabled = true
+# timeout_ms = 60000
+# memory_limit_bytes = 67108864
+# max_output_bytes = 65536
+# max_tool_calls_per_run = 16
+# max_list_chars = 8000
+# disclosure = "auto"                # full | catalog | auto (see PTC_PLAN.md §5.2)
+# max_lookup_calls = 50              # list_tools/describe_tool budget per run_code
+# [ptc.tool_modes]
+# "*" = "both"
+# "shell" = "direct"
+# "github_*" = "ptc"

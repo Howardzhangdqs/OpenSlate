@@ -29,6 +29,9 @@ reqwest = { workspace = true }
 rmcp = { workspace = true }
 # In-process builtin MCP servers (read_file / write_file / shell / edit_file).
 openslate-mcp-builtin = { path = "../openslate-mcp-builtin" }
+# Programmatic Tool Calling (PTC): ToolCallMode enum shared by [ptc] config
+# and the sandbox executor (see PTC_PLAN.md).
+openslate-ptc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

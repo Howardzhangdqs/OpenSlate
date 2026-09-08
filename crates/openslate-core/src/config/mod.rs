@@ -19,6 +19,7 @@
 //! | `trace`     | `TraceConfig`       | no       | Observability settings             |
 //! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
 //! | `skills`    | `SkillsConfig`      | no       | Skill discovery / injection        |
+//! | `ptc`       | `PtcConfig`         | no       | Programmatic Tool Calling settings |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -35,7 +36,7 @@
 
 pub mod validation;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -72,6 +73,9 @@ pub struct OpenSlateConfig {
     /// Skills (`SKILL.md`) discovery and prompt-injection settings.
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Programmatic Tool Calling (`run_code` sandbox) settings.
+    #[serde(default)]
+    pub ptc: PtcConfig,
 }
 
 /// Project metadata.
@@ -281,6 +285,55 @@ impl Default for SkillsConfig {
         Self {
             enabled: true,
             max_list_chars: 8000,
+        }
+    }
+}
+
+/// Programmatic Tool Calling (PTC) settings — see PTC_PLAN.md.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PtcConfig {
+    /// Master switch: `false` (default) disables PTC entirely; every tool
+    /// behaves as direct-only.
+    pub enabled: bool,
+    /// Hard wall-clock timeout per run_code execution, in milliseconds.
+    pub timeout_ms: u64,
+    /// QuickJS sandbox heap limit in bytes.
+    pub memory_limit_bytes: usize,
+    /// Truncation budget for run_code result+logs output, in bytes.
+    pub max_output_bytes: usize,
+    /// Max tool calls a single run_code script may make.
+    pub max_tool_calls_per_run: usize,
+    /// Max characters for the TypeScript declarations injected into the
+    /// run_code tool description. 0 = unlimited.
+    pub max_list_chars: usize,
+    /// Disclosure strategy for the run_code tool description
+    /// (`full` / `catalog` / `auto`, PTC_PLAN.md §5.2). `auto` (default):
+    /// full signatures; over `max_list_chars`, demote both-mode tools
+    /// (whose schemas already sit in the direct tool list) to catalog
+    /// lines; still over, a pure catalog.
+    pub disclosure: openslate_ptc::Disclosure,
+    /// Max `list_tools`/`describe_tool` calls a single run_code script may
+    /// make (separate, more generous budget than the tool-call budget).
+    pub max_lookup_calls: usize,
+    /// Per-tool call modes: glob pattern -> mode (direct/ptc/both).
+    /// Longest matching pattern wins; unmatched tools default to `both`
+    /// when PTC is enabled.
+    pub tool_modes: BTreeMap<String, openslate_ptc::ToolCallMode>,
+}
+
+impl Default for PtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_ms: 60_000,
+            memory_limit_bytes: 67_108_864,
+            max_output_bytes: 65_536,
+            max_tool_calls_per_run: 16,
+            max_list_chars: 8000,
+            disclosure: openslate_ptc::Disclosure::Auto,
+            max_lookup_calls: 50,
+            tool_modes: BTreeMap::new(),
         }
     }
 }
@@ -702,6 +755,153 @@ telepathy = true
         );
     }
 
+    #[test]
+    fn default_ptc_config() {
+        let ptc = PtcConfig::default();
+        assert!(!ptc.enabled);
+        assert_eq!(ptc.timeout_ms, 60_000);
+        assert_eq!(ptc.memory_limit_bytes, 67_108_864); // 64 MB
+        assert_eq!(ptc.max_output_bytes, 65_536);
+        assert_eq!(ptc.max_tool_calls_per_run, 16);
+        assert_eq!(ptc.max_list_chars, 8000);
+        assert_eq!(ptc.disclosure, openslate_ptc::Disclosure::Auto);
+        assert_eq!(ptc.max_lookup_calls, 50);
+        assert!(ptc.tool_modes.is_empty());
+    }
+
+    #[test]
+    fn parse_ptc_defaults_when_section_absent() {
+        let config = parse_openslate_toml("").expect("empty toml should parse");
+        assert!(!config.ptc.enabled);
+        assert_eq!(config.ptc.timeout_ms, 60_000);
+        assert_eq!(config.ptc.memory_limit_bytes, 67_108_864);
+        assert_eq!(config.ptc.max_output_bytes, 65_536);
+        assert_eq!(config.ptc.max_tool_calls_per_run, 16);
+        assert_eq!(config.ptc.max_list_chars, 8000);
+        assert_eq!(
+            config.ptc.disclosure,
+            openslate_ptc::Disclosure::Auto,
+            "disclosure defaults to auto"
+        );
+        assert_eq!(config.ptc.max_lookup_calls, 50);
+        assert!(config.ptc.tool_modes.is_empty());
+    }
+
+    #[test]
+    fn parse_ptc_full_section_with_tool_modes() {
+        let toml = r#"
+[ptc]
+enabled = true
+timeout_ms = 5000
+memory_limit_bytes = 33554432
+max_output_bytes = 4096
+max_tool_calls_per_run = 8
+max_list_chars = 2000
+disclosure = "catalog"
+max_lookup_calls = 10
+
+[ptc.tool_modes]
+"*" = "both"
+"shell" = "direct"
+"github_*" = "ptc"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let ptc = &config.ptc;
+        assert!(ptc.enabled);
+        assert_eq!(ptc.timeout_ms, 5000);
+        assert_eq!(ptc.memory_limit_bytes, 33_554_432);
+        assert_eq!(ptc.max_output_bytes, 4096);
+        assert_eq!(ptc.max_tool_calls_per_run, 8);
+        assert_eq!(ptc.max_list_chars, 2000);
+        assert_eq!(ptc.disclosure, openslate_ptc::Disclosure::Catalog);
+        assert_eq!(ptc.max_lookup_calls, 10);
+        assert_eq!(ptc.tool_modes.len(), 3);
+        assert_eq!(
+            ptc.tool_modes.get("*"),
+            Some(&openslate_ptc::ToolCallMode::Both)
+        );
+        assert_eq!(
+            ptc.tool_modes.get("shell"),
+            Some(&openslate_ptc::ToolCallMode::DirectOnly)
+        );
+        assert_eq!(
+            ptc.tool_modes.get("github_*"),
+            Some(&openslate_ptc::ToolCallMode::PtcOnly)
+        );
+    }
+
+    #[test]
+    fn parse_ptc_partial_override_keeps_defaults() {
+        let toml = r#"
+[ptc]
+enabled = true
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(config.ptc.enabled);
+        assert_eq!(
+            config.ptc.timeout_ms, 60_000,
+            "unspecified fields keep their defaults"
+        );
+        assert!(config.ptc.tool_modes.is_empty());
+    }
+
+    #[test]
+    fn parse_ptc_unknown_field_rejected() {
+        let toml = r#"
+[ptc]
+bogus = 1
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("bogus"),
+            "error should name the offending field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_ptc_invalid_mode_rejected() {
+        let toml = r#"
+[ptc]
+enabled = true
+
+[ptc.tool_modes]
+"read_file" = "wrong"
+"#;
+        assert!(parse_openslate_toml(toml).is_err());
+    }
+
+    #[test]
+    fn parse_ptc_disclosure_tiers() {
+        for (value, expected) in [
+            ("full", openslate_ptc::Disclosure::Full),
+            ("catalog", openslate_ptc::Disclosure::Catalog),
+            ("auto", openslate_ptc::Disclosure::Auto),
+        ] {
+            let toml = format!("[ptc]\ndisclosure = \"{value}\"\n");
+            let config = parse_openslate_toml(&toml).expect("valid tier should parse");
+            assert_eq!(config.ptc.disclosure, expected);
+        }
+    }
+
+    #[test]
+    fn parse_ptc_invalid_disclosure_rejected() {
+        let toml = r#"
+[ptc]
+disclosure = "everything"
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown disclosure tier must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("disclosure"),
+            "error should name the offending field, got: {msg}"
+        );
+    }
+
     // ── Full example TOML ────────────────────────────────────────────────
 
     #[test]
@@ -751,6 +951,11 @@ telepathy = true
         assert!(trace.enabled);
         assert!(trace.store_sqlite);
         assert_eq!(trace.default_export_format, "chrome-json");
+
+        // The [ptc] example block is fully commented out, so PTC must stay
+        // at its disabled-by-default state.
+        assert!(!config.ptc.enabled);
+        assert!(config.ptc.tool_modes.is_empty());
     }
 
     // ── Markdown agent parsing tests ─────────────────────────────────────

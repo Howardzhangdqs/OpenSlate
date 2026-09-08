@@ -406,6 +406,35 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         }
     }
 
+    // 7.6 PTC diagnostics: exact-name `[ptc.tool_modes]` entries that match
+    //     no registered tool are almost certainly config drift (a renamed
+    //     tool, a typo, or a not-yet-connected MCP server's tool) and would
+    //     silently never apply. Glob patterns are skipped — matching nothing
+    //     yet is legitimate for them. Never fatal (the same warning style as
+    //     the skills diagnostics).
+    if config.ptc.enabled {
+        let registered = registry.tool_names();
+        let invalid: Vec<&str> = config
+            .ptc
+            .tool_modes
+            .keys()
+            .filter(|pattern| {
+                !pattern.contains('*')
+                    && !pattern.contains('?')
+                    && !registered.iter().any(|name| name == *pattern)
+            })
+            .map(String::as_str)
+            .collect();
+        if !invalid.is_empty() {
+            tracing::warn!(
+                target: "openslate_ptc",
+                "ptc tool_modes reference unknown tool(s): [{}] — these entries will never \
+                 match a registered tool (check for renames/typos)",
+                invalid.join(", ")
+            );
+        }
+    }
+
     // 8. Resolve the root agent to determine which model to use (informational;
     //    the provider itself is built per run/turn via build_provider_for_model).
     let root_agent = agent_tree.get_root();

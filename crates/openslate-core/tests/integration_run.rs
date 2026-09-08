@@ -625,3 +625,146 @@ async fn integration_delegates_root_to_child() {
     assert_eq!(result.total_input_tokens, 60);
     assert_eq!(result.total_output_tokens, 16);
 }
+
+// ─── PTC (run_code) ──────────────────────────────────────────────────────
+
+/// ScriptedProvider that also records the tool names of every request, so
+/// tests can assert on the model-facing tool list.
+struct CapturingScriptedProvider {
+    responses: Vec<ModelResponse>,
+    call_count: AtomicUsize,
+    tools_per_request: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait]
+impl ModelProvider for CapturingScriptedProvider {
+    async fn generate(&self, request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
+        self.tools_per_request
+            .lock()
+            .expect("tools_per_request poisoned")
+            .push(request.tools.iter().map(|t| t.name.clone()).collect());
+        let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.responses
+            .get(idx)
+            .cloned()
+            .ok_or(ProviderError::ServerError(500))
+    }
+
+    fn provider_name(&self) -> &str {
+        "capturing-scripted"
+    }
+}
+
+/// PTC enabled with `read_file` ptc-only and `shell` direct-only.
+fn test_config_ptc() -> openslate_core::config::OpenSlateConfig {
+    let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "mock-model"
+
+[limits]
+max_steps = 10
+max_depth = 4
+max_context_bytes = 100_000
+max_output_bytes = 10_000
+
+[ptc]
+enabled = true
+
+[ptc.tool_modes]
+read_file = "ptc"
+shell = "direct"
+"#;
+    parse_openslate_toml(toml).expect("test config should parse")
+}
+
+/// End-to-end PTC: the model-facing tool list hides the ptc-only tool and
+/// shows `run_code`; a `run_code` tool call whose code invokes the ptc-only
+/// tool executes it for real through the sandbox bridge, and the file's
+/// content flows back as the tool result.
+#[tokio::test]
+async fn integration_ptc_run_code_end_to_end() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("data.txt"), "ptc secret payload").unwrap();
+    let (registry, _mcp_services) = builtin_mcp_registry(workspace.path()).await;
+
+    let code =
+        r#"async () => { const r = await tools.read_file({ path: "data.txt" }); return r; }"#;
+    let provider = CapturingScriptedProvider {
+        responses: vec![
+            // Step 1: model calls run_code, orchestrating read_file in code.
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("rc-1".into()),
+                    name: "run_code".into(),
+                    arguments: serde_json::json!({ "code": code }),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            // Step 2: model wraps up.
+            ModelResponse {
+                content: Some("read the file via code".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ],
+        call_count: AtomicUsize::new(0),
+        tools_per_request: std::sync::Mutex::new(Vec::new()),
+    };
+
+    let manager = RunManager::new(
+        test_config_ptc(),
+        test_agent_tree(vec![]),
+        registry,
+        SkillsCatalog::default(),
+    );
+    let result = manager
+        .execute(&provider, "read data.txt via run_code", None)
+        .await
+        .expect("run should succeed");
+
+    assert_eq!(result.status, RunStatus::Completed);
+
+    // Model view: read_file (ptc-only) hidden, run_code present, shell
+    // (direct-only) still directly visible.
+    let tools = provider.tools_per_request.lock().expect("tools");
+    assert_eq!(tools.len(), 2, "two model requests");
+    assert!(
+        !tools[0].contains(&"read_file".to_string()),
+        "ptc-only tool must not appear in the request tools: {tools:?}"
+    );
+    assert!(
+        tools[0].contains(&"run_code".to_string()),
+        "run_code must appear in the request tools: {tools:?}"
+    );
+    assert!(
+        tools[0].contains(&"shell".to_string()),
+        "direct-only tool stays visible: {tools:?}"
+    );
+    drop(tools);
+
+    // The run_code tool result carries the real execution outcome: the file
+    // content read through the sandbox bridge.
+    let tool_msg = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("run_code tool message should be present");
+    assert!(
+        tool_msg.content.contains("[result]"),
+        "result section missing, got: {}",
+        tool_msg.content
+    );
+    assert!(
+        tool_msg.content.contains("ptc secret payload"),
+        "file content missing from run_code result, got: {}",
+        tool_msg.content
+    );
+}

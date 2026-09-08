@@ -6,6 +6,7 @@ members = [
     "crates/openslate-model-genai",
     "crates/openslate-cli",
     "crates/openslate-mcp-builtin",
+    "crates/openslate-ptc",
 ]
 
 [workspace.package]
@@ -52,6 +53,13 @@ async-trait = "0.1"
 
 # Async primitives (channels etc. for in-process MCP transports)
 futures = "0.3"
+
+# Embedded QuickJS sandbox for Programmatic Tool Calling (openslate-ptc).
+# Sync runtime usage only (default features); see PTC_PLAN.md §6.
+rquickjs = { version = "0.12.2", default-features = false, features = ["std"] }
+
+# Workspace-internal crates
+openslate-ptc = { path = "crates/openslate-ptc" }
 
 # Testing
 mockito = "1"

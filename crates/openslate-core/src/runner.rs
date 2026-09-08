@@ -11,16 +11,21 @@
 //! that executor makes recursion happen naturally without touching the
 //! single-agent loop. See `.slim/deepwork/subagent-recursive-delegation.md`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
+use openslate_ptc::{
+    resolve_tool_mode, run_code_description, run_code_parameters_schema, PtcBoundTool, PtcLimits,
+    PtcToolInfo, ToolBridge, ToolCallMode, RUN_CODE_TOOL,
+};
 
 use crate::agent_tree::AgentTree;
 use crate::callable::child_agent_definitions;
-use crate::config::OpenSlateConfig;
+use crate::config::{OpenSlateConfig, PtcConfig};
 use crate::context::{build_child_context, ContextIsolationConfig};
 use crate::error::OpenSlateError;
 use crate::execution::{ExecutionStatus, ExecutionTree};
@@ -28,7 +33,7 @@ use crate::model_config::resolve_model;
 use crate::provider::{ModelProvider, ProgressCallback, ToolDefinition};
 use crate::runtime::{check_limits, execute_run, RunConfig, RunResult, RuntimeLimits};
 use crate::skills::SkillsCatalog;
-use crate::tool::{ToolExecutor, ToolRegistry};
+use crate::tool::{Tool, ToolExecutor, ToolRegistry};
 use crate::types::*;
 
 /// Snapshot of the currently-executing agent pushed onto the runner's call
@@ -67,11 +72,22 @@ pub struct AgentRunner<'a> {
     /// Rendered tier-1 skills catalog section (None = no skills / nothing to
     /// inject), appended to every agent's system prompt.
     skills_section: Option<String>,
+    /// PTC (`run_code`) settings, snapshotted from `config.ptc` at
+    /// construction (same pipeline as skills: wiring loads the config →
+    /// RunManager holds it → AgentRunner snapshots the slice it needs).
+    ptc: PtcConfig,
 
     // Interior-mutable shared state across the run and recursion layers.
     execution_tree: Mutex<ExecutionTree>,
     caller_stack: Mutex<Vec<CallerFrame>>,
     child_call_count: AtomicU32,
+    /// Global tool-call count for the whole run: every direct tool call the
+    /// model makes (including `run_code` itself) plus every bridge call a
+    /// `run_code` script makes. `call_agent` is excluded — it has its own
+    /// budget (`max_child_agent_calls`). Consulted by `check_limits` at
+    /// delegation boundaries (best-effort fix for the exp-1 gap: the main
+    /// loop itself never increments the `max_tool_calls` budget).
+    tool_call_count: AtomicU32,
     total_input_tokens: AtomicU64,
     total_output_tokens: AtomicU64,
     /// Wall-clock deadline shared by the whole run. Each child layer gets
@@ -123,9 +139,11 @@ impl<'a> AgentRunner<'a> {
             context_config: ContextIsolationConfig::default(),
             run_id,
             skills_section,
+            ptc: config.ptc.clone(),
             execution_tree: Mutex::new(execution_tree),
             caller_stack: Mutex::new(Vec::new()),
             child_call_count: AtomicU32::new(0),
+            tool_call_count: AtomicU32::new(0),
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
             root_deadline,
@@ -155,6 +173,13 @@ impl<'a> AgentRunner<'a> {
         self.child_call_count.load(Ordering::Relaxed)
     }
 
+    /// Number of tool calls counted this run: direct calls (including
+    /// `run_code` invocations) plus the bridge calls each `run_code` script
+    /// made. `call_agent` calls are counted separately.
+    pub fn tool_call_count(&self) -> u32 {
+        self.tool_call_count.load(Ordering::Relaxed)
+    }
+
     /// Append the skills catalog section (if any) to a system prompt.
     ///
     /// With no skills configured this is the identity function, so the
@@ -170,6 +195,10 @@ impl<'a> AgentRunner<'a> {
     /// whitelist (or all registered tools when the whitelist is empty) plus,
     /// when the agent has children, the `call_agent` definitions that let the
     /// model delegate sub-tasks.
+    ///
+    /// With PTC enabled, ptc-only tools are removed from the direct list and
+    /// a `run_code` tool is appended when the agent has at least one
+    /// code-callable tool (PTC_PLAN.md §3, 收口①).
     fn tool_definitions_for(&self, agent_id: &AgentId) -> Vec<ToolDefinition> {
         let agent = match self.agent_tree.get_agent(agent_id) {
             Some(a) => a,
@@ -183,7 +212,89 @@ impl<'a> AgentRunner<'a> {
         if !agent.children.is_empty() {
             defs.extend(child_agent_definitions(&agent.children, self.agent_tree));
         }
+        if self.ptc.enabled {
+            // ptc-only tools must not reach the model's direct tool list.
+            defs.retain(|d| {
+                resolve_tool_mode(&self.ptc.tool_modes, &d.name, true).direct_visible()
+            });
+            let code_defs = self.ptc_code_tool_defs(agent_id);
+            if !code_defs.is_empty() {
+                let infos = self.ptc_infos(&code_defs);
+                // both-mode tools are the first candidates for auto-tier
+                // demotion — their schemas are already paid for in the
+                // direct tool list. ptc-only tools never demote (the code
+                // description is the only place their schema is exposed).
+                let both_mode_names: Vec<String> = code_defs
+                    .iter()
+                    .filter(|d| {
+                        resolve_tool_mode(&self.ptc.tool_modes, &d.name, true) == ToolCallMode::Both
+                    })
+                    .map(|d| d.name.clone())
+                    .collect();
+                defs.push(ToolDefinition {
+                    name: RUN_CODE_TOOL.to_owned(),
+                    description: run_code_description(
+                        &infos,
+                        &both_mode_names,
+                        self.ptc.disclosure,
+                        self.ptc.max_list_chars,
+                    ),
+                    parameters: run_code_parameters_schema(),
+                });
+            }
+        }
         defs
+    }
+
+    /// Tools the given agent may call from inside `run_code` — the PTC
+    /// binding set (PTC_PLAN.md §3, 收口②): its `tools:` whitelist (or every
+    /// registered tool when the whitelist is empty) restricted to
+    /// ptc-callable modes, excluding `run_code` itself and `call_agent` (no
+    /// recursive delegation from code; `call_agent` is not a registry tool,
+    /// so the registry-derived list would exclude it anyway — the explicit
+    /// filter guards against future changes).
+    ///
+    /// Shared by [`Self::tool_definitions_for`] (which renders these defs
+    /// into the `run_code` description) and
+    /// [`Self::handle_run_code`](Self::handle_run_code) (which bridges them),
+    /// so the model-facing list and the sandbox binding set can never drift.
+    fn ptc_code_tool_defs(&self, agent_id: &AgentId) -> Vec<ToolDefinition> {
+        let agent = match self.agent_tree.get_agent(agent_id) {
+            Some(a) => a,
+            None => return vec![],
+        };
+        let mut defs = if agent.tools.is_empty() {
+            self.tool_registry.definitions()
+        } else {
+            self.tool_registry.definitions_for(&agent.tools)
+        };
+        defs.retain(|d| {
+            d.name != RUN_CODE_TOOL
+                && d.name != "call_agent"
+                && resolve_tool_mode(&self.ptc.tool_modes, &d.name, true).ptc_callable()
+        });
+        // Registry iteration order is a HashMap artifact; sort so the
+        // generated declarations (and the model's view) are deterministic.
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
+    /// Map code-tool defs to [`PtcToolInfo`], resolving each tool's PTC
+    /// namespace from the registry: MCP tools report their server alias
+    /// (sandbox path `tools.<server>.<method>`, declarations grouped);
+    /// builtin tools report `None` (flat `tools.<name>`).
+    fn ptc_infos(&self, defs: &[ToolDefinition]) -> Vec<PtcToolInfo> {
+        defs.iter()
+            .map(|def| PtcToolInfo {
+                name: def.name.clone(),
+                description: def.description.clone(),
+                parameters: def.parameters.clone(),
+                namespace: self
+                    .tool_registry
+                    .get(&def.name)
+                    .and_then(|t| t.namespace()),
+            })
+            .collect()
     }
 
     // ── caller-stack helpers ───────────────────────────────────────────────
@@ -435,9 +546,18 @@ impl<'a> AgentRunner<'a> {
         // is "how many child calls are allowed", so a run that has already
         // made `current` calls may proceed only while current < max
         // (check_limits rejects when current >= max). The slot is reserved
-        // only after the check passes.
+        // only after the check passes. The global tool-call count feeds the
+        // same check (best-effort `max_tool_calls` enforcement; the main
+        // loop itself never increments it — exp-1 gap).
         let current_calls = self.child_call_count.load(Ordering::Relaxed);
-        if let Err(e) = check_limits(&self.limits, 0, child_depth, 0, current_calls) {
+        let current_tool_calls = self.tool_call_count.load(Ordering::Relaxed);
+        if let Err(e) = check_limits(
+            &self.limits,
+            0,
+            child_depth,
+            current_tool_calls,
+            current_calls,
+        ) {
             return self.error_output(format!("child agent call denied: {}", e));
         }
         self.child_call_count.fetch_add(1, Ordering::Relaxed);
@@ -529,6 +649,166 @@ impl<'a> AgentRunner<'a> {
             status: ToolOutputStatus::Error,
         }
     }
+
+    /// Handle an intercepted `run_code` tool call (PTC): bind the calling
+    /// agent's ptc-callable tools into a fresh QuickJS sandbox, execute the
+    /// model's code through [`openslate_ptc::run_code`], and translate the
+    /// outcome into a ToolOutput whose content follows PTC_PLAN.md §6.4
+    /// (`[logs]`/`[result]` on success, `[error]` + logs on failure).
+    ///
+    /// Errors are data: script failures become an Error ToolOutput with the
+    /// full message as content, so the model can self-heal and the run loop
+    /// keeps going.
+    async fn handle_run_code(&self, args: &serde_json::Value) -> ToolOutput {
+        let start = Instant::now();
+        let code = match args.get("code").and_then(|c| c.as_str()) {
+            Some(c) => c.to_owned(),
+            None => {
+                return self.error_output(
+                    "run_code requires a 'code' string argument: an async arrow function, \
+                     e.g. async () => { return await tools.read_file({ path: \"x\" }); }",
+                );
+            }
+        };
+
+        // The binding set belongs to the agent whose loop emitted the call.
+        // Outside a run (no caller frame — direct invocation in tests) the
+        // root agent's set is used.
+        let agent_id = self
+            .current_frame()
+            .map(|f| f.agent_id)
+            .unwrap_or_else(|| self.agent_tree.get_root().id.clone());
+
+        // Owned bridge map: the executor's `spawn_blocking` boundary requires
+        // 'static data while `AgentRunner<'a>` borrows, so resolve the bound
+        // tools to their `Arc<dyn Tool>` handles up front (the same objects
+        // the registry dispatches through). Names missing from the registry
+        // (should not happen — the defs came from it) are skipped.
+        // The same infos double as the sandbox discovery catalog powering
+        // list_tools/describe_tool.
+        let catalog = self.ptc_infos(&self.ptc_code_tool_defs(&agent_id));
+        let mut bound: Vec<PtcBoundTool> = Vec::new();
+        let mut bridge_tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
+        for info in &catalog {
+            if let Some(tool) = self.tool_registry.get(&info.name) {
+                bridge_tools.insert(info.name.clone(), tool);
+                bound.push(PtcBoundTool {
+                    name: info.name.clone(),
+                    namespace: info.namespace.clone(),
+                });
+            }
+        }
+
+        // Host-side bridge (errors-as-data protocol): every outcome — lookup
+        // failure, bad arguments, tool Err, or an error-status ToolOutput —
+        // comes back as an error envelope the sandbox turns into a JS
+        // exception the code can try/catch.
+        let max_output = self.ptc.max_output_bytes;
+        let bridge: ToolBridge = Arc::new(
+            move |name: &str, args_json: &str| -> BoxFuture<'static, String> {
+                let name = name.to_owned();
+                let args_json = args_json.to_owned();
+                let tool = bridge_tools.get(&name).cloned();
+                Box::pin(async move {
+                    let tool = match tool {
+                        Some(t) => t,
+                        None => {
+                            return openslate_ptc::envelope_error(format!(
+                                "tool not available in code mode: {name}"
+                            ));
+                        }
+                    };
+                    let parsed: serde_json::Value = match serde_json::from_str(&args_json) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return openslate_ptc::envelope_error(format!(
+                                "invalid tool arguments JSON: {e}"
+                            ));
+                        }
+                    };
+                    if !parsed.is_object() && !parsed.is_null() {
+                        return openslate_ptc::envelope_error(format!(
+                            "tool arguments must be a JSON object, got: {args_json}"
+                        ));
+                    }
+                    match tool.execute(&parsed).await {
+                        Err(e) => openslate_ptc::envelope_error(e),
+                        Ok(out) => {
+                            let content = truncate_bridge_output(&out.content, max_output);
+                            match out.status {
+                                ToolOutputStatus::Error => openslate_ptc::envelope_error(content),
+                                _ => openslate_ptc::envelope_result(serde_json::Value::String(
+                                    content,
+                                )),
+                            }
+                        }
+                    }
+                })
+            },
+        );
+
+        let limits = PtcLimits {
+            timeout_ms: self.ptc.timeout_ms,
+            memory_limit_bytes: self.ptc.memory_limit_bytes,
+            max_output_bytes: self.ptc.max_output_bytes,
+            max_tool_calls_per_run: self.ptc.max_tool_calls_per_run,
+            max_lookup_calls: self.ptc.max_lookup_calls,
+        };
+
+        let outcome = openslate_ptc::run_code(&code, &bound, &catalog, &limits, bridge).await;
+
+        // Fold the script's bridge calls into the global tool-call budget
+        // (the run_code invocation itself is already counted in execute()).
+        if outcome.tool_calls > 0 {
+            self.tool_call_count
+                .fetch_add(outcome.tool_calls as u32, Ordering::Relaxed);
+        }
+
+        let logs = outcome.logs.join("\n");
+        let content = if let Some(err) = &outcome.error {
+            if logs.is_empty() {
+                format!("[error] {err}")
+            } else {
+                format!("[error] {err}\n\n[logs]\n{logs}")
+            }
+        } else {
+            let result = outcome.result.as_deref().unwrap_or("null");
+            if logs.is_empty() {
+                format!("[result]\n{result}")
+            } else {
+                format!("[logs]\n{logs}\n\n[result]\n{result}")
+            }
+        };
+        let bytes = content.len();
+        ToolOutput {
+            content,
+            bytes,
+            duration_ms: start.elapsed().as_millis() as u64,
+            status: if outcome.error.is_some() {
+                ToolOutputStatus::Error
+            } else {
+                ToolOutputStatus::Success
+            },
+        }
+    }
+}
+
+/// Cut PTC bridge tool content to `max` bytes on a UTF-8 char boundary,
+/// appending a truncation marker noting the original size (same style as
+/// `tool::limit_tool_output` and the ptc executor's `truncate_bytes`).
+fn truncate_bridge_output(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n--- TRUNCATED (original {} bytes) ---",
+        &s[..cut],
+        s.len()
+    )
 }
 
 /// Pull all leading system-role messages out of a message list and join them
@@ -690,6 +970,27 @@ impl<'a> ToolExecutor for AgentRunner<'a> {
     async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput {
         if name == "call_agent" {
             return self.handle_call_agent(args).await;
+        }
+        // Count every (attempted) direct tool call toward the global
+        // max_tool_calls budget, consulted at delegation boundaries; a
+        // run_code script folds its inner bridge calls in via
+        // handle_run_code. call_agent is excluded (own budget, above).
+        self.tool_call_count.fetch_add(1, Ordering::Relaxed);
+        // PTC interception (PTC_PLAN.md §3, 收口②): run_code executes the
+        // model's code in the sandbox instead of dispatching to the registry.
+        // Only when PTC is enabled; disabled, it falls through to the
+        // registry's unknown-tool error.
+        if name == RUN_CODE_TOOL && self.ptc.enabled {
+            return self.handle_run_code(args).await;
+        }
+        // Hallucination guard (收口④): the model may still emit a direct
+        // call to a ptc-only tool it saw in an earlier turn or invented —
+        // reject it with an actionable message instead of executing.
+        if self.ptc.enabled && !resolve_tool_mode(&self.ptc.tool_modes, name, true).direct_visible()
+        {
+            return self.error_output(format!(
+                "tool '{name}' is ptc-only: call it from code inside {RUN_CODE_TOOL}"
+            ));
         }
         // Delegate all other tools to the shared registry, converting errors
         // into error ToolOutputs exactly as ToolRegistry's own ToolExecutor
@@ -1378,5 +1679,638 @@ model = "mock-fast"
         // Byte-identical to the agent's default_prompt: empty catalog must
         // not alter existing behavior.
         assert_eq!(prompts[0], "root prompt");
+    }
+
+    // ── PTC (run_code) ────────────────────────────────────────────────────
+
+    /// A tool that gets configured ptc-only in tests.
+    struct SearchWebTool;
+    #[async_trait]
+    impl crate::tool::Tool for SearchWebTool {
+        fn name(&self) -> &str {
+            "search_web"
+        }
+        fn description(&self) -> &str {
+            "Search the web"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}})
+        }
+        async fn execute(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<ToolOutput, crate::error::ToolError> {
+            Ok(ToolOutput {
+                content: "web results".into(),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Success,
+            })
+        }
+    }
+
+    /// A tool that counts its invocations so tests can assert how many calls
+    /// actually crossed the PTC bridge.
+    struct CountingEchoTool {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl crate::tool::Tool for CountingEchoTool {
+        fn name(&self) -> &str {
+            "mock_echo"
+        }
+        fn description(&self) -> &str {
+            "Echo its arguments back"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}}})
+        }
+        async fn execute(
+            &self,
+            args: &serde_json::Value,
+        ) -> Result<ToolOutput, crate::error::ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: format!("echo:{}", args["x"]),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Success,
+            })
+        }
+    }
+
+    /// test_config + `[ptc] enabled = true` plus extra TOML appended inside
+    /// the `[ptc]` table (must come before any `[ptc.tool_modes]` subtable).
+    fn ptc_config(extra: &str) -> OpenSlateConfig {
+        let toml = format!(
+            r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "mock-model"
+
+[models.fast]
+provider = "mock"
+model = "mock-fast"
+
+[ptc]
+enabled = true
+{extra}"#
+        );
+        crate::config::parse_openslate_toml(&toml).expect("ptc config should parse")
+    }
+
+    #[test]
+    fn ptc_disabled_by_default_definitions_unchanged() {
+        // No [ptc] section → PtcConfig::default() → disabled: no run_code,
+        // no mode filtering.
+        let config = test_config();
+        let tree = root_only_tree();
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let defs = runner.tool_definitions_for(&AgentId("root".into()));
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"echo"));
+        assert!(
+            !names.contains(&"run_code"),
+            "run_code must not appear when ptc is disabled: {names:?}"
+        );
+    }
+
+    #[test]
+    fn ptc_enabled_filters_ptc_only_and_injects_run_code() {
+        let config = ptc_config("\n[ptc.tool_modes]\nsearch_web = \"ptc\"\n");
+        let tree = root_only_tree();
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        registry.register(SearchWebTool);
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let defs = runner.tool_definitions_for(&AgentId("root".into()));
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"run_code"),
+            "run_code injected when a code-callable tool exists: {names:?}"
+        );
+        assert!(
+            !names.contains(&"search_web"),
+            "ptc-only tool hidden from the direct list: {names:?}"
+        );
+        assert!(
+            names.contains(&"echo"),
+            "both-mode tool stays directly visible: {names:?}"
+        );
+        let run_code_def = defs
+            .iter()
+            .find(|d| d.name == "run_code")
+            .expect("run_code definition");
+        assert!(
+            run_code_def.description.contains("declare const tools:"),
+            "TS declarations must be inlined, got: {}",
+            run_code_def.description
+        );
+        assert!(run_code_def.description.contains("echo"));
+        assert!(
+            run_code_def.description.contains("search_web"),
+            "ptc-only tool is code-callable, so it MUST appear in the \
+             code-mode declarations: {}",
+            run_code_def.description
+        );
+    }
+
+    #[tokio::test]
+    async fn ptc_only_direct_call_is_rejected() {
+        let config = ptc_config("\n[ptc.tool_modes]\nsearch_web = \"ptc\"\n");
+        let tree = root_only_tree();
+        let mut registry = ToolRegistry::new();
+        registry.register(SearchWebTool);
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner
+            .execute("search_web", &serde_json::json!({"q": "x"}))
+            .await;
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("ptc-only"),
+            "expected ptc-only guard message, got: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn run_code_executes_tool_through_bridge() {
+        let config = ptc_config("");
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "async () => { const r = await tools.mock_echo({x:1}); return r; }"
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            out.status,
+            ToolOutputStatus::Success,
+            "run_code content: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("[result]"),
+            "result section missing, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("echo:1"),
+            "tool return value missing, got: {}",
+            out.content
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one bridge call");
+        // One model-facing run_code invocation + one inner bridge call.
+        assert_eq!(runner.tool_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_code_enforces_tool_call_budget() {
+        // Budget of 1 + code calling the tool twice: the second bridge call
+        // gets a budget-exceeded envelope, which throws inside the sandbox
+        // and surfaces as an error the model can self-heal from.
+        let config = ptc_config("max_tool_calls_per_run = 1\n");
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "async () => { const a = await tools.mock_echo({x:1}); \
+                             const b = await tools.mock_echo({x:2}); return b; }"
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            out.status,
+            ToolOutputStatus::Error,
+            "budget overrun must be an error output, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("budget exceeded"),
+            "budget message missing, got: {}",
+            out.content
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the first call reached the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_code_without_code_argument_is_a_usage_error() {
+        let config = ptc_config("");
+        let tree = root_only_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner.execute("run_code", &serde_json::json!({})).await;
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("'code'"),
+            "usage hint missing, got: {}",
+            out.content
+        );
+    }
+
+    // ── PTC P2: namespaces, disclosure tiers, lookup budget ──────────────
+
+    /// A namespaced mock tool: registry name `github_list_prs`, PTC sandbox
+    /// path `tools.github.list_prs`.
+    struct GithubListPrsTool {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl crate::tool::Tool for GithubListPrsTool {
+        fn name(&self) -> &str {
+            "github_list_prs"
+        }
+        fn namespace(&self) -> Option<String> {
+            Some("github".to_string())
+        }
+        fn description(&self) -> &str {
+            "List pull requests"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "state": {"type": "string", "enum": ["open", "closed", "all"]} },
+                "required": ["state"]
+            })
+        }
+        async fn execute(
+            &self,
+            args: &serde_json::Value,
+        ) -> Result<ToolOutput, crate::error::ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let state = args["state"].as_str().unwrap_or("all");
+            Ok(ToolOutput {
+                content: format!("prs[{state}]=3"),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Success,
+            })
+        }
+    }
+
+    /// Flat mock tool configured ptc-only via tool_modes.
+    struct MockSearchTool;
+    #[async_trait]
+    impl crate::tool::Tool for MockSearchTool {
+        fn name(&self) -> &str {
+            "mock_search"
+        }
+        fn description(&self) -> &str {
+            "Search the index"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "q": {"type": "string"}, "limit": {"type": "integer"} }
+            })
+        }
+        async fn execute(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<ToolOutput, crate::error::ToolError> {
+            Ok(ToolOutput {
+                content: "index hits".into(),
+                bytes: 0,
+                duration_ms: 0,
+                status: ToolOutputStatus::Success,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_code_namespaced_tool_dispatches_under_registry_name() {
+        let config = ptc_config("");
+        let tree = root_only_tree();
+        let gh_calls = Arc::new(AtomicUsize::new(0));
+        let echo_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(GithubListPrsTool {
+            calls: gh_calls.clone(),
+        });
+        registry.register(CountingEchoTool {
+            calls: echo_calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        // The namespaced tool is reached via the composed path
+        // `tools.github.list_prs`; a wrong dispatch name would surface as
+        // "tool not available in code mode" instead of the real result.
+        let out = runner
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "async () => { const prs = await tools.github.list_prs({ state: \"open\" }); \
+                             const echo = await tools.mock_echo({x: 7}); return prs + \" | \" + echo; }"
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            out.status,
+            ToolOutputStatus::Success,
+            "run_code content: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("prs[open]=3"),
+            "namespaced call result missing, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("echo:7"),
+            "flat call result missing, got: {}",
+            out.content
+        );
+        assert_eq!(gh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(echo_calls.load(Ordering::SeqCst), 1);
+
+        // The declarations group the namespaced tool under `github: {`.
+        let defs = runner.tool_definitions_for(&AgentId("root".into()));
+        let run_code_def = defs
+            .iter()
+            .find(|d| d.name == "run_code")
+            .expect("run_code definition");
+        assert!(
+            run_code_def.description.contains("github: {"),
+            "namespace group missing from declarations: {}",
+            run_code_def.description
+        );
+    }
+
+    #[test]
+    fn ptc_disclosure_auto_demotes_both_tools_over_budget() {
+        // Tool set: one ptc-only tool (stays full) + three both tools
+        // (demote to comment catalog lines when over budget).
+        let registry_tools = || {
+            let echo_calls = Arc::new(AtomicUsize::new(0));
+            let mut registry = ToolRegistry::new();
+            registry.register(MockSearchTool);
+            registry.register(EchoTool);
+            registry.register(SearchWebTool);
+            registry.register(CountingEchoTool { calls: echo_calls });
+            registry
+        };
+        let tree = root_only_tree();
+        let skills = SkillsCatalog::default();
+        let agent_id = AgentId("root".into());
+        let modes = "\n[ptc.tool_modes]\nmock_search = \"ptc\"\n";
+
+        // Compute a budget that lands in the auto tier's MIXED branch using
+        // the same renderer the runner uses: full render must overflow it,
+        // while ptc-only-full + comment lines must fit.
+        let probe_registry = registry_tools();
+        let probe_config = ptc_config(modes);
+        let probe = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &probe_registry,
+            &skills,
+            &probe_config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+        let infos = probe.ptc_infos(&probe.ptc_code_tool_defs(&agent_id));
+        let full = openslate_ptc::generate_declarations(&infos);
+        let ptc_only: Vec<PtcToolInfo> = infos
+            .iter()
+            .filter(|i| i.name == "mock_search")
+            .cloned()
+            .collect();
+        let base = openslate_ptc::generate_declarations(&ptc_only);
+        let budget = base.chars().count() + 150;
+        assert!(
+            budget < full.chars().count(),
+            "test premise: both-tool signatures ({}) must exceed the comment-line \
+             allowance (150); full={budget}",
+            full.chars().count()
+        );
+        drop(probe);
+
+        let config = ptc_config(&format!("max_list_chars = {budget}\n{modes}"));
+        let registry = registry_tools();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+        let defs = runner.tool_definitions_for(&agent_id);
+        let desc = &defs
+            .iter()
+            .find(|d| d.name == "run_code")
+            .expect("run_code definition")
+            .description;
+
+        // ptc-only tool keeps its full signature...
+        assert!(
+            desc.contains("mock_search: (input:"),
+            "ptc-only tool must stay a full signature, got: {desc}"
+        );
+        // ...while both tools demote to comment catalog lines...
+        assert!(
+            desc.contains("// search_web: Search the web"),
+            "both tool not demoted to a catalog comment line, got: {desc}"
+        );
+        assert!(
+            !desc.contains("search_web: (input:"),
+            "demoted tool must not keep its full signature, got: {desc}"
+        );
+        // ...and the discovery hint tells the model how to look them up.
+        assert!(
+            desc.contains("describe_tool(name)"),
+            "discovery hint missing, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn ptc_disclosure_catalog_only_shows_catalog_and_hint() {
+        let config = ptc_config("disclosure = \"catalog\"\n");
+        let tree = root_only_tree();
+        let mut registry = ToolRegistry::new();
+        registry.register(MockSearchTool);
+        registry.register(SearchWebTool);
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let defs = runner.tool_definitions_for(&AgentId("root".into()));
+        let desc = &defs
+            .iter()
+            .find(|d| d.name == "run_code")
+            .expect("run_code definition")
+            .description;
+        assert!(
+            desc.contains("mock_search: Search the index"),
+            "catalog line missing, got: {desc}"
+        );
+        assert!(
+            desc.contains("search_web: Search the web"),
+            "catalog line missing, got: {desc}"
+        );
+        assert!(
+            !desc.contains("declare const"),
+            "catalog tier must not inline signatures, got: {desc}"
+        );
+        assert!(
+            desc.contains("describe_tool(name)"),
+            "discovery hint missing, got: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_code_lookup_budget_is_enforced() {
+        // max_lookup_calls = 1: the second describe_tool returns the budget
+        // string as data (it does not throw); lookups never touch the tool
+        // bridge, so the mock tool's counter stays at zero.
+        let config = ptc_config("max_lookup_calls = 1\n");
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let out = runner
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "async () => { const first = describe_tool(\"mock_echo\"); \
+                             const second = describe_tool(\"mock_echo\"); return second; }"
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            out.status,
+            ToolOutputStatus::Success,
+            "budget string is data, not an error, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("lookup budget exceeded (2/1)"),
+            "budget message missing, got: {}",
+            out.content
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "lookups must not consume the tool-call budget"
+        );
     }
 }

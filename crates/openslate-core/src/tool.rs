@@ -18,6 +18,15 @@ pub trait Tool: Send + Sync {
     /// The unique name of this tool (e.g., "bash", "read_file").
     fn name(&self) -> &str;
 
+    /// Optional namespace for PTC sandbox exposure (`PTC_PLAN.md` §5.1):
+    /// `Some(ns)` makes the tool callable from `run_code` code via the
+    /// composed path `tools.<ns>.<method>`; `None` (the default) keeps the
+    /// tool flat at `tools.<name>`. MCP tools override this to return their
+    /// server alias; builtin tools stay flat.
+    fn namespace(&self) -> Option<String> {
+        None
+    }
+
     /// Human-readable description of what this tool does.
     fn description(&self) -> &str;
 

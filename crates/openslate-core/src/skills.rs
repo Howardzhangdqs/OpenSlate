@@ -84,6 +84,11 @@ pub fn parse_skill_markdown(content: &str, path: &Path) -> Result<Skill, ConfigE
         ConfigError::ParseError(format!("{}: no frontmatter delimiter", path.display()))
     })?;
 
+    // Known limitation: splitting at the first "\n---" can clip a
+    // multi-line quoted YAML scalar whose continuation line starts with
+    // `---` (the truncated YAML then fails to parse → warn + skip).
+    // Lenient by design; accepted trade-off — don't "fix" this into a
+    // YAML-aware splitter.
     let (yaml_str, body) = match content.find("\n---") {
         Some(pos) => {
             let yaml = &content[..pos];
@@ -263,8 +268,10 @@ pub fn discover_skills(sources: &[PathBuf]) -> (SkillsCatalog, Vec<SkillWarning>
 
 // ── Catalog prompt ───────────────────────────────────────────────────────────
 
-/// XML-escape a description so skill metadata cannot inject markup into the
-/// system prompt.
+/// XML-escape skill metadata (names, descriptions) so it cannot inject
+/// markup into the system prompt. Descriptions are trusted content by
+/// design, but names/descriptions ride in every system prompt, so they are
+/// escaped defensively.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -294,7 +301,7 @@ the full skill instructions before acting; load a skill at most once per task.\n
     let mut lines: Vec<String> = kept
         .iter()
         .zip(descriptions)
-        .map(|(skill, desc)| format!("- name: {}\n  description: {desc}", skill.name))
+        .map(|(skill, desc)| format!("- name: {}\n  description: {desc}", xml_escape(&skill.name)))
         .collect();
     if let Some(omission) = omission {
         lines.push(omission);
@@ -360,9 +367,9 @@ impl SkillsCatalog {
         // Drop skills from the END (name-sorted) until it fits, with an
         // omission line that counts toward the budget.
         for keep in (0..self.skills.len()).rev() {
-            let omitted: Vec<&str> = self.skills[keep..]
+            let omitted: Vec<String> = self.skills[keep..]
                 .iter()
-                .map(|s| s.name.as_str())
+                .map(|s| xml_escape(&s.name))
                 .collect();
             let omission = format!(
                 "- ({} more skills omitted: {})",
@@ -489,6 +496,17 @@ mod tests {
             .expect("BOM-prefixed content should parse");
         assert_eq!(skill.name, "bom");
         assert_eq!(skill.body, "body");
+    }
+
+    #[test]
+    fn parse_crlf_line_endings() {
+        // Windows-authored SKILL.md: frontmatter and body with \r\n.
+        let content = "---\r\nname: crlf\ndescription: crlf skill\r\n---\r\n\r\n## Usage\r\n\r\nDo the thing.\r\n";
+        let skill = parse_skill_markdown(content, Path::new("/skills/crlf/SKILL.md"))
+            .expect("CRLF content should parse");
+        assert_eq!(skill.name, "crlf");
+        assert_eq!(skill.description, "crlf skill");
+        assert_eq!(skill.body, "## Usage\r\n\r\nDo the thing.");
     }
 
     #[test]
@@ -727,6 +745,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn discover_follows_symlinked_skill_dir() {
+        // Symlinked skill directories are followed (matching Codex), as
+        // advertised in the `discover_skills` docs.
+        let root = TempDir::new().unwrap();
+        let real = root.path().join("real-dir");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(
+            real.join("SKILL.md"),
+            "---\nname: linked\ndescription: l\n---\nlinked body",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("alias")).unwrap();
+
+        let (catalog, _) = discover_skills(&[root.path().to_path_buf()]);
+        assert_eq!(
+            catalog
+                .get("linked")
+                .expect("symlinked dir discovered")
+                .body,
+            "linked body"
+        );
+    }
+
+    #[test]
     fn discover_empty_sources() {
         let (catalog, warnings) = discover_skills(&[]);
         assert!(catalog.is_empty());
@@ -774,6 +817,24 @@ mod tests {
         let prompt = catalog.catalog_prompt(0).expect("renders");
         assert!(prompt.contains("Use &lt;tags&gt; &amp; entities"));
         assert!(!prompt.contains("<tags>"));
+    }
+
+    #[test]
+    fn catalog_prompt_escapes_xml_characters_in_name() {
+        // Spec-violating name (lenient validation still loads it) must not
+        // inject raw markup into every system prompt.
+        let root = TempDir::new().unwrap();
+        write_skill(
+            root.path(),
+            "weird",
+            "name: \"a<b>&c\"\ndescription: d\n",
+            "body",
+        );
+        let (catalog, _) = discover_skills(&[root.path().to_path_buf()]);
+        let prompt = catalog.catalog_prompt(0).expect("renders");
+        assert!(prompt.contains("- name: a&lt;b&gt;&amp;c"), "{prompt}");
+        assert!(!prompt.contains("a<b>&c"), "{prompt}");
+        assert!(!prompt.contains("<b>"), "{prompt}");
     }
 
     #[test]

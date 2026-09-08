@@ -27,6 +27,42 @@ use rmcp::{
 /// Maximum number of resource entries listed before truncation.
 const MAX_RESOURCE_ENTRIES: usize = 50;
 
+/// Maximum skill-body size served by `read_skill` before truncation.
+///
+/// Whole SKILL.md files are loaded at discovery and served from memory, so
+/// a pathological multi-MB body would otherwise flood the context in a
+/// single tool call (tier-1 disclosure has a char budget; tier-2 needs its
+/// own cap). A constant, like the shell builtin's 64KB cap: limits are not
+/// plumbed into builtin server construction.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Escape a skill name for use inside the wrapper's double-quoted XML
+/// attribute. Description and body stay raw (trusted content by design).
+fn xml_attribute_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Truncate an oversized skill body on a char boundary, appending a visible
+/// marker (same style as the runner's `--- TRUNCATED (...) ---` line).
+/// Bodies within the cap pass through unchanged.
+fn truncate_body(body: &str) -> String {
+    if body.len() <= MAX_BODY_BYTES {
+        return body.to_owned();
+    }
+    let mut end = MAX_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let kept = &body[..end];
+    format!(
+        "{kept}\n--- SKILL BODY TRUNCATED ({end} of {} bytes) ---",
+        body.len()
+    )
+}
+
 /// One discoverable skill, converted from core's catalog at connect time.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
@@ -124,9 +160,9 @@ impl SkillServer {
 
         let mut content = format!(
             "<skill name=\"{}\">\n{}\n\n{}\n\nSkill directory: {}\nRelative paths in this skill resolve against the skill directory.\n",
-            skill.name,
+            xml_attribute_escape(&skill.name),
             skill.description,
-            skill.body,
+            truncate_body(&skill.body),
             skill.dir.display()
         );
         content.push_str("<skill_resources>\n");
@@ -311,6 +347,80 @@ mod tests {
             .await
             .expect_err("empty name must be invalid params");
         assert!(format!("{err}").contains("name"));
+    }
+
+    // ── escaping / truncation ──
+
+    #[tokio::test]
+    async fn read_skill_escapes_name_in_wrapper_attribute() {
+        // A `"` (or `&`/`<`) in a spec-violating but loaded skill name must
+        // not break the wrapper's XML attribute.
+        let dir = tempfile::TempDir::new().unwrap();
+        let weird = "we\"ird & <name>";
+        let client = spawn_server(SkillServer::new(vec![skill_info(
+            weird,
+            "d",
+            "b",
+            dir.path(),
+        )]))
+        .await;
+
+        let text = first_text(&call(&client, weird).await);
+        assert!(
+            text.starts_with("<skill name=\"we&quot;ird &amp; &lt;name&gt;\">"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_skill_truncates_oversized_body() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let body = "x".repeat(MAX_BODY_BYTES + 1024);
+        let client = spawn_server(SkillServer::new(vec![skill_info(
+            "big",
+            "d",
+            &body,
+            dir.path(),
+        )]))
+        .await;
+
+        let text = first_text(&call(&client, "big").await);
+        assert!(
+            text.contains(&format!(
+                "--- SKILL BODY TRUNCATED ({MAX_BODY_BYTES} of {} bytes) ---",
+                body.len()
+            )),
+            "{text}"
+        );
+        assert!(text.len() < body.len(), "output capped near the limit");
+        assert!(text.ends_with("</skill>"), "wrapper stays intact");
+    }
+
+    #[tokio::test]
+    async fn read_skill_truncates_oversized_body_on_char_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Multibyte tail straddling the cap byte: must not panic and must
+        // keep valid UTF-8 (the marker proves a boundary-aligned cut).
+        let mut body = "x".repeat(MAX_BODY_BYTES - 1);
+        body.push_str("中中中中");
+        let client = spawn_server(SkillServer::new(vec![skill_info(
+            "wide",
+            "d",
+            &body,
+            dir.path(),
+        )]))
+        .await;
+
+        let text = first_text(&call(&client, "wide").await);
+        assert!(text.contains("--- SKILL BODY TRUNCATED ("), "{text}");
+        assert!(text.ends_with("</skill>"), "{text}");
+    }
+
+    #[test]
+    fn truncate_body_noop_under_limit() {
+        let body = "x".repeat(1024);
+        assert_eq!(truncate_body(&body), body);
+        assert_eq!(truncate_body(""), "");
     }
 
     // ── resource listing ──

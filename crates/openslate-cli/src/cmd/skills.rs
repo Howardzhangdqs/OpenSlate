@@ -36,10 +36,12 @@ pub(crate) fn render_skills_listing(catalog: &SkillsCatalog, sources: &[PathBuf]
         return out;
     }
 
+    // Column widths count chars (not bytes) so non-ASCII names don't skew
+    // the table; `{:<w$}` padding also counts chars for str.
     let name_w = catalog
         .skills()
         .iter()
-        .map(|s| s.name.len())
+        .map(|s| s.name.chars().count())
         .chain(std::iter::once("NAME".len()))
         .max()
         .unwrap_or(0);
@@ -223,5 +225,26 @@ model = "m1"
         let truncated = first_description_line(&long);
         assert_eq!(truncated.chars().count(), MAX_DESCRIPTION_COLUMN);
         assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_listing_width_counts_chars_not_bytes() {
+        // A non-ASCII (spec-violating but loaded) name: the name column is
+        // sized by char count, so the row is name + the standard 2-space
+        // separator, not byte-padded with extra spaces.
+        let root = TempDir::new().expect("temp dir");
+        write_skill(
+            root.path(),
+            "nonascii",
+            "name: 日本語語語語\ndescription: d\n",
+            "b",
+        );
+        let (catalog, _) = discover_skills(&[root.path().to_path_buf()]);
+        let out = render_skills_listing(&catalog, &[]);
+        assert!(
+            out.contains("日本語語語語  d"),
+            "char-based width, no byte over-padding: {out}"
+        );
+        assert!(!out.contains("日本語語語語   d"), "{out}");
     }
 }

@@ -105,9 +105,14 @@ pub fn resolve_agents_dir(config_path: &Path) -> std::path::PathBuf {
 /// 3. `cwd/.agents/skills` — project-local, tool-agnostic location;
 /// 4. `{config dir}/skills` — project-native (e.g. `.openslate/skills`).
 ///
-/// Source 4 equals source 2 when running off the global config; exact
-/// duplicates are removed keeping the LATER (higher-precedence) occurrence.
-/// Missing directories are silently skipped by the discovery itself.
+/// Every source is normalized ([`canonical_source`]) BEFORE dedupe, so a
+/// relative `--config` spelling (whose parent yields a relative source-4
+/// path, or an empty parent for a bare `openslate.toml`) and symlinked
+/// directories cannot evade dedupe and double-scan the same physical dir
+/// (which would produce spurious "shadows" warnings). Source 4 equals
+/// source 2 when running off the global config; exact duplicates are
+/// removed keeping the LATER (higher-precedence) occurrence. Missing
+/// directories are silently skipped by the discovery itself.
 pub fn skills_sources(config_path: &Path, cwd: &Path) -> Vec<PathBuf> {
     let mut sources: Vec<PathBuf> = Vec::with_capacity(4);
     if let Some(home) = dirs::home_dir() {
@@ -115,12 +120,18 @@ pub fn skills_sources(config_path: &Path, cwd: &Path) -> Vec<PathBuf> {
     }
     sources.push(resolve_paths(cwd).global_config_dir.join("skills"));
     sources.push(cwd.join(".agents").join("skills"));
+    // A bare `--config openslate.toml` has an empty parent; the joined
+    // `skills` stays relative here and is resolved against `cwd` below
+    // (consistent with the empty-parent fallback in core's
+    // `parse_skill_markdown`, which yields `.`).
     if let Some(parent) = config_path.parent() {
         sources.push(parent.join("skills"));
     }
+    let sources: Vec<PathBuf> = sources.iter().map(|s| canonical_source(s, cwd)).collect();
 
-    // Dedupe by exact path equality, keeping the later occurrence (it has
-    // higher precedence, and `discover_skills` lets later sources shadow).
+    // Dedupe by normalized path equality, keeping the later occurrence (it
+    // has higher precedence, and `discover_skills` lets later sources
+    // shadow).
     let mut deduped: Vec<PathBuf> = Vec::with_capacity(sources.len());
     for source in sources {
         if let Some(pos) = deduped.iter().position(|s| s == &source) {
@@ -129,6 +140,19 @@ pub fn skills_sources(config_path: &Path, cwd: &Path) -> Vec<PathBuf> {
         deduped.push(source);
     }
     deduped
+}
+
+/// Absolutize `path` against `cwd` (for relative spellings, e.g. a
+/// `--config` flag value), then canonicalize when the directory exists so
+/// symlinked paths to one physical dir compare equal. Non-existent dirs
+/// (silently skipped by discovery anyway) fall back to the absolute path.
+fn canonical_source(path: &Path, cwd: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    abs.canonicalize().unwrap_or(abs)
 }
 
 /// Discover skills per `config.skills` and log the outcome.
@@ -655,7 +679,8 @@ path = "{}"
         let cwd = Path::new("/nowhere/.openslate-absent"); // no local config
         let config_path = resolve_paths(cwd).global_config_dir.join("openslate.toml");
         let sources = skills_sources(&config_path, cwd);
-        let global_skills = resolve_paths(cwd).global_config_dir.join("skills");
+        let global_skills =
+            canonical_source(&resolve_paths(cwd).global_config_dir.join("skills"), cwd);
         assert_eq!(
             sources.iter().filter(|s| **s == global_skills).count(),
             1,
@@ -665,6 +690,114 @@ path = "{}"
             *sources.last().unwrap(),
             global_skills,
             "the later (higher-precedence) occurrence is kept"
+        );
+    }
+
+    #[test]
+    fn test_skills_sources_relative_config_is_absolutized() {
+        // `--config .openslate/openslate.toml` typed from `cwd`: source 4
+        // must come out absolute (and canonical), not `.openslate/skills`.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let cwd = tmp.path();
+        fs::create_dir_all(cwd.join(".openslate/skills")).expect("mkdir");
+
+        let sources = skills_sources(Path::new(".openslate/openslate.toml"), cwd);
+        assert!(
+            sources.iter().all(|s| s.is_absolute()),
+            "all sources absolute: {sources:?}"
+        );
+        assert_eq!(
+            *sources.last().unwrap(),
+            cwd.join(".openslate").join("skills"),
+            "relative config parent resolves against cwd"
+        );
+    }
+
+    #[test]
+    fn test_skills_sources_bare_config_filename_resolves_against_cwd() {
+        // `--config openslate.toml` (bare filename, empty parent) must not
+        // push a bare relative `skills` source.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let cwd = tmp.path();
+
+        let sources = skills_sources(Path::new("openslate.toml"), cwd);
+        assert!(
+            sources.iter().all(|s| s.is_absolute()),
+            "no relative sources: {sources:?}"
+        );
+        assert_eq!(
+            *sources.last().unwrap(),
+            cwd.join("skills"),
+            "empty config parent resolves against cwd"
+        );
+    }
+
+    #[test]
+    fn test_skills_sources_relative_config_does_not_double_scan() {
+        // `--config .agents/openslate.toml` (relative) spells the same
+        // physical dir for source 4 as source 3 (cwd/.agents/skills): the
+        // dedupe must see them as equal instead of scanning the dir twice
+        // and emitting a spurious self-shadow warning.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let cwd = tmp.path().to_path_buf();
+        let skills_dir = cwd.join(".agents").join("skills");
+        write_skill(
+            &skills_dir,
+            "dedupe-probe",
+            "name: dedupe-probe\ndescription: d\n",
+            "b",
+        );
+
+        let sources = skills_sources(Path::new(".agents/openslate.toml"), &cwd);
+        let mut sorted = sources.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            sources.len(),
+            "no duplicate sources: {sources:?}"
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|s| s.starts_with(&cwd) && s.ends_with(".agents/skills"))
+                .count(),
+            1,
+            "the shared dir is listed exactly once: {sources:?}"
+        );
+
+        let (_, warnings) = discover_skills(&sources);
+        let self_shadows: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.path.starts_with(&cwd) && w.message.contains("shadows"))
+            .collect();
+        assert!(
+            self_shadows.is_empty(),
+            "same dir scanned twice would self-shadow: {self_shadows:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_skills_sources_symlinked_spelling_dedupes() {
+        // cwd spelled through a symlink, config spelled through the real
+        // path: canonicalization must make sources 3 and 4 compare equal.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join(".agents").join("skills")).expect("mkdir");
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).expect("symlink");
+
+        let sources = skills_sources(
+            &real.join(".agents/openslate.toml"),
+            &tmp.path().join("link"),
+        );
+        let mut sorted = sources.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            sources.len(),
+            "symlinked spelling must not evade dedupe: {sources:?}"
         );
     }
 

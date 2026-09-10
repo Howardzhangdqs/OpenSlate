@@ -28,6 +28,39 @@ pub struct PragmaState {
     pub busy_timeout: i64,
 }
 
+/// Tighten permissions on the main db file and any already-existing WAL/-shm
+/// sidecars to owner-only (0o600). The db holds full conversation history in
+/// plaintext; the default umask leaves it 0644 (readable by any local user).
+/// Best-effort: missing sidecars are skipped and failures only warn — the
+/// store keeps working either way.
+#[cfg(unix)]
+fn restrict_db_file_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    for file in [
+        std::path::PathBuf::from(path),
+        std::path::PathBuf::from(format!("{path}-wal")),
+        std::path::PathBuf::from(format!("{path}-shm")),
+    ] {
+        let Ok(metadata) = std::fs::metadata(&file) else {
+            continue; // sidecars appear lazily; nothing to do yet
+        };
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(&file, perms) {
+            tracing::warn!(
+                target: "openslate_store",
+                "failed to restrict db file permissions for {}: {}",
+                file.display(),
+                e
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_file_permissions(_path: &str) {}
+
 impl SqliteStore {
     /// Create a new store with an in-memory SQLite database (for testing).
     pub async fn new_in_memory() -> Result<Self, StoreError> {
@@ -78,6 +111,10 @@ impl SqliteStore {
             .execute(&pool)
             .await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        // The db file (and by now possibly the WAL/-shm sidecars) exists —
+        // tighten permissions before any run data lands in it.
+        restrict_db_file_permissions(path);
 
         Ok(Self { pool })
     }
@@ -241,6 +278,27 @@ mod tests {
 
         let store = SqliteStore::new(path_str).await;
         assert!(store.is_ok(), "file-based store should create successfully");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_file_based_db_permissions_owner_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test_perms.db");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        let _store = SqliteStore::new(path_str).await.expect("store created");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("db file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "db file must be owner-only (conversation plaintext)"
+        );
     }
 
     #[tokio::test]

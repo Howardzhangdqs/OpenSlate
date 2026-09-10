@@ -102,6 +102,19 @@ pub fn build_child_context(
     messages
 }
 
+/// Find the nearest valid UTF-8 char boundary at or before `byte_index`.
+///
+/// Same logic as `context_manager::find_char_boundary` (private there, so
+/// duplicated here): slicing multi-byte content at a raw byte offset would
+/// panic on the char boundary check.
+fn find_char_boundary(s: &str, byte_index: usize) -> usize {
+    let mut idx = byte_index.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Generate a brief summary of parent's conversation.
 /// Simple approach: take last few exchanges, truncated.
 fn generate_conversation_summary(parent_messages: &[Message]) -> String {
@@ -115,7 +128,10 @@ fn generate_conversation_summary(parent_messages: &[Message]) -> String {
             MessageRole::Tool => "tool",
         };
         let content_preview = if msg.content.len() > 200 {
-            format!("{}...", &msg.content[..200])
+            // Cut at a char boundary so multi-byte (e.g. Chinese) content
+            // doesn't panic on the slice.
+            let end = find_char_boundary(&msg.content, 200);
+            format!("{}...", &msg.content[..end])
         } else {
             msg.content.clone()
         };
@@ -339,5 +355,43 @@ mod tests {
         assert!(result
             .iter()
             .all(|m| !m.content.contains("[Parent conversation summary]")));
+    }
+
+    #[test]
+    fn test_summary_truncates_multibyte_content_safely() {
+        // 300 "中" characters = 900 bytes, so byte offset 200 falls in the
+        // middle of a character — the preview must cut at a char boundary
+        // instead of panicking on the raw byte slice.
+        let long_chinese = "中".repeat(300);
+        let parent_messages = vec![
+            make_message(MessageRole::User, "short message"),
+            make_message(MessageRole::Assistant, &long_chinese),
+        ];
+
+        // Summary generation must not panic on multi-byte content.
+        let summary = generate_conversation_summary(&parent_messages);
+        let lines: Vec<&str> = summary.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "[user] short message");
+
+        let preview = lines[1];
+        assert!(preview.starts_with("[assistant] "));
+        assert!(preview.ends_with("..."));
+        // Preview is capped at 200 bytes of content plus the "..." suffix.
+        assert!(preview.len() <= "[assistant] ".len() + 200 + "...".len());
+        // Truncation kept whole characters (no mid-character slicing).
+        let body = preview
+            .strip_prefix("[assistant] ")
+            .and_then(|s| s.strip_suffix("..."))
+            .unwrap();
+        assert!(body.chars().all(|c| c == '中'));
+        assert!(body.len() <= 200);
+
+        // End-to-end: building a child context with such a parent message
+        // must not panic either.
+        let config = ContextIsolationConfig::default();
+        let result = build_child_context(&config, None, "Do the task", &parent_messages);
+        assert_eq!(result.len(), 2); // summary + task
+        assert!(result[0].content.contains("[Parent conversation summary]"));
     }
 }

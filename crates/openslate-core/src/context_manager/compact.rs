@@ -1,3 +1,4 @@
+use super::find_char_boundary;
 use crate::types::{Message, MessageRole};
 use std::future::Future;
 
@@ -97,14 +98,39 @@ where
     messages.extend(recent);
 
     let system_bytes = system_prompt.map(|s| s.len()).unwrap_or(0);
-    let mut total: usize = system_bytes;
-    for msg in messages.iter() {
-        total += msg.content.len();
-        if total > max_context_bytes {
-            let excess_msg_idx = messages.len() - 1;
-            if excess_msg_idx > 0 {
-                messages.truncate(excess_msg_idx);
-            }
+
+    // Enforce the byte budget: shrink the summary message itself first
+    // (char-boundary safe), and only then drop the oldest of the kept
+    // messages so the most recent ones survive the longest. Re-check
+    // after every step until the budget is met or nothing is left to trim.
+    let mut summary_end = summary.len();
+    loop {
+        let total: usize = system_bytes + messages.iter().map(|m| m.content.len()).sum::<usize>();
+        if total <= max_context_bytes {
+            break;
+        }
+
+        let rest_bytes: usize =
+            system_bytes + messages[1..].iter().map(|m| m.content.len()).sum::<usize>();
+        let budget = max_context_bytes
+            .saturating_sub(rest_bytes + SUMMARY_PREFIX.len() + SUMMARY_SUFFIX.len());
+
+        if budget < summary_end {
+            // `total > max` implies `budget < summary_end` unless the budget
+            // saturated, so this strictly shrinks the summary each round.
+            summary_end = find_char_boundary(&summary, budget);
+            messages[0].content = format!(
+                "{}{}{}",
+                SUMMARY_PREFIX,
+                &summary[..summary_end],
+                SUMMARY_SUFFIX
+            );
+        } else if messages.len() > 1 {
+            // Even an empty summary leaves no room: drop the oldest kept
+            // message, keeping the newest ones.
+            messages.remove(1);
+        } else {
+            // Only the minimal summary remains — nothing left to trim.
             break;
         }
     }
@@ -288,5 +314,85 @@ mod tests {
         assert!(result.messages_after <= result.messages_before);
         let total: usize = msgs.iter().map(|m| m.content.len()).sum();
         assert!(total <= 200, "total bytes {} exceeds 200", total);
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_summary_converges_and_keeps_newest() {
+        // Summary far larger than the whole byte budget (3000 bytes of
+        // multi-byte content — also exercises char-boundary truncation).
+        let mut msgs = make_messages(3);
+        let result = compact(&mut msgs, None, 100, 400, |_text| async {
+            Some("中".repeat(1000))
+        })
+        .await;
+
+        assert_eq!(result.messages_before, 6);
+        let total: usize = msgs.iter().map(|m| m.content.len()).sum();
+        assert!(total <= 400, "total bytes {} exceeds 400", total);
+        // The summary itself was truncated, not the recent messages:
+        // both newest messages survive verbatim.
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].content, "user msg 2");
+        assert_eq!(msgs[2].content, "assistant msg 2");
+        assert_eq!(msgs[0].name.as_deref(), Some("compact"));
+        assert!(msgs[0].content.starts_with(SUMMARY_PREFIX));
+        assert!(msgs[0].content.ends_with(SUMMARY_SUFFIX));
+        // Truncation kept whole characters (no mid-character slicing).
+        let body = msgs[0]
+            .content
+            .strip_prefix(SUMMARY_PREFIX)
+            .and_then(|s| s.strip_suffix(SUMMARY_SUFFIX))
+            .unwrap();
+        assert!(body.chars().all(|c| c == '中'));
+    }
+
+    #[tokio::test]
+    async fn compact_byte_limit_drops_oldest_kept_first() {
+        // The older of the two kept messages is huge; the budget cannot
+        // hold it, so it must be dropped while the newest survives
+        // (dropping from the newest end would lose "newest message").
+        let big = "x".repeat(300);
+        let mut msgs = vec![
+            Message {
+                role: MessageRole::User,
+                content: "old one".to_owned(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "old two".to_owned(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::User,
+                content: big,
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "newest message".to_owned(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        ];
+        let result = compact(&mut msgs, None, 100, 100, |_text| async {
+            Some("tiny summary".to_owned())
+        })
+        .await;
+
+        assert_eq!(result.messages_before, 4);
+        let total: usize = msgs.iter().map(|m| m.content.len()).sum();
+        assert!(total <= 100, "total bytes {} exceeds 100", total);
+        // Newest message kept, oversized older-kept message dropped.
+        assert_eq!(msgs.last().unwrap().content, "newest message");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].name.as_deref(), Some("compact"));
     }
 }

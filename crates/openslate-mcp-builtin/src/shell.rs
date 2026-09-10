@@ -118,6 +118,28 @@ fn effective_timeout(timeout_ms: Option<u64>) -> Duration {
     )
 }
 
+/// Substrings marking an environment variable as secret-bearing. Matched
+/// case-insensitively against the variable name.
+const SENSITIVE_ENV_MARKERS: &[&str] = &[
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
+];
+
+/// Whether an environment variable holds a secret and must not leak into a
+/// model-driven child process (e.g. `OPENSLATE_API_KEY` injected from `.env`
+/// — a spawned `env | grep -i key` would otherwise exfiltrate it). Ordinary
+/// variables (`PATH`, `HOME`, `LANG`, ...) pass through: a whitelist would
+/// break normal commands.
+fn is_sensitive_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SENSITIVE_ENV_MARKERS.iter().any(|m| upper.contains(m))
+}
+
 #[tool_router]
 impl ShellServer {
     /// Create a server that runs commands with `root` as working directory.
@@ -158,6 +180,15 @@ impl ShellServer {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Scrub secret-bearing variables (API keys, tokens, ...) inherited
+        // from this process so the model cannot read them out of the child
+        // (e.g. `env | grep -i key`) into its context.
+        for (name, _value) in std::env::vars() {
+            if is_sensitive_env(&name) {
+                command.env_remove(&name);
+            }
+        }
 
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -451,6 +482,34 @@ mod tests {
         );
         // Zero clamps up to 1ms (no instant kill).
         assert_eq!(effective_timeout(Some(0)), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn sensitive_env_names_are_scrubbed() {
+        // The exact leak this guards against (key injected by wiring.rs).
+        assert!(is_sensitive_env("OPENSLATE_API_KEY"));
+        assert!(is_sensitive_env("GITHUB_TOKEN"));
+        assert!(is_sensitive_env("DB_PASSWORD"));
+        // All other markers, incl. word-internal and suffix matches.
+        assert!(is_sensitive_env("PASSWD"));
+        assert!(is_sensitive_env("CLIENT_SECRET"));
+        assert!(is_sensitive_env("AWS_CREDENTIAL"));
+        assert!(is_sensitive_env("SSH_PRIVATE_KEY"));
+        // Case-insensitive.
+        assert!(is_sensitive_env("openslate_api_key"));
+        assert!(is_sensitive_env("Github_Token"));
+    }
+
+    #[test]
+    fn ordinary_env_names_are_kept() {
+        assert!(!is_sensitive_env("PATH"));
+        assert!(!is_sensitive_env("HOME"));
+        assert!(!is_sensitive_env("LANG"));
+        assert!(!is_sensitive_env("TERM"));
+        assert!(!is_sensitive_env("PWD"));
+        assert!(!is_sensitive_env("SHELL"));
+        assert!(!is_sensitive_env("USER"));
+        assert!(!is_sensitive_env("TMPDIR"));
     }
 
     #[tokio::test]

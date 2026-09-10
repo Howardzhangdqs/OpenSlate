@@ -5,7 +5,7 @@
 //! - Stdin pipe detection and reading
 //! - Multi-line input accumulation (REPL)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -35,25 +35,37 @@ impl WorkspaceRoot {
 
     /// Check if a path is within the workspace root.
     /// Returns the canonicalized path if valid, or an error if outside workspace.
+    ///
+    /// Both the target and the root are canonicalized (resolving `..` and
+    /// symlinks) before comparison, so lexical escapes like
+    /// `<root>/../../etc/passwd` cannot slip past the prefix check. The
+    /// target must exist: `@file` references are only ever read, and a path
+    /// that cannot be canonicalized (missing file, broken symlink) cannot be
+    /// read either — reject it instead of falling back to a lexical check.
     pub fn validate_path(&self, target_path: &Path) -> Result<PathBuf> {
-        // Canonicalize the target path
-        let canonical = if target_path.is_absolute() {
+        // Relative paths resolve from the workspace root; absolute paths
+        // are taken as-is. Either way the result must canonicalize.
+        let joined = if target_path.is_absolute() {
             target_path.to_path_buf()
         } else {
-            // For relative paths, resolve from workspace root
-            self.0.join(target_path).canonicalize().unwrap_or_else(|_| {
-                // If canonicalize fails (e.g., file doesn't exist), use std::fs::canonicalize on joined path
-                self.0
-                    .join(target_path)
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.0.join(target_path))
-            })
+            self.0.join(target_path)
         };
 
-        // Canonicalize workspace root
-        let root_canonical = self.0.canonicalize().unwrap_or_else(|_| self.0.clone());
+        let canonical = joined.canonicalize().with_context(|| {
+            format!(
+                "Path '{}' cannot be resolved within workspace root '{}' (does it exist?)",
+                target_path.display(),
+                self.0.display()
+            )
+        })?;
 
-        // Check if the canonical target path starts with the workspace root
+        // Canonicalize the root too, so the containment check compares
+        // fully resolved paths on both sides.
+        let root_canonical = self
+            .0
+            .canonicalize()
+            .with_context(|| format!("Workspace root '{}' cannot be resolved", self.0.display()))?;
+
         if canonical.starts_with(&root_canonical) {
             Ok(canonical)
         } else {
@@ -136,9 +148,10 @@ pub fn expand_at_files(input: &str, workspace_root: &WorkspaceRoot) -> String {
                 }
             }
             Err(_) => {
-                // Path outside workspace - security error, leave as-is with warning
+                // Outside workspace or unresolvable (e.g. nonexistent) —
+                // leave as-is with a warning
                 eprintln!(
-                    "Warning: path '{}' is outside workspace root '{}': leaving @ reference as-is",
+                    "Warning: path '{}' is not accessible within workspace root '{}': leaving @ reference as-is",
                     path_str,
                     workspace_root.path().display()
                 );
@@ -240,8 +253,10 @@ max_steps = 10
 
     #[test]
     fn test_validate_path_inside_workspace() {
-        let (_, root) = temp_project();
-        let config_file = root.path().join(".openslate").join("openslate.toml");
+        // Keep `tmp` alive: the target must exist for canonicalize to
+        // succeed (dropping the TempDir would delete the file).
+        let (tmp, root) = temp_project();
+        let config_file = tmp.path().join(".openslate").join("openslate.toml");
         let result = root.validate_path(&config_file);
         assert!(result.is_ok(), "config file should be inside workspace");
     }
@@ -259,12 +274,73 @@ max_steps = 10
 
     #[test]
     fn test_validate_path_relative_inside() {
-        let (_, root) = temp_project();
+        // Keep `tmp` alive: the target must exist for canonicalize to succeed.
+        let (_tmp, root) = temp_project();
         let relative = Path::new(".openslate/openslate.toml");
         let result = root.validate_path(relative);
         assert!(
             result.is_ok(),
             "relative path inside workspace should be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_traversal_escape_rejected() {
+        let (tmp, root) = temp_project();
+        // A real file OUTSIDE the workspace root, referenced through `..`:
+        // the lexical form starts with the root, but resolves outside it.
+        let outside = tempfile::TempDir::new().expect("create outside temp dir");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write outside file");
+
+        let outside_dir_name = outside.path().file_name().unwrap().to_str().unwrap();
+        let traversal = tmp
+            .path()
+            .join("..")
+            .join(outside_dir_name)
+            .join("secret.txt");
+        assert!(
+            root.validate_path(&traversal).is_err(),
+            "`..` traversal pointing outside workspace must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_path_traversal_staying_inside_accepted() {
+        let (tmp, root) = temp_project();
+        // `..` segments that still resolve INSIDE the root are fine.
+        let zigzag = tmp
+            .path()
+            .join(".openslate")
+            .join("..")
+            .join(".openslate")
+            .join("openslate.toml");
+        let result = root.validate_path(&zigzag);
+        assert!(
+            result.is_ok(),
+            "`..` segments resolving inside workspace should be accepted"
+        );
+        assert_eq!(
+            result.unwrap(),
+            tmp.path()
+                .join(".openslate")
+                .join("openslate.toml")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_validate_path_nonexistent_rejected() {
+        let (tmp, root) = temp_project();
+        assert!(
+            root.validate_path(Path::new("no_such_file.txt")).is_err(),
+            "nonexistent relative path must be rejected"
+        );
+        assert!(
+            root.validate_path(&tmp.path().join("no_such_file.txt"))
+                .is_err(),
+            "nonexistent absolute path must be rejected"
         );
     }
 

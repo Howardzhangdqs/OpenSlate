@@ -80,6 +80,16 @@ enum Commands {
         /// Export Chrome Trace JSON to file after execution
         #[arg(long)]
         trace: Option<String>,
+        /// Auto-approve all tool calls (overrides [approval] policy)
+        #[arg(long)]
+        yes: bool,
+        /// Resume a previous run by ID: its persisted messages become the
+        /// prior conversation and execution continues under the same run id
+        /// (works for interrupted / cancelled / crashed runs, including
+        /// partial tool transcripts). Combine with --prompt to append a new
+        /// user turn.
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Start an interactive chat session
     Chat {
@@ -299,6 +309,8 @@ async fn main() -> Result<()> {
             root_agent,
             quiet,
             trace,
+            yes,
+            resume,
         } => {
             let output_format = format
                 .parse::<cmd::run::OutputFormat>()
@@ -314,6 +326,8 @@ async fn main() -> Result<()> {
                 root_agent,
                 quiet,
                 trace_path: trace,
+                yes,
+                resume,
             };
             cmd::run::run_run_command(params).await?;
         }
@@ -446,10 +460,50 @@ mod tests {
                 root_agent: None,
                 quiet: false,
                 trace: None,
+                yes: false,
+                resume: None,
             } => {
                 assert_eq!(prompt.as_deref(), Some("hello"));
                 assert_eq!(profile, "default");
                 assert_eq!(format, "text");
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_run_yes_flag() {
+        let cli = Cli::try_parse_from(["openslate", "run", "--prompt", "hello", "--yes"])
+            .expect("parse run --yes");
+        match cli.command {
+            Commands::Run { yes, .. } => assert!(yes),
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_run_resume_flag() {
+        let cli = Cli::try_parse_from([
+            "openslate",
+            "run",
+            "--resume",
+            "0123abcd-1111-2222-3333-444455556666",
+            "--prompt",
+            "continue",
+        ])
+        .expect("parse run --resume");
+        match cli.command {
+            Commands::Run {
+                resume,
+                prompt,
+                yes: false,
+                ..
+            } => {
+                assert_eq!(
+                    resume.as_deref(),
+                    Some("0123abcd-1111-2222-3333-444455556666")
+                );
+                assert_eq!(prompt.as_deref(), Some("continue"));
             }
             _ => panic!("expected Run command"),
         }
@@ -473,6 +527,7 @@ mod tests {
             "--root-agent",
             "root",
             "--quiet",
+            "--yes",
         ])
         .expect("parse run with all flags");
         match cli.command {
@@ -485,6 +540,8 @@ mod tests {
                 root_agent,
                 quiet,
                 trace,
+                yes,
+                resume,
             } => {
                 assert_eq!(agent.as_deref(), Some("root"));
                 assert_eq!(prompt.as_deref(), Some("test"));
@@ -494,6 +551,8 @@ mod tests {
                 assert_eq!(root_agent.as_deref(), Some("root"));
                 assert!(quiet);
                 assert_eq!(trace, None);
+                assert!(yes);
+                assert_eq!(resume, None);
             }
             _ => panic!("expected Run command"),
         }

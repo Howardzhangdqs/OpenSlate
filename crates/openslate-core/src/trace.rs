@@ -275,11 +275,7 @@ impl TraceCollector {
     ///
     /// Output format: `[{"ph":"B",...}, {"ph":"E",...}]`
     pub fn to_chrome_trace_json(&self) -> String {
-        let json_events: Vec<serde_json::Value> = self
-            .events
-            .iter()
-            .map(event_to_json)
-            .collect();
+        let json_events: Vec<serde_json::Value> = self.events.iter().map(event_to_json).collect();
         serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned())
     }
 
@@ -515,7 +511,10 @@ mod tests {
     fn begin_span_with_args_preserved_in_json() {
         let mut tc = make_collector();
         let mut args = HashMap::new();
-        args.insert("key".to_owned(), serde_json::Value::String("value".to_owned()));
+        args.insert(
+            "key".to_owned(),
+            serde_json::Value::String("value".to_owned()),
+        );
         let span = tc.begin_span_with_args("task", "work", args);
         tc.end_span(span);
 

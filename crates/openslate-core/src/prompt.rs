@@ -66,18 +66,19 @@ impl ResolvedPrompt {
             let mut hasher = Sha256::new();
             hasher.update(self.content.as_bytes());
             let bytes = hasher.finalize();
-            bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
         };
 
         let (source_kind, source_path) = match &self.source {
-            PromptSource::ProfileFile { path } => (
-                "profile_file",
-                Some(path.to_str().unwrap_or("").to_owned()),
-            ),
-            PromptSource::DefaultFile { path } => (
-                "default_file",
-                Some(path.to_str().unwrap_or("").to_owned()),
-            ),
+            PromptSource::ProfileFile { path } => {
+                ("profile_file", Some(path.to_str().unwrap_or("").to_owned()))
+            }
+            PromptSource::DefaultFile { path } => {
+                ("default_file", Some(path.to_str().unwrap_or("").to_owned()))
+            }
             PromptSource::AgentDefault => ("agent_default", None),
             PromptSource::Builtin => ("builtin", None),
         };
@@ -107,10 +108,7 @@ fn read_file_optional(path: &std::path::Path) -> Option<String> {
 /// 1. `prompts/{profile}/prompt.md`
 /// 2. `prompts/default/prompt.md`
 /// 3. Built-in fallback: "You are a helpful AI assistant."
-pub fn resolve_root_prompt(
-    prompts_dir: &std::path::Path,
-    profile: &str,
-) -> ResolvedPrompt {
+pub fn resolve_root_prompt(prompts_dir: &std::path::Path, profile: &str) -> ResolvedPrompt {
     // 1. Try profile-specific file (for non-default profiles)
     if profile != "default" {
         let profile_path = prompts_dir.join(profile).join("prompt.md");
@@ -318,7 +316,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let prompts = dir.path().join("prompts");
         // Only default exists, no "coding" profile
-        write_file(&prompts.join("default").join("prompt.md"), "Fallback default");
+        write_file(
+            &prompts.join("default").join("prompt.md"),
+            "Fallback default",
+        );
 
         let result = resolve_root_prompt(&prompts, "coding");
         assert_eq!(result.content, "Fallback default");
@@ -369,10 +370,7 @@ mod tests {
         let prompts = dir.path().join("prompts");
         // Only default has the agent override, not the "coding" profile
         write_file(
-            &prompts
-                .join("default")
-                .join("agents")
-                .join("root.md"),
+            &prompts.join("default").join("agents").join("root.md"),
             "Default root agent",
         );
 
@@ -392,12 +390,8 @@ mod tests {
         let prompts = dir.path().join("prompts");
         // No files, but we pass a default_prompt
 
-        let result = resolve_agent_prompt(
-            &prompts,
-            "coding",
-            "root",
-            Some("Config default prompt"),
-        );
+        let result =
+            resolve_agent_prompt(&prompts, "coding", "root", Some("Config default prompt"));
         assert_eq!(result.content, "Config default prompt");
         assert_eq!(result.source, PromptSource::AgentDefault);
     }

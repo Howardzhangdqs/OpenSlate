@@ -10,8 +10,12 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use openslate_core::agent_tree::AgentTree;
+use openslate_core::approval::{
+    ApprovalCallback, ApprovalDecision, ApprovalManager, ApprovalPolicy, ApprovalRequest, RiskLevel,
+};
 use openslate_core::config::validation::validate_config;
 use openslate_core::config::{
     parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig,
@@ -189,6 +193,85 @@ fn load_skills(config: &OpenSlateConfig, config_path: &Path, cwd: &Path) -> Skil
         sources.len()
     );
     catalog
+}
+
+// ── Approval wiring (Phase 1) ───────────────────────────────────────────────
+
+/// Tools gated by the derived REPL default when no `[approval]` section is
+/// configured (locked product decision: interactive sessions ask before the
+/// dangerous tools, while non-interactive runs stay fully automatic).
+pub(crate) const REPL_DEFAULT_APPROVAL_TOOLS: [&str; 2] = ["shell", "run_code"];
+
+/// Derive the effective approval policy.
+///
+/// Priority (locked): `--yes` > `[approval].policy` > default. The default
+/// itself depends on interactivity — an interactive session with no
+/// `[approval]` section derives `auto_except(["shell", "run_code"])`; a
+/// non-interactive run derives plain `auto`. Pure function; fully covered by
+/// a matrix unit test.
+pub(crate) fn derive_effective_policy(
+    configured: Option<ApprovalPolicy>,
+    interactive: bool,
+    yes: bool,
+) -> ApprovalPolicy {
+    if yes {
+        return ApprovalPolicy::Auto;
+    }
+    if let Some(policy) = configured {
+        return policy;
+    }
+    if interactive {
+        return ApprovalPolicy::AutoExcept(
+            REPL_DEFAULT_APPROVAL_TOOLS
+                .iter()
+                .map(|t| (*t).to_owned())
+                .collect(),
+        );
+    }
+    ApprovalPolicy::Auto
+}
+
+/// Non-interactive safety gate: a non-interactive run has no human to ask,
+/// so high-risk tool calls are denied with an actionable reason and
+/// everything else is approved. Installed by [`apply_approval`] whenever the
+/// effective policy is not `auto` in a non-interactive run without `--yes`
+/// (the CLI-derived strategy that avoids "needs approval, no callback").
+pub(crate) struct NonInteractiveGate;
+
+impl ApprovalCallback for NonInteractiveGate {
+    fn decide(&self, req: &ApprovalRequest) -> ApprovalDecision {
+        if req.risk_level == RiskLevel::High {
+            ApprovalDecision::Denied("非交互 manual 模式拒绝高危工具,可用 --yes 覆盖".to_owned())
+        } else {
+            ApprovalDecision::Approved
+        }
+    }
+}
+
+/// Wire the effective approval manager into a RunManager.
+///
+/// Non-interactive runs with a non-`auto` effective policy and no `--yes`
+/// get the [`NonInteractiveGate`] callback plus a one-line startup WARN.
+/// Returns the effective policy for callers that want to report it.
+pub(crate) fn apply_approval(
+    manager: &mut RunManager,
+    config: &OpenSlateConfig,
+    interactive: bool,
+    yes: bool,
+) -> ApprovalPolicy {
+    let configured = config.approval.as_ref().map(|a| a.to_policy());
+    let effective = derive_effective_policy(configured, interactive, yes);
+    let mut approval = ApprovalManager::new(effective.clone());
+    if !interactive && !yes && effective != ApprovalPolicy::Auto {
+        approval = approval.with_callback(Arc::new(NonInteractiveGate));
+        tracing::warn!(
+            target: "openslate_approval",
+            "非交互运行且未加 --yes:审批策略 {:?} 下高危工具将被拒绝(可用 --yes 覆盖)",
+            effective
+        );
+    }
+    manager.approval = approval;
+    effective
 }
 
 /// Initialize the SQLite store based on config.
@@ -889,6 +972,148 @@ path = "{}"
         assert!(
             ctx.skills.get("bad").is_none(),
             "broken skill is skipped (warning logged, startup proceeds)"
+        );
+    }
+
+    // ── Approval wiring (Phase 1) ────────────────────────────────────────
+
+    use openslate_core::approval::{ApprovalPolicy, RiskLevel};
+
+    fn auto_except(tools: &[&str]) -> ApprovalPolicy {
+        ApprovalPolicy::AutoExcept(tools.iter().map(|t| (*t).to_owned()).collect())
+    }
+
+    #[test]
+    fn test_derive_effective_policy_full_matrix() {
+        // (configured, interactive, yes) → expected. --yes wins over
+        // everything; else the configured policy wins; else interactive
+        // sessions get the auto_except([shell, run_code]) default and
+        // non-interactive runs get plain auto.
+        let manual = Some(ApprovalPolicy::Manual);
+        let custom = Some(auto_except(&["write_file"]));
+        let cases: &[(Option<ApprovalPolicy>, bool, bool, ApprovalPolicy)] = &[
+            // --yes forces auto regardless of config or interactivity.
+            (None, false, true, ApprovalPolicy::Auto),
+            (None, true, true, ApprovalPolicy::Auto),
+            (manual.clone(), false, true, ApprovalPolicy::Auto),
+            (manual.clone(), true, true, ApprovalPolicy::Auto),
+            (custom.clone(), false, true, ApprovalPolicy::Auto),
+            (custom.clone(), true, true, ApprovalPolicy::Auto),
+            // Configured policy wins without --yes.
+            (manual.clone(), false, false, ApprovalPolicy::Manual),
+            (manual.clone(), true, false, ApprovalPolicy::Manual),
+            (custom.clone(), false, false, auto_except(&["write_file"])),
+            (custom, true, false, auto_except(&["write_file"])),
+            // No section: interactive default vs non-interactive default.
+            (None, true, false, auto_except(&["shell", "run_code"])),
+            (None, false, false, ApprovalPolicy::Auto),
+            // Some(auto) explicitly configured behaves like the default.
+            (
+                Some(ApprovalPolicy::Auto),
+                true,
+                false,
+                ApprovalPolicy::Auto,
+            ),
+            (
+                Some(ApprovalPolicy::Auto),
+                false,
+                false,
+                ApprovalPolicy::Auto,
+            ),
+        ];
+        for (configured, interactive, yes, expected) in cases {
+            assert_eq!(
+                derive_effective_policy(configured.clone(), *interactive, *yes),
+                *expected,
+                "configured={configured:?} interactive={interactive} yes={yes}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_repl_default_tools_are_shell_and_run_code() {
+        assert_eq!(REPL_DEFAULT_APPROVAL_TOOLS, ["shell", "run_code"]);
+    }
+
+    #[test]
+    fn test_noninteractive_gate_denies_high_risk() {
+        let req = ApprovalRequest {
+            tool_name: "run_code".to_owned(),
+            arguments: serde_json::json!({"code": "async () => 1"}),
+            agent_id: "root".to_owned(),
+            risk_level: RiskLevel::High,
+        };
+        match NonInteractiveGate.decide(&req) {
+            ApprovalDecision::Denied(reason) => {
+                assert!(reason.contains("--yes"), "reason: {reason}");
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_noninteractive_gate_approves_lower_risk() {
+        for risk in [RiskLevel::Low, RiskLevel::Medium] {
+            let req = ApprovalRequest {
+                tool_name: "read_file".to_owned(),
+                arguments: serde_json::json!({}),
+                agent_id: "root".to_owned(),
+                risk_level: risk,
+            };
+            assert_eq!(NonInteractiveGate.decide(&req), ApprovalDecision::Approved);
+        }
+    }
+
+    #[test]
+    fn test_apply_approval_installs_derived_policy_on_manager() {
+        let build_manager = |toml: &str| -> RunManager {
+            let config = parse_openslate_toml(toml).expect("parse");
+            let agents = AgentsConfig {
+                agents: vec![openslate_core::types::AgentConfig {
+                    id: openslate_core::types::AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    children: vec![],
+                    tools: vec![],
+                    default_prompt: "p".into(),
+                }],
+            };
+            let tree = AgentTree::from_configs(&agents.agents).expect("tree");
+            RunManager::new(config, tree, ToolRegistry::new(), SkillsCatalog::default())
+        };
+        let base = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+"#;
+
+        // Non-interactive + manual config (no --yes) → Manual.
+        let mut manager = build_manager(&format!("{base}\n[approval]\npolicy = \"manual\"\n"));
+        let cfg = manager.config.clone();
+        assert_eq!(
+            apply_approval(&mut manager, &cfg, false, false),
+            ApprovalPolicy::Manual
+        );
+
+        // --yes overrides the configured manual policy → Auto.
+        let mut manager = build_manager(&format!("{base}\n[approval]\npolicy = \"manual\"\n"));
+        let cfg = manager.config.clone();
+        assert_eq!(
+            apply_approval(&mut manager, &cfg, false, true),
+            ApprovalPolicy::Auto
+        );
+        assert_eq!(manager.approval.policy(), &ApprovalPolicy::Auto);
+
+        // No section + non-interactive → Auto (no gate, no callback).
+        let mut manager = build_manager(base);
+        let cfg = manager.config.clone();
+        assert_eq!(
+            apply_approval(&mut manager, &cfg, false, false),
+            ApprovalPolicy::Auto
         );
     }
 }

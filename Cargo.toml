@@ -15,8 +15,11 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# Async runtime
-tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs"] }
+# Async runtime ("signal" drives the CLI's Ctrl-C cancellation, Phase 4)
+tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs", "signal"] }
+
+# Cancellation tokens for graceful Ctrl-C shutdown (threaded into execute_run, Phase 4)
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Serialization
 serde = { version = "1.0.227", features = ["derive"] }

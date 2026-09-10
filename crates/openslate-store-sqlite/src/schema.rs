@@ -27,7 +27,12 @@ pub fn ddl_statements() -> Vec<&'static str> {
 /// Each statement is designed to be idempotent: callers should
 /// ignore "duplicate column name" errors.
 pub fn alter_statements() -> Vec<&'static str> {
-    vec![ALTER_RUNS_ADD_CWD]
+    vec![
+        ALTER_RUNS_ADD_CWD,
+        ALTER_RUNS_ADD_COST_USD,
+        ALTER_MESSAGES_ADD_SEQ,
+        ALTER_STEPS_ADD_SEQ,
+    ]
 }
 
 /// Returns the ordered list of CREATE INDEX statements.
@@ -40,6 +45,7 @@ pub fn index_statements() -> Vec<&'static str> {
         IDX_RUNS_STARTED_AT,
         IDX_STEPS_RUN_ID,
         IDX_MESSAGES_EXECUTION_NODE_ID,
+        IDX_MESSAGES_RUN_SEQ,
         IDX_TRACE_EVENTS_RUN_ID,
         IDX_AUDIT_LOG_RUN_ID,
     ]
@@ -59,7 +65,8 @@ CREATE TABLE IF NOT EXISTS runs (
     input_json TEXT NOT NULL,
     output_json TEXT,
     started_at INTEGER NOT NULL,
-    finished_at INTEGER
+    finished_at INTEGER,
+    cost_usd REAL NOT NULL DEFAULT 0
 );
 "#;
 
@@ -87,6 +94,7 @@ CREATE TABLE IF NOT EXISTS steps (
     agent_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     data_json TEXT NOT NULL,
+    seq INTEGER NOT NULL DEFAULT 0,
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
     FOREIGN KEY(run_id) REFERENCES runs(id),
@@ -102,6 +110,7 @@ CREATE TABLE IF NOT EXISTS messages (
     agent_id TEXT,
     role TEXT NOT NULL,
     content_json TEXT NOT NULL,
+    seq INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(run_id) REFERENCES runs(id),
     FOREIGN KEY(execution_node_id) REFERENCES execution_nodes(id)
@@ -163,13 +172,36 @@ CREATE TABLE IF NOT EXISTS trace_events (
 /// For existing databases this ALTER TABLE migrates the schema.
 const ALTER_RUNS_ADD_CWD: &str = "ALTER TABLE runs ADD COLUMN cwd TEXT";
 
+/// Add `cost_usd` column to the `runs` table (P2-3 cost tracking): the
+/// run's accumulated model spend in USD (0 = unpriced or no usage).
+///
+/// For fresh databases the column is included in `DDL_RUNS`.
+const ALTER_RUNS_ADD_COST_USD: &str =
+    "ALTER TABLE runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0";
+
+/// Add `seq` column to the `messages` table: a per-run monotonically
+/// increasing sequence number assigned by the writer.
+///
+/// Ordering by `created_at` alone is unstable for messages inserted in the
+/// same instant (batch inserts share a timestamp), and conversation order is
+/// load-bearing — a provider rejects history whose `tool_calls` are shuffled
+/// away from their tool results. `seq` gives `ORDER BY` a total order.
+///
+/// For fresh databases the column is included in `DDL_MESSAGES`.
+const ALTER_MESSAGES_ADD_SEQ: &str =
+    "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0";
+
+/// Add `seq` column to the `steps` table (same rationale as
+/// [`ALTER_MESSAGES_ADD_SEQ`]: `started_at` alone cannot order same-batch
+/// inserts).
+const ALTER_STEPS_ADD_SEQ: &str = "ALTER TABLE steps ADD COLUMN seq INTEGER NOT NULL DEFAULT 0";
+
 // ---------------------------------------------------------------------------
 // Index DDL
 // ---------------------------------------------------------------------------
 
 /// Index for filtering runs by status (e.g. `get_last_interrupted_run`).
-const IDX_RUNS_STATUS: &str =
-    "CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)";
+const IDX_RUNS_STATUS: &str = "CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)";
 
 /// Index for listing runs by working directory (`list_runs_by_cwd`).
 const IDX_RUNS_CWD: &str = "CREATE INDEX IF NOT EXISTS idx_runs_cwd ON runs(cwd)";
@@ -179,12 +211,16 @@ const IDX_RUNS_STARTED_AT: &str =
     "CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at)";
 
 /// Index for listing steps belonging to a run (`list_steps`).
-const IDX_STEPS_RUN_ID: &str =
-    "CREATE INDEX IF NOT EXISTS idx_steps_run_id ON steps(run_id)";
+const IDX_STEPS_RUN_ID: &str = "CREATE INDEX IF NOT EXISTS idx_steps_run_id ON steps(run_id)";
 
 /// Index for listing messages by execution node (`list_messages`).
 const IDX_MESSAGES_EXECUTION_NODE_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_messages_execution_node_id ON messages(execution_node_id)";
+
+/// Index for loading a run's full conversation in `seq` order
+/// (`list_messages_by_run` — the resume path).
+const IDX_MESSAGES_RUN_SEQ: &str =
+    "CREATE INDEX IF NOT EXISTS idx_messages_run_seq ON messages(run_id, seq)";
 
 /// Index for listing trace events by run (`list_trace_events`).
 const IDX_TRACE_EVENTS_RUN_ID: &str =
@@ -216,6 +252,7 @@ pub const INDEX_NAMES: &[&str] = &[
     "idx_runs_started_at",
     "idx_steps_run_id",
     "idx_messages_execution_node_id",
+    "idx_messages_run_seq",
     "idx_trace_events_run_id",
     "idx_audit_log_run_id",
 ];

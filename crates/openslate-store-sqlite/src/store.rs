@@ -10,6 +10,11 @@ use sqlx::{query, query_scalar, SqlitePool};
 use crate::schema;
 
 /// SQLite-backed store for OpenSlate run data.
+///
+/// `Clone` is cheap: the pool is `Arc`-based, so long-lived recorders (e.g.
+/// the per-run `RunRecorder`) can hold their own handle alongside the
+/// `AppContext`'s.
+#[derive(Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
 }
@@ -328,16 +333,57 @@ mod tests {
         let store = SqliteStore::new_in_memory().await.expect("store created");
         store.run_migrations().await.expect("migrations run");
 
-        let columns: Vec<String> = query_scalar(
-            "SELECT name FROM pragma_table_info('runs') ORDER BY name",
-        )
-        .fetch_all(store.pool())
-        .await
-        .expect("query pragma_table_info");
+        let columns: Vec<String> =
+            query_scalar("SELECT name FROM pragma_table_info('runs') ORDER BY name")
+                .fetch_all(store.pool())
+                .await
+                .expect("query pragma_table_info");
 
         assert!(
             columns.iter().any(|c| c == "cwd"),
             "runs table should have a 'cwd' column, got: {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runs_table_has_cost_usd_column() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        store.run_migrations().await.expect("migrations run");
+
+        let columns: Vec<String> =
+            query_scalar("SELECT name FROM pragma_table_info('runs') ORDER BY name")
+                .fetch_all(store.pool())
+                .await
+                .expect("query pragma_table_info");
+
+        assert!(
+            columns.iter().any(|c| c == "cost_usd"),
+            "runs table should have a 'cost_usd' column (P2-3), got: {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_and_steps_have_seq_columns() {
+        let store = SqliteStore::new_in_memory().await.expect("store created");
+        store.run_migrations().await.expect("migrations run");
+
+        let msg_columns: Vec<String> =
+            query_scalar("SELECT name FROM pragma_table_info('messages')")
+                .fetch_all(store.pool())
+                .await
+                .expect("query pragma_table_info(messages)");
+        assert!(
+            msg_columns.iter().any(|c| c == "seq"),
+            "messages should have a 'seq' column, got: {msg_columns:?}"
+        );
+
+        let step_columns: Vec<String> = query_scalar("SELECT name FROM pragma_table_info('steps')")
+            .fetch_all(store.pool())
+            .await
+            .expect("query pragma_table_info(steps)");
+        assert!(
+            step_columns.iter().any(|c| c == "seq"),
+            "steps should have a 'seq' column, got: {step_columns:?}"
         );
     }
 

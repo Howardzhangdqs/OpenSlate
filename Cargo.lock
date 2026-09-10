@@ -1950,6 +1950,7 @@ name = "openslate-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "dirs",
@@ -1991,6 +1992,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "uuid",
@@ -2041,6 +2043,7 @@ dependencies = [
 name = "openslate-store-sqlite"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "openslate-core",
  "serde",
@@ -3503,6 +3506,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

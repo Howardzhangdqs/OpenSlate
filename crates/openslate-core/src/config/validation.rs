@@ -6,7 +6,9 @@
 
 use std::collections::HashSet;
 
-use crate::config::{AgentsConfig, OpenSlateConfig, PtcConfig, TransportConfig};
+use crate::config::{
+    AgentsConfig, ApprovalPolicySetting, OpenSlateConfig, PtcConfig, TransportConfig,
+};
 
 /// Severity of a validation finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +360,7 @@ pub fn validate_strict(
     }
 
     warnings.extend(disabled_builtin_tool_warnings(config, agents));
+    warnings.extend(approval_warnings(config, agents));
 
     (errors, warnings)
 }
@@ -419,6 +422,7 @@ pub fn validate_config_full(config: &OpenSlateConfig, agents: &AgentsConfig) -> 
 
     // ── Warning: agent whitelists reference disabled builtin tools ───────
     warnings.extend(disabled_builtin_tool_warnings(config, agents));
+    warnings.extend(approval_warnings(config, agents));
 
     ValidationResult { errors, warnings }
 }
@@ -457,6 +461,62 @@ fn disabled_builtin_tool_warnings(
                     ),
                 });
             }
+        }
+    }
+    warnings
+}
+
+/// Warnings for `[approval]` drift (never fatal, read_skill-style exact-name
+/// comparisons):
+///
+/// - `auto_except` with an empty `tools` list never asks for anything —
+///   equivalent to `auto` and almost certainly a misconfiguration;
+/// - a `tools` entry that matches no known tool name can never gate
+///   anything. Known names are the builtins (`read_file` / `write_file` /
+///   `shell` / `edit_file` / `read_skill`), the special tools (`run_code`,
+///   `call_agent`), and every entry of every agent's `tools:` whitelist —
+///   external MCP tool names are not knowable at validation time, so such
+///   entries may be false positives (the message says so).
+fn approval_warnings(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<ValidationError> {
+    let Some(approval) = config.approval.as_ref() else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+
+    if approval.policy == ApprovalPolicySetting::AutoExcept && approval.tools.is_empty() {
+        warnings.push(ValidationError {
+            field: "approval.tools".into(),
+            message: "policy is 'auto_except' but the tools list is empty — nothing will \
+                      require approval (equivalent to 'auto')"
+                .into(),
+        });
+    }
+
+    let mut known: HashSet<String> = [
+        "read_file",
+        "write_file",
+        "shell",
+        "edit_file",
+        "read_skill",
+        "run_code",
+        "call_agent",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    for agent in &agents.agents {
+        known.extend(agent.tools.iter().cloned());
+    }
+    for tool in &approval.tools {
+        if !known.iter().any(|k| k.eq_ignore_ascii_case(tool)) {
+            warnings.push(ValidationError {
+                field: "approval.tools".into(),
+                message: format!(
+                    "tool '{tool}' is not a known tool (builtin, run_code/call_agent, or in \
+                     any agent whitelist) — approval can never match it; if it is an external \
+                     MCP tool this warning may be a false positive"
+                ),
+            });
         }
     }
     warnings
@@ -824,6 +884,8 @@ max_output_bytes = 65536
                 supports_tool_call: true,
                 supports_vision: false,
                 supports_reasoning: false,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
             },
         );
         let (errors, warnings) = validate_strict(&config, &valid_agents());
@@ -1140,6 +1202,8 @@ path = ""
                 base_url: "https://orphan.example.com".into(),
                 api_key_env: "ORPHAN_KEY".into(),
                 adapter: None,
+                max_attempts: 3,
+                retry_base_ms: 500,
             },
         );
         let result = validate_config_full(&config, &valid_agents());
@@ -1205,6 +1269,8 @@ path = ""
                 supports_tool_call: true,
                 supports_vision: false,
                 supports_reasoning: false,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
             },
         );
         let result = validate_config_full(&config, &valid_agents());
@@ -1617,6 +1683,90 @@ transport = "carrier-pigeon"
                     && w.message.contains("'read_file'")
                     && w.message.contains("[builtin_tools]")),
             "master switch off must warn regardless of per-tool flag: {:?}",
+            result.warnings
+        );
+    }
+
+    // ── Warning: [approval] drift ─────────────────────────────────────────
+
+    #[test]
+    fn warns_when_auto_except_has_empty_tools() {
+        let mut config = valid_config();
+        config.approval = Some(crate::config::ApprovalConfig {
+            policy: ApprovalPolicySetting::AutoExcept,
+            tools: vec![],
+        });
+        let (_errors, warnings) = validate_strict(&config, &valid_agents());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "approval.tools" && w.message.contains("empty")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warns_when_approval_tools_reference_unknown_tool() {
+        let mut config = valid_config();
+        config.approval = Some(crate::config::ApprovalConfig {
+            policy: ApprovalPolicySetting::AutoExcept,
+            tools: vec!["teleport".to_owned()],
+        });
+        let result = validate_config_full(&config, &valid_agents());
+        assert!(
+            result.is_valid(),
+            "unknown approval tools are a warning, not an error"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.field == "approval.tools" && w.message.contains("'teleport'")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn no_approval_warnings_for_known_tool_names() {
+        // `shell` / `run_code` are known specials; `github_list_prs` appears
+        // in an agent whitelist (the external-MCP stand-in).
+        let agents = single_agent(
+            "root",
+            "Root",
+            "main",
+            vec!["github_list_prs"],
+            vec![],
+            "prompt long enough",
+        );
+        let mut config = valid_config();
+        config.approval = Some(crate::config::ApprovalConfig {
+            policy: ApprovalPolicySetting::AutoExcept,
+            tools: vec![
+                "shell".to_owned(),
+                "run_code".to_owned(),
+                "github_list_prs".to_owned(),
+            ],
+        });
+        let result = validate_config_full(&config, &agents);
+        assert!(
+            !result.warnings.iter().any(|w| w.field == "approval.tools"),
+            "known tool names must not warn: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn no_approval_warnings_when_section_absent() {
+        let config = valid_config();
+        assert!(config.approval.is_none());
+        let result = validate_config_full(&config, &valid_agents());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.field.starts_with("approval.")),
+            "absent [approval] must not warn: {:?}",
             result.warnings
         );
     }

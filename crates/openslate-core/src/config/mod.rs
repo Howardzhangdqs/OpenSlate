@@ -20,6 +20,7 @@
 //! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
 //! | `skills`    | `SkillsConfig`      | no       | Skill discovery / injection        |
 //! | `ptc`       | `PtcConfig`         | no       | Programmatic Tool Calling settings |
+//! | `approval`  | `Option<ApprovalConfig>` | no  | Tool approval gating               |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -76,6 +77,11 @@ pub struct OpenSlateConfig {
     /// Programmatic Tool Calling (`run_code` sandbox) settings.
     #[serde(default)]
     pub ptc: PtcConfig,
+    /// Tool approval gating (`[approval]`). `None` when the section is
+    /// absent — the CLI layer then derives the effective policy from
+    /// interactivity and `--yes`.
+    #[serde(default)]
+    pub approval: Option<ApprovalConfig>,
 }
 
 /// Project metadata.
@@ -119,6 +125,15 @@ pub struct LimitsConfig {
     pub max_context_messages: u32,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    /// Auto-compact the conversation history (LLM summary via the `fast`
+    /// model, mechanical-concatenation fallback) once it crosses the
+    /// context limits, before a turn is dispatched. Default: on. The
+    /// manual `/compact` command works regardless of this flag.
+    pub auto_compact: bool,
+    /// P2-1: direct tool calls within one step run concurrently (batches
+    /// containing `call_agent`/`run_code` stay sequential regardless).
+    /// `false` restores the fully sequential tool loop. Default: on.
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for LimitsConfig {
@@ -132,6 +147,8 @@ impl Default for LimitsConfig {
             max_context_messages: 16,
             max_context_bytes: 64_000,
             max_output_bytes: 65_536,
+            auto_compact: true,
+            parallel_tool_calls: true,
         }
     }
 }
@@ -147,6 +164,14 @@ pub struct ProviderConfig {
     /// for unrecognized model names.
     #[serde(default)]
     pub adapter: Option<String>,
+    /// Total attempts per call for transient failures (HTTP 429/5xx,
+    /// network errors), INCLUDING the first attempt. `0` is clamped to `1`.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// Exponential backoff base in milliseconds between attempts:
+    /// `retry_base_ms * 2^(attempt-1) + jitter`, single sleep capped at 10s.
+    #[serde(default = "default_retry_base_ms")]
+    pub retry_base_ms: u64,
 }
 
 /// A named model alias referencing a provider.
@@ -164,6 +189,14 @@ pub struct ModelConfig {
     pub supports_vision: bool,
     #[serde(default)]
     pub supports_reasoning: bool,
+    /// Standard input price, USD per million tokens (P2-3 cost tracking).
+    /// Absent → the model's input usage is priced at 0.
+    #[serde(default)]
+    pub input_price_per_mtok: Option<f64>,
+    /// Standard output price, USD per million tokens (P2-3 cost tracking).
+    /// Absent → the model's output usage is priced at 0.
+    #[serde(default)]
+    pub output_price_per_mtok: Option<f64>,
 }
 
 /// Tracing / observability settings.
@@ -338,6 +371,53 @@ impl Default for PtcConfig {
     }
 }
 
+/// Policy selector for `[approval].policy` (config-file spelling).
+///
+/// The runtime [`ApprovalPolicy`](crate::approval::ApprovalPolicy) is
+/// derived from this plus the `tools` list via
+/// [`ApprovalConfig::to_policy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicySetting {
+    /// Approve every tool call without asking (default).
+    #[default]
+    Auto,
+    /// Ask before every tool call.
+    Manual,
+    /// Ask only for the tools listed in `tools`.
+    AutoExcept,
+}
+
+/// Tool approval gating settings (`[approval]`).
+///
+/// Controls whether tool calls require human approval before execution.
+/// Interactive sessions prompt via an approval callback; non-interactive
+/// runs install a high-risk gate unless `--yes` forces `auto`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// Approval policy. Defaults to `auto`.
+    #[serde(default)]
+    pub policy: ApprovalPolicySetting,
+    /// Tools that require approval under the `auto_except` policy
+    /// (case-insensitive exact names). Ignored under `auto` / `manual`.
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+impl ApprovalConfig {
+    /// Map the config section to the runtime approval policy.
+    pub fn to_policy(&self) -> crate::approval::ApprovalPolicy {
+        match self.policy {
+            ApprovalPolicySetting::Auto => crate::approval::ApprovalPolicy::Auto,
+            ApprovalPolicySetting::Manual => crate::approval::ApprovalPolicy::Manual,
+            ApprovalPolicySetting::AutoExcept => {
+                crate::approval::ApprovalPolicy::AutoExcept(self.tools.clone())
+            }
+        }
+    }
+}
+
 // ── Default helpers ──────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -350,6 +430,14 @@ fn default_busy_timeout() -> u64 {
 
 fn default_profile() -> String {
     "default".to_owned()
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+fn default_retry_base_ms() -> u64 {
+    500
 }
 
 // ── Parsing functions ────────────────────────────────────────────────────────
@@ -511,6 +599,68 @@ mod tests {
         assert_eq!(limits.max_context_messages, 16);
         assert_eq!(limits.max_context_bytes, 64_000);
         assert_eq!(limits.max_output_bytes, 65_536);
+        assert!(limits.auto_compact);
+        assert!(limits.parallel_tool_calls);
+    }
+
+    // ── [limits].parallel_tool_calls ─────────────────────────────────────
+
+    #[test]
+    fn parse_limits_parallel_tool_calls_explicit_false() {
+        let toml = r#"
+[limits]
+max_steps = 5
+parallel_tool_calls = false
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(!config.limits.expect("limits").parallel_tool_calls);
+    }
+
+    #[test]
+    fn parse_limits_parallel_tool_calls_defaults_to_true_when_absent() {
+        // A [limits] section without the field still defaults to on
+        // (container-level #[serde(default)] fills from Default).
+        let toml = r#"
+[limits]
+max_steps = 5
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(config.limits.expect("limits").parallel_tool_calls);
+    }
+
+    // ── [limits].auto_compact ────────────────────────────────────────────
+
+    #[test]
+    fn parse_limits_auto_compact_explicit_false() {
+        let toml = r#"
+[limits]
+max_steps = 5
+auto_compact = false
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(!config.limits.expect("limits").auto_compact);
+    }
+
+    #[test]
+    fn parse_limits_auto_compact_defaults_to_true_when_absent() {
+        // A [limits] section without the field still defaults to on
+        // (container-level #[serde(default)] fills from Default).
+        let toml = r#"
+[limits]
+max_steps = 5
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(config.limits.expect("limits").auto_compact);
+    }
+
+    #[test]
+    fn parse_limits_auto_compact_defaults_to_true_without_section() {
+        let toml = r#"
+[project]
+name = "test"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(config.limits.is_none());
     }
 
     #[test]
@@ -580,6 +730,34 @@ api_key_env = "ZHIPU_API_KEY"
     }
 
     #[test]
+    fn parse_provider_retry_defaults() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let zhipu = config.providers.get("zhipu").expect("provider zhipu");
+        assert_eq!(zhipu.max_attempts, 3, "default total attempts");
+        assert_eq!(zhipu.retry_base_ms, 500, "default backoff base");
+    }
+
+    #[test]
+    fn parse_provider_retry_custom_values() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+max_attempts = 5
+retry_base_ms = 250
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let zhipu = config.providers.get("zhipu").expect("provider zhipu");
+        assert_eq!(zhipu.max_attempts, 5);
+        assert_eq!(zhipu.retry_base_ms, 250);
+    }
+
+    #[test]
     fn parse_model_config_with_optional_fields() {
         let toml = r#"
 [models.main]
@@ -618,6 +796,53 @@ model = "m"
         assert!(bare.supports_tool_call);
         assert!(!bare.supports_vision);
         assert!(!bare.supports_reasoning);
+    }
+
+    // ── [models].input_price_per_mtok / output_price_per_mtok (P2-3) ────
+
+    #[test]
+    fn parse_model_config_pricing_both_fields() {
+        let toml = r#"
+[models.main]
+provider = "zhipu"
+model = "glm-5.1"
+input_price_per_mtok = 0.5
+output_price_per_mtok = 2.0
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let main = config.models.get("main").expect("model main");
+        assert_eq!(main.input_price_per_mtok, Some(0.5));
+        assert_eq!(main.output_price_per_mtok, Some(2.0));
+    }
+
+    #[test]
+    fn parse_model_config_pricing_partial_configuration() {
+        // Only the input price is set: output usage prices at 0 while the
+        // model still counts as "pricing configured".
+        let toml = r#"
+[models.fast]
+provider = "zhipu"
+model = "fast-m"
+input_price_per_mtok = 0.15
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let fast = config.models.get("fast").expect("model fast");
+        assert_eq!(fast.input_price_per_mtok, Some(0.15));
+        assert_eq!(fast.output_price_per_mtok, None);
+    }
+
+    #[test]
+    fn parse_model_config_pricing_defaults_to_none_when_absent() {
+        let toml = r#"
+[models.main]
+provider = "zhipu"
+model = "glm-5.1"
+supports_tool_call = true
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let main = config.models.get("main").expect("model main");
+        assert_eq!(main.input_price_per_mtok, None);
+        assert_eq!(main.output_price_per_mtok, None);
     }
 
     #[test]
@@ -764,6 +989,104 @@ telepathy = true
         assert!(
             msg.contains("telepathy"),
             "error should name the offending field, got: {msg}"
+        );
+    }
+
+    // ── [approval] parse tests ────────────────────────────────────────────
+
+    #[test]
+    fn default_approval_config_is_auto() {
+        let approval = ApprovalConfig::default();
+        assert_eq!(approval.policy, ApprovalPolicySetting::Auto);
+        assert!(approval.tools.is_empty());
+        assert_eq!(approval.to_policy(), crate::approval::ApprovalPolicy::Auto);
+    }
+
+    #[test]
+    fn parse_approval_absent_section_is_none() {
+        let config = parse_openslate_toml("").expect("empty toml should parse");
+        assert!(config.approval.is_none());
+    }
+
+    #[test]
+    fn parse_approval_section_present_defaults_policy_auto() {
+        let toml = r#"
+[approval]
+tools = ["shell"]
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let approval = config.approval.as_ref().expect("section present");
+        assert_eq!(approval.policy, ApprovalPolicySetting::Auto);
+        assert_eq!(approval.tools, vec!["shell".to_owned()]);
+    }
+
+    #[test]
+    fn parse_approval_manual() {
+        let toml = r#"
+[approval]
+policy = "manual"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let policy = config
+            .approval
+            .as_ref()
+            .expect("section present")
+            .to_policy();
+        assert_eq!(policy, crate::approval::ApprovalPolicy::Manual);
+    }
+
+    #[test]
+    fn parse_approval_auto_except_with_tools() {
+        let toml = r#"
+[approval]
+policy = "auto_except"
+tools = ["shell", "run_code"]
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let policy = config
+            .approval
+            .as_ref()
+            .expect("section present")
+            .to_policy();
+        assert_eq!(
+            policy,
+            crate::approval::ApprovalPolicy::AutoExcept(vec![
+                "shell".to_owned(),
+                "run_code".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_approval_unknown_field_rejected() {
+        let toml = r#"
+[approval]
+policy = "auto"
+vibes = false
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("vibes"),
+            "error should name the offending field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_approval_unknown_policy_rejected() {
+        let toml = r#"
+[approval]
+policy = "ask_sometimes"
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown policy must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ask_sometimes"),
+            "error should name the bad variant, got: {msg}"
         );
     }
 
@@ -987,6 +1310,8 @@ max_list_chars = 0
         let limits = config.limits.as_ref().expect("limits");
         assert_eq!(limits.max_steps, 12);
         assert_eq!(limits.max_depth, 4);
+        assert!(limits.auto_compact);
+        assert!(limits.parallel_tool_calls);
 
         assert_eq!(config.providers.len(), 2);
         let zhipu = config.providers.get("zhipu").expect("zhipu provider");

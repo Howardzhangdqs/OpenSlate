@@ -22,11 +22,27 @@ timeout_ms = 60000
 max_context_messages = 64
 max_context_bytes = 64000
 max_output_bytes = 32000
+# Auto-compact the history (LLM summary via the "fast" model, mechanical
+# fallback when unavailable) once it crosses the context limits. /compact
+# works regardless of this flag.
+auto_compact = true
+# Direct tool calls within one step run concurrently (default true). Batches
+# containing call_agent/run_code always run sequentially. Set false to restore
+# the fully sequential tool loop (e.g. for order-sensitive write→read chains).
+parallel_tool_calls = true
 
 [providers.zhipu]
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "ZHIPU_API_KEY"
+# Retry policy for transient failures (HTTP 429/5xx, network errors):
+# max_attempts = total attempts per call including the first (default 3);
+# retry_base_ms = exponential backoff base in ms
+# (delay = retry_base_ms * 2^(attempt-1) + jitter, single sleep capped at 10s).
+max_attempts = 3
+retry_base_ms = 500
 
+# [providers.minimax] keeps the retry defaults (max_attempts = 3,
+# retry_base_ms = 500) by omitting the fields.
 [providers.minimax]
 base_url = "https://api.minimax.chat/v1"
 api_key_env = "MINIMAX_API_KEY"
@@ -38,12 +54,20 @@ max_context_tokens = 200000
 max_output_tokens = 8192
 supports_tool_call = true
 supports_reasoning = true
+# Cost tracking (P2-3): standard prices in USD per million tokens.
+# Absent fields price that side at 0; with neither set a run reports
+# "pricing not configured". v1 prices standard input/output only —
+# cache-read discounts are a known limitation.
+# input_price_per_mtok = 0.5
+# output_price_per_mtok = 2.0
 
 [models.fast]
 provider = "minimax"
 model = "MiniMax-M2.7-highspeed"
 max_context_tokens = 128000
 supports_tool_call = true
+# input_price_per_mtok = 0.1
+# output_price_per_mtok = 0.4
 
 [models.deep-reasoner]
 provider = "zhipu"
@@ -92,3 +116,13 @@ url = "http://localhost:8000/mcp"
 # "*" = "both"
 # "shell" = "direct"
 # "github_*" = "ptc"
+
+# Tool approval gating. policy: "auto" (default, approve everything) |
+# "manual" (ask before every tool) | "auto_except" (ask only for `tools`).
+# Interactive sessions (REPL) prompt y/n/a; non-interactive runs deny
+# high-risk tools under manual/auto_except unless --yes forces auto.
+# Validation warns when auto_except has an empty tools list or a tool name
+# that matches no known tool.
+# [approval]
+# policy = "auto_except"
+# tools = ["shell", "run_code"]

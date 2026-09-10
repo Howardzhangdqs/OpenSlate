@@ -1,10 +1,10 @@
 //! Callable abstraction — base trait for tools and child agents.
 
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::provider::ToolDefinition;
 use crate::tool::Tool;
 use crate::types::{AgentId, ToolOutput, ToolOutputStatus};
+use async_trait::async_trait;
 
 /// Discriminator for the kind of callable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,10 +101,7 @@ impl Tool for ChildAgentCallable {
         // This is a stub — the runtime intercepts call_agent calls
         // and handles them specially (creates new execution node, runs child agent).
         let task = args["task"].as_str().unwrap_or("");
-        let content = format!(
-            "Child agent '{}' would execute: {}",
-            self.agent_id.0, task
-        );
+        let content = format!("Child agent '{}' would execute: {}", self.agent_id.0, task);
         let bytes = content.len();
         Ok(ToolOutput {
             content,
@@ -210,7 +207,9 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["agent_id"].is_object());
         assert!(schema["properties"]["task"].is_object());
-        let required = schema["required"].as_array().expect("required should be array");
+        let required = schema["required"]
+            .as_array()
+            .expect("required should be array");
         assert!(required.iter().any(|v| v == "agent_id"));
         assert!(required.iter().any(|v| v == "task"));
     }
@@ -230,7 +229,10 @@ mod tests {
     async fn test_child_agent_execute_stub() {
         let callable = ChildAgentCallable::new(AgentId("researcher".into()), "Researcher".into());
         let args = serde_json::json!({"agent_id": "researcher", "task": "analyze data"});
-        let output = callable.execute(&args).await.expect("execute should succeed");
+        let output = callable
+            .execute(&args)
+            .await
+            .expect("execute should succeed");
         assert_eq!(output.status, ToolOutputStatus::Success);
         assert!(output.content.contains("researcher"));
         assert!(output.content.contains("analyze data"));
@@ -284,7 +286,10 @@ mod tests {
         assert_eq!(callable.name(), "call_agent");
         assert!(callable.description().contains("Writer"));
         let args = serde_json::json!({"agent_id": "writer", "task": "write report"});
-        let output = callable.execute(&args).await.expect("execute should succeed");
+        let output = callable
+            .execute(&args)
+            .await
+            .expect("execute should succeed");
         assert_eq!(output.status, ToolOutputStatus::Success);
         assert!(output.content.contains("writer"));
         assert!(output.content.contains("write report"));

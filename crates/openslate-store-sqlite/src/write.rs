@@ -45,16 +45,26 @@ impl SqliteStore {
         output_json: Option<&str>,
         finished_at: Option<i64>,
     ) -> Result<(), StoreError> {
-        query(
-            "UPDATE runs SET status = ?, output_json = ?, finished_at = ? WHERE id = ?",
-        )
-        .bind(status)
-        .bind(output_json)
-        .bind(finished_at)
-        .bind(id)
-        .execute(self.pool())
-        .await
-        .map_err(|e| StoreError::WriteError(e.to_string()))?;
+        query("UPDATE runs SET status = ?, output_json = ?, finished_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(output_json)
+            .bind(finished_at)
+            .bind(id)
+            .execute(self.pool())
+            .await
+            .map_err(|e| StoreError::WriteError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record a run's accumulated cost in USD (P2-3). `0.0` is the
+    /// canonical value for unpriced models ("未配置→成本记 0").
+    pub async fn update_run_cost(&self, id: &str, cost_usd: f64) -> Result<(), StoreError> {
+        query("UPDATE runs SET cost_usd = ? WHERE id = ?")
+            .bind(cost_usd)
+            .bind(id)
+            .execute(self.pool())
+            .await
+            .map_err(|e| StoreError::WriteError(e.to_string()))?;
         Ok(())
     }
 
@@ -90,6 +100,9 @@ impl SqliteStore {
     }
 
     /// Insert a step.
+    ///
+    /// `seq` is the per-run monotonic sequence number (caller-assigned);
+    /// queries order by it so same-timestamp batch inserts stay stable.
     pub async fn insert_step(
         &self,
         id: &str,
@@ -98,12 +111,13 @@ impl SqliteStore {
         agent_id: &str,
         kind: &str,
         data_json: &str,
+        seq: i64,
         started_at: i64,
     ) -> Result<(), StoreError> {
         query(
             "INSERT INTO steps \
-             (id, run_id, execution_node_id, agent_id, kind, data_json, started_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (id, run_id, execution_node_id, agent_id, kind, data_json, seq, started_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(run_id)
@@ -111,6 +125,7 @@ impl SqliteStore {
         .bind(agent_id)
         .bind(kind)
         .bind(data_json)
+        .bind(seq)
         .bind(started_at)
         .execute(self.pool())
         .await
@@ -119,6 +134,11 @@ impl SqliteStore {
     }
 
     /// Insert a message.
+    ///
+    /// `seq` is the per-run monotonic sequence number (caller-assigned).
+    /// Conversation order is load-bearing for resume — providers reject
+    /// history whose `tool_calls` are separated from their tool results —
+    /// so readers order by `seq`, never by `created_at` alone.
     pub async fn insert_message(
         &self,
         id: &str,
@@ -127,12 +147,13 @@ impl SqliteStore {
         agent_id: Option<&str>,
         role: &str,
         content_json: &str,
+        seq: i64,
         created_at: i64,
     ) -> Result<(), StoreError> {
         query(
             "INSERT INTO messages \
-             (id, run_id, execution_node_id, agent_id, role, content_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(run_id)
@@ -140,6 +161,7 @@ impl SqliteStore {
         .bind(agent_id)
         .bind(role)
         .bind(content_json)
+        .bind(seq)
         .bind(created_at)
         .execute(self.pool())
         .await
@@ -261,7 +283,14 @@ mod tests {
 
     async fn seed_run(store: &SqliteStore) {
         store
-            .insert_run("run-1", Some("test run"), "agent-root", "running", "{}", 1000)
+            .insert_run(
+                "run-1",
+                Some("test run"),
+                "agent-root",
+                "running",
+                "{}",
+                1000,
+            )
             .await
             .expect("seed run");
     }
@@ -288,7 +317,14 @@ mod tests {
         let store = setup_store().await;
 
         store
-            .insert_run("run-1", Some("my run"), "agent-a", "running", r#"{"q":"hi"}"#, 1000)
+            .insert_run(
+                "run-1",
+                Some("my run"),
+                "agent-a",
+                "running",
+                r#"{"q":"hi"}"#,
+                1000,
+            )
             .await
             .expect("insert run");
 
@@ -373,18 +409,20 @@ mod tests {
                 "agent-root",
                 "model_call",
                 r#"{"model":"gpt-4"}"#,
+                1,
                 1200,
             )
             .await
             .expect("insert step");
 
-        let kind: String =
-            query_scalar::<_, String>("SELECT kind FROM steps WHERE id = 'step-1'")
+        let (kind, seq): (String, i64) =
+            sqlx::query_as::<_, (String, i64)>("SELECT kind, seq FROM steps WHERE id = 'step-1'")
                 .fetch_one(store.pool())
                 .await
                 .expect("query kind");
 
         assert_eq!(kind, "model_call");
+        assert_eq!(seq, 1);
     }
 
     #[tokio::test]
@@ -400,14 +438,15 @@ mod tests {
                 Some("agent-root"),
                 "user",
                 r#"{"text":"hello"}"#,
+                1,
                 1300,
             )
             .await
             .expect("insert message");
 
-        let (role, content): (String, String) =
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT role, content_json FROM messages WHERE id = 'msg-1'",
+        let (role, content, seq): (String, String, i64) =
+            sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT role, content_json, seq FROM messages WHERE id = 'msg-1'",
             )
             .fetch_one(store.pool())
             .await
@@ -415,6 +454,7 @@ mod tests {
 
         assert_eq!(role, "user");
         assert_eq!(content, r#"{"text":"hello"}"#);
+        assert_eq!(seq, 1);
     }
 
     #[tokio::test]
@@ -438,19 +478,21 @@ mod tests {
             .await
             .expect("insert prompt snapshot");
 
-        let profile: String =
-            query_scalar::<_, String>("SELECT profile_name FROM prompt_snapshots WHERE id = 'ps-1'")
-                .fetch_one(store.pool())
-                .await
-                .expect("query profile");
+        let profile: String = query_scalar::<_, String>(
+            "SELECT profile_name FROM prompt_snapshots WHERE id = 'ps-1'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("query profile");
 
         assert_eq!(profile, "default");
 
-        let hash: String =
-            query_scalar::<_, String>("SELECT content_hash FROM prompt_snapshots WHERE id = 'ps-1'")
-                .fetch_one(store.pool())
-                .await
-                .expect("query hash");
+        let hash: String = query_scalar::<_, String>(
+            "SELECT content_hash FROM prompt_snapshots WHERE id = 'ps-1'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("query hash");
 
         assert_eq!(hash, "abc123hash");
     }
@@ -505,13 +547,12 @@ mod tests {
             .await
             .expect("insert trace event");
 
-        let (event_name, ts_ns): (String, i64) =
-            sqlx::query_as::<_, (String, i64)>(
-                "SELECT event_name, ts_ns FROM trace_events WHERE id = 'trace-1'",
-            )
-            .fetch_one(store.pool())
-            .await
-            .expect("query trace");
+        let (event_name, ts_ns): (String, i64) = sqlx::query_as::<_, (String, i64)>(
+            "SELECT event_name, ts_ns FROM trace_events WHERE id = 'trace-1'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("query trace");
 
         assert_eq!(event_name, "llm_call");
         assert_eq!(ts_ns, 1_000_000_000);
@@ -532,16 +573,18 @@ mod tests {
                 None,
                 "assistant",
                 &large_content,
+                1,
                 1600,
             )
             .await
             .expect("large insert should succeed");
 
-        let len: i64 =
-            query_scalar::<_, i64>("SELECT LENGTH(content_json) FROM messages WHERE id = 'msg-big'")
-                .fetch_one(store.pool())
-                .await
-                .expect("query length");
+        let len: i64 = query_scalar::<_, i64>(
+            "SELECT LENGTH(content_json) FROM messages WHERE id = 'msg-big'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("query length");
 
         assert_eq!(len, 1_048_576);
     }

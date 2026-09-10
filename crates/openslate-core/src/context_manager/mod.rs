@@ -11,6 +11,7 @@
 pub mod compact;
 
 use crate::types::{Message, MessageRole, ToolCallId};
+use std::future::Future;
 
 pub use compact::{compact, needs_compact, CompactResult};
 
@@ -141,7 +142,9 @@ impl ContextManager {
         }
 
         if total_bytes > self.max_context_bytes && !result.is_empty() {
-            let available = self.max_context_bytes.saturating_sub(TRUNCATED_MARKER.len());
+            let available = self
+                .max_context_bytes
+                .saturating_sub(TRUNCATED_MARKER.len());
             result[0].content = if available > 0 {
                 format!(
                     "{}{}",
@@ -149,8 +152,14 @@ impl ContextManager {
                     TRUNCATED_MARKER
                 )
             } else if self.max_context_bytes > 0 {
-                let end = find_char_boundary(&self.system_prompt.clone().unwrap_or_default(), self.max_context_bytes);
-                self.system_prompt.as_deref().map(|s| s[..end].to_owned()).unwrap_or_default()
+                let end = find_char_boundary(
+                    &self.system_prompt.clone().unwrap_or_default(),
+                    self.max_context_bytes,
+                );
+                self.system_prompt
+                    .as_deref()
+                    .map(|s| s[..end].to_owned())
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
@@ -171,7 +180,9 @@ impl ContextManager {
 
         for msg in recent.iter().rev() {
             let msg_bytes = msg.content.len();
-            let remaining = self.max_context_bytes.saturating_sub(total_bytes + temp_bytes);
+            let remaining = self
+                .max_context_bytes
+                .saturating_sub(total_bytes + temp_bytes);
 
             if msg_bytes <= remaining {
                 temp_bytes += msg_bytes;
@@ -227,9 +238,19 @@ impl ContextManager {
         )
     }
 
-    pub fn compact<F>(&mut self, summarize: F) -> CompactResult
+    /// Compress the accumulated history (see [`compact::compact`]).
+    ///
+    /// `summarize` is async: callers typically route it through a "fast"
+    /// model provider call and return `None` on any failure, which selects
+    /// the mechanical-concatenation fallback.
+    ///
+    /// Note: after this, the in-memory history (summarized) intentionally
+    /// diverges from any persisted transcript (full) — restoring the
+    /// uncompressed history on resume is a feature, not a bug.
+    pub async fn compact<F, Fut>(&mut self, summarize: F) -> CompactResult
     where
-        F: FnOnce(&str) -> Option<String>,
+        F: FnOnce(&str) -> Fut,
+        Fut: Future<Output = Option<String>>,
     {
         compact::compact(
             &mut self.messages,
@@ -238,6 +259,7 @@ impl ContextManager {
             self.max_context_bytes,
             summarize,
         )
+        .await
     }
 }
 
@@ -336,7 +358,10 @@ mod tests {
         assert_eq!(cm.message_count(), 2);
         let ctx = cm.get_context();
         assert_eq!(ctx[1].role, MessageRole::Tool);
-        assert_eq!(ctx[1].tool_call_id.as_ref().map(|id| id.0.as_str()), Some("tc-1"));
+        assert_eq!(
+            ctx[1].tool_call_id.as_ref().map(|id| id.0.as_str()),
+            Some("tc-1")
+        );
     }
 
     // ── Truncation by message count ──
@@ -563,7 +588,10 @@ mod tests {
         let ctx = cm.get_context();
         assert_eq!(ctx[0].role, MessageRole::Tool);
         assert_eq!(ctx[0].name.as_deref(), Some("bash"));
-        assert_eq!(ctx[0].tool_call_id.as_ref().map(|id| id.0.as_str()), Some("tc-1"));
+        assert_eq!(
+            ctx[0].tool_call_id.as_ref().map(|id| id.0.as_str()),
+            Some("tc-1")
+        );
     }
 
     // ── Truncation with mixed roles ──
@@ -618,5 +646,148 @@ mod tests {
         cm.add_user_message("hello");
         let ctx = cm.get_context();
         assert!(ctx.is_empty());
+    }
+
+    // ── /compact (async summarize) ──────────────────────────────────────
+
+    use crate::error::ProviderError;
+    use crate::provider::{GenerateRequest, ModelProvider};
+    use crate::types::{ModelResponse, Usage};
+    use async_trait::async_trait;
+
+    /// Minimal scripted provider standing in for the configured "fast"
+    /// model: returns canned responses in order, or an error when asked to.
+    struct ScriptedFast {
+        response: Result<ModelResponse, ProviderError>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedFast {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
+            // ProviderError is not Clone: rebuild it instead of cloning.
+            match &self.response {
+                Ok(resp) => Ok(resp.clone()),
+                Err(_) => Err(ProviderError::ServerError(500)),
+            }
+        }
+        fn provider_name(&self) -> &str {
+            "scripted-fast"
+        }
+    }
+
+    fn scripted_ok(content: &str) -> ScriptedFast {
+        ScriptedFast {
+            response: Ok(ModelResponse {
+                content: Some(content.to_owned()),
+                tool_calls: Vec::new(),
+                usage: Some(Usage {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                }),
+                finish_reason: Some("stop".into()),
+            }),
+        }
+    }
+
+    fn seeded_manager() -> ContextManager {
+        let mut cm = make_manager(100, 1_000_000);
+        for i in 0..3 {
+            cm.add_user_message(format!("user {}", i));
+            cm.add_assistant_message(format!("assistant {}", i));
+        }
+        cm
+    }
+
+    #[tokio::test]
+    async fn manager_compact_routes_through_async_provider_summary() {
+        let mut cm = seeded_manager();
+        let provider = scripted_ok("decided X, touched a.rs, todo: Y");
+
+        // The same closure shape the REPL uses: copy the text, await a
+        // provider generate, map the reply into the summary slot.
+        let result = cm
+            .compact(|text: &str| {
+                let text = text.to_owned();
+                async move {
+                    let req = GenerateRequest {
+                        model_id: "fast-model".to_owned(),
+                        system_prompt: None,
+                        messages: vec![Message {
+                            role: MessageRole::User,
+                            content: text,
+                            tool_call_id: None,
+                            name: None,
+                            tool_calls: None,
+                        }],
+                        tools: Vec::new(),
+                        max_tokens: None,
+                        temperature: None,
+                    };
+                    provider.generate(req).await.ok().and_then(|r| r.content)
+                }
+            })
+            .await;
+
+        assert_eq!(result.messages_before, 6);
+        assert_eq!(result.messages_after, 3);
+        // Summary text lands as the leading System message…
+        assert_eq!(cm.messages[0].role, MessageRole::System);
+        assert_eq!(cm.messages[0].name.as_deref(), Some("compact"));
+        assert!(cm.messages[0].content.contains("decided X"));
+        // …and KEEP_RECENT_COUNT recent messages survive verbatim.
+        assert_eq!(cm.messages[1].content, "user 2");
+        assert_eq!(cm.messages[2].content, "assistant 2");
+    }
+
+    #[tokio::test]
+    async fn manager_compact_provider_error_falls_back_to_mechanical() {
+        let mut cm = seeded_manager();
+        let provider = ScriptedFast {
+            response: Err(ProviderError::ServerError(500)),
+        };
+
+        let result = cm
+            .compact(|text: &str| {
+                let text = text.to_owned();
+                async move {
+                    let req = GenerateRequest {
+                        model_id: "fast-model".to_owned(),
+                        system_prompt: None,
+                        messages: vec![Message {
+                            role: MessageRole::User,
+                            content: text,
+                            tool_call_id: None,
+                            name: None,
+                            tool_calls: None,
+                        }],
+                        tools: Vec::new(),
+                        max_tokens: None,
+                        temperature: None,
+                    };
+                    provider.generate(req).await.ok().and_then(|r| r.content)
+                }
+            })
+            .await;
+
+        // Errored summary → mechanical concatenation of the older tail.
+        assert_eq!(result.messages_after, 3);
+        assert_eq!(cm.messages[0].name.as_deref(), Some("compact"));
+        assert!(cm.messages[0].content.contains("User: user"));
+        assert_eq!(cm.messages[1].content, "user 2");
+        assert_eq!(cm.messages[2].content, "assistant 2");
+    }
+
+    #[tokio::test]
+    async fn manager_compact_empty_history_is_guarded() {
+        let mut cm = make_manager(100, 1_000_000);
+        let result = cm
+            .compact(|_text: &str| async { panic!("should not be called") })
+            .await;
+        assert_eq!(result.messages_before, 0);
+        assert_eq!(result.messages_after, 0);
+        assert_eq!(cm.message_count(), 0);
     }
 }

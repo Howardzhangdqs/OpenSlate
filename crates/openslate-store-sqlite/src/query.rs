@@ -5,7 +5,7 @@
 
 use openslate_core::error::StoreError;
 use serde::{Deserialize, Serialize};
-use sqlx::query_as;
+use sqlx::{query_as, query_scalar};
 
 use crate::store::SqliteStore;
 
@@ -24,6 +24,8 @@ pub struct RunRecord {
     pub output_json: Option<String>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
+    /// Accumulated model spend in USD (P2-3); 0.0 when unpriced.
+    pub cost_usd: f64,
 }
 
 /// An execution node record.
@@ -50,6 +52,10 @@ pub struct StepRecord {
     pub agent_id: String,
     pub kind: String,
     pub data_json: String,
+    /// Per-run monotonic sequence number (writer-assigned). Conversation /
+    /// step order is load-bearing; `started_at` alone cannot order
+    /// same-batch inserts.
+    pub seq: i64,
     pub started_at: i64,
     pub finished_at: Option<i64>,
 }
@@ -63,6 +69,10 @@ pub struct MessageRecord {
     pub agent_id: Option<String>,
     pub role: String,
     pub content_json: String,
+    /// Per-run monotonic sequence number (writer-assigned). Readers order by
+    /// it — `created_at` alone cannot order same-batch inserts, and a
+    /// provider rejects shuffled `tool_calls`/tool-result pairs.
+    pub seq: i64,
     pub created_at: i64,
 }
 
@@ -113,84 +123,87 @@ pub struct TraceEventRecord {
 // ---------------------------------------------------------------------------
 
 type RunRow = (
-    String,             // id
-    Option<String>,     // title
-    String,             // root_agent_id
-    String,             // status
-    String,             // input_json
-    Option<String>,     // output_json
-    i64,                // started_at
-    Option<i64>,        // finished_at
+    String,         // id
+    Option<String>, // title
+    String,         // root_agent_id
+    String,         // status
+    String,         // input_json
+    Option<String>, // output_json
+    i64,            // started_at
+    Option<i64>,    // finished_at
+    f64,            // cost_usd
 );
 
 type ExecutionNodeRow = (
-    String,             // id
-    String,             // run_id
-    String,             // agent_id
-    Option<String>,     // parent_execution_id
-    Option<String>,     // parent_call_id
-    String,             // status
-    String,             // input_json
-    Option<String>,     // output_json
-    i64,                // started_at
-    Option<i64>,        // finished_at
+    String,         // id
+    String,         // run_id
+    String,         // agent_id
+    Option<String>, // parent_execution_id
+    Option<String>, // parent_call_id
+    String,         // status
+    String,         // input_json
+    Option<String>, // output_json
+    i64,            // started_at
+    Option<i64>,    // finished_at
 );
 
 type StepRow = (
-    String,             // id
-    String,             // run_id
-    String,             // execution_node_id
-    String,             // agent_id
-    String,             // kind
-    String,             // data_json
-    i64,                // started_at
-    Option<i64>,        // finished_at
+    String,      // id
+    String,      // run_id
+    String,      // execution_node_id
+    String,      // agent_id
+    String,      // kind
+    String,      // data_json
+    i64,         // seq
+    i64,         // started_at
+    Option<i64>, // finished_at
 );
 
 type MessageRow = (
-    String,             // id
-    String,             // run_id
-    String,             // execution_node_id
-    Option<String>,     // agent_id
-    String,             // role
-    String,             // content_json
-    i64,                // created_at
+    String,         // id
+    String,         // run_id
+    String,         // execution_node_id
+    Option<String>, // agent_id
+    String,         // role
+    String,         // content_json
+    i64,            // seq
+    i64,            // created_at
 );
 
 type PromptSnapshotRow = (
-    String,             // id
-    String,             // run_id
-    String,             // execution_node_id
-    String,             // agent_id
-    String,             // profile_name
-    String,             // source_kind
-    Option<String>,     // source_path
-    String,             // content_hash
-    String,             // rendered_prompt
-    i64,                // created_at
+    String,         // id
+    String,         // run_id
+    String,         // execution_node_id
+    String,         // agent_id
+    String,         // profile_name
+    String,         // source_kind
+    Option<String>, // source_path
+    String,         // content_hash
+    String,         // rendered_prompt
+    i64,            // created_at
 );
 
 type AuditLogRow = (
-    String,             // id
-    Option<String>,     // run_id
-    Option<String>,     // agent_id
-    String,             // event_type
-    String,             // event_json
-    i64,                // created_at
+    String,         // id
+    Option<String>, // run_id
+    Option<String>, // agent_id
+    String,         // event_type
+    String,         // event_json
+    i64,            // created_at
 );
 
 type TraceEventRow = (
-    String,             // id
-    String,             // run_id
-    Option<String>,     // execution_node_id
-    Option<String>,     // step_id
-    Option<String>,     // agent_id
-    String,             // event_name
-    String,             // event_kind
-    i64,                // ts_ns
-    Option<i64>,        // dur_ns
-    String,             // track
-    Option<String>,     // args_json
+    String,         // id
+    String,         // run_id
+    Option<String>, // execution_node_id
+    Option<String>, // step_id
+    Option<String>, // agent_id
+    String,         // event_name
+    String,         // event_kind
+    i64,            // ts_ns
+    Option<i64>,    // dur_ns
+    String,         // track
+    Option<String>, // args_json
 );
 
 // ---------------------------------------------------------------------------
@@ -207,6 +220,7 @@ fn row_to_run(row: RunRow) -> RunRecord {
         output_json: row.5,
         started_at: row.6,
         finished_at: row.7,
+        cost_usd: row.8,
     }
 }
 
@@ -233,8 +247,9 @@ fn row_to_step(row: StepRow) -> StepRecord {
         agent_id: row.3,
         kind: row.4,
         data_json: row.5,
-        started_at: row.6,
-        finished_at: row.7,
+        seq: row.6,
+        started_at: row.7,
+        finished_at: row.8,
     }
 }
 
@@ -246,7 +261,8 @@ fn row_to_message(row: MessageRow) -> MessageRecord {
         agent_id: row.3,
         role: row.4,
         content_json: row.5,
-        created_at: row.6,
+        seq: row.6,
+        created_at: row.7,
     }
 }
 
@@ -309,7 +325,7 @@ impl SqliteStore {
     pub async fn get_run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
              FROM runs WHERE id = ?",
         )
         .bind(id)
@@ -321,14 +337,10 @@ impl SqliteStore {
     }
 
     /// List runs ordered by most recently started, with pagination.
-    pub async fn list_runs(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<RunRecord>, StoreError> {
+    pub async fn list_runs(&self, limit: i64, offset: i64) -> Result<Vec<RunRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
              FROM runs ORDER BY started_at DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
@@ -359,12 +371,13 @@ impl SqliteStore {
         Ok(row.map(row_to_execution_node))
     }
 
-    /// List all steps for a given run, ordered by `started_at`.
+    /// List all steps for a given run, ordered by `seq` (the writer-assigned
+    /// per-run sequence; `started_at` alone cannot order same-batch inserts).
     pub async fn list_steps(&self, run_id: &str) -> Result<Vec<StepRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<StepRow> = query_as(
-            "SELECT id, run_id, execution_node_id, agent_id, kind, data_json, started_at, finished_at \
-             FROM steps WHERE run_id = ? ORDER BY started_at",
+            "SELECT id, run_id, execution_node_id, agent_id, kind, data_json, seq, started_at, finished_at \
+             FROM steps WHERE run_id = ? ORDER BY seq",
         )
         .bind(run_id)
         .fetch_all(pool)
@@ -374,15 +387,15 @@ impl SqliteStore {
         Ok(rows.into_iter().map(row_to_step).collect())
     }
 
-    /// List all messages for a given execution node, ordered by `created_at`.
+    /// List all messages for a given execution node, ordered by `seq`.
     pub async fn list_messages(
         &self,
         execution_node_id: &str,
     ) -> Result<Vec<MessageRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<MessageRow> = query_as(
-            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, created_at \
-             FROM messages WHERE execution_node_id = ? ORDER BY created_at",
+            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at \
+             FROM messages WHERE execution_node_id = ? ORDER BY seq",
         )
         .bind(execution_node_id)
         .fetch_all(pool)
@@ -390,6 +403,38 @@ impl SqliteStore {
         .map_err(qerr)?;
 
         Ok(rows.into_iter().map(row_to_message).collect())
+    }
+
+    /// List the full conversation of a run (all execution nodes merged),
+    /// ordered by `seq`. This is the resume path: the root conversation is
+    /// rebuilt from it.
+    pub async fn list_messages_by_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<MessageRow> = query_as(
+            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at \
+             FROM messages WHERE run_id = ? ORDER BY seq",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows.into_iter().map(row_to_message).collect())
+    }
+
+    /// Highest `seq` used by a run's messages (`0` when the run has none).
+    /// Callers continuing a run start assigning at `max + 1`.
+    pub async fn max_message_seq(&self, run_id: &str) -> Result<i64, StoreError> {
+        let pool = self.pool();
+        let max: i64 = query_scalar("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .map_err(qerr)?;
+        Ok(max)
     }
 
     /// Get the most recent prompt snapshot for a given run + agent.
@@ -416,10 +461,7 @@ impl SqliteStore {
     }
 
     /// List all audit log entries for a given run, ordered by `created_at`.
-    pub async fn list_audit_logs(
-        &self,
-        run_id: &str,
-    ) -> Result<Vec<AuditLogRecord>, StoreError> {
+    pub async fn list_audit_logs(&self, run_id: &str) -> Result<Vec<AuditLogRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<AuditLogRow> = query_as(
             "SELECT id, run_id, agent_id, event_type, event_json, created_at \
@@ -456,8 +498,26 @@ impl SqliteStore {
     pub async fn get_last_interrupted_run(&self) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
              FROM runs WHERE status = 'interrupted' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(row.map(row_to_run))
+    }
+
+    /// Get the most recently started resumable run: any run whose status is
+    /// not `failed` (running = crashed/mid-session, interrupted, cancelled,
+    /// completed REPL sessions). Failed runs are excluded — their transcript
+    /// typically ends mid-error, and the operator asked to fail.
+    pub async fn get_last_resumable_run(&self) -> Result<Option<RunRecord>, StoreError> {
+        let pool = self.pool();
+        let row: Option<RunRow> = query_as(
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
+             FROM runs WHERE status != 'failed' \
              ORDER BY started_at DESC LIMIT 1",
         )
         .fetch_optional(pool)
@@ -477,7 +537,7 @@ impl SqliteStore {
         let pool = self.pool();
         let pattern = format!("%{cwd}%");
         let rows: Vec<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
              FROM runs WHERE input_json LIKE ? \
              ORDER BY started_at DESC LIMIT ? OFFSET ?",
         )
@@ -657,21 +717,23 @@ mod tests {
         let pool = store.pool();
 
         insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
-        insert_execution_node(pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100)
-            .await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
 
-        // Insert 2 steps
+        // Insert 2 steps (same started_at; seq is the order tiebreaker)
         sqlx::query(
-            "INSERT INTO steps (id, run_id, execution_node_id, agent_id, kind, data_json, started_at) \
-             VALUES ('step-1', 'run-1', 'en-1', 'root', 'model_call', '{\"model\":\"gpt-4\"}', 1200)",
+            "INSERT INTO steps (id, run_id, execution_node_id, agent_id, kind, data_json, seq, started_at) \
+             VALUES ('step-1', 'run-1', 'en-1', 'root', 'model_call', '{\"model\":\"gpt-4\"}', 1, 1200)",
         )
         .execute(pool)
         .await
         .expect("insert step 1");
 
         sqlx::query(
-            "INSERT INTO steps (id, run_id, execution_node_id, agent_id, kind, data_json, started_at) \
-             VALUES ('step-2', 'run-1', 'en-1', 'root', 'tool_call', '{\"tool\":\"bash\"}', 1300)",
+            "INSERT INTO steps (id, run_id, execution_node_id, agent_id, kind, data_json, seq, started_at) \
+             VALUES ('step-2', 'run-1', 'en-1', 'root', 'tool_call', '{\"tool\":\"bash\"}', 2, 1200)",
         )
         .execute(pool)
         .await
@@ -679,11 +741,13 @@ mod tests {
 
         let steps = store.list_steps("run-1").await.expect("list_steps");
         assert_eq!(steps.len(), 2);
-        // Ordered by started_at
+        // Ordered by seq (started_at is identical here)
         assert_eq!(steps[0].id, "step-1");
         assert_eq!(steps[0].kind, "model_call");
+        assert_eq!(steps[0].seq, 1);
         assert_eq!(steps[1].id, "step-2");
         assert_eq!(steps[1].kind, "tool_call");
+        assert_eq!(steps[1].seq, 2);
     }
 
     #[tokio::test]
@@ -692,20 +756,23 @@ mod tests {
         let pool = store.pool();
 
         insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
-        insert_execution_node(pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100)
-            .await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
 
+        // Same created_at on purpose: seq must be the order tiebreaker.
         sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, created_at) \
-             VALUES ('msg-1', 'run-1', 'en-1', 'root', 'user', '\"hello\"', 1200)",
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('msg-1', 'run-1', 'en-1', 'root', 'user', '\"hello\"', 1, 1200)",
         )
         .execute(pool)
         .await
         .expect("insert msg 1");
 
         sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, created_at) \
-             VALUES ('msg-2', 'run-1', 'en-1', 'root', 'assistant', '\"world\"', 1300)",
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('msg-2', 'run-1', 'en-1', 'root', 'assistant', '\"world\"', 2, 1200)",
         )
         .execute(pool)
         .await
@@ -713,11 +780,124 @@ mod tests {
 
         let msgs = store.list_messages("en-1").await.expect("list_messages");
         assert_eq!(msgs.len(), 2);
-        // Ordered by created_at
+        // Ordered by seq (created_at is identical here)
         assert_eq!(msgs[0].id, "msg-1");
         assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].seq, 1);
         assert_eq!(msgs[1].id, "msg-2");
         assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_messages_by_run_orders_across_nodes_by_seq() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
+        insert_execution_node(
+            pool,
+            "en-2",
+            "run-1",
+            "child",
+            Some("en-1"),
+            None,
+            "running",
+            "{}",
+            1150,
+        )
+        .await;
+
+        // Interleaved across nodes, all sharing one timestamp; only seq
+        // restores the true conversation order (a shuffled tool_call/tool
+        // pair would be rejected by providers on resume).
+        sqlx::query(
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('m-1', 'run-1', 'en-1', 'root', 'user', '\"q\"', 1, 1200)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert m-1");
+        sqlx::query(
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('m-2', 'run-1', 'en-2', 'child', 'assistant', '\"a\"', 2, 1200)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert m-2");
+        sqlx::query(
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('m-3', 'run-1', 'en-1', 'root', 'tool', '\"t\"', 3, 1200)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert m-3");
+
+        let msgs = store
+            .list_messages_by_run("run-1")
+            .await
+            .expect("list_messages_by_run");
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-1", "m-2", "m-3"]);
+
+        // Other runs' messages are excluded.
+        insert_run(pool, "run-2", None, "root", "running", "{}", 2000).await;
+        insert_execution_node(
+            pool, "en-3", "run-2", "root", None, None, "running", "{}", 2100,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('m-9', 'run-2', 'en-3', 'root', 'user', '\"other\"', 1, 2200)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert m-9");
+        let msgs = store
+            .list_messages_by_run("run-1")
+            .await
+            .expect("list again");
+        assert_eq!(msgs.len(), 3, "run-2 messages must not leak in");
+    }
+
+    #[tokio::test]
+    async fn test_max_message_seq() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
+
+        assert_eq!(
+            store.max_message_seq("run-1").await.expect("max seq"),
+            0,
+            "no messages yet → 0"
+        );
+
+        for (i, id) in ["m-1", "m-2", "m-3"].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+                 VALUES (?, 'run-1', 'en-1', 'root', 'user', '\"x\"', ?, 1200)",
+            )
+            .bind(id)
+            .bind((i + 1) as i64)
+            .execute(pool)
+            .await
+            .expect("insert");
+        }
+
+        assert_eq!(
+            store.max_message_seq("run-1").await.expect("max seq"),
+            3,
+            "continuing the run must start assigning at 4"
+        );
     }
 
     #[tokio::test]
@@ -726,8 +906,10 @@ mod tests {
         let pool = store.pool();
 
         insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
-        insert_execution_node(pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100)
-            .await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
 
         sqlx::query(
             "INSERT INTO prompt_snapshots \
@@ -780,7 +962,10 @@ mod tests {
             .expect("insert trace event");
         }
 
-        let events = store.list_trace_events("run-1").await.expect("list_trace_events");
+        let events = store
+            .list_trace_events("run-1")
+            .await
+            .expect("list_trace_events");
         assert_eq!(events.len(), 3);
         // Ordered by ts_ns
         assert_eq!(events[0].id, "te-1");
@@ -806,6 +991,45 @@ mod tests {
         // Should return the most recently started interrupted run
         assert_eq!(r.id, "run-int2");
         assert_eq!(r.status, "interrupted");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_resumable_run() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        // Failed runs are never resumable; everything else is.
+        insert_run(pool, "run-failed", None, "root", "failed", "{}", 1000).await;
+        insert_run(pool, "run-done", None, "root", "completed", "{}", 2000).await;
+        insert_run(pool, "run-crashed", None, "root", "running", "{}", 3000).await;
+
+        let result = store.get_last_resumable_run().await.expect("query");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "run-crashed");
+    }
+
+    #[tokio::test]
+    async fn test_get_last_resumable_run_skips_failed() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        insert_run(pool, "run-int", None, "root", "interrupted", "{}", 1000).await;
+        insert_run(pool, "run-failed", None, "root", "failed", "{}", 2000).await;
+
+        let result = store.get_last_resumable_run().await.expect("query");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().id,
+            "run-int",
+            "a newer failed run must not shadow the older resumable one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_last_resumable_run_empty() {
+        let store = setup_store().await;
+        let result = store.get_last_resumable_run().await.expect("query");
+        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -861,28 +1085,58 @@ mod tests {
         let store = setup_store().await;
 
         store
-            .insert_audit_event("audit-1", Some("run-1"), Some("agent-a"), "tool_approved", r#"{"tool":"bash","details":{"approved":true}}"#, 1000)
+            .insert_audit_event(
+                "audit-1",
+                Some("run-1"),
+                Some("agent-a"),
+                "tool_approved",
+                r#"{"tool":"bash","details":{"approved":true}}"#,
+                1000,
+            )
             .await
             .expect("insert audit 1");
         store
-            .insert_audit_event("audit-2", Some("run-1"), Some("agent-a"), "tool_denied", r#"{"tool":"rm","details":{"reason":"dangerous"}}"#, 2000)
+            .insert_audit_event(
+                "audit-2",
+                Some("run-1"),
+                Some("agent-a"),
+                "tool_denied",
+                r#"{"tool":"rm","details":{"reason":"dangerous"}}"#,
+                2000,
+            )
             .await
             .expect("insert audit 2");
         store
-            .insert_audit_event("audit-3", Some("run-2"), None, "tool_executed", r#"{"tool":"ls"}"#, 3000)
+            .insert_audit_event(
+                "audit-3",
+                Some("run-2"),
+                None,
+                "tool_executed",
+                r#"{"tool":"ls"}"#,
+                3000,
+            )
             .await
             .expect("insert audit 3");
 
-        let logs_run1 = store.list_audit_logs("run-1").await.expect("list_audit_logs run-1");
+        let logs_run1 = store
+            .list_audit_logs("run-1")
+            .await
+            .expect("list_audit_logs run-1");
         assert_eq!(logs_run1.len(), 2);
         assert_eq!(logs_run1[0].event_type, "tool_approved");
         assert_eq!(logs_run1[1].event_type, "tool_denied");
 
-        let logs_run2 = store.list_audit_logs("run-2").await.expect("list_audit_logs run-2");
+        let logs_run2 = store
+            .list_audit_logs("run-2")
+            .await
+            .expect("list_audit_logs run-2");
         assert_eq!(logs_run2.len(), 1);
         assert_eq!(logs_run2[0].event_type, "tool_executed");
 
-        let logs_run3 = store.list_audit_logs("run-3").await.expect("list_audit_logs run-3");
+        let logs_run3 = store
+            .list_audit_logs("run-3")
+            .await
+            .expect("list_audit_logs run-3");
         assert_eq!(logs_run3.len(), 0);
     }
 }

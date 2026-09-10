@@ -65,7 +65,9 @@ pub fn build_child_context(
 
     if config.inherit_parent_context {
         // Include last N parent messages (truncated)
-        let start = parent_messages.len().saturating_sub(config.max_context_messages as usize);
+        let start = parent_messages
+            .len()
+            .saturating_sub(config.max_context_messages as usize);
         let parent_slice = &parent_messages[start..];
 
         let mut total_bytes = 0u32;
@@ -251,8 +253,14 @@ mod tests {
             max_context_bytes: 100, // Very small limit
         };
         let parent_messages = vec![
-            make_message(MessageRole::User, "This is a long message that should be truncated when we hit the byte limit"),
-            make_message(MessageRole::Assistant, "Another long message that adds to the total byte count"),
+            make_message(
+                MessageRole::User,
+                "This is a long message that should be truncated when we hit the byte limit",
+            ),
+            make_message(
+                MessageRole::Assistant,
+                "Another long message that adds to the total byte count",
+            ),
             make_message(MessageRole::User, "Short"),
         ];
 
@@ -328,6 +336,8 @@ mod tests {
 
         // Should have: system prompt + task (no summary since no parent messages)
         assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|m| !m.content.contains("[Parent conversation summary]")));
+        assert!(result
+            .iter()
+            .all(|m| !m.content.contains("[Parent conversation summary]")));
     }
 }

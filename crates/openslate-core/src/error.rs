@@ -87,6 +87,11 @@ pub enum ProviderError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// Retry budget exhausted: `attempts` transient failures in a row,
+    /// `last` carries the final error verbatim.
+    #[error("request failed after {attempts} attempt(s); last error: {last}")]
+    RetryExhausted { attempts: u32, last: String },
 }
 
 /// Agent runtime-related errors.
@@ -133,7 +138,9 @@ pub enum RuntimeError {
     },
 
     /// Model returned tool call arguments that could not be parsed or are invalid.
-    #[error("malformed tool arguments for '{tool_name}' at step {step}, agent {agent_id}: {details}")]
+    #[error(
+        "malformed tool arguments for '{tool_name}' at step {step}, agent {agent_id}: {details}"
+    )]
     ToolArgumentError {
         tool_name: String,
         step: u32,
@@ -150,8 +157,21 @@ pub enum RuntimeError {
         reason: String,
     },
 
+    /// The approval watchdog aborted the run: the same tool was denied
+    /// `denials` times in a row and the model kept retrying it.
+    #[error(
+        "approval watchdog: tool '{tool_name}' denied {denials} consecutive times, agent {agent_id}, run aborted"
+    )]
+    ApprovalAbort {
+        tool_name: String,
+        agent_id: String,
+        denials: u32,
+    },
+
     /// Too many consecutive empty responses from the model.
-    #[error("max empty turns exceeded ({count}) at step {step}, agent {agent_id}, model {model_alias}")]
+    #[error(
+        "max empty turns exceeded ({count}) at step {step}, agent {agent_id}, model {model_alias}"
+    )]
     MaxEmptyTurnsExceeded {
         count: u32,
         step: u32,
@@ -197,7 +217,10 @@ pub enum ToolError {
     SecurityError(String),
 
     #[error("output too large: {actual_bytes} bytes (max {max_bytes})")]
-    OutputTooLarge { max_bytes: usize, actual_bytes: usize },
+    OutputTooLarge {
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
 }
 
 #[cfg(test)]
@@ -217,7 +240,10 @@ mod tests {
     fn open_slate_error_from_config() {
         let inner = ConfigError::MissingField("model".into());
         let err = OpenSlateError::from(inner);
-        assert!(matches!(err, OpenSlateError::Config(ConfigError::MissingField(_))));
+        assert!(matches!(
+            err,
+            OpenSlateError::Config(ConfigError::MissingField(_))
+        ));
         assert_eq!(format!("{err}"), "config error: missing field: model");
     }
 
@@ -225,21 +251,30 @@ mod tests {
     fn open_slate_error_from_provider() {
         let inner = ProviderError::AuthError("bad key".into());
         let err = OpenSlateError::from(inner);
-        assert!(matches!(err, OpenSlateError::Provider(ProviderError::AuthError(_))));
+        assert!(matches!(
+            err,
+            OpenSlateError::Provider(ProviderError::AuthError(_))
+        ));
     }
 
     #[test]
     fn open_slate_error_from_runtime() {
         let inner = RuntimeError::Cancelled;
         let err = OpenSlateError::from(inner);
-        assert!(matches!(err, OpenSlateError::Runtime(RuntimeError::Cancelled)));
+        assert!(matches!(
+            err,
+            OpenSlateError::Runtime(RuntimeError::Cancelled)
+        ));
     }
 
     #[test]
     fn open_slate_error_from_store() {
         let inner = StoreError::QueryError("syntax".into());
         let err = OpenSlateError::from(inner);
-        assert!(matches!(err, OpenSlateError::Store(StoreError::QueryError(_))));
+        assert!(matches!(
+            err,
+            OpenSlateError::Store(StoreError::QueryError(_))
+        ));
     }
 
     #[test]
@@ -284,7 +319,10 @@ mod tests {
     #[test]
     fn provider_error_variants() {
         assert_eq!(format!("{}", ProviderError::Timeout), "request timed out");
-        assert_eq!(format!("{}", ProviderError::RateLimit), "rate limit exceeded");
+        assert_eq!(
+            format!("{}", ProviderError::RateLimit),
+            "rate limit exceeded"
+        );
         assert_eq!(
             format!("{}", ProviderError::ServerError(503)),
             "server error: status 503"
@@ -300,6 +338,16 @@ mod tests {
         assert_eq!(
             format!("{}", ProviderError::NotFound("model-x".into())),
             "not found: model-x"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ProviderError::RetryExhausted {
+                    attempts: 3,
+                    last: "rate limit exceeded".into(),
+                }
+            ),
+            "request failed after 3 attempt(s); last error: rate limit exceeded"
         );
     }
 
@@ -325,7 +373,10 @@ mod tests {
             format!("{}", RuntimeError::Timeout { timeout_ms: 5000 }),
             "timeout after 5000ms"
         );
-        assert_eq!(format!("{}", RuntimeError::Cancelled), "operation cancelled");
+        assert_eq!(
+            format!("{}", RuntimeError::Cancelled),
+            "operation cancelled"
+        );
         assert_eq!(
             format!("{}", RuntimeError::AgentNotFound("agent-1".into())),
             "agent not found: agent-1"
@@ -379,6 +430,17 @@ mod tests {
                 }
             ),
             "tool 'bash' execution failed at step 7, agent agent-1: panic"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                RuntimeError::ApprovalAbort {
+                    tool_name: "shell".into(),
+                    agent_id: "agent-1".into(),
+                    denials: 3,
+                }
+            ),
+            "approval watchdog: tool 'shell' denied 3 consecutive times, agent agent-1, run aborted"
         );
         assert_eq!(
             format!(

@@ -43,7 +43,11 @@ async fn file_db_run_persists_across_reopen() {
             .expect("insert run 2");
 
         // Verify while still open
-        let run = store.get_run("run-persist-1").await.expect("query").unwrap();
+        let run = store
+            .get_run("run-persist-1")
+            .await
+            .expect("query")
+            .unwrap();
         assert_eq!(run.title.as_deref(), Some("Persistence Test"));
         assert_eq!(run.status, "running");
 
@@ -55,7 +59,11 @@ async fn file_db_run_persists_across_reopen() {
         let store = SqliteStore::new(db_path_str).await.expect("store reopened");
         // No need to run_migrations again — schema is already on disk
 
-        let run1 = store.get_run("run-persist-1").await.expect("query").unwrap();
+        let run1 = store
+            .get_run("run-persist-1")
+            .await
+            .expect("query")
+            .unwrap();
         assert_eq!(run1.id, "run-persist-1");
         assert_eq!(run1.title.as_deref(), Some("Persistence Test"));
         assert_eq!(run1.root_agent_id, "root-agent");
@@ -63,7 +71,11 @@ async fn file_db_run_persists_across_reopen() {
         assert_eq!(run1.input_json, r#"{"prompt":"hello"}"#);
         assert_eq!(run1.started_at, 1000);
 
-        let run2 = store.get_run("run-persist-2").await.expect("query").unwrap();
+        let run2 = store
+            .get_run("run-persist-2")
+            .await
+            .expect("query")
+            .unwrap();
         assert_eq!(run2.id, "run-persist-2");
         assert_eq!(run2.status, "completed");
         assert_eq!(run2.started_at, 2000);
@@ -83,12 +95,24 @@ async fn file_db_update_status_persists() {
         store.run_migrations().await.expect("migrations");
 
         store
-            .insert_run("run-upd", Some("Update Test"), "agent", "running", "{}", 500)
+            .insert_run(
+                "run-upd",
+                Some("Update Test"),
+                "agent",
+                "running",
+                "{}",
+                500,
+            )
             .await
             .expect("insert");
 
         store
-            .update_run_status("run-upd", "completed", Some(r#"{"result":"ok"}"#), Some(600))
+            .update_run_status(
+                "run-upd",
+                "completed",
+                Some(r#"{"result":"ok"}"#),
+                Some(600),
+            )
             .await
             .expect("update");
     }
@@ -193,6 +217,7 @@ async fn file_db_full_write_query_roundtrip() {
                 "root",
                 "model_call",
                 r#"{"model":"test"}"#,
+                1,
                 1200,
             )
             .await
@@ -207,6 +232,7 @@ async fn file_db_full_write_query_roundtrip() {
                 Some("root"),
                 "user",
                 r#""hello""#,
+                1,
                 1300,
             )
             .await
@@ -220,6 +246,7 @@ async fn file_db_full_write_query_roundtrip() {
                 Some("root"),
                 "assistant",
                 r#""world""#,
+                2,
                 1400,
             )
             .await
@@ -232,7 +259,11 @@ async fn file_db_full_write_query_roundtrip() {
             .await
             .expect("reopen");
 
-        let en = store.get_execution_node("rr-en").await.expect("query").unwrap();
+        let en = store
+            .get_execution_node("rr-en")
+            .await
+            .expect("query")
+            .unwrap();
         assert_eq!(en.run_id, "rr-run");
         assert_eq!(en.agent_id, "root");
         assert_eq!(en.input_json, r#"{"task":"do"}"#);
@@ -245,6 +276,15 @@ async fn file_db_full_write_query_roundtrip() {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+
+        // The run-scoped conversation read (resume path) is also ordered by seq.
+        let by_run = store
+            .list_messages_by_run("rr-run")
+            .await
+            .expect("messages by run");
+        assert_eq!(by_run.len(), 2);
+        assert_eq!(by_run[0].id, "rr-msg-1");
+        assert_eq!(by_run[1].id, "rr-msg-2");
     }
 }
 

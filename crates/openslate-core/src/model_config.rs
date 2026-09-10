@@ -26,6 +26,19 @@ pub struct ResolvedModel {
     pub supports_vision: bool,
     /// Whether this model supports extended reasoning.
     pub supports_reasoning: bool,
+    /// Standard input price, USD per million tokens (P2-3).
+    pub input_price_per_mtok: Option<f64>,
+    /// Standard output price, USD per million tokens (P2-3).
+    pub output_price_per_mtok: Option<f64>,
+}
+
+impl ResolvedModel {
+    /// Pricing snapshot for this model (P2-3) — THE pricing helper shared
+    /// by the runtime loop (via `RunConfig::cost`) and the REPL's compact
+    /// summary accounting, so every consumer prices usage identically.
+    pub fn cost_spec(&self) -> crate::runtime::CostSpec {
+        crate::runtime::CostSpec::from_prices(self.input_price_per_mtok, self.output_price_per_mtok)
+    }
 }
 
 /// Resolve a model alias to a fully resolved model configuration.
@@ -33,12 +46,12 @@ pub struct ResolvedModel {
 /// # Errors
 /// - Returns `ConfigError::MissingRequiredModel` if the alias doesn't exist.
 /// - Returns `ConfigError::InvalidProviderRef` if the referenced provider doesn't exist.
-pub fn resolve_model(
-    config: &OpenSlateConfig,
-    alias: &str,
-) -> Result<ResolvedModel, ConfigError> {
+pub fn resolve_model(config: &OpenSlateConfig, alias: &str) -> Result<ResolvedModel, ConfigError> {
     let model = config.models.get(alias).ok_or_else(|| {
-        ConfigError::MissingRequiredModel(format!("Model alias '{}' not found in configuration", alias))
+        ConfigError::MissingRequiredModel(format!(
+            "Model alias '{}' not found in configuration",
+            alias
+        ))
     })?;
 
     let provider = config.providers.get(&model.provider).ok_or_else(|| {
@@ -56,6 +69,8 @@ pub fn resolve_model(
         supports_tool_call: model.supports_tool_call,
         supports_vision: model.supports_vision,
         supports_reasoning: model.supports_reasoning,
+        input_price_per_mtok: model.input_price_per_mtok,
+        output_price_per_mtok: model.output_price_per_mtok,
     })
 }
 
@@ -80,8 +95,7 @@ mod tests {
     use super::*;
 
     fn example_config() -> OpenSlateConfig {
-        crate::config::parse_openslate_toml(include_str!("../fixtures/openslate.toml"))
-        .unwrap()
+        crate::config::parse_openslate_toml(include_str!("../fixtures/openslate.toml")).unwrap()
     }
 
     #[test]
@@ -154,5 +168,47 @@ model = "ghost-model"
             "https://open.bigmodel.cn/api/paas/v4"
         );
         assert_eq!(resolved.provider.api_key_env, "ZHIPU_API_KEY");
+    }
+
+    #[test]
+    fn cost_spec_resolves_from_model_pricing() {
+        // The fixture keeps pricing commented out → unconfigured spec.
+        let config = example_config();
+        let main = resolve_model(&config, "main").unwrap();
+        assert!(!main.cost_spec().is_configured());
+        assert_eq!(
+            main.cost_spec().cost_of(&crate::types::Usage {
+                input_tokens: 5,
+                output_tokens: 5
+            }),
+            0.0
+        );
+
+        // With prices configured, the spec carries both through.
+        let toml = r#"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "K"
+
+[models.priced]
+provider = "p"
+model = "m"
+input_price_per_mtok = 1.5
+output_price_per_mtok = 3.0
+"#;
+        let config = crate::config::parse_openslate_toml(toml).unwrap();
+        let resolved = resolve_model(&config, "priced").unwrap();
+        let spec = resolved.cost_spec();
+        assert!(spec.is_configured());
+        assert_eq!(spec.input_price_per_mtok, Some(1.5));
+        assert_eq!(spec.output_price_per_mtok, Some(3.0));
+        assert!(
+            (spec.cost_of(&crate::types::Usage {
+                input_tokens: 2_000_000,
+                output_tokens: 1_000_000
+            }) - 6.0f64)
+                .abs()
+                < 1e-12
+        );
     }
 }

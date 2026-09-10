@@ -1,4 +1,5 @@
 use crate::types::{Message, MessageRole};
+use std::future::Future;
 
 const COMPACT_NAME: &str = "compact";
 const SUMMARY_PREFIX: &str = "[Conversation summary: ";
@@ -23,7 +24,21 @@ pub fn needs_compact(
     msg_usage > THRESHOLD_RATIO || byte_usage > THRESHOLD_RATIO
 }
 
-pub fn compact<F>(
+/// Replace older messages with a summary, keeping the most recent
+/// [`KEEP_RECENT_COUNT`] messages.
+///
+/// `summarize` is async so callers can route it through a real (fast) model;
+/// when it resolves to `None` — alias missing, provider error, empty reply —
+/// a mechanical concatenation of the tail of the older messages is used
+/// instead (degraded-but-working fallback, never an error).
+///
+/// # In-memory vs. on-disk history — intentional fork
+///
+/// After a compact, the in-memory history is the summarized version while
+/// any persisted transcript keeps the full, uncompressed messages. This is
+/// BY DESIGN, not a bug: `/resume` restores the uncompressed full history,
+/// trading a larger context for zero information loss across restarts.
+pub async fn compact<F, Fut>(
     messages: &mut Vec<Message>,
     system_prompt: Option<&str>,
     max_context_messages: usize,
@@ -31,7 +46,8 @@ pub fn compact<F>(
     summarize: F,
 ) -> CompactResult
 where
-    F: FnOnce(&str) -> Option<String>,
+    F: FnOnce(&str) -> Fut,
+    Fut: Future<Output = Option<String>>,
 {
     let messages_before = messages.len();
 
@@ -47,7 +63,10 @@ where
 
     let conversation_text = format_older_messages(older);
 
-    let summary = summarize(&conversation_text).unwrap_or_else(|| {
+    // `conversation_text` is an owned local, so the returned future is free
+    // to outlive the `&str` (and never borrows `messages`): the closure
+    // copies the text before awaiting.
+    let summary = summarize(&conversation_text).await.unwrap_or_else(|| {
         let keep = std::cmp::min(max_context_messages, split_point);
         let start = split_point.saturating_sub(keep);
         older[start..]
@@ -140,12 +159,13 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn compact_replaces_older_with_summary() {
+    #[tokio::test]
+    async fn compact_replaces_older_with_summary() {
         let mut msgs = make_messages(5);
-        let result = compact(&mut msgs, None, 100, 1_000_000, |_text| {
+        let result = compact(&mut msgs, None, 100, 1_000_000, |_text| async {
             Some("summary of conversation".to_owned())
-        });
+        })
+        .await;
 
         assert_eq!(result.messages_before, 10);
         assert_eq!(result.messages_after, 3);
@@ -155,12 +175,40 @@ mod tests {
         assert!(msgs[1].content.contains("user msg 4"));
     }
 
-    #[test]
-    fn compact_preserves_system_prompt_and_recent() {
+    #[tokio::test]
+    async fn compact_uses_async_summarize_future() {
+        // The summarize callback resolves a real future (with an actual
+        // await point) and receives the formatted older conversation.
         let mut msgs = make_messages(3);
-        let result = compact(&mut msgs, Some("system prompt"), 100, 1_000_000, |_text| {
-            Some("summarized".to_owned())
-        });
+        let result = compact(&mut msgs, None, 100, 1_000_000, |text: &str| {
+            let text = text.to_owned();
+            async move {
+                tokio::task::yield_now().await;
+                assert!(text.contains("User: user msg 0"));
+                assert!(text.contains("Assistant: assistant msg 1"));
+                Some("async summary".to_owned())
+            }
+        })
+        .await;
+
+        assert_eq!(result.messages_before, 6);
+        assert_eq!(result.messages_after, 3);
+        assert!(msgs[0].content.contains("async summary"));
+        assert_eq!(msgs[1].content, "user msg 2");
+        assert_eq!(msgs[2].content, "assistant msg 2");
+    }
+
+    #[tokio::test]
+    async fn compact_preserves_system_prompt_and_recent() {
+        let mut msgs = make_messages(3);
+        let result = compact(
+            &mut msgs,
+            Some("system prompt"),
+            100,
+            1_000_000,
+            |_text| async { Some("summarized".to_owned()) },
+        )
+        .await;
 
         assert_eq!(result.messages_before, 6);
         assert_eq!(result.messages_after, 3);
@@ -197,10 +245,10 @@ mod tests {
         assert!(!needs_compact(&msgs, 100, 1_000_000, 0));
     }
 
-    #[test]
-    fn fallback_truncation_when_summarize_fails() {
+    #[tokio::test]
+    async fn fallback_truncation_when_summarize_fails() {
         let mut msgs = make_messages(4);
-        let result = compact(&mut msgs, None, 100, 1_000_000, |_text| None);
+        let result = compact(&mut msgs, None, 100, 1_000_000, |_text| async { None }).await;
 
         assert_eq!(result.messages_before, 8);
         assert!(result.messages_after >= 3);
@@ -208,19 +256,20 @@ mod tests {
         assert!(msgs[0].content.contains("User:") || msgs[0].content.contains("Assistant:"));
     }
 
-    #[test]
-    fn compact_with_few_messages_is_noop() {
+    #[tokio::test]
+    async fn compact_with_few_messages_is_noop() {
         let mut msgs = make_messages(1);
-        let result = compact(&mut msgs, None, 100, 1_000_000, |_text| {
+        let result = compact(&mut msgs, None, 100, 1_000_000, |_text| async {
             panic!("should not be called")
-        });
+        })
+        .await;
 
         assert_eq!(result.messages_before, 2);
         assert_eq!(result.messages_after, 2);
     }
 
-    #[test]
-    fn compact_respects_byte_limit() {
+    #[tokio::test]
+    async fn compact_respects_byte_limit() {
         let mut msgs: Vec<Message> = (0..20)
             .map(|i| Message {
                 role: MessageRole::User,
@@ -231,9 +280,10 @@ mod tests {
             })
             .collect();
 
-        let result = compact(&mut msgs, None, 100, 200, |_text| {
+        let result = compact(&mut msgs, None, 100, 200, |_text| async {
             Some("short summary".to_owned())
-        });
+        })
+        .await;
 
         assert!(result.messages_after <= result.messages_before);
         let total: usize = msgs.iter().map(|m| m.content.len()).sum();

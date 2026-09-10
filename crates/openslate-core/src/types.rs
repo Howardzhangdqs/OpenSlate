@@ -46,8 +46,14 @@ macro_rules! id_type {
 id_type!(AgentId, "Unique identifier for an agent definition.");
 id_type!(RunId, "Unique identifier for a single agent run.");
 id_type!(StepId, "Unique identifier for a step within a run.");
-id_type!(ExecutionNodeId, "Unique identifier for a node in the execution tree.");
-id_type!(ToolCallId, "Unique identifier for a tool call within a step.");
+id_type!(
+    ExecutionNodeId,
+    "Unique identifier for a node in the execution tree."
+);
+id_type!(
+    ToolCallId,
+    "Unique identifier for a tool call within a step."
+);
 
 /// The role of a conversation message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

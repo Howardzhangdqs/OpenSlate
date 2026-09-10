@@ -5,11 +5,13 @@
 //! intercepts it and recursively runs the child agent. Non-`call_agent` tools
 //! are delegated to the shared [`ToolRegistry`].
 //!
-//! Design rationale: [`execute_run`] is NOT modified. The delegation seam is
+//! Design rationale: [`execute_run`] stays generic — the delegation seam is
 //! the [`ToolExecutor`] trait, which `execute_run` already invokes for every
 //! tool call (`runtime.rs:execute_tool_safely`). Passing an `AgentRunner` as
-//! that executor makes recursion happen naturally without touching the
-//! single-agent loop. See `.slim/deepwork/subagent-recursive-delegation.md`.
+//! that executor makes recursion happen naturally. Run-scoped concerns (the
+//! Phase 3 persistence sink, the Phase 4 cancellation token) are injected via
+//! builder methods and forwarded from `run_root`. See
+//! `.slim/deepwork/subagent-recursive-delegation.md`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -24,6 +26,7 @@ use openslate_ptc::{
 };
 
 use crate::agent_tree::AgentTree;
+use crate::approval::{ApprovalDecision, ApprovalManager};
 use crate::callable::child_agent_definitions;
 use crate::config::{OpenSlateConfig, PtcConfig};
 use crate::context::{build_child_context, ContextIsolationConfig};
@@ -31,13 +34,20 @@ use crate::error::OpenSlateError;
 use crate::execution::{ExecutionStatus, ExecutionTree};
 use crate::model_config::resolve_model;
 use crate::provider::{ModelProvider, ProgressCallback, ToolDefinition};
-use crate::runtime::{check_limits, execute_run, RunConfig, RunResult, RuntimeLimits};
+use crate::runtime::{
+    check_limits, execute_run, CancellationToken, MessageSink, RunConfig, RunResult, RuntimeLimits,
+};
 use crate::skills::SkillsCatalog;
 use crate::tool::{
     create_audit_record, limit_tool_output, Tool, ToolAuditRecord, ToolExecutor, ToolRegistry,
     TOOL_CALLER_DIRECT, TOOL_CALLER_RUN_CODE,
 };
 use crate::types::*;
+
+/// Consecutive approval denials of the same tool that trip the watchdog and
+/// abort the run (stops a model from hammering a denied tool forever; an
+/// `Approved` decision resets the tool's counter).
+const APPROVAL_DENIAL_LIMIT: u32 = 3;
 
 /// Snapshot of the currently-executing agent pushed onto the runner's call
 /// stack. `run_agent`/`run_root` push a frame on entry and pop it on exit
@@ -79,6 +89,26 @@ pub struct AgentRunner<'a> {
     /// construction (same pipeline as skills: wiring loads the config →
     /// RunManager holds it → AgentRunner snapshots the slice it needs).
     ptc: PtcConfig,
+    /// Approval gate (Phase 1), snapshotted from the RunManager at
+    /// construction — same pipeline as skills/ptc (wiring derives the
+    /// effective policy → RunManager holds the ApprovalManager → the
+    /// runner snapshots it per run). Defaults to `Auto` (approve
+    /// everything); consult `with_approval` / RunManager wiring.
+    approval: ApprovalManager,
+    /// Per-run message persistence sink (Phase 3), cloned from the
+    /// RunManager. Only the ROOT layer receives it (`run_root` passes it to
+    /// `execute_run`; child layers pass `None`) — resume rebuilds the root
+    /// conversation, and interleaving child-layer messages into the same
+    /// run row would corrupt the restored ordering.
+    message_sink: Option<Arc<dyn MessageSink>>,
+    /// Cooperative cancellation token (Phase 4), cloned from the RunManager.
+    /// Shared by every recursion layer — root AND children observe the same
+    /// token, so cancelling it stops the whole delegation tree: each layer's
+    /// `execute_run` returns `Ok(RunStatus::Interrupted)` with its partial
+    /// transcript at its next checkpoint (children do not need their own
+    /// trigger). A token already cancelled at `run_root` entry surfaces
+    /// `RuntimeError::Cancelled` — the variant's real trigger point.
+    cancel_token: CancellationToken,
 
     // Interior-mutable shared state across the run and recursion layers.
     execution_tree: Mutex<ExecutionTree>,
@@ -96,8 +126,23 @@ pub struct AgentRunner<'a> {
     /// PTC_PLAN.md §6.5. `Arc` so the `run_code` bridge closure (which must
     /// be 'static) can record into the same log.
     tool_audit_log: Arc<Mutex<Vec<ToolAuditRecord>>>,
+    /// Approval watchdog: consecutive `Denied` counts per tool name; an
+    /// `Approved` decision resets its tool's counter.
+    denial_counts: Mutex<HashMap<String, u32>>,
+    /// Tool that tripped the approval watchdog (reported in the abort
+    /// error).
+    watchdog_tool: Mutex<Option<String>>,
+    /// Wakes `run_root`'s abort branch when the approval watchdog trips.
+    abort_notify: tokio::sync::Notify,
     total_input_tokens: AtomicU64,
     total_output_tokens: AtomicU64,
+    /// Accumulated cost in USD across all layers of the run (P2-3): every
+    /// layer's `RunResult::total_cost_usd` (already priced with that
+    /// layer's own model pricing) folds in here — the same aggregation
+    /// path as the token counters. Mutex (not atomic) because f64 has no
+    /// atomic ops; folds happen once per completed layer, never racing
+    /// (`call_agent` batches run sequentially).
+    total_cost_usd: Mutex<f64>,
     /// Wall-clock deadline shared by the whole run. Each child layer gets
     /// `min(limits.timeout_ms, remaining_to_deadline)` as its timeout.
     root_deadline: tokio::time::Instant,
@@ -148,15 +193,54 @@ impl<'a> AgentRunner<'a> {
             run_id,
             skills_section,
             ptc: config.ptc.clone(),
+            approval: ApprovalManager::auto(),
+            message_sink: None,
+            cancel_token: CancellationToken::new(),
             execution_tree: Mutex::new(execution_tree),
             caller_stack: Mutex::new(Vec::new()),
             child_call_count: AtomicU32::new(0),
             tool_call_count: AtomicU32::new(0),
             tool_audit_log: Arc::new(Mutex::new(Vec::new())),
+            denial_counts: Mutex::new(HashMap::new()),
+            watchdog_tool: Mutex::new(None),
+            abort_notify: tokio::sync::Notify::new(),
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
+            total_cost_usd: Mutex::new(0.0),
             root_deadline,
         }
+    }
+
+    /// Attach the approval manager (builder style).
+    ///
+    /// The manager is cloned from the RunManager (config → RunManager →
+    /// AgentRunner snapshot, same pipeline as skills/ptc). The callback
+    /// inside it is `Arc`-shared, so session-level state (e.g. a REPL
+    /// allowlist) is observed by every recursion layer of the run.
+    pub fn with_approval(mut self, approval: ApprovalManager) -> Self {
+        self.approval = approval;
+        self
+    }
+
+    /// Attach the per-run message persistence sink (builder style, Phase 3).
+    ///
+    /// Cloned from the RunManager's `message_sink`; the root layer forwards
+    /// it to `execute_run` so every appended assistant message / tool result
+    /// is persisted inline before the loop continues.
+    pub fn with_message_sink(mut self, sink: Option<Arc<dyn MessageSink>>) -> Self {
+        self.message_sink = sink;
+        self
+    }
+
+    /// Attach the run's cancellation token (builder style, Phase 4).
+    ///
+    /// Cloned from the RunManager's token; both the root layer and every
+    /// child layer forward it to their `execute_run` so Ctrl-C stops the
+    /// whole delegation tree at the next checkpoint, gracefully, with
+    /// partial transcripts.
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = token;
+        self
     }
 
     /// Total input tokens accumulated across the whole run (all layers).
@@ -167,6 +251,23 @@ impl<'a> AgentRunner<'a> {
     /// Total output tokens accumulated across the whole run (all layers).
     pub fn total_output_tokens(&self) -> u64 {
         self.total_output_tokens.load(Ordering::Relaxed)
+    }
+
+    /// Total cost in USD accumulated across the whole run (all layers,
+    /// each priced with its own model's pricing — P2-3).
+    pub fn total_cost_usd(&self) -> f64 {
+        *self.total_cost_usd.lock().expect("total_cost_usd poisoned")
+    }
+
+    /// Fold a completed layer's usage totals (tokens and cost) into the
+    /// run-wide accumulators. Called for the root result AND every child
+    /// result, which is how delegated spend aggregates into the root.
+    fn accumulate_tokens(&self, result: &RunResult) {
+        self.total_input_tokens
+            .fetch_add(result.total_input_tokens, Ordering::Relaxed);
+        self.total_output_tokens
+            .fetch_add(result.total_output_tokens, Ordering::Relaxed);
+        *self.total_cost_usd.lock().expect("total_cost_usd poisoned") += result.total_cost_usd;
     }
 
     /// Take a snapshot of the execution tree built during the run.
@@ -210,6 +311,72 @@ impl<'a> AgentRunner<'a> {
             .lock()
             .expect("tool_audit_log poisoned")
             .push(create_audit_record(name, caller, args, output));
+    }
+
+    /// Agent whose loop emitted the current tool call (the top caller
+    /// frame, or the root agent when `execute` is invoked outside a run —
+    /// direct test invocation).
+    fn current_agent_id(&self) -> AgentId {
+        self.current_frame()
+            .map(|f| f.agent_id)
+            .unwrap_or_else(|| self.agent_tree.get_root().id.clone())
+    }
+
+    /// Record a consecutive denial for `name`; returns `true` when the
+    /// watchdog limit is reached (the caller aborts the run).
+    fn note_denial(&self, name: &str) -> bool {
+        let mut counts = self.denial_counts.lock().expect("denial_counts poisoned");
+        let count = counts.entry(name.to_owned()).or_insert(0);
+        *count += 1;
+        *count >= APPROVAL_DENIAL_LIMIT
+    }
+
+    /// Reset the consecutive-denial counter for `name` (approved call).
+    fn clear_denials(&self, name: &str) {
+        self.denial_counts
+            .lock()
+            .expect("denial_counts poisoned")
+            .remove(name);
+    }
+
+    /// Build the watchdog abort error once the watchdog has tripped.
+    fn watchdog_error(&self, agent_id: &AgentId) -> Option<OpenSlateError> {
+        let tool = self
+            .watchdog_tool
+            .lock()
+            .expect("watchdog_tool poisoned")
+            .clone()?;
+        Some(OpenSlateError::Runtime(
+            crate::error::RuntimeError::ApprovalAbort {
+                tool_name: tool,
+                agent_id: agent_id.0.clone(),
+                denials: APPROVAL_DENIAL_LIMIT,
+            },
+        ))
+    }
+
+    /// Translate a denied approval into an errors-as-data tool result and
+    /// feed the consecutive-denial watchdog.
+    ///
+    /// The denial is audited into the in-memory tool log (as an error
+    /// result attributed to the direct caller) and via `tracing`; nothing
+    /// is written to the store.
+    fn denied_output(&self, name: &str, args: &serde_json::Value, reason: String) -> ToolOutput {
+        let tripped = self.note_denial(name);
+        let out = self.error_output(format!(
+            "approval denied tool '{name}': {reason}\n\
+             不要重试同一调用,请换方案或直接作答。"
+        ));
+        self.record_tool_audit(name, TOOL_CALLER_DIRECT, args, &out);
+        if tripped {
+            tracing::warn!(
+                target: "openslate_approval",
+                "tool '{name}' denied {APPROVAL_DENIAL_LIMIT} consecutive times — aborting run"
+            );
+            *self.watchdog_tool.lock().expect("watchdog_tool poisoned") = Some(name.to_owned());
+            self.abort_notify.notify_one();
+        }
+        out
     }
 
     /// Append the skills catalog section (if any) to a system prompt.
@@ -346,13 +513,6 @@ impl<'a> AgentRunner<'a> {
             .cloned()
     }
 
-    fn accumulate_tokens(&self, result: &RunResult) {
-        self.total_input_tokens
-            .fetch_add(result.total_input_tokens, Ordering::Relaxed);
-        self.total_output_tokens
-            .fetch_add(result.total_output_tokens, Ordering::Relaxed);
-    }
-
     fn update_exec_status(&self, exec_id: &ExecutionNodeId, status: ExecutionStatus) {
         let mut tree = self.execution_tree.lock().expect("execution_tree poisoned");
         tree.update_status(exec_id, status);
@@ -380,6 +540,18 @@ impl<'a> AgentRunner<'a> {
         prior_messages: Vec<Message>,
         progress: Option<&mut dyn ProgressCallback>,
     ) -> Result<RunResult, OpenSlateError> {
+        // Cancellation (Phase 4): a token already cancelled at entry means
+        // the run was stopped before it started — there is no partial
+        // transcript to return gracefully, so `RuntimeError::Cancelled` is
+        // surfaced here (the variant's real trigger point; a cancellation
+        // observed mid-loop instead returns `Ok(RunStatus::Interrupted)`
+        // with the partial messages from execute_run's checkpoints).
+        if self.cancel_token.is_cancelled() {
+            return Err(OpenSlateError::Runtime(
+                crate::error::RuntimeError::Cancelled,
+            ));
+        }
+
         let root = self.agent_tree.get_root();
         let root_exec_id = self
             .execution_tree
@@ -413,16 +585,53 @@ impl<'a> AgentRunner<'a> {
             tool_definitions: self.tool_definitions_for(&root.id),
             timeout_ms: self.limits.timeout_ms,
             depth: 0,
+            parallel_tool_calls: self.limits.parallel_tool_calls,
+            // P2-3: pricing resolved here, at RunConfig construction, from
+            // the same config source as the model itself — execute_run
+            // stays config-unaware.
+            cost: resolved.cost_spec(),
         };
 
-        let result = execute_run(
-            self.provider,
-            run_config,
-            &resolved.model_id,
-            self,
-            progress,
-        )
-        .await;
+        // Drive the root loop, racing it against the approval watchdog: a
+        // tripped watchdog (same tool denied APPROVAL_DENIAL_LIMIT times
+        // consecutively) aborts the whole run — including any in-flight
+        // child layers, since dropping this future cancels everything it
+        // transitively awaits. `biased` polls the abort branch first, so a
+        // stored permit wins even if the loop raced toward completion; the
+        // post-select re-check then makes the abort deterministic even when
+        // the loop never yields (e.g. an instantly-completing provider).
+        //
+        // Cancellation (Phase 4) deliberately has NO branch here: the token
+        // is observed inside `execute_run` (checkpoints before/inside
+        // provider calls and around tool execution), which returns
+        // `Ok(RunStatus::Interrupted)` with the partial transcript — racing
+        // the loop in this select would drop it and lose the context.
+        let outcome = tokio::select! {
+            biased;
+            _ = self.abort_notify.notified() => None,
+            r = execute_run(
+                self.provider,
+                run_config,
+                &resolved.model_id,
+                self,
+                self.message_sink.as_deref(),
+                progress,
+                Some(&self.cancel_token),
+            ) => Some(r),
+        };
+        let result = match self.watchdog_error(&root.id) {
+            Some(err) => Err(err),
+            None => match outcome {
+                Some(r) => r,
+                // The abort branch fired without a recorded watchdog trip
+                // (spurious notify): the run was halted from outside its
+                // loop, so its context cannot be recovered here — report it
+                // as a cancellation of the whole run.
+                None => Err(OpenSlateError::Runtime(
+                    crate::error::RuntimeError::Cancelled,
+                )),
+            },
+        };
 
         // Update root status from the outcome, then accumulate tokens.
         match &result {
@@ -501,20 +710,32 @@ impl<'a> AgentRunner<'a> {
                 tool_definitions: self.tool_definitions_for(&agent_id),
                 timeout_ms: self.child_timeout_ms(),
                 depth,
+                parallel_tool_calls: self.limits.parallel_tool_calls,
+                // P2-3: the child prices its OWN model alias (e.g. `fast`),
+                // so a mixed main/fast delegation accumulates each layer's
+                // spend at the right rate.
+                cost: resolved.cost_spec(),
             };
 
             // Drive the child with the same streaming progress path the root
             // uses, but via a text-mode callback (ChildProgress) that emits
             // indented tracing lines — so reasoning, tool calls, answer, and
-            // per-step stats all show up nested under the parent, matching the
-            // root's output format minus the spinner TUI.
+            // per-step stats all show up nested under the parent, matching
+            // the root's output format minus the spinner TUI.
+            //
+            // The child observes the SAME cancellation token as the root
+            // (Phase 4): cancelling stops every layer at its next
+            // checkpoint; the child's partial result flows back through the
+            // Interrupted branch of handle_call_agent.
             let mut child_progress = ChildProgress::new(depth, agent_id.0.clone());
             let result = execute_run(
                 self.provider,
                 run_config,
                 &resolved.model_id,
                 self,
+                None,
                 Some(&mut child_progress),
+                Some(&self.cancel_token),
             )
             .await;
 
@@ -1018,6 +1239,19 @@ impl ProgressCallback for ChildProgress {
 #[async_trait]
 impl<'a> ToolExecutor for AgentRunner<'a> {
     async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput {
+        // Approval gate — the single choke point every tool call passes
+        // through, at the very top (BEFORE the call_agent branch and every
+        // budget check), so child-agent layers (same runner) and `run_code`
+        // (PTC) are covered too; the PTC bridge's inner sandbox calls are
+        // deliberately covered by the one approval granted to `run_code`
+        // (always assessed high-risk). A denial is errors-as-data: the
+        // model sees the refusal with guidance and self-heals; the
+        // consecutive-denial watchdog aborts runs that keep retrying.
+        let agent_id = self.current_agent_id();
+        if let ApprovalDecision::Denied(reason) = self.approval.check(name, args, &agent_id.0) {
+            return self.denied_output(name, args, reason);
+        }
+        self.clear_denials(name);
         if name == "call_agent" {
             return self.handle_call_agent(args).await;
         }
@@ -1407,6 +1641,113 @@ model = "mock-fast"
         let node_count = exec.node_count();
         assert_eq!(node_count, 2, "root + child execution nodes");
         assert_eq!(runner.child_call_count(), 1);
+    }
+
+    // ── Cost aggregation across delegation (P2-3) ────────────────────────
+
+    /// Config where `main` and `fast` carry DIFFERENT prices, so a mixed
+    /// delegation must price each layer at its own rate.
+    fn priced_test_config() -> OpenSlateConfig {
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "mock-model"
+input_price_per_mtok = 2.0
+output_price_per_mtok = 4.0
+
+[models.fast]
+provider = "mock"
+model = "mock-fast"
+input_price_per_mtok = 0.5
+output_price_per_mtok = 1.0
+"#;
+        crate::config::parse_openslate_toml(toml).expect("config should parse")
+    }
+
+    fn response_with_usage(
+        content: Option<&str>,
+        tool_calls: Vec<ToolCall>,
+        usage: Usage,
+    ) -> ModelResponse {
+        let has_calls = !tool_calls.is_empty();
+        ModelResponse {
+            content: content.map(|c| c.to_owned()),
+            tool_calls,
+            usage: Some(usage),
+            finish_reason: Some(if has_calls { "tool_calls" } else { "stop" }.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_prices_mixed_model_delegation_per_layer() {
+        // root step 1 (main, 1000 in / 100 out → $2e-3·1 + $4e-6·0.1k = 0.0024)
+        //   → call_agent(child)
+        // child step 1 (fast, 500 in / 50 out → 0.5e-6·500 + 1e-6·50 = 0.0003)
+        // root step 2 (main, 2000 in / 200 out → 0.0048)
+        // run total = 0.0024 + 0.0003 + 0.0048 = 0.0075
+        let provider = ScriptedProvider::new(vec![
+            response_with_usage(
+                None,
+                vec![call_agent_tool_call("ca-1", "child", "greet")],
+                Usage {
+                    input_tokens: 1_000,
+                    output_tokens: 100,
+                },
+            ),
+            response_with_usage(
+                Some("Hello from child"),
+                vec![],
+                Usage {
+                    input_tokens: 500,
+                    output_tokens: 50,
+                },
+            ),
+            response_with_usage(
+                Some("Delegation done"),
+                vec![],
+                Usage {
+                    input_tokens: 2_000,
+                    output_tokens: 200,
+                },
+            ),
+        ]);
+
+        let config = priced_test_config();
+        let tree = root_child_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        );
+
+        let result = runner
+            .run_root(vec![user_message("delegate please")], None)
+            .await
+            .expect("run ok");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        // The root's own RunResult prices only the root layer...
+        assert!(
+            (result.total_cost_usd - 0.0072f64).abs() < 1e-12,
+            "root layer cost = 0.0024 + 0.0048, got {}",
+            result.total_cost_usd
+        );
+        // ...while the runner aggregates the child's fast-priced spend in.
+        assert!(
+            (runner.total_cost_usd() - 0.0075f64).abs() < 1e-12,
+            "run-wide cost must include the child layer, got {}",
+            runner.total_cost_usd()
+        );
     }
 
     #[tokio::test]
@@ -2598,6 +2939,698 @@ enabled = true
             out.content.contains("not found") && !out.content.contains("ptc-only"),
             "expected unknown-tool error, got: {}",
             out.content
+        );
+    }
+
+    // ── Approval gating (Phase 1) ─────────────────────────────────────────
+
+    use crate::approval::{ApprovalCallback, ApprovalRequest};
+
+    /// Denies every approval request.
+    struct DenyAll;
+    impl ApprovalCallback for DenyAll {
+        fn decide(&self, _req: &ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Denied("denied by test policy".to_owned())
+        }
+    }
+
+    /// Denies only the named tool; approves everything else.
+    struct DenyTool(&'static str);
+    impl ApprovalCallback for DenyTool {
+        fn decide(&self, req: &ApprovalRequest) -> ApprovalDecision {
+            if req.tool_name == self.0 {
+                ApprovalDecision::Denied(format!("{} is not allowed here", self.0))
+            } else {
+                ApprovalDecision::Approved
+            }
+        }
+    }
+
+    /// Denies the first N approval requests, approves the rest.
+    struct DenyFirstN {
+        remaining: Mutex<u32>,
+    }
+    impl ApprovalCallback for DenyFirstN {
+        fn decide(&self, _req: &ApprovalRequest) -> ApprovalDecision {
+            let mut remaining = self.remaining.lock().expect("remaining poisoned");
+            if *remaining > 0 {
+                *remaining -= 1;
+                ApprovalDecision::Denied("first call denied".to_owned())
+            } else {
+                ApprovalDecision::Approved
+            }
+        }
+    }
+
+    fn manual_with(callback: Arc<dyn ApprovalCallback>) -> ApprovalManager {
+        ApprovalManager::manual().with_callback(callback)
+    }
+
+    fn echo_call(id: &str, x: i64) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(id.into()),
+            name: "mock_echo".into(),
+            arguments: serde_json::json!({"x": x}),
+        }
+    }
+
+    fn tool_call_response(calls: Vec<ToolCall>) -> ModelResponse {
+        ModelResponse {
+            content: None,
+            tool_calls: calls,
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_manual_blocks_run_code_under_ptc() {
+        // PTC enabled + manual policy: the run_code invocation itself is
+        // gated (hard-coded high risk) — the sandbox must never start, so
+        // the bound tool is never reached through the bridge either.
+        let config = ptc_config("");
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyAll)));
+
+        let out = runner
+            .execute(
+                "run_code",
+                &serde_json::json!({
+                    "code": "async () => { return await tools.mock_echo({x:1}); }"
+                }),
+            )
+            .await;
+
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("approval denied tool 'run_code'"),
+            "expected denial message, got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("不要重试同一调用"),
+            "denial must tell the model not to retry, got: {}",
+            out.content
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "tool must not run");
+        assert_eq!(
+            runner.tool_call_count(),
+            0,
+            "denied calls do not consume the tool-call budget"
+        );
+        // The denial is audited (errors-as-data, direct attribution).
+        let records = runner.tool_audit_records();
+        let denied = records
+            .iter()
+            .find(|r| r.tool_name == "run_code")
+            .expect("denial audited");
+        assert_eq!(denied.output_status, "error");
+        assert_eq!(denied.caller, "direct");
+    }
+
+    #[tokio::test]
+    async fn approval_gate_covers_call_agent_calls() {
+        // Manual + deny-all: even the call_agent dispatch itself is denied
+        // before handle_call_agent runs (gate sits above the branch).
+        let config = test_config();
+        let tree = root_child_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &NoopProvider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyAll)));
+
+        let out = runner
+            .execute(
+                "call_agent",
+                &serde_json::json!({"agent_id": "child", "task": "x"}),
+            )
+            .await;
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("approval denied tool 'call_agent'"),
+            "got: {}",
+            out.content
+        );
+        assert_eq!(runner.child_call_count(), 0, "no child spawned");
+        assert_eq!(runner.execution_tree().node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_propagates_to_child_agent_tool_calls() {
+        // root delegates to child; the child's own tool call goes through
+        // the SAME runner (and thus the same approval manager) and is
+        // denied there. The child sees the refusal as data and finishes;
+        // the root still completes.
+        let provider = ScriptedProvider::new(vec![
+            // root: delegate to child
+            tool_call_response(vec![call_agent_tool_call("ca-1", "child", "do it")]),
+            // child: calls mock_echo (denied)
+            tool_call_response(vec![echo_call("tc-child", 1)]),
+            // child: recovers with a final answer
+            assistant_text("child could not echo"),
+            // root: final answer
+            assistant_text("root done"),
+        ]);
+
+        let config = test_config();
+        let tree = root_child_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyTool("mock_echo"))));
+
+        let result = runner
+            .run_root(vec![user_message("delegate")], None)
+            .await
+            .expect("run ok");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "child's tool call must not execute"
+        );
+        // The child layer ran (its denial happened inside the child's own
+        // loop, via the shared runner).
+        assert_eq!(runner.execution_tree().node_count(), 2);
+        let records = runner.tool_audit_records();
+        let denied = records
+            .iter()
+            .find(|r| r.tool_name == "mock_echo")
+            .expect("child-layer denial audited");
+        assert_eq!(denied.output_status, "error");
+        assert_eq!(denied.caller, "direct");
+    }
+
+    #[tokio::test]
+    async fn approval_watchdog_aborts_run_after_three_consecutive_denials() {
+        // The model keeps requesting the same denied tool; on the third
+        // consecutive denial the watchdog aborts the whole run with an
+        // error instead of looping forever.
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![echo_call("tc-1", 1)]),
+            tool_call_response(vec![echo_call("tc-2", 1)]),
+            tool_call_response(vec![echo_call("tc-3", 1)]),
+            // Never reached: the run aborts right after the third denial.
+            assistant_text("done"),
+        ]);
+
+        let config = test_config();
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyAll)));
+
+        let err = runner
+            .run_root(vec![user_message("keep trying the tool")], None)
+            .await
+            .expect_err("watchdog must abort the run");
+        assert!(
+            matches!(
+                &err,
+                OpenSlateError::Runtime(crate::error::RuntimeError::ApprovalAbort {
+                    tool_name,
+                    denials: 3,
+                    ..
+                }) if tool_name == "mock_echo"
+            ),
+            "expected ApprovalAbort for mock_echo after 3 denials, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("watchdog") && msg.contains("mock_echo"),
+            "error should name the tool and the watchdog, got: {msg}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "tool never ran");
+        // Root execution node is marked failed by run_root's error path.
+        assert_eq!(
+            runner.execution_tree().root().status,
+            crate::execution::ExecutionStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_result_self_heals_and_counter_resets() {
+        // First request is denied (errors-as-data back to the model with
+        // retry guidance); the second identical request is approved — the
+        // consecutive-denial counter reset on the approval proves the
+        // watchdog only counts CONSECUTIVE denials.
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![echo_call("tc-1", 1)]),
+            tool_call_response(vec![echo_call("tc-2", 2)]),
+            assistant_text("recovered"),
+        ]);
+
+        let config = test_config();
+        let tree = root_only_tree();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyFirstN {
+            remaining: Mutex::new(1),
+        })));
+
+        let result = runner
+            .run_root(vec![user_message("try the tool")], None)
+            .await
+            .expect("run ok");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let tool_msgs: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 2, "two tool-call turns");
+        assert!(
+            tool_msgs[0]
+                .content
+                .contains("approval denied tool 'mock_echo'"),
+            "got: {}",
+            tool_msgs[0].content
+        );
+        assert!(
+            tool_msgs[0].content.contains("不要重试同一调用"),
+            "denial guidance missing, got: {}",
+            tool_msgs[0].content
+        );
+        assert!(
+            tool_msgs[1].content.contains("echo:2"),
+            "second call must execute, got: {}",
+            tool_msgs[1].content
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Parallel batches + approval (P2-1) ───────────────────────────────
+
+    /// Second registry tool for mixed parallel batches ("mock_echo" is
+    /// CountingEchoTool's fixed name).
+    struct CountingOtherTool {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl crate::tool::Tool for CountingOtherTool {
+        fn name(&self) -> &str {
+            "mock_other"
+        }
+        fn description(&self) -> &str {
+            "Second tool for parallel-batch approval tests"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<ToolOutput, crate::error::ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "other done".into(),
+                bytes: 11,
+                duration_ms: 1,
+                status: ToolOutputStatus::Success,
+            })
+        }
+    }
+
+    fn other_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId(id.into()),
+            name: "mock_other".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_denial_is_independent_errors_as_data() {
+        // One parallel batch mixes a denied tool and an approved sibling
+        // (no call_agent/run_code → the P2-1 concurrent path): the denial
+        // is errors-as-data for ITS OWN call only — the sibling executes
+        // normally and the run completes (a single denial never trips the
+        // watchdog).
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![echo_call("tc-d", 1), other_call("tc-o")]),
+            assistant_text("mixed batch done"),
+        ]);
+
+        let config = test_config();
+        let tree = root_only_tree();
+        let echo_calls = Arc::new(AtomicUsize::new(0));
+        let other_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: echo_calls.clone(),
+        });
+        registry.register(CountingOtherTool {
+            calls: other_calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyTool("mock_echo"))));
+
+        let result = runner
+            .run_root(vec![user_message("mixed batch")], None)
+            .await
+            .expect("run ok");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(
+            echo_calls.load(Ordering::SeqCst),
+            0,
+            "denied tool never ran"
+        );
+        assert_eq!(other_calls.load(Ordering::SeqCst), 1, "sibling executed");
+
+        // Both calls got their tool results, in tool_call order.
+        let tool_msgs: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(tool_msgs[0].tool_call_id, Some(ToolCallId("tc-d".into())));
+        assert!(
+            tool_msgs[0]
+                .content
+                .contains("approval denied tool 'mock_echo'"),
+            "denial guidance, got: {}",
+            tool_msgs[0].content
+        );
+        assert_eq!(tool_msgs[1].tool_call_id, Some(ToolCallId("tc-o".into())));
+        assert_eq!(tool_msgs[1].content, "other done");
+    }
+
+    #[tokio::test]
+    async fn approval_watchdog_trips_across_parallel_batches() {
+        // Three steps each carry a REAL parallel batch (denied mock_echo +
+        // approved mock_other): the third consecutive mock_echo denial
+        // trips the watchdog and aborts the run — concurrent dispatch
+        // does not bypass the AgentRunner::execute choke point.
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![echo_call("tc-1", 1), other_call("tc-o1")]),
+            tool_call_response(vec![echo_call("tc-2", 1), other_call("tc-o2")]),
+            tool_call_response(vec![echo_call("tc-3", 1), other_call("tc-o3")]),
+            // Never reached: the run aborts right after the third denial.
+            assistant_text("done"),
+        ]);
+
+        let config = test_config();
+        let tree = root_only_tree();
+        let echo_calls = Arc::new(AtomicUsize::new(0));
+        let other_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingEchoTool {
+            calls: echo_calls.clone(),
+        });
+        registry.register(CountingOtherTool {
+            calls: other_calls.clone(),
+        });
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_approval(manual_with(Arc::new(DenyTool("mock_echo"))));
+
+        let err = runner
+            .run_root(vec![user_message("keep trying the tool")], None)
+            .await
+            .expect_err("watchdog must abort the run");
+        assert!(
+            matches!(
+                &err,
+                OpenSlateError::Runtime(crate::error::RuntimeError::ApprovalAbort {
+                    tool_name,
+                    denials: 3,
+                    ..
+                }) if tool_name == "mock_echo"
+            ),
+            "expected ApprovalAbort for mock_echo after 3 denials, got {err:?}"
+        );
+        assert_eq!(
+            echo_calls.load(Ordering::SeqCst),
+            0,
+            "denied tool never ran"
+        );
+        // The approved sibling ran in every batch (the parallel path
+        // dispatches it alongside each denial).
+        assert_eq!(other_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            runner.execution_tree().root().status,
+            crate::execution::ExecutionStatus::Failed
+        );
+    }
+
+    // ── Cancellation (Phase 4) ────────────────────────────────────────────
+
+    /// Provider whose `generate` counts calls (proving a pre-cancelled run
+    /// never reaches the provider).
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelProvider for CountingProvider {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(assistant_text("never expected"))
+        }
+        fn provider_name(&self) -> &str {
+            "counting"
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_pre_cancelled_token_returns_cancelled_error() {
+        // RuntimeError::Cancelled's real trigger point: a token already
+        // cancelled at run_root entry means the run never started — there is
+        // no partial transcript to return as Interrupted.
+        let provider = CountingProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let config = test_config();
+        let tree = root_only_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let token = CancellationToken::new();
+        token.cancel();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_cancel_token(token);
+
+        let err = runner
+            .run_root(vec![user_message("go")], None)
+            .await
+            .expect_err("pre-cancelled run must fail with Cancelled");
+        assert!(
+            matches!(
+                err,
+                OpenSlateError::Runtime(crate::error::RuntimeError::Cancelled)
+            ),
+            "expected RuntimeError::Cancelled, got {err:?}"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "provider must not be called"
+        );
+    }
+
+    /// Root uses non-streaming `generate` (progress=None in tests); the
+    /// child layer streams via `generate_stream`. This provider scripts the
+    /// root's responses and makes the child's stream stick forever after
+    /// announcing it started — the exact shape a Ctrl-C interrupts.
+    struct ChildStuckProvider {
+        responses: Vec<ModelResponse>,
+        generate_calls: AtomicUsize,
+        child_started: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl ModelProvider for ChildStuckProvider {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
+            let idx = self.generate_calls.fetch_add(1, Ordering::SeqCst);
+            self.responses
+                .get(idx)
+                .cloned()
+                .ok_or(ProviderError::ServerError(500))
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: GenerateRequest,
+        ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            self.child_started.notify_one();
+            tokio::spawn(async move {
+                // Hold the sender open forever (a real binding — `let _ =`
+                // would NOT capture it, the channel would close instantly).
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            });
+            rx
+        }
+
+        fn provider_name(&self) -> &str {
+            "child-stuck"
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_cancel_during_child_delegation_returns_interrupted() {
+        // root delegates to child → child's stream sticks → token cancelled
+        // → child returns Interrupted (partial) → its "[did not finish]"
+        // tool output lands in the root transcript → the root's next
+        // checkpoint observes the same token and stops the whole run.
+        let provider = ChildStuckProvider {
+            responses: vec![
+                tool_call_response(vec![call_agent_tool_call("ca-1", "child", "sub-task")]),
+                assistant_text("root final (never reached)"),
+            ],
+            generate_calls: AtomicUsize::new(0),
+            child_started: Arc::new(tokio::sync::Notify::new()),
+        };
+        let token = CancellationToken::new();
+
+        let canceller = {
+            let token = token.clone();
+            let started = Arc::clone(&provider.child_started);
+            tokio::spawn(async move {
+                started.notified().await;
+                token.cancel();
+            })
+        };
+
+        let config = test_config();
+        let tree = root_child_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            RuntimeLimits::default(),
+            RunId("t".into()),
+        )
+        .with_cancel_token(token);
+
+        let result = runner
+            .run_root(vec![user_message("delegate please")], None)
+            .await
+            .expect("cancelled delegation run still returns Ok");
+        canceller.abort();
+
+        assert_eq!(result.status, RunStatus::Interrupted);
+        // The delegation hop is in the partial transcript with its pairing
+        // intact — filled by a synthetic cancelled result (the in-flight
+        // child future was dropped at the checkpoint, aborting it).
+        let tool_msg = result
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("call_agent hop present");
+        assert!(
+            tool_msg.content.contains("cancelled"),
+            "expected cancelled marker for the aborted delegation, got: {}",
+            tool_msg.content
+        );
+        assert_eq!(
+            tool_msg.tool_call_id,
+            Some(ToolCallId("ca-1".into())),
+            "tool result must pair with the call_agent call"
+        );
+        // The root never issued its second request (loop-top checkpoint).
+        assert_eq!(
+            provider.generate_calls.load(Ordering::SeqCst),
+            1,
+            "root's second provider call must not happen"
         );
     }
 }

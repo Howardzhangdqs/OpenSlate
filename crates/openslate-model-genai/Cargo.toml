@@ -17,3 +17,6 @@ futures = "0.3"
 
 [dev-dependencies]
 mockito = { workspace = true }
+# "net" (raw TCP test servers for the retry-boundary tests) merges with the
+# workspace feature set for this crate's tests only.
+tokio = { workspace = true, features = ["net"] }

@@ -61,7 +61,8 @@ impl AgentTree {
         }
 
         // Find root(s) — agents that are NOT children of any other agent
-        let all_children: HashSet<&AgentId> = agents.iter().flat_map(|a| a.children.iter()).collect();
+        let all_children: HashSet<&AgentId> =
+            agents.iter().flat_map(|a| a.children.iter()).collect();
         let roots: Vec<&AgentConfig> = agents
             .iter()
             .filter(|a| !all_children.contains(&a.id))
@@ -288,16 +289,14 @@ mod tests {
 
     #[test]
     fn test_invalid_child_ref() {
-        let configs = vec![
-            AgentConfig {
-                id: AgentId("root".into()),
-                name: "Root".into(),
-                model: "m".into(),
-                children: vec![AgentId("ghost".into())],
-                tools: vec![],
-                default_prompt: "".into(),
-            },
-        ];
+        let configs = vec![AgentConfig {
+            id: AgentId("root".into()),
+            name: "Root".into(),
+            model: "m".into(),
+            children: vec![AgentId("ghost".into())],
+            tools: vec![],
+            default_prompt: "".into(),
+        }];
         let err = AgentTree::from_configs(&configs).unwrap_err();
         assert!(
             matches!(

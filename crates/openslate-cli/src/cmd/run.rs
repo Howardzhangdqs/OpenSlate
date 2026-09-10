@@ -243,7 +243,7 @@ fn generate_jsonl_events(result: &openslate_core::run_manager::ManagedRunResult)
     let run_end = serde_json::json!({
         "type": "run_end",
         "run_id": result.run_id.to_string(),
-        "status": serde_json::to_string(&result.status).unwrap().trim_matches('"'),
+        "status": status_str(result.status),
         "steps": result.total_steps,
         "input_tokens": result.total_input_tokens,
         "output_tokens": result.total_output_tokens,
@@ -700,13 +700,21 @@ pub(crate) fn build_provider_for_model(
         .clone()
         .or_else(|| Some("openai".to_owned()));
 
+    // Provider HTTP timeout: pass through the effective [limits].timeout_ms
+    // (rounded up to whole seconds, min 1s). A missing [limits] section (or a
+    // degenerate 0) falls back to 60s.
+    let timeout_secs = match config.limits.as_ref().map(|l| l.timeout_ms) {
+        Some(ms) if ms > 0 => ms.div_ceil(1000),
+        _ => 60,
+    };
+
     let cfg = openslate_model_genai::GenaiConfig {
         provider_name: resolved.provider_name.clone(),
         model: resolved.model_id.clone(),
         api_key: Some(api_key),
         base_url: Some(resolved.provider.base_url.clone()),
         adapter,
-        timeout_secs: 60,
+        timeout_secs,
         max_attempts: resolved.provider.max_attempts,
         retry_base_ms: resolved.provider.retry_base_ms,
     };

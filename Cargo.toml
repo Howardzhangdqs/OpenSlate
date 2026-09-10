@@ -24,7 +24,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Serialization
 serde = { version = "1.0.227", features = ["derive"] }
 serde_json = "1.0.148"
-serde_yml = "0.0.13"
+# serde_yaml fork lineage: serde_yml (RUSTSEC-2025-0068, unmaintained) →
+# serde_norway, the maintained drop-in successor.
+serde_norway = "0.9"
 toml = "0.9"
 
 # Error handling

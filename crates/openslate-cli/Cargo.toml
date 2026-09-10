@@ -2,6 +2,7 @@
 name = "openslate-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "openslate"
@@ -20,7 +21,7 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
 dirs = { workspace = true }
 rustyline = "18"
 indicatif = { workspace = true }

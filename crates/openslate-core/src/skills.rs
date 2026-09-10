@@ -103,7 +103,7 @@ pub fn parse_skill_markdown(content: &str, path: &Path) -> Result<Skill, ConfigE
         }
     };
 
-    let fm: SkillFrontmatter = serde_yml::from_str(yaml_str).map_err(|e| {
+    let fm: SkillFrontmatter = serde_norway::from_str(yaml_str).map_err(|e| {
         ConfigError::ParseError(format!("{}: invalid frontmatter YAML: {e}", path.display()))
     })?;
 

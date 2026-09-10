@@ -4,6 +4,7 @@ version.workspace = true
 # Edition 2024: this crate is new and follows the current edition; the rest of
 # the workspace stays on 2021 until a coordinated bump.
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 futures = { workspace = true }

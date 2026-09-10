@@ -530,7 +530,7 @@ pub fn parse_agent_markdown(content: &str, filename: &str) -> Result<AgentConfig
         }
     };
 
-    let fm: AgentFrontmatter = serde_yml::from_str(yaml_str).map_err(|e| {
+    let fm: AgentFrontmatter = serde_norway::from_str(yaml_str).map_err(|e| {
         ConfigError::ParseError(format!("{filename}: invalid frontmatter YAML: {e}"))
     })?;
 

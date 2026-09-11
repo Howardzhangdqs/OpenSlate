@@ -21,9 +21,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::cmd::run::{build_provider_for_model, resolve_agent};
+use crate::cmd::run::resolve_agent;
 use crate::spinner::SpinnerCallback;
 use crate::wiring::AppContext;
+use openslate_app::build_provider_for_model;
 
 const PROMPT: &str = "openslate> ";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2682,6 +2683,7 @@ max_tool_calls = 20
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2711,6 +2713,7 @@ max_tool_calls = 20
                 usage: Some(Usage {
                     input_tokens: 2_000,
                     output_tokens: 500,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2774,6 +2777,7 @@ max_tool_calls = 20
                 usage: Some(Usage {
                     input_tokens: 3,
                     output_tokens: 0,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),

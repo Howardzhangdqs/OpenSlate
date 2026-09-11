@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use openslate_app::build_provider_for_model;
 use openslate_core::agent_tree::AgentTree;
-use openslate_core::provider::ModelProvider;
 use openslate_core::run_manager::RunManager;
 use openslate_core::runtime::{CancellationToken, MessageSink};
 use openslate_core::types::{Message, MessageRole, RunId, RunStatus};
@@ -19,7 +19,7 @@ use openslate_store_sqlite::recorder::RunRecorder;
 
 use crate::input::{expand_at_files, read_stdin_if_pipe, WorkspaceRoot};
 use crate::spinner::SpinnerCallback;
-use crate::wiring as app_wiring;
+use openslate_app as app_wiring;
 
 /// Output format for run results.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,68 +668,6 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     Ok(())
 }
 
-/// Build a provider for a specific model alias.
-///
-/// All providers are routed through the genai adapter — the sole provider
-/// implementation. `ProviderConfig.kind` is retained as an informational hint
-/// (e.g. `"openai_compatible"`, `"genai"`) but no longer selects an
-/// implementation. The genai `adapter` protocol (openai/anthropic/gemini/ollama)
-/// is taken from `ProviderConfig.adapter`, defaulting to `"openai"` when unset
-/// (the common case for OpenAI-compatible endpoints) to avoid genai's silent
-/// Ollama fallthrough for unrecognized model names.
-pub(crate) fn build_provider_for_model(
-    config: &openslate_core::config::OpenSlateConfig,
-    model_alias: &str,
-) -> Result<Box<dyn ModelProvider>> {
-    let resolved = openslate_core::model_config::resolve_model(config, model_alias)
-        .with_context(|| format!("Failed to resolve model alias '{}'", model_alias))?;
-
-    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
-        format!(
-            "API key not found: set environment variable '{}'",
-            resolved.provider.api_key_env
-        )
-    })?;
-
-    // Default to the OpenAI adapter when unset: most OpenAI-compatible
-    // providers (zhipu, minimax, internlm, …) don't set `adapter` explicitly,
-    // and genai would otherwise infer Ollama from the model name.
-    let adapter = resolved
-        .provider
-        .adapter
-        .clone()
-        .or_else(|| Some("openai".to_owned()));
-
-    // Provider HTTP timeout: pass through the effective [limits].timeout_ms
-    // (rounded up to whole seconds, min 1s). A missing [limits] section (or a
-    // degenerate 0) falls back to 60s.
-    let timeout_secs = match config.limits.as_ref().map(|l| l.timeout_ms) {
-        Some(ms) if ms > 0 => ms.div_ceil(1000),
-        _ => 60,
-    };
-
-    let cfg = openslate_model_genai::GenaiConfig {
-        provider_name: resolved.provider_name.clone(),
-        model: resolved.model_id.clone(),
-        api_key: Some(api_key),
-        base_url: Some(resolved.provider.base_url.clone()),
-        adapter,
-        timeout_secs,
-        max_attempts: resolved.provider.max_attempts,
-        retry_base_ms: resolved.provider.retry_base_ms,
-    };
-
-    let provider = openslate_model_genai::GenaiProvider::new(cfg).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to build genai provider for '{}': {}",
-            resolved.provider_name,
-            e
-        )
-    })?;
-
-    Ok(Box::new(provider))
-}
-
 async fn persist_trace_to_store(
     store: &openslate_store_sqlite::store::SqliteStore,
     result: &openslate_core::run_manager::ManagedRunResult,
@@ -959,44 +897,6 @@ max_output_bytes = 65536
             tool_calls: None,
         }];
         assert_eq!(extract_final_assistant_message(&messages), None);
-    }
-
-    #[test]
-    fn test_build_provider_for_model_missing_env_var() {
-        let tmp = temp_project();
-        let config =
-            crate::wiring::load_config(&tmp.path().join(".openslate/openslate.toml")).unwrap();
-        match build_provider_for_model(&config, "main") {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("TEST_API_KEY"),
-                    "error should mention env var name: {msg}"
-                );
-            }
-            Ok(_) => panic!("expected error when env var is not set"),
-        }
-    }
-
-    /// A genai-backed provider config must construct a `GenaiProvider` successfully.
-    #[test]
-    fn test_genai_provider_constructs_with_feature() {
-        // Unique env var name to avoid races with parallel tests.
-        // SAFETY of env mutation: this var is not read by any other test.
-        std::env::set_var("GENAI_TEST_KEY", "sk-test");
-        let toml = r#"
-[providers.anthropic_prod]
-base_url = "https://api.anthropic.com"
-api_key_env = "GENAI_TEST_KEY"
-adapter = "anthropic"
-
-[models.main]
-provider = "anthropic_prod"
-model = "claude-sonnet-4-5"
-"#;
-        let config = openslate_core::config::parse_openslate_toml(toml).unwrap();
-        let provider = build_provider_for_model(&config, "main").expect("genai provider builds");
-        assert_eq!(provider.provider_name(), "anthropic_prod");
     }
 
     #[test]

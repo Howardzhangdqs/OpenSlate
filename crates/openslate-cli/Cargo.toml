@@ -11,9 +11,10 @@ path = "src/main.rs"
 [dependencies]
 openslate-core = { path = "../openslate-core" }
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
-# The genai-backed multi-provider adapter — the sole provider implementation
-# (OpenAI-compatible, Anthropic, Gemini, Ollama all routed via genai).
-openslate-model-genai = { path = "../openslate-model-genai" }
+# Shared application wiring (config/store/agents/skills/MCP/RunManager
+# assembly + provider construction + approval policy derivation), extracted
+# from this crate's former `wiring` module in P2a.
+openslate-app = { path = "../openslate-app" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -22,14 +23,10 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
-dirs = { workspace = true }
 rustyline = "18"
 indicatif = { workspace = true }
 # Local-time formatting for the tracing timestamp.
 chrono = { workspace = true }
-# Auto-load .env from the openslate.toml directory (KEY=VALUE; does not override
-# existing env vars, so shell exports take precedence).
-dotenvy = "0.15"
 # Markdown → ANSI rendering for model output on stdout. No Ratatui dependency;
 # coexists with indicatif (spinner) and rustyline (REPL input).
 termimad = "0.35"

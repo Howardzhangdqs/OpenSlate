@@ -5,10 +5,13 @@ mod input;
 mod markdown;
 mod repl;
 mod spinner;
-mod wiring;
 
+// Shared application wiring (config/store/agents/skills/MCP/RunManager
+// assembly), extracted to the openslate-app lib crate in P2a. Aliased here
+// so every `wiring::X` / `crate::wiring::X` reference keeps resolving.
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use openslate_app as wiring;
 use std::fs;
 use std::path::Path;
 

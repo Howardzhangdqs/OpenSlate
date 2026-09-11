@@ -4,8 +4,8 @@
 //! config loading → validation → SQLite store → agent tree → tool registry → RunManager.
 //!
 //! NOTE: the LLM provider is no longer stored in `AppContext`; it is built per
-//! run/turn via `cmd::run::build_provider_for_model` (so it can be dispatched on
-//! `ProviderConfig.kind`, e.g. OpenAI-compatible vs. genai).
+//! run/turn via `crate::provider::build_provider_for_model` (so it can be
+//! dispatched on `ProviderConfig.kind`, e.g. OpenAI-compatible vs. genai).
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -51,7 +51,7 @@ pub struct AppContext {
 }
 
 /// Load and parse `openslate.toml` from the given path.
-pub(crate) fn load_config(config_path: &Path) -> Result<OpenSlateConfig> {
+pub fn load_config(config_path: &Path) -> Result<OpenSlateConfig> {
     let content = fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file '{}'", config_path.display()))?;
     parse_openslate_toml(&content)
@@ -59,7 +59,7 @@ pub(crate) fn load_config(config_path: &Path) -> Result<OpenSlateConfig> {
 }
 
 /// Load and parse agents from the `agents/` directory.
-pub(crate) fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
+pub fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
     if !agents_dir.is_dir() {
         anyhow::bail!("Agents directory not found: {}", agents_dir.display());
     }
@@ -200,7 +200,7 @@ fn load_skills(config: &OpenSlateConfig, config_path: &Path, cwd: &Path) -> Skil
 /// Tools gated by the derived REPL default when no `[approval]` section is
 /// configured (locked product decision: interactive sessions ask before the
 /// dangerous tools, while non-interactive runs stay fully automatic).
-pub(crate) const REPL_DEFAULT_APPROVAL_TOOLS: [&str; 2] = ["shell", "run_code"];
+pub const REPL_DEFAULT_APPROVAL_TOOLS: [&str; 2] = ["shell", "run_code"];
 
 /// Derive the effective approval policy.
 ///
@@ -209,7 +209,7 @@ pub(crate) const REPL_DEFAULT_APPROVAL_TOOLS: [&str; 2] = ["shell", "run_code"];
 /// `[approval]` section derives `auto_except(["shell", "run_code"])`; a
 /// non-interactive run derives plain `auto`. Pure function; fully covered by
 /// a matrix unit test.
-pub(crate) fn derive_effective_policy(
+pub fn derive_effective_policy(
     configured: Option<ApprovalPolicy>,
     interactive: bool,
     yes: bool,
@@ -236,7 +236,7 @@ pub(crate) fn derive_effective_policy(
 /// everything else is approved. Installed by [`apply_approval`] whenever the
 /// effective policy is not `auto` in a non-interactive run without `--yes`
 /// (the CLI-derived strategy that avoids "needs approval, no callback").
-pub(crate) struct NonInteractiveGate;
+pub struct NonInteractiveGate;
 
 impl ApprovalCallback for NonInteractiveGate {
     fn decide(&self, req: &ApprovalRequest) -> ApprovalDecision {
@@ -253,7 +253,7 @@ impl ApprovalCallback for NonInteractiveGate {
 /// Non-interactive runs with a non-`auto` effective policy and no `--yes`
 /// get the [`NonInteractiveGate`] callback plus a one-line startup WARN.
 /// Returns the effective policy for callers that want to report it.
-pub(crate) fn apply_approval(
+pub fn apply_approval(
     manager: &mut RunManager,
     config: &OpenSlateConfig,
     interactive: bool,

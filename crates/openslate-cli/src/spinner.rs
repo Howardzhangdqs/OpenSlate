@@ -612,6 +612,7 @@ mod tests {
         spinner.on_usage(Usage {
             input_tokens: 50,
             output_tokens: 100,
+            cached_input_tokens: None,
         });
         // input + real_output updated from the provider; content is derived as
         // output - reasoning so tool_call tokens in output are reflected (not
@@ -629,6 +630,7 @@ mod tests {
         spinner.on_usage(Usage {
             input_tokens: 50,
             output_tokens: 100,
+            cached_input_tokens: None,
         });
         // no reasoning -> content counter takes the accurate output count
         assert_eq!(spinner.content_tokens(), 100);

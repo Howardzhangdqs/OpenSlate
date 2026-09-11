@@ -1,0 +1,27 @@
+[package]
+name = "openslate-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+# SQLite store assembled by build_app_context (SqliteStore + migrations).
+openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+# The genai-backed multi-provider adapter — the sole provider implementation,
+# constructed by build_provider_for_model.
+openslate-model-genai = { path = "../openslate-model-genai" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+# Home-dir lookup for the user-global skill discovery source (~/.agents/skills).
+dirs = { workspace = true }
+# Auto-load .env from the openslate.toml directory (KEY=VALUE; does not
+# override existing env vars, so shell exports take precedence). Direct
+# version pin, carried over from openslate-cli at the P2a extraction.
+dotenvy = "0.15"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# serde_json::json! in the NonInteractiveGate approval tests.
+serde_json = { workspace = true }

@@ -327,6 +327,7 @@ max_output_bytes = 10_000
             usage: Some(Usage {
                 input_tokens: 50,
                 output_tokens: 10,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);
@@ -400,6 +401,7 @@ max_output_bytes = 10_000
                 usage: Some(Usage {
                     input_tokens: 100,
                     output_tokens: 20,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -410,6 +412,7 @@ max_output_bytes = 10_000
                 usage: Some(Usage {
                     input_tokens: 120,
                     output_tokens: 5,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -476,6 +479,7 @@ max_output_bytes = 10_000
                 usage: Some(Usage {
                     input_tokens: 200,
                     output_tokens: 50,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -485,6 +489,7 @@ max_output_bytes = 10_000
                 usage: Some(Usage {
                     input_tokens: 300,
                     output_tokens: 100,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -536,6 +541,7 @@ output_price_per_mtok = 2.0
                 usage: Some(Usage {
                     input_tokens: 500_000,
                     output_tokens: 100_000,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -545,6 +551,7 @@ output_price_per_mtok = 2.0
                 usage: Some(Usage {
                     input_tokens: 500_000,
                     output_tokens: 100_000,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -581,6 +588,7 @@ output_price_per_mtok = 2.0
             usage: Some(Usage {
                 input_tokens: 42,
                 output_tokens: 7,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);

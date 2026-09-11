@@ -138,6 +138,14 @@ pub struct ToolCall {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Input tokens served from the provider's prompt cache (OpenAI's
+    /// `usage.prompt_tokens_details.cached_tokens`, Anthropic's
+    /// `cache_read_input_tokens`). `None` when the provider does not
+    /// report cache information. Additive field: older serialized
+    /// payloads (without it) deserialize to `None`, and cost
+    /// computations deliberately ignore it.
+    #[serde(default)]
+    pub cached_input_tokens: Option<u32>,
 }
 
 /// Events emitted during a streaming chat completion.
@@ -314,7 +322,24 @@ mod tests {
         let usage = resp.usage.unwrap();
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+        // The cached field is additive: payloads without it → None.
+        assert_eq!(usage.cached_input_tokens, None);
         assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn usage_cached_input_tokens_roundtrip() {
+        // Old-shape payload (no cached field) → None.
+        let usage: Usage = serde_json::from_str(r#"{"input_tokens":3,"output_tokens":4}"#).unwrap();
+        assert_eq!(usage.cached_input_tokens, None);
+        // With the field → Some.
+        let usage: Usage =
+            serde_json::from_str(r#"{"input_tokens":3,"output_tokens":4,"cached_input_tokens":2}"#)
+                .unwrap();
+        assert_eq!(usage.cached_input_tokens, Some(2));
+        // Round-trip keeps it.
+        let back: Usage = serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        assert_eq!(back, usage);
     }
 
     #[test]

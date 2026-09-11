@@ -30,13 +30,33 @@
 //! after the first forwarded `Delta`/`Reasoning` event is never retried
 //! (replaying it would duplicate displayed output).
 //!
-//! **Failure-mode drift**: every attempt is an independent HTTP request with
-//! its own per-request timeout (`timeout_secs`, 60s by default), while the
-//! total wall clock remains bounded by the runtime's
+//! **Failure-mode drift**: every attempt is an independent HTTP request,
+//! and the total wall clock remains bounded by the runtime's
 //! `tokio::time::timeout(remaining)`. A call whose retries burn the
 //! remaining budget therefore fails with a run-level `Timeout` where it
 //! previously failed immediately with a `ProviderError` — expected and
 //! documented behaviour.
+//!
+//! # Timeout semantics (fix-20)
+//!
+//! `GenaiConfig::timeout_ms` (from `[limits].timeout_ms`, 60s by default)
+//! has DUAL semantics:
+//!
+//! - **Non-streaming** (`generate`): a TOTAL per-attempt budget — the whole
+//!   request/response must complete within it. Enforced by a
+//!   `tokio::time::timeout` wrapper around each `exec_chat` attempt; the
+//!   underlying reqwest client carries NO total timeout.
+//! - **Streaming** (`generate_stream`): an IDLE budget — the maximum
+//!   allowed silence while waiting for response headers or between stream
+//!   events. Tokens flowing keep the stream healthy however long the total
+//!   duration; only a stall beyond the budget times out (error message:
+//!   `stream idle timeout after Xms`). Idle timeouts are terminal, never
+//!   retried.
+//!
+//! Connection establishment on both paths is bounded by a fixed 15s
+//! `connect_timeout`. The client-level total timeout was REMOVED because
+//! reqwest applies it to the entire response body — it killed long
+//! streaming answers mid-flight.
 //!
 //! `Retry-After` headers are not honored: `genai::Error::HttpError` (the
 //! streaming error shape) carries no response headers, so a streaming 429

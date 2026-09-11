@@ -29,6 +29,28 @@ use crate::retry::{backoff_or_consumer_gone, exhausted_error, is_retryable, Retr
 /// requests on the wire.
 const USER_AGENT: &str = concat!("openslate/", env!("CARGO_PKG_VERSION"));
 
+/// Fixed budget for establishing a connection (TCP + TLS) on every model
+/// request. reqwest applies it to both the streaming and non-streaming
+/// paths; it is deliberately NOT the user-facing `timeout_ms` budget — a
+/// hung connect is always a dead endpoint, whatever the per-request budget
+/// is.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Terminal error for a stream that went silent for longer than the idle
+/// budget (`GenaiConfig::timeout_ms`). Shaped as a `ConnectionError` — the
+/// same variant today's transport-level stream timeouts surface as — but
+/// with an explicit idle message so the UI can tell "stalled stream" apart
+/// from the non-streaming "request timed out".
+///
+/// Never retried: like a total-timeout on the non-streaming path, the
+/// attempt already consumed its full budget.
+fn stream_idle_timeout_error(idle: Duration) -> ProviderError {
+    ProviderError::ConnectionError(format!(
+        "stream idle timeout after {}ms (no stream data received within the idle budget)",
+        idle.as_millis()
+    ))
+}
+
 /// Configuration for constructing a [`GenaiProvider`].
 #[derive(Debug, Clone)]
 pub struct GenaiConfig {
@@ -47,9 +69,19 @@ pub struct GenaiConfig {
     /// but unknown prefixes silently fall through to Ollama, so an explicit
     /// `adapter` is strongly recommended.
     pub adapter: Option<String>,
-    /// Per-request HTTP timeout, in seconds. Every retry attempt is a fresh
-    /// HTTP request and gets this timeout independently.
-    pub timeout_secs: u64,
+    /// Per-request timeout budget, in milliseconds. Dual semantics (fix-20):
+    ///
+    /// - **Non-streaming** (`generate`): TOTAL per-attempt budget — the whole
+    ///   HTTP request/response must complete within it. Every retry attempt
+    ///   is a fresh HTTP request and gets this budget independently.
+    /// - **Streaming** (`generate_stream`): IDLE budget — the maximum silence
+    ///   allowed while waiting for response headers OR between stream events.
+    ///   Tokens flowing = request healthy, however long the total stream
+    ///   takes; only a stall longer than this budget times out. Connection
+    ///   establishment is bounded separately by a fixed 15s connect timeout.
+    ///
+    /// Maps to `[limits].timeout_ms` (default 60000).
+    pub timeout_ms: u64,
     /// Total attempts per call for transient failures (HTTP 429/5xx,
     /// network errors), INCLUDING the first attempt. `0` is clamped to `1`.
     /// Maps to `[providers.X].max_attempts` (default 3).
@@ -73,18 +105,31 @@ pub struct GenaiProvider {
     default_chat_options: ChatOptions,
     /// Transient-failure retry policy (see [`crate::retry`]).
     retry: RetryPolicy,
+    /// The dual-semantics budget from `GenaiConfig::timeout_ms`: total
+    /// per-attempt budget on the non-streaming path, idle budget on the
+    /// streaming path (see `GenaiConfig::timeout_ms`).
+    timeout: Duration,
 }
 
 impl GenaiProvider {
     /// Construct a new provider from the given config.
     pub fn new(config: GenaiConfig) -> Result<Self, GenaiBuildError> {
-        // Inject a custom reqwest client: genai's default has no timeout, and it
-        // honors proxy env vars by default (OpenSlate's OpenAI provider uses
-        // `.no_proxy()`). Match that behaviour, add the timeout, and stamp the
-        // project User-Agent on every model request.
+        // Inject a custom reqwest client. genai's default has no timeout, and
+        // it honors proxy env vars by default (OpenSlate's OpenAI provider
+        // uses `.no_proxy()`); match that, and stamp the project User-Agent
+        // on every model request.
+        //
+        // fix-20: NO client-level total `.timeout()` here. reqwest's total
+        // timeout covers the ENTIRE request-response cycle including a
+        // streaming response body, so any stream longer than the budget was
+        // killed mid-flight ("timeout after 60000ms" on long answers). The
+        // budget is now enforced at the call site instead: `generate` wraps
+        // each attempt in a total `tokio::time::timeout`, and
+        // `generate_stream` enforces an idle budget between stream events
+        // (connection establishment is bounded by CONNECT_TIMEOUT above).
         let reqwest_client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .connect_timeout(CONNECT_TIMEOUT)
             .no_proxy()
             .build()
             .map_err(|e| GenaiBuildError::ReqwestBuild(e.to_string()))?;
@@ -154,6 +199,7 @@ impl GenaiProvider {
             provider_name: config.provider_name,
             default_chat_options,
             retry: RetryPolicy::new(config.max_attempts, config.retry_base_ms),
+            timeout: Duration::from_millis(config.timeout_ms),
         })
     }
 
@@ -174,23 +220,31 @@ impl ModelProvider for GenaiProvider {
         let max_attempts = self.retry.max_attempts();
 
         // Retry loop (Phase 2): total attempts = `max_attempts`, each attempt
-        // an independent HTTP request with its own per-request reqwest
-        // timeout. NOTE the failure-mode drift: the runtime's outer
-        // `tokio::time::timeout(remaining)` still bounds the total wall
-        // clock, so a call whose retries burn the remaining budget now fails
-        // with a run-level Timeout instead of an immediate ProviderError.
+        // an independent HTTP request with its own total budget (`timeout`,
+        // enforced by the tokio wrapper below — the reqwest client itself
+        // carries no total timeout anymore, see fix-20 in `new`). NOTE the
+        // failure-mode drift: the runtime's outer `tokio::time::timeout(remaining)`
+        // still bounds the total wall clock, so a call whose retries burn the
+        // remaining budget now fails with a run-level Timeout instead of an
+        // immediate ProviderError.
         let mut attempt: u32 = 1;
         loop {
             // The ChatRequest is consumed by exec_chat; rebuild it per
             // attempt from the (Clone) original.
             let chat_req = to_chat_request(&request);
-            match self
-                .client
-                .exec_chat(&self.model, chat_req, Some(&opts))
-                .await
-            {
-                Ok(res) => return Ok(from_chat_response(res)),
-                Err(e) => {
+            // Total per-attempt budget. On Elapsed the exec_chat future is
+            // dropped (aborting the request); like the old reqwest-level
+            // total timeout, this is NOT retried — the attempt already spent
+            // its whole budget.
+            let outcome = tokio::time::timeout(
+                self.timeout,
+                self.client.exec_chat(&self.model, chat_req, Some(&opts)),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(res)) => return Ok(from_chat_response(res)),
+                Err(_elapsed) => return Err(ProviderError::Timeout),
+                Ok(Err(e)) => {
                     let retryable = is_retryable(&e);
                     let mapped = map_error(e);
                     if !retryable {
@@ -226,6 +280,11 @@ impl ModelProvider for GenaiProvider {
         let model = self.model.clone();
         let client = self.client.clone();
         let retry = self.retry;
+        // Streaming budget is IDLE, not total (fix-20): tokens flowing =
+        // request healthy, however long the whole stream takes. Each wait —
+        // for response headers AND for every subsequent stream event — is
+        // individually bounded by this duration.
+        let idle = self.timeout;
 
         // The whole attempt loop — request establishment, event polling, and
         // retry/backoff — runs in a spawned task so `generate_stream`
@@ -239,10 +298,23 @@ impl ModelProvider for GenaiProvider {
             let mut attempt: u32 = 1;
             loop {
                 let chat_req = to_chat_request(&request);
-                let mut stream = match client.exec_chat_stream(&model, chat_req, Some(&opts)).await
+                // The establishment wait (request sent → response headers
+                // received) is the stream's first silent phase: bound it by
+                // the idle budget too. An idle Elapsed here is terminal —
+                // no retry, the attempt already burned its whole budget
+                // (same rationale as the non-streaming total timeout).
+                let mut stream = match tokio::time::timeout(
+                    idle,
+                    client.exec_chat_stream(&model, chat_req, Some(&opts)),
+                )
+                .await
                 {
-                    Ok(sr) => sr.stream,
-                    Err(e) => {
+                    Err(_elapsed) => {
+                        let _ = tx.send(Err(stream_idle_timeout_error(idle))).await;
+                        return;
+                    }
+                    Ok(Ok(sr)) => sr.stream,
+                    Ok(Err(e)) => {
                         let retryable = is_retryable(&e);
                         let mapped = map_error(e);
                         let err = if retryable && attempt < max_attempts {
@@ -279,7 +351,22 @@ impl ModelProvider for GenaiProvider {
                 let mut sent_output = false;
                 let mut failure: Option<(bool, ProviderError)> = None;
 
-                while let Some(ev) = stream.next().await {
+                loop {
+                    // Per-event idle budget (fix-20): only continuous SILENCE
+                    // beyond `idle` kills a stream — a long answer whose
+                    // tokens keep arriving stays healthy indefinitely. On
+                    // Elapsed the `stream.next()` future is dropped and the
+                    // error is terminal: the attempt already spent its whole
+                    // budget, so retrying would only multiply the wait (and
+                    // if output was already forwarded, replay is forbidden).
+                    let ev = match tokio::time::timeout(idle, stream.next()).await {
+                        Err(_elapsed) => {
+                            let _ = tx.send(Err(stream_idle_timeout_error(idle))).await;
+                            return;
+                        }
+                        Ok(None) => break, // stream ended
+                        Ok(Some(ev)) => ev,
+                    };
                     let mapped: Option<Result<ModelStreamEvent, ProviderError>> = match ev {
                         Ok(ChatStreamEvent::Start) => None,
                         Ok(ChatStreamEvent::Chunk(c)) => {
@@ -370,7 +457,7 @@ mod tests {
             api_key: Some("k".into()),
             base_url: None,
             adapter: Some("anthropic".into()),
-            timeout_secs: 60,
+            timeout_ms: 60_000,
             max_attempts: 3,
             retry_base_ms: 500,
         };
@@ -388,7 +475,7 @@ mod tests {
             api_key: None,
             base_url: None,
             adapter: Some("not-a-real-adapter".into()),
-            timeout_secs: 60,
+            timeout_ms: 60_000,
             max_attempts: 3,
             retry_base_ms: 500,
         };
@@ -445,7 +532,7 @@ mod tests {
             api_key: Some("test-key".into()),
             base_url: Some(server.url()),
             adapter: Some("openai".into()),
-            timeout_secs: 30,
+            timeout_ms: 30_000,
             max_attempts: 3,
             retry_base_ms: 500,
         })
@@ -468,6 +555,82 @@ mod tests {
         _mock.assert_async().await;
     }
 
+    /// E2E usage parsing: OpenAI's `usage.prompt_tokens_details.cached_tokens`
+    /// travels through the genai adapter into
+    /// `Usage::cached_input_tokens` (and stays `None` when the server
+    /// omits the details object).
+    #[tokio::test]
+    async fn usage_cached_tokens_parsed_from_wire() {
+        async fn generate_with_body(
+            server: &mut mockito::Server,
+            body: &'static str,
+        ) -> ModelResponse {
+            let _mock = server
+                .mock("POST", "/chat/completions")
+                .match_body(mockito::Matcher::Any)
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+
+            let provider = GenaiProvider::new(GenaiConfig {
+                provider_name: "test".into(),
+                model: "test-model".into(),
+                api_key: Some("test-key".into()),
+                base_url: Some(server.url()),
+                adapter: Some("openai".into()),
+                timeout_ms: 30_000,
+                max_attempts: 1,
+                retry_base_ms: 500,
+            })
+            .expect("constructs");
+
+            provider
+                .generate(GenerateRequest {
+                    model_id: "test-model".into(),
+                    system_prompt: None,
+                    messages: vec![],
+                    tools: vec![],
+                    max_tokens: None,
+                    temperature: None,
+                })
+                .await
+                .expect("request ok")
+        }
+
+        // With cached_tokens: 4 → Some(4).
+        let mut server = mockito::Server::new_async().await;
+        let res = generate_with_body(
+            &mut server,
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":0,
+                "model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+                "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,
+                "prompt_tokens_details":{"cached_tokens":4}}}"#,
+        )
+        .await;
+        let usage = res.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.cached_input_tokens, Some(4));
+
+        // Without the details object → None.
+        let mut server = mockito::Server::new_async().await;
+        let res = generate_with_body(
+            &mut server,
+            r#"{"id":"chatcmpl-2","object":"chat.completion","created":0,
+                "model":"test-model",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+                "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        )
+        .await;
+        let usage = res.usage.expect("usage");
+        assert_eq!(usage.cached_input_tokens, None);
+    }
+
     // ── Retry / backoff behaviour (Phase 2) ──────────────────────────────
 
     mod retry_behaviour {
@@ -485,7 +648,7 @@ mod tests {
                 api_key: Some("test-key".into()),
                 base_url: Some(base_url),
                 adapter: Some("openai".into()),
-                timeout_secs: 30,
+                timeout_ms: 30_000,
                 max_attempts,
                 retry_base_ms,
             }
@@ -688,22 +851,22 @@ mod tests {
             always_429.assert_async().await;
         }
 
-        /// A per-request timeout (reqwest-level, one attempt = one full
-        /// `timeout_secs` burn) is NOT retried: the error is
-        /// `ProviderError::Timeout` and the server saw exactly one
-        /// connection.
+        /// A total-budget timeout on the NON-streaming path (one attempt =
+        /// one full `timeout_ms` burn, enforced by the tokio wrapper around
+        /// `exec_chat`) is NOT retried: the error is `ProviderError::Timeout`
+        /// and the server saw exactly one connection.
         #[tokio::test]
         async fn generate_timeout_is_not_retried() {
             let (base_url, connections) = spawn_raw_server(|mut socket| async move {
                 drain_request(&mut socket).await;
-                // Hold the connection open past the client's 1s per-request
-                // timeout, then drop without responding.
+                // Hold the connection open past the client's 1s total
+                // budget, then drop without responding.
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             })
             .await;
 
             let mut cfg = test_config(base_url, 3, 1);
-            cfg.timeout_secs = 1; // per-request timeout shorter than the hold
+            cfg.timeout_ms = 1_000; // total budget shorter than the hold
             let provider = GenaiProvider::new(cfg).expect("constructs");
 
             let err = provider
@@ -883,6 +1046,179 @@ mod tests {
                 connections.load(Ordering::SeqCst),
                 1,
                 "no retry after the first forwarded Reasoning"
+            );
+        }
+
+        // ── Streaming idle-timeout semantics (fix-20) ─────────────────────
+        //
+        // The streaming budget is IDLE, not total: a stream whose events
+        // keep arriving stays healthy however long it runs in total; only
+        // continuous silence beyond the budget kills it.
+
+        /// Common SSE chunked-response head used by the paced/silent raw
+        /// servers below.
+        const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+
+        /// Write one HTTP chunk carrying an SSE event.
+        async fn write_sse_event(
+            socket: &mut tokio::net::TcpStream,
+            event: &str,
+        ) -> std::io::Result<()> {
+            use tokio::io::AsyncWriteExt;
+            let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+            socket.write_all(chunk.as_bytes()).await
+        }
+
+        /// A stream whose events arrive with 400ms gaps, for a ~1.2s TOTAL
+        /// duration, against a 700ms budget: idle semantics keep it alive
+        /// (every gap < budget) where the old reqwest total timeout killed
+        /// it at 700ms mid-stream. This is the fix-20 regression pin.
+        #[tokio::test]
+        async fn stream_flowing_longer_than_budget_succeeds() {
+            let (base_url, _connections) = spawn_raw_server(|mut socket| async move {
+                use tokio::io::AsyncWriteExt;
+                drain_request(&mut socket).await;
+                let _ = socket.write_all(SSE_HEAD.as_bytes()).await;
+                let events = [
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n".to_owned(),
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n\n".to_owned(),
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n\
+                     data: [DONE]\n\n"
+                        .to_owned(),
+                ];
+                for event in &events {
+                    // 400ms gap: comfortably inside the 700ms idle budget,
+                    // while the cumulative total (~1.2s) exceeds it.
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = write_sse_event(&mut socket, event).await;
+                }
+                // Clean chunked terminator.
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+                let _ = socket.shutdown().await;
+            })
+            .await;
+
+            let mut cfg = test_config(base_url, 1, 1);
+            cfg.timeout_ms = 700; // idle budget: gaps (400ms) fit, total (~1.2s) does not
+            let provider = GenaiProvider::new(cfg).expect("constructs");
+
+            let rx = provider.generate_stream(empty_request()).await;
+            let events = collect_stream(rx).await;
+
+            let deltas: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Ok(ModelStreamEvent::Delta(t)) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                deltas,
+                vec!["A".to_string(), "B".to_string()],
+                "events: {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Ok(ModelStreamEvent::Done(_)))),
+                "expected Done despite total duration exceeding the budget, got: {events:?}"
+            );
+            assert!(
+                events.iter().all(|e| e.is_ok()),
+                "no error events expected, got: {events:?}"
+            );
+        }
+
+        /// A stream that forwards one Delta and then goes SILENT beyond the
+        /// idle budget: the consumer sees the forwarded Delta, then an error
+        /// carrying `stream idle timeout after <budget>ms`, and no retry
+        /// happens (one connection).
+        #[tokio::test]
+        async fn stream_idle_timeout_on_mid_stream_silence() {
+            let (base_url, connections) = spawn_raw_server(|mut socket| async move {
+                use tokio::io::AsyncWriteExt;
+                drain_request(&mut socket).await;
+                let _ = socket.write_all(SSE_HEAD.as_bytes()).await;
+                let _ = write_sse_event(
+                    &mut socket,
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n",
+                )
+                .await;
+                // Then silence: hold the socket far beyond the client's idle
+                // budget (the client drops the connection at ~300ms).
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            })
+            .await;
+
+            let mut cfg = test_config(base_url, 3, 1);
+            cfg.timeout_ms = 300; // idle budget: silence beyond 300ms is fatal
+            let provider = GenaiProvider::new(cfg).expect("constructs");
+
+            let rx = provider.generate_stream(empty_request()).await;
+            let events = collect_stream(rx).await;
+
+            let deltas: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Ok(ModelStreamEvent::Delta(t)) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(deltas, vec!["A".to_string()], "events: {events:?}");
+            let last = events.last().expect("stream must end with the idle error");
+            match last {
+                Err(ProviderError::ConnectionError(msg)) => {
+                    assert!(
+                        msg.contains("stream idle timeout after 300ms"),
+                        "idle message, got: {msg}"
+                    );
+                }
+                other => panic!("expected ConnectionError(stream idle timeout), got {other:?}"),
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                connections.load(Ordering::SeqCst),
+                1,
+                "idle timeout must not be retried"
+            );
+        }
+
+        /// A server that accepts the connection but never sends response
+        /// headers: the establishment wait is bounded by the same idle
+        /// budget, terminal, not retried.
+        #[tokio::test]
+        async fn stream_idle_timeout_when_headers_never_arrive() {
+            let (base_url, connections) = spawn_raw_server(|mut socket| async move {
+                drain_request(&mut socket).await;
+                // Headers never arrive; hold until the client drops us.
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            })
+            .await;
+
+            let mut cfg = test_config(base_url, 3, 1);
+            cfg.timeout_ms = 300;
+            let provider = GenaiProvider::new(cfg).expect("constructs");
+
+            let rx = provider.generate_stream(empty_request()).await;
+            let events = collect_stream(rx).await;
+
+            assert_eq!(events.len(), 1, "events: {events:?}");
+            match &events[0] {
+                Err(ProviderError::ConnectionError(msg)) => {
+                    assert!(
+                        msg.contains("stream idle timeout after 300ms"),
+                        "idle message, got: {msg}"
+                    );
+                }
+                other => panic!("expected ConnectionError(stream idle timeout), got {other:?}"),
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                connections.load(Ordering::SeqCst),
+                1,
+                "idle timeout must not be retried"
             );
         }
     }

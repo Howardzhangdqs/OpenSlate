@@ -12,11 +12,20 @@
 //! Phase 3 persistence sink, the Phase 4 cancellation token) are injected via
 //! builder methods and forwarded from `run_root`. See
 //! `.slim/deepwork/subagent-recursive-delegation.md`.
+//!
+//! Time budget (fix-22): every recursion layer runs `execute_run` with the
+//! FULL per-agent `timeout_ms` budget — there is no run-level wall-clock
+//! deadline. fix-21 made each round's budget pure LLM time (approval waits
+//! and tool runs pause it inside `execute_run`); delegation layers get the
+//! same semantics with a fresh LLM-time account, so a parent's approval
+//! queue, tool runs, or model spend never shrink a child's starting budget.
+//! Depth is bounded by `max_depth` / `max_steps` / `max_child_agent_calls`,
+//! not by shrinking budgets.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
@@ -143,9 +152,6 @@ pub struct AgentRunner<'a> {
     /// atomic ops; folds happen once per completed layer, never racing
     /// (`call_agent` batches run sequentially).
     total_cost_usd: Mutex<f64>,
-    /// Wall-clock deadline shared by the whole run. Each child layer gets
-    /// `min(limits.timeout_ms, remaining_to_deadline)` as its timeout.
-    root_deadline: tokio::time::Instant,
 }
 
 /// RAII guard that pops a caller frame when dropped, so the stack stays
@@ -168,8 +174,7 @@ impl<'r, 'a> Drop for FrameGuard<'r, 'a> {
 impl<'a> AgentRunner<'a> {
     /// Create a new runner bound to the given shared dependencies.
     ///
-    /// Seeds the execution tree with a root node for the configured root agent
-    /// and starts the shared wall-clock deadline.
+    /// Seeds the execution tree with a root node for the configured root agent.
     pub fn new(
         provider: &'a dyn ModelProvider,
         agent_tree: &'a AgentTree,
@@ -181,7 +186,6 @@ impl<'a> AgentRunner<'a> {
     ) -> Self {
         let root_agent = agent_tree.get_root();
         let execution_tree = ExecutionTree::new(run_id.clone(), root_agent.id.clone());
-        let root_deadline = tokio::time::Instant::now() + Duration::from_millis(limits.timeout_ms);
         let skills_section = skills.catalog_prompt(config.skills.max_list_chars);
         Self {
             provider,
@@ -207,7 +211,6 @@ impl<'a> AgentRunner<'a> {
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
             total_cost_usd: Mutex::new(0.0),
-            root_deadline,
         }
     }
 
@@ -518,18 +521,6 @@ impl<'a> AgentRunner<'a> {
         tree.update_status(exec_id, status);
     }
 
-    /// Remaining timeout for a child layer: the smaller of the per-layer cap
-    /// and the time left until the shared run deadline. Returns 0 once the
-    /// deadline has passed (which makes `execute_run` fail fast with Timeout).
-    fn child_timeout_ms(&self) -> u64 {
-        let now = tokio::time::Instant::now();
-        if now >= self.root_deadline {
-            return 0;
-        }
-        let remaining = (self.root_deadline - now).as_millis() as u64;
-        remaining.min(self.limits.timeout_ms)
-    }
-
     /// Execute the root agent to completion.
     ///
     /// Runs the single-agent [`execute_run`] loop with `self` as the
@@ -708,7 +699,21 @@ impl<'a> AgentRunner<'a> {
                 max_output_bytes: self.limits.max_output_bytes,
                 max_empty_turns: self.limits.max_empty_turns,
                 tool_definitions: self.tool_definitions_for(&agent_id),
-                timeout_ms: self.child_timeout_ms(),
+                // fix-22: every layer — child, grandchild, ... — runs with
+                // the FULL per-agent `timeout_ms` budget, NOT a share of a
+                // run-level wall-clock deadline. fix-21 made the budget
+                // pure-LLM time inside `execute_run` (approval waits and
+                // tool runs pause it); the child-layer counterpart is that
+                // the PARENT's wall clock (its approval queue, tool runs,
+                // even its own LLM spend) must not shrink the child's
+                // starting budget. Each layer's `execute_run` opens a
+                // fresh LLM-time account, so the budget semantics are
+                // uniform at every depth, and a child that trips the
+                // budget reports the full configured value in its Timeout
+                // error. Recursion runaway is bounded by max_depth /
+                // max_steps / max_child_agent_calls / max_tool_calls —
+                // shrinking the budget with depth would double-punish.
+                timeout_ms: self.limits.timeout_ms,
                 depth,
                 parallel_tool_calls: self.limits.parallel_tool_calls,
                 // P2-3: the child prices its OWN model alias (e.g. `fast`),
@@ -1323,6 +1328,7 @@ mod tests {
     use crate::error::ProviderError;
     use crate::provider::GenerateRequest;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     // ── Test doubles ───────────────────────────────────────────────────────
 
@@ -1696,6 +1702,7 @@ output_price_per_mtok = 1.0
                 Usage {
                     input_tokens: 1_000,
                     output_tokens: 100,
+                    cached_input_tokens: None,
                 },
             ),
             response_with_usage(
@@ -1704,6 +1711,7 @@ output_price_per_mtok = 1.0
                 Usage {
                     input_tokens: 500,
                     output_tokens: 50,
+                    cached_input_tokens: None,
                 },
             ),
             response_with_usage(
@@ -1712,6 +1720,7 @@ output_price_per_mtok = 1.0
                 Usage {
                     input_tokens: 2_000,
                     output_tokens: 200,
+                    cached_input_tokens: None,
                 },
             ),
         ]);
@@ -1998,6 +2007,311 @@ output_price_per_mtok = 1.0
             "grandchild reply should reach root via child's summary, got: {}",
             tool_msgs[0].content
         );
+    }
+
+    // ── Child-layer time budget (fix-22) ────────────────────────────────
+    //
+    // The per-layer counterpart of fix-21's LLM-time budget: every
+    // delegation layer runs with its own FULL `timeout_ms` budget of
+    // pure LLM time. The parent's approval waits and tool runs (wall
+    // clock) must not shrink the child's starting budget, while the
+    // child's own provider-await time still trips `RuntimeError::Timeout`.
+
+    /// Approval callback that blocks before approving — the shape of a
+    /// manual-approval wait. decide() is called inline at the top of
+    /// tool execution, outside every budgeted request segment, so wall
+    /// clock advances while zero LLM time is billed.
+    struct BlockingApprover {
+        block_ms: u64,
+    }
+    impl crate::approval::ApprovalCallback for BlockingApprover {
+        fn decide(&self, _req: &crate::approval::ApprovalRequest) -> ApprovalDecision {
+            std::thread::sleep(Duration::from_millis(self.block_ms));
+            ApprovalDecision::Approved
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_child_gets_full_budget_after_parent_approval_block() {
+        // fix-22 nail: the root's call_agent goes through a 300ms approval
+        // wait — LONGER than the whole 200ms timeout budget. The child
+        // must still start with the full per-layer budget and complete.
+        // Under the old shared root_deadline wall clock, child_timeout_ms()
+        // returned 0 and the child died instantly with `timeout after 0ms`.
+        let provider = ScriptedProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![call_agent_tool_call("ca-1", "child", "greet")],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            assistant_text("Hello from child"),
+            assistant_text("root done"),
+        ]);
+
+        let config = test_config();
+        let tree = root_child_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let limits = RuntimeLimits {
+            timeout_ms: 200,
+            ..RuntimeLimits::default()
+        };
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            limits,
+            RunId("t".into()),
+        )
+        .with_approval(
+            ApprovalManager::manual().with_callback(Arc::new(BlockingApprover { block_ms: 300 })),
+        );
+
+        let result = runner
+            .run_root(vec![user_message("delegate please")], None)
+            .await
+            .expect("run ok");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let tool_msg = result
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool message present");
+        assert!(
+            tool_msg.content.contains("Hello from child"),
+            "child must complete with the full budget despite the parent's \
+             300ms approval wait (budget 200ms), got: {}",
+            tool_msg.content
+        );
+    }
+
+    /// Concatenate the user-role text of a request — the child's task
+    /// (and the root's prompt) are the user messages, so this identifies
+    /// which layer is talking without relying on global call order (a
+    /// layer that dies before its first request consumes no scripted
+    /// response, which shifts naive indexes).
+    fn user_text_of(request: &GenerateRequest) -> String {
+        request
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .map(|m| m.content.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn runner_child_llm_over_budget_times_out_with_full_budget() {
+        // The other side of the fix-22 semantics: the child's OWN provider
+        // time still trips Timeout — and the error reports the FULL
+        // per-layer budget (`timeout after 200ms`), proving the child
+        // started from a fresh LLM-time account rather than the wall-clock
+        // remainder (which the old code exhausted to 0ms during the 300ms
+        // approval wait before the child even started).
+        struct MarkerDelayProvider {
+            marker: &'static str,
+            delay_ms: u64,
+        }
+        #[async_trait]
+        impl ModelProvider for MarkerDelayProvider {
+            async fn generate(
+                &self,
+                request: GenerateRequest,
+            ) -> Result<ModelResponse, ProviderError> {
+                let user_text = user_text_of(&request);
+                if user_text.contains(self.marker) {
+                    // The child's request: `delay_ms` of pure LLM time,
+                    // spent inside the awaited request segment.
+                    tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+                    Ok(assistant_text("never seen"))
+                } else if request.messages.iter().any(|m| m.role == MessageRole::Tool) {
+                    // Root wrap-up after the child's outcome.
+                    Ok(assistant_text("root done"))
+                } else {
+                    // Root kick-off: delegate to the child.
+                    Ok(ModelResponse {
+                        content: None,
+                        tool_calls: vec![call_agent_tool_call("ca-1", "child", self.marker)],
+                        usage: None,
+                        finish_reason: Some("tool_calls".into()),
+                    })
+                }
+            }
+            fn provider_name(&self) -> &str {
+                "marker-delay"
+            }
+        }
+
+        let provider = MarkerDelayProvider {
+            marker: "slow work",
+            delay_ms: 500, // > the 200ms budget
+        };
+
+        let config = test_config();
+        let tree = root_child_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let limits = RuntimeLimits {
+            timeout_ms: 200,
+            ..RuntimeLimits::default()
+        };
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            limits,
+            RunId("t".into()),
+        )
+        .with_approval(
+            ApprovalManager::manual().with_callback(Arc::new(BlockingApprover { block_ms: 300 })),
+        );
+
+        let result = runner
+            .run_root(vec![user_message("delegate please")], None)
+            .await
+            .expect("root survives the child's timeout");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let tool_msg = result
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool message present");
+        assert!(
+            tool_msg.content.contains("timeout after 200ms"),
+            "child must time out against the full 200ms budget (not the \
+             wall-clock remainder), got: {}",
+            tool_msg.content
+        );
+    }
+
+    /// Provider for the depth-2 budget test: dispatches on the request's
+    /// SHAPE (user-text markers + tool-result presence), so it stays
+    /// coherent even when a layer dies before consuming a scripted
+    /// response. The root delegates to the child, the child delegates to
+    /// the grandchild, and the child's summary ECHOES the grandchild's
+    /// actual outcome (found in its own tool-result message) — so the
+    /// root's final view reveals whether the grandchild ran with a
+    /// usable budget.
+    struct DepthTwoProvider;
+    #[async_trait]
+    impl ModelProvider for DepthTwoProvider {
+        async fn generate(&self, request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
+            let user_text = user_text_of(&request);
+            let saw_tool_result = request.messages.iter().any(|m| m.role == MessageRole::Tool);
+            let saw_deep_result = request
+                .messages
+                .iter()
+                .any(|m| m.role == MessageRole::Tool && m.content.contains("deep result"));
+            Ok(if saw_tool_result {
+                if user_text.contains("do it") {
+                    // The child summarizes the grandchild's outcome.
+                    if saw_deep_result {
+                        assistant_text("child aggregated: deep result")
+                    } else {
+                        assistant_text("child got no deep result")
+                    }
+                } else {
+                    // Root wrap-up.
+                    assistant_text("root done")
+                }
+            } else if user_text.contains("sub-task") {
+                // The grandchild answers (checked before "do it": its
+                // inherited parent summary also mentions the child's task).
+                assistant_text("deep result")
+            } else if user_text.contains("do it") {
+                // The child delegates to the grandchild.
+                ModelResponse {
+                    content: None,
+                    tool_calls: vec![call_agent_tool_call("ca-2", "grandchild", "sub-task")],
+                    usage: None,
+                    finish_reason: Some("tool_calls".into()),
+                }
+            } else {
+                // Root kick-off: delegate to the child.
+                ModelResponse {
+                    content: None,
+                    tool_calls: vec![call_agent_tool_call("ca-1", "child", "do it")],
+                    usage: None,
+                    finish_reason: Some("tool_calls".into()),
+                }
+            })
+        }
+        fn provider_name(&self) -> &str {
+            "depth-two"
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_grandchild_budget_independent_of_ancestor_wall_clock() {
+        // Depth ≥ 2 consistency: every call_agent approval blocks 150ms, so
+        // by the time the grandchild starts, 300ms of wall clock has passed
+        // — more than the whole 200ms budget. The grandchild must still run
+        // with the same full per-layer budget as every other depth. Under
+        // the old shared root_deadline, the grandchild's child_timeout_ms()
+        // returned 0 and it died instantly.
+        let provider = DepthTwoProvider;
+
+        let config = test_config();
+        let tree = root_child_grandchild_tree();
+        let registry = ToolRegistry::new();
+        let skills = SkillsCatalog::default();
+        let limits = RuntimeLimits {
+            timeout_ms: 200,
+            ..RuntimeLimits::default()
+        };
+        let runner = AgentRunner::new(
+            &provider,
+            &tree,
+            &registry,
+            &skills,
+            &config,
+            limits,
+            RunId("t".into()),
+        )
+        .with_approval(
+            ApprovalManager::manual().with_callback(Arc::new(BlockingApprover { block_ms: 150 })),
+        );
+
+        let result = runner
+            .run_root(vec![user_message("go")], None)
+            .await
+            .expect("run ok");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(runner.child_call_count(), 2);
+        let tool_msgs: Vec<&Message> = result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tool_msgs.len(), 1, "root has one call_agent hop");
+        assert!(
+            tool_msgs[0]
+                .content
+                .contains("child aggregated: deep result"),
+            "grandchild must complete despite 300ms of ancestor approval \
+             waits (budget 200ms), got: {}",
+            tool_msgs[0].content
+        );
+        // The grandchild's execution node must be Completed, not Failed.
+        let exec_tree = runner.execution_tree();
+        let grandchild_node = exec_tree
+            .all_nodes()
+            .into_iter()
+            .find(|n| n.agent_id.0 == "grandchild")
+            .expect("grandchild execution node");
+        assert_eq!(
+            grandchild_node.status,
+            ExecutionStatus::Completed,
+            "grandchild layer status"
+        );
+        assert_eq!(grandchild_node.depth, 2);
     }
 
     // ── Skills catalog injection ──────────────────────────────────────────

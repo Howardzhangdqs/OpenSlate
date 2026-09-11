@@ -121,6 +121,17 @@ pub struct LimitsConfig {
     pub max_depth: u32,
     pub max_tool_calls: u32,
     pub max_child_agent_calls: u32,
+    /// Model-request timeout budget, in milliseconds (default 60000). Dual
+    /// semantics (fix-20): for NON-streaming model requests it is the TOTAL
+    /// per-attempt budget (whole request/response); for STREAMING requests
+    /// it is the IDLE budget — the maximum silence while waiting for
+    /// response headers or between stream events, so a long answer whose
+    /// tokens keep flowing is never cut off (connection establishment is
+    /// separately bounded by a fixed 15s connect timeout). At the runtime
+    /// layer (fix-21) it is the round-level budget for TOTAL LLM request
+    /// time: approval waits (decide() blocking) and tool execution do not
+    /// consume it; only the sum of the round's provider-await segments is
+    /// checked against it.
     pub timeout_ms: u64,
     pub max_context_messages: u32,
     pub max_context_bytes: u32,

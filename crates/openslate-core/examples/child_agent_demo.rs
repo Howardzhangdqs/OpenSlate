@@ -63,6 +63,7 @@ fn text(t: &str, usage: (u32, u32)) -> ModelResponse {
         usage: Some(Usage {
             input_tokens: usage.0,
             output_tokens: usage.1,
+            cached_input_tokens: None,
         }),
         finish_reason: Some("stop".into()),
     }
@@ -75,6 +76,7 @@ fn delegate(tag: &str, child: &str, task: &str, usage: (u32, u32)) -> ModelRespo
         usage: Some(Usage {
             input_tokens: usage.0,
             output_tokens: usage.1,
+            cached_input_tokens: None,
         }),
         finish_reason: Some("tool_calls".into()),
     }

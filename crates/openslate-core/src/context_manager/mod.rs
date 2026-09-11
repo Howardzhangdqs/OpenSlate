@@ -686,6 +686,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 11,
                     output_tokens: 7,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),

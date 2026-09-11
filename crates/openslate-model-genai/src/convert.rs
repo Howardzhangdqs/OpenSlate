@@ -128,6 +128,19 @@ fn joined_text_parts(content: &MessageContent) -> Option<String> {
     }
 }
 
+/// Extract the cached-input-token count from a genai usage struct
+/// (normalized across adapters: OpenAI `prompt_tokens_details.cached_tokens`,
+/// Anthropic `cache_read_input_tokens`). genai deserializes 0 as `None`
+/// (its `zero_as_none` convention), so `Some` means the server actually
+/// reported a non-zero cache read; anything else stays `None`.
+fn cached_input_tokens(u: &genai::chat::Usage) -> Option<u32> {
+    u.prompt_tokens_details
+        .as_ref()
+        .and_then(|d| d.cached_tokens)
+        .filter(|t| *t > 0)
+        .map(|t| t.max(0) as u32)
+}
+
 /// Convert a non-streaming genai [`ChatResponse`] into an OpenSlate
 /// [`ModelResponse`].
 ///
@@ -140,6 +153,7 @@ pub(crate) fn from_chat_response(res: ChatResponse) -> ModelResponse {
     let usage = Usage {
         input_tokens: res.usage.prompt_tokens.unwrap_or(0).max(0) as u32,
         output_tokens: res.usage.completion_tokens.unwrap_or(0).max(0) as u32,
+        cached_input_tokens: cached_input_tokens(&res.usage),
     };
     let finish_reason = res.stop_reason.as_ref().map(|sr| sr.raw().to_string());
 
@@ -176,6 +190,7 @@ pub(crate) fn from_stream_end(end: StreamEnd) -> (Option<Usage>, ModelResponse) 
     let usage = end.captured_usage.map(|u| Usage {
         input_tokens: u.prompt_tokens.unwrap_or(0).max(0) as u32,
         output_tokens: u.completion_tokens.unwrap_or(0).max(0) as u32,
+        cached_input_tokens: cached_input_tokens(&u),
     });
 
     // All text parts, newline-joined (first_text() would drop the rest).
@@ -415,5 +430,102 @@ mod tests {
             serialized.contains("\"call_id\":\"\""),
             "missing call_id should map to empty string; got: {serialized}"
         );
+    }
+
+    /// Cached input tokens survive both conversion paths when the provider
+    /// reports `prompt_tokens_details.cached_tokens` (genai normalizes
+    /// Anthropic's `cache_read_input_tokens` into the same field).
+    #[test]
+    fn cached_input_tokens_parsed_on_both_paths() {
+        let genai_usage = || genai::chat::Usage {
+            prompt_tokens: Some(10),
+            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+                cached_tokens: Some(4),
+                ..Default::default()
+            }),
+            completion_tokens: Some(2),
+            ..Default::default()
+        };
+
+        // Non-streaming path.
+        let model_iden = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "m");
+        let res = ChatResponse {
+            content: MessageContent::from_text("hi"),
+            reasoning_content: None,
+            model_iden: model_iden.clone(),
+            provider_model_iden: model_iden,
+            stop_reason: None,
+            usage: genai_usage(),
+            captured_raw_body: None,
+            response_id: None,
+        };
+        let mr = from_chat_response(res);
+        let usage = mr.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.cached_input_tokens, Some(4));
+
+        // Streaming path: the usage event AND the embedded response usage.
+        let end = StreamEnd {
+            captured_usage: Some(genai_usage()),
+            captured_stop_reason: None,
+            captured_content: Some(MessageContent::from_text("hi")),
+            captured_reasoning_content: None,
+            captured_response_id: None,
+        };
+        let (usage_event, mr) = from_stream_end(end);
+        assert_eq!(
+            usage_event.expect("usage event").cached_input_tokens,
+            Some(4)
+        );
+        assert_eq!(mr.usage.expect("usage").cached_input_tokens, Some(4));
+    }
+
+    /// When the server does not report cache details the field stays `None`
+    /// (absent details object, details without `cached_tokens`, and a
+    /// reported 0 — which genai's `zero_as_none` already folds to None).
+    #[test]
+    fn cached_input_tokens_absent_when_unreported() {
+        let cases = [
+            genai::chat::Usage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(1),
+                ..Default::default()
+            },
+            genai::chat::Usage {
+                prompt_tokens: Some(5),
+                prompt_tokens_details: Some(Default::default()),
+                completion_tokens: Some(1),
+                ..Default::default()
+            },
+            genai::chat::Usage {
+                prompt_tokens: Some(5),
+                prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
+                    cached_tokens: None,
+                    ..Default::default()
+                }),
+                completion_tokens: Some(1),
+                ..Default::default()
+            },
+        ];
+        for usage in cases {
+            let model_iden = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "m");
+            let res = ChatResponse {
+                content: MessageContent::from_text("hi"),
+                reasoning_content: None,
+                model_iden: model_iden.clone(),
+                provider_model_iden: model_iden,
+                stop_reason: None,
+                usage,
+                captured_raw_body: None,
+                response_id: None,
+            };
+            let mr = from_chat_response(res);
+            assert_eq!(
+                mr.usage.expect("usage").cached_input_tokens,
+                None,
+                "unreported cache must stay None"
+            );
+        }
     }
 }

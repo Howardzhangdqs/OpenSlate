@@ -255,6 +255,7 @@ async fn integration_simple_single_turn() {
         usage: Some(Usage {
             input_tokens: 10,
             output_tokens: 5,
+            cached_input_tokens: None,
         }),
         finish_reason: Some("stop".into()),
     }]);
@@ -301,6 +302,7 @@ async fn integration_run_with_real_tool() {
             usage: Some(Usage {
                 input_tokens: 50,
                 output_tokens: 20,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("tool_calls".into()),
         },
@@ -311,6 +313,7 @@ async fn integration_run_with_real_tool() {
             usage: Some(Usage {
                 input_tokens: 80,
                 output_tokens: 10,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
@@ -657,6 +660,7 @@ async fn integration_delegates_root_to_child() {
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("tool_calls".into()),
         },
@@ -667,6 +671,7 @@ async fn integration_delegates_root_to_child() {
             usage: Some(Usage {
                 input_tokens: 20,
                 output_tokens: 3,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
@@ -677,6 +682,7 @@ async fn integration_delegates_root_to_child() {
             usage: Some(Usage {
                 input_tokens: 30,
                 output_tokens: 8,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },

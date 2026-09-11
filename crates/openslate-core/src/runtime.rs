@@ -127,6 +127,14 @@ pub struct RuntimeLimits {
     pub max_depth: u32,
     pub max_tool_calls: u32,
     pub max_child_agent_calls: u32,
+    /// Round-level budget for TOTAL LLM request time, in milliseconds
+    /// (fix-21): only the time spent awaiting the provider (streaming or
+    /// not) accumulates against it. Approval waits (decide() blocking)
+    /// and tool execution pause the budget. When a round's accumulated
+    /// provider-await time exhausts it, the run fails with
+    /// `RuntimeError::Timeout`. The provider layer keeps its own
+    /// per-request semantics (streaming idle / non-streaming total,
+    /// fix-20).
     pub timeout_ms: u64,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
@@ -244,8 +252,12 @@ pub struct RunConfig {
     pub max_output_bytes: u32,
     pub max_empty_turns: u32,
     pub tool_definitions: Vec<crate::provider::ToolDefinition>,
-    /// Wall-clock timeout for the entire run in milliseconds.
-    /// If exceeded, the run returns `RuntimeError::Timeout`.
+    /// Round-level budget for TOTAL LLM request time in milliseconds
+    /// (fix-21): the sum of every provider-await segment of the round
+    /// (request dispatch through response/stream completion). Approval
+    /// waits and tool execution do NOT consume it. If the accumulated
+    /// LLM time exceeds it, the run returns `RuntimeError::Timeout`;
+    /// `0` times out immediately.
     pub timeout_ms: u64,
     /// Recursion depth of this agent run (0 = root). Used only to indent
     /// tracing logs so child-agent activity is visually nested under its
@@ -326,6 +338,21 @@ pub struct StepResult {
 /// layer must NOT race the run future in a `select!` and drop it — that
 /// would throw away everything.
 ///
+/// Time budget (fix-21): `timeout_ms` bounds the round's TOTAL
+/// provider-await time, not its wall clock. The loop accumulates only
+/// the request segments (streaming: dispatch + event receive loop;
+/// non-streaming: the `generate` await) into an LLM-time account and
+/// wraps each request with the remaining `timeout_ms − accumulated`
+/// budget. Approval waits (the decide() block inside tool execution) and
+/// tool runs happen outside those segments, so a round with healthy
+/// requests survives arbitrarily long approval queues and tool runs;
+/// conversely, genuinely slow LLM time still trips `RuntimeError::Timeout`
+/// once the accumulated total crosses the budget. The provider layer has
+/// its own independent per-request semantics (streaming idle /
+/// non-streaming total, fix-20). The runner (fix-22) delegates a FULL
+/// independent budget to every recursion layer, so each `execute_run`
+/// starts with a fresh LLM-time account.
+///
 /// Returns `RunResult` with final status and full conversation.
 pub async fn execute_run(
     provider: &dyn ModelProvider,
@@ -346,7 +373,15 @@ pub async fn execute_run(
     let mut total_cost_usd = 0.0f64;
     let mut consecutive_empty_turns = 0u32;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(config.timeout_ms);
+    // fix-21 LLM-time budget: `config.timeout_ms` bounds the TOTAL time
+    // this round spends AWAITING the provider (every step's request
+    // segments combined), NOT the round's wall clock. Approval waits
+    // (the decide() block inside tool execution) and tool runs pause the
+    // budget — they happen outside the request segments below and never
+    // touch `llm_time_accumulated`. Before each request the remainder is
+    // `timeout_ms − accumulated`; an exhausted remainder fails the round
+    // with `RuntimeError::Timeout` (same error and format as before).
+    let mut llm_time_accumulated = Duration::ZERO;
 
     // Indent per recursion depth so child-agent logs nest under their parent,
     // and tag every line with the agent id so it's clear who is acting.
@@ -381,14 +416,17 @@ pub async fn execute_run(
             });
         }
 
-        // Check remaining time budget before each model call.
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
+        // Remaining pure-LLM budget for this request segment (fix-21):
+        // `timeout_ms` minus the provider-await time already spent on
+        // earlier steps. Exhausted (including `timeout_ms = 0`, the
+        // immediate-timeout convention pinned by tests) → Timeout.
+        let remaining_llm =
+            Duration::from_millis(config.timeout_ms).saturating_sub(llm_time_accumulated);
+        if remaining_llm.is_zero() {
             return Err(OpenSlateError::Runtime(RuntimeError::Timeout {
                 timeout_ms: config.timeout_ms,
             }));
         }
-        let remaining = deadline - now;
 
         truncate_context_if_needed(&mut messages, config.max_context_bytes);
 
@@ -430,14 +468,28 @@ pub async fn execute_run(
             // before the provider's real usage arrives at stream end.
             cb.on_input_estimate(estimate_input_tokens(&request));
 
-            let mut rx = provider.generate_stream(request).await;
+            // The LLM-time segment starts at request dispatch (fix-21):
+            // default-trait providers run the whole request inline inside
+            // `generate_stream` (it awaits `generate()`), real adapters
+            // spawn and stream via the channel — both are provider
+            // awaiting, so both belong to the budgeted segment. The
+            // timeout wraps dispatch AND the receive loop together
+            // (fix-22): with the dispatch outside, an inline default
+            // `generate_stream` (exactly what child layers use via
+            // ChildProgress) ran the whole request unbounded and the
+            // timeout only guarded the already-drained channel. Real
+            // adapters are unaffected — their dispatch returns a
+            // receiver immediately, so the bound is the same recv loop
+            // it always was.
+            let segment_start = Instant::now();
             let mut assembled: Option<ModelResponse> = None;
             // Set when the cancel token fires mid-stream; the partial turn is
             // discarded (no assistant message is appended for it) and the run
             // returns Interrupted with everything accumulated so far.
             let mut stream_cancelled = false;
 
-            let timeout_result = tokio::time::timeout(remaining, async {
+            let timeout_result = tokio::time::timeout(remaining_llm, async {
+                let mut rx = provider.generate_stream(request).await;
                 let mut first_token = true;
                 loop {
                     tokio::select! {
@@ -475,6 +527,12 @@ pub async fn execute_run(
                 Ok::<_, ProviderError>(())
             })
             .await;
+
+            // Bill the segment (dispatch + stream receive loop) against
+            // the round's LLM budget (fix-21). Error outcomes return
+            // below, so the accumulation only matters on the paths that
+            // continue the loop.
+            llm_time_accumulated += segment_start.elapsed();
 
             cb.on_request_end();
 
@@ -523,7 +581,11 @@ pub async fn execute_run(
                         total_cost_usd,
                     ));
                 }
-                resp = tokio::time::timeout(remaining, provider.generate(request)) => {
+                resp = tokio::time::timeout(remaining_llm, provider.generate(request)) => {
+                    // Bill the request segment against the LLM budget
+                    // before any error propagation (fix-21) — on success
+                    // the loop continues with the shrunken remainder.
+                    llm_time_accumulated += call_start.elapsed();
                     resp.map_err(|_| {
                         OpenSlateError::Runtime(RuntimeError::Timeout {
                             timeout_ms: config.timeout_ms,
@@ -1335,6 +1397,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 100,
                     output_tokens: 20,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1345,6 +1408,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 150,
                     output_tokens: 5,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -1860,6 +1924,291 @@ mod tests {
         match result.unwrap_err() {
             OpenSlateError::Runtime(RuntimeError::Timeout { timeout_ms }) => {
                 assert_eq!(timeout_ms, 0);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    // ── LLM-time budget semantics (fix-21) ──────────────────────────────
+    //
+    // `[limits].timeout_ms` bounds the round's TOTAL provider-await time.
+    // Approval waits (decide() blocking inside tool execution) and tool
+    // runs pause the budget; pure LLM time spent across steps accumulates
+    // and still kills the round when it exceeds the budget.
+
+    /// Executor whose tool blocks far longer than the round budget — the
+    /// shape of a manual-approval wait (decide() blocking on the user's
+    /// y/n) plus the tool's own run: exactly the fix-21 repro.
+    struct ApprovalBlockingExecutor {
+        block_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::ToolExecutor for ApprovalBlockingExecutor {
+        async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
+            tokio::time::sleep(Duration::from_millis(self.block_ms)).await;
+            ToolOutput {
+                content: "approved and ran".into(),
+                bytes: 18,
+                duration_ms: self.block_ms,
+                status: ToolOutputStatus::Success,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_budget_ignores_approval_and_tool_time() {
+        // fix-21 repro nail (non-streaming path): step 1 answers with a
+        // tool call; the tool's "approval" blocks 300ms — LONGER than the
+        // whole 200ms budget; step 2's request must still get the full
+        // budget and succeed. Under the old round wall clock the
+        // pre-step-2 check found the deadline burnt by the approval and
+        // killed the run with `timeout after 200ms`.
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("tutorial draft done".into()),
+                tool_calls: vec![],
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        let mut config = default_config();
+        config.timeout_ms = 200;
+
+        let result = execute_run(
+            &provider,
+            config,
+            "m1",
+            &ApprovalBlockingExecutor { block_ms: 300 },
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("approval/tool time must not burn the LLM budget");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 2);
+    }
+
+    /// Streaming provider with a spawned dispatch (the shape of the real
+    /// genai adapter — `generate_stream` returns a receiver immediately
+    /// and the response arrives as stream events): each call streams its
+    /// scripted response as Delta(s) + Done.
+    struct ScriptedStreamProvider {
+        responses: Vec<ModelResponse>,
+        call_count: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedStreamProvider {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
+            Err(ProviderError::ServerError(500)) // streaming path only
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: GenerateRequest,
+        ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let resp = self.responses.get(idx).cloned();
+            tokio::spawn(async move {
+                match resp {
+                    Some(resp) => {
+                        if let Some(text) = &resp.content {
+                            let _ = tx.send(Ok(ModelStreamEvent::Delta(text.clone()))).await;
+                        }
+                        let _ = tx.send(Ok(ModelStreamEvent::Done(resp))).await;
+                    }
+                    None => {
+                        let _ = tx.send(Err(ProviderError::ServerError(500))).await;
+                    }
+                }
+            });
+            rx
+        }
+
+        fn provider_name(&self) -> &str {
+            "scripted-stream"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_budget_ignores_tool_time_streaming_path() {
+        // The same nail on the STREAMING path (progress callback wired —
+        // the production CLI/TUI shape): the tool block must not consume
+        // the budget and the second stream must complete with its full
+        // remainder.
+        let provider = ScriptedStreamProvider {
+            responses: vec![
+                ModelResponse {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: ToolCallId("tc-1".into()),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                    }],
+                    usage: None,
+                    finish_reason: Some("tool_calls".into()),
+                },
+                ModelResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    finish_reason: Some("stop".into()),
+                },
+            ],
+            call_count: AtomicUsize::new(0),
+        };
+
+        let mut config = default_config();
+        config.timeout_ms = 200;
+        let mut progress = NoopProgress;
+
+        let result = execute_run(
+            &provider,
+            config,
+            "m1",
+            &ApprovalBlockingExecutor { block_ms: 300 },
+            None,
+            Some(&mut progress),
+            None,
+        )
+        .await
+        .expect("streaming run must survive the approval block");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        assert_eq!(result.total_steps, 2);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_bounds_inline_stream_dispatch() {
+        // fix-22 pin: a provider relying on the DEFAULT `generate_stream`
+        // (which awaits `generate()` inline — the shape of child-agent
+        // layers wired through ChildProgress) must have a single over-
+        // budget request killed by the per-request budget. Previously the
+        // timeout only wrapped the receive loop, so the inline dispatch
+        // ran unbounded and the (already-drained) channel never tripped
+        // it; the overrun only surfaced at the NEXT step boundary.
+        struct InlineSleepyStreamProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for InlineSleepyStreamProvider {
+            async fn generate(
+                &self,
+                _request: GenerateRequest,
+            ) -> Result<ModelResponse, ProviderError> {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(ModelResponse {
+                    content: Some("never".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    finish_reason: Some("stop".into()),
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "inline-sleepy-stream"
+            }
+        }
+
+        let mut config = default_config();
+        config.timeout_ms = 200;
+        let mut progress = NoopProgress;
+
+        let result = execute_run(
+            &InlineSleepyStreamProvider,
+            config,
+            "m1",
+            &MockToolExecutor,
+            None,
+            Some(&mut progress),
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            OpenSlateError::Runtime(RuntimeError::Timeout { timeout_ms }) => {
+                assert_eq!(timeout_ms, 200);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_budget_accumulates_llm_time_across_steps() {
+        // The budget is the round's TOTAL LLM time (fix-21): request 1
+        // spends ~120ms of the 200ms budget and returns a tool call; the
+        // tool itself is instant; request 2 then has only ~80ms of budget
+        // left and its 500ms await must be killed by Timeout — pure-LLM
+        // overrun still times out.
+        struct SleepyProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for SleepyProvider {
+            async fn generate(
+                &self,
+                request: GenerateRequest,
+            ) -> Result<ModelResponse, ProviderError> {
+                let is_first = !request.messages.iter().any(|m| m.role == MessageRole::Tool);
+                if is_first {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    Ok(ModelResponse {
+                        content: None,
+                        tool_calls: vec![ToolCall {
+                            id: ToolCallId("tc-1".into()),
+                            name: "fast".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        usage: None,
+                        finish_reason: Some("tool_calls".into()),
+                    })
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok(ModelResponse {
+                        content: Some("never".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        finish_reason: Some("stop".into()),
+                    })
+                }
+            }
+            fn provider_name(&self) -> &str {
+                "sleepy"
+            }
+        }
+
+        let mut config = default_config();
+        config.timeout_ms = 200;
+
+        let result = execute_run(
+            &SleepyProvider,
+            config,
+            "m1",
+            &MockToolExecutor,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            OpenSlateError::Runtime(RuntimeError::Timeout { timeout_ms }) => {
+                assert_eq!(timeout_ms, 200);
             }
             other => panic!("expected Timeout, got {other:?}"),
         }
@@ -3012,7 +3361,8 @@ mod tests {
         assert!(
             (spec.cost_of(&Usage {
                 input_tokens: 500_000,
-                output_tokens: 100_000
+                output_tokens: 100_000,
+                cached_input_tokens: None
             }) - 1.6f64)
                 .abs()
                 < 1e-12
@@ -3022,7 +3372,8 @@ mod tests {
         assert!(
             (input_only.cost_of(&Usage {
                 input_tokens: 1_000_000,
-                output_tokens: 999
+                output_tokens: 999,
+                cached_input_tokens: None
             }) - 1.0f64)
                 .abs()
                 < 1e-12
@@ -3036,7 +3387,8 @@ mod tests {
         assert_eq!(
             spec.cost_of(&Usage {
                 input_tokens: 123_456,
-                output_tokens: 65_432
+                output_tokens: 65_432,
+                cached_input_tokens: None
             }),
             0.0,
             "unconfigured pricing must record cost 0"
@@ -3062,6 +3414,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 1_000,
                     output_tokens: 2_000,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -3071,6 +3424,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 3_000,
                     output_tokens: 4_000,
+                    cached_input_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -3101,6 +3455,7 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 9_999,
                 output_tokens: 1_111,
+                cached_input_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);

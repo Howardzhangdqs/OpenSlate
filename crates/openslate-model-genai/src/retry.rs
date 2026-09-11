@@ -3,22 +3,23 @@
 //! # Semantics (Phase 2 network-resilience design)
 //!
 //! - Retries live INSIDE `GenaiProvider::generate` / `generate_stream`.
-//! - Every attempt is an independent HTTP request with its own per-request
-//!   reqwest timeout (`GenaiConfig::timeout_secs`, 60s by default). Total
-//!   wall clock is still bounded by the runtime's outer
-//!   `tokio::time::timeout(remaining)`: a call whose retries burn the
-//!   remaining budget now fails with a run-level `Timeout` instead of an
-//!   immediate `ProviderError` — a deliberate, documented failure-mode
-//!   drift from the pre-retry behaviour.
+//! - Every attempt is an independent HTTP request with its own budget
+//!   (`GenaiConfig::timeout_ms`: TOTAL per attempt on `generate`, IDLE
+//!   between stream events on `generate_stream` — see the crate docs'
+//!   "Timeout semantics"). Total wall clock is still bounded by the
+//!   runtime's outer `tokio::time::timeout(remaining)`: a call whose
+//!   retries burn the remaining budget now fails with a run-level Timeout
+//!   instead of an immediate `ProviderError` — a deliberate, documented
+//!   failure-mode drift from the pre-retry behaviour.
 //! - **Retryable**: HTTP 429, HTTP 5xx, transient network/connect errors
 //!   (including `genai::Error::WebStream` transport failures that occur
 //!   before any output has been forwarded).
 //! - **Not retryable**: permanent 4xx (401/403/400/404…), request timeouts
-//!   (a single attempt already spent the full per-request timeout), and any
-//!   stream error observed AFTER the first `Delta` or `Reasoning` event has
-//!   been forwarded to the consumer — retrying then would replay
-//!   already-displayed UI output. Errors after `Usage`/`Done` are moot (the
-//!   stream is terminal by then).
+//!   (a single attempt already spent the full budget — total on
+//!   `generate`, idle on `generate_stream`), and any stream error observed
+//!   AFTER the first `Delta` or `Reasoning` event has been forwarded to the
+//!   consumer — retrying then would replay already-displayed UI output.
+//!   Errors after `Usage`/`Done` are moot (the stream is terminal by then).
 //! - Backoff: `retry_base_ms * 2^(attempt-1) + jitter` for the 1-based
 //!   number of the attempt that just failed; a single sleep is capped at
 //!   10s. `max_attempts` is the TOTAL number of attempts, including the

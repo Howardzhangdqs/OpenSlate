@@ -1,0 +1,41 @@
+[package]
+name = "openslate-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openslate-tui"
+path = "src/main.rs"
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+# Shared application wiring (build_app_context / resolve_config_file) and
+# per-turn provider construction, shared with the CLI.
+openslate-app = { path = "../openslate-app" }
+# RunRecorder session wiring (lazy shared run_id + per-turn message_sink).
+openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+# TUI framework (pinned =0.30.2 workspace-wide, see root Cargo.toml).
+ratatui = { workspace = true }
+# Terminal backend; must stay version-aligned with ratatui's backend
+# (event-stream enables the async EventStream used in the main select! loop).
+crossterm = { workspace = true }
+# StreamExt for the crossterm EventStream.
+tokio-stream = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# File logging to ~/.local/share/openslate/logs/tui.log (env-filter driven).
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+# ApprovalRequest argument summaries + message JSON handling.
+serde_json = { workspace = true }
+# Local-time formatting for log timestamps.
+chrono = { workspace = true }
+# XDG data-dir resolution for the log file location.
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Implementing ModelProvider for the scripted test provider.
+async-trait = { workspace = true }

@@ -87,11 +87,60 @@ fn load_agents(agents_dir: &Path) -> Result<AgentsConfig> {
     })
 }
 
-/// Run the validate command.
+/// Resolve and load the merged configuration for `validate` on DEFAULT
+/// discovery (model-mgmt-1 layering).
 ///
-/// Loads config from `config_path` and agents from `agents_path`,
-/// runs validation, prints results, and returns `Ok(())` on success
-/// or `Err(..)` on failure.
+/// Returns `(config_path, config, merged_global_path)`: the user-global
+/// library (`~/.config/openslate/`) is merged underneath the active config
+/// via the shared wiring helpers; `merged_global_path` is `Some` only when
+/// both files existed and were merged, so the caller can print the
+/// provenance diagnostic. A missing config file surfaces through the loader
+/// exactly as before ("Failed to read config file '<path>'").
+///
+/// Explicit `--config` does NOT go through here — `run_validate` keeps the
+/// legacy single-file path for it (path not existence-checked, no global
+/// library, identical error printing).
+pub fn resolve_effective_config() -> Result<(PathBuf, OpenSlateConfig, Option<PathBuf>)> {
+    let cwd = env::current_dir().context("Failed to get current directory")?;
+    let paths = resolve_paths(&cwd);
+    let (path, global) = openslate_app::wiring::select_config_files(
+        paths.local_config_dir.as_deref(),
+        &paths.global_config_dir,
+    );
+    let config = openslate_app::wiring::load_config_layered(&path, global.as_deref())?;
+    Ok((path, config, global))
+}
+
+/// Entry point for `openslate validate` (main.rs).
+///
+/// - explicit `--config`: the legacy single-file path, byte-identical to the
+///   pre-layering command (resolution, load-error printing, no merging);
+/// - default discovery: the global library is merged underneath the active
+///   config, with a provenance line when a merge happened.
+pub fn run_validate(config_flag: Option<&str>, strict: bool) -> Result<()> {
+    if let Some(flag) = config_flag {
+        let config_path = resolve_config_path(Some(flag))?;
+        let agents_path =
+            resolve_agents_path(config_path.parent().unwrap_or_else(|| Path::new(".")));
+        return run_validate_command(&config_path, &agents_path, strict);
+    }
+
+    let (config_path, config, merged_global) = match resolve_effective_config() {
+        Ok(ok) => ok,
+        Err(e) => {
+            print_error(&format!("Failed to load config: {}", e));
+            return Err(e);
+        }
+    };
+    if let Some(global_path) = &merged_global {
+        print_info(&format!("merged global library: {}", global_path.display()));
+    }
+    let agents_path = resolve_agents_path(config_path.parent().unwrap_or_else(|| Path::new(".")));
+    run_validate_loaded(config, &config_path, &agents_path, strict)
+}
+
+/// Run the validate command against a config file on disk (legacy
+/// single-file path: exact load-error printing preserved).
 pub fn run_validate_command(config_path: &Path, agents_path: &Path, strict: bool) -> Result<()> {
     // Load config
     let config = match load_config(config_path) {
@@ -101,7 +150,16 @@ pub fn run_validate_command(config_path: &Path, agents_path: &Path, strict: bool
             return Err(e);
         }
     };
+    run_validate_loaded(config, config_path, agents_path, strict)
+}
 
+/// Run validation over an already-loaded (possibly globally merged) config.
+fn run_validate_loaded(
+    config: OpenSlateConfig,
+    config_path: &Path,
+    agents_path: &Path,
+    strict: bool,
+) -> Result<()> {
     // Load agents
     let agents = match load_agents(agents_path) {
         Ok(a) => a,
@@ -347,6 +405,196 @@ model = "m2"
             err_msg.contains("Failed to load config") || err_msg.contains("Failed to read"),
             "error should mention config loading failure: {err_msg}"
         );
+    }
+
+    // ── model-mgmt-1: global library merged on default discovery ─────────
+
+    /// The orchestrator's integration scenario, driven in-process through the
+    /// same composition `resolve_effective_config` uses on default discovery
+    /// (`select_config_files` + `load_config_layered`), with explicit temp
+    /// dirs instead of `XDG_CONFIG_HOME` env mutation (parallel-test safe).
+    ///
+    /// Global library: providers.g + models.good + models.bad (→ ghost
+    /// provider) + levels main=good fast=bad. Local project: ONLY
+    /// `[levels] main = "bad"` (a level remap of a global entry).
+    ///
+    /// Expected: the merged validate run reports the ghost PROVIDER for
+    /// models.bad (the global library WAS merged), not "levels.main points
+    /// to non-existent model entry 'bad'" (which a single-file read of the
+    /// local config would produce).
+    #[test]
+    fn test_validate_merges_global_library_under_local_override() {
+        let project = TempDir::new().expect("tmp project");
+        let global_dir = TempDir::new().expect("tmp global");
+
+        std::fs::write(
+            global_dir.path().join("openslate.toml"),
+            "[providers.g]\nbase_url = \"https://g.example.com\"\napi_key_env = \"GK\"\n\n\
+             [models.good]\nprovider = \"g\"\nmodel = \"m-good\"\n\n\
+             [models.bad]\nprovider = \"ghost\"\nmodel = \"m-bad\"\n\n\
+             [levels]\nmain = \"good\"\nfast = \"bad\"\n",
+        )
+        .expect("global toml");
+        let local_dir = project.path().join(".openslate");
+        std::fs::create_dir(&local_dir).expect("mkdir");
+        std::fs::write(
+            local_dir.join("openslate.toml"),
+            "[levels]\nmain = \"bad\"\n",
+        )
+        .expect("local toml");
+        let agents_dir = local_dir.join("agents");
+        std::fs::create_dir(&agents_dir).expect("mkdir");
+        std::fs::write(
+            agents_dir.join("root.md"),
+            "---\nid: root\nname: Root\nmodel: main\ndefault_prompt: hi\n---\n",
+        )
+        .expect("agent file");
+        let agents = parse_agents_dir(&agents_dir).expect("agents parse");
+
+        // Same composition as resolve_effective_config's default branch.
+        let (active, global) =
+            openslate_app::wiring::select_config_files(Some(&local_dir), global_dir.path());
+        assert_eq!(active, local_dir.join("openslate.toml"));
+        assert_eq!(
+            global.as_deref(),
+            Some(global_dir.path().join("openslate.toml").as_path())
+        );
+        let merged = openslate_app::wiring::load_config_layered(&active, global.as_deref())
+            .expect("layered load");
+
+        // p1: local override main→bad + global model library merged in.
+        assert_eq!(
+            merged.levels.get("main").map(String::as_str),
+            Some("bad"),
+            "local level mapping wins"
+        );
+        assert!(merged.models.contains_key("bad"), "global model merged");
+        assert!(merged.models.contains_key("good"), "global model merged");
+
+        let errors = validate_config(&merged, &agents);
+        let ghost_err = errors.iter().find(|e| e.message.contains("ghost"));
+        assert!(
+            ghost_err.is_some(),
+            "merged validate must report the ghost provider: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.message.contains("points to non-existent model entry")),
+            "the local level remap must resolve against the MERGED library: {errors:?}"
+        );
+
+        // Contrast: the local file ALONE (pre-layering behavior) would flag
+        // the dangling level — this is the bug this integration fixes.
+        let local_alone =
+            openslate_app::wiring::load_config_layered(&active, None).expect("single-file load");
+        let errors_alone = validate_config(&local_alone, &agents);
+        assert!(
+            errors_alone
+                .iter()
+                .any(|e| e.message.contains("points to non-existent model entry")),
+            "sanity: single-file read does NOT see the global library: {errors_alone:?}"
+        );
+    }
+
+    /// p2 companion scenario: a global library with only valid entries and a
+    /// local `[levels]` remap onto them validates clean under the merged
+    /// load — the level requirements are satisfied entirely through the
+    /// global library.
+    #[test]
+    fn test_validate_global_only_library_with_local_level_passes() {
+        let project = TempDir::new().expect("tmp project");
+        let global_dir = TempDir::new().expect("tmp global");
+
+        std::fs::write(
+            global_dir.path().join("openslate.toml"),
+            "[providers.g]\nbase_url = \"https://g.example.com\"\napi_key_env = \"GK\"\n\n\
+             [models.good]\nprovider = \"g\"\nmodel = \"m-good\"\n\n\
+             [levels]\nfast = \"good\"\n",
+        )
+        .expect("global toml");
+        let local_dir = project.path().join(".openslate");
+        std::fs::create_dir(&local_dir).expect("mkdir");
+        std::fs::write(
+            local_dir.join("openslate.toml"),
+            "[levels]\nmain = \"good\"\n",
+        )
+        .expect("local toml");
+
+        let (active, global) =
+            openslate_app::wiring::select_config_files(Some(&local_dir), global_dir.path());
+        let merged = openslate_app::wiring::load_config_layered(&active, global.as_deref())
+            .expect("layered load");
+        assert!(merged.levels.contains_key("main"));
+
+        let agents_dir = local_dir.join("agents");
+        std::fs::create_dir(&agents_dir).expect("mkdir");
+        std::fs::write(
+            agents_dir.join("root.md"),
+            "---\nid: root\nname: Root\nmodel: main\ndefault_prompt: hi\n---\n",
+        )
+        .expect("agent file");
+        let agents = parse_agents_dir(&agents_dir).expect("agents parse");
+
+        let errors = validate_config(&merged, &agents);
+        assert!(
+            errors.is_empty(),
+            "merged global library + local levels validate clean: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_config_stays_single_file() {
+        // An explicit --config must NOT consult any global library: this
+        // config has a dangling level and no matching model, which only
+        // fails via the plain single-file finding (no merge can rescue it).
+        let tmp = TempDir::new().expect("tmp");
+        let config_path = tmp.path().join("only-levels.toml");
+        std::fs::write(&config_path, "[levels]\nmain = \"ghost2\"\n").expect("write toml");
+        let agents_path = tmp.path().join("agents");
+        std::fs::create_dir(&agents_path).expect("mkdir");
+        std::fs::write(
+            agents_path.join("root.md"),
+            "---\nid: root\nname: Root\nmodel: main\ndefault_prompt: hi\n---\n",
+        )
+        .expect("agent file");
+
+        let config = load_config(&config_path).expect("config parses");
+        let agents = parse_agents_dir(&agents_path).expect("agents parse");
+        let errors = validate_config(&config, &agents);
+        assert!(
+            errors.iter().any(|e| e.message.contains("ghost2")
+                && e.message.contains("points to non-existent model entry")),
+            "explicit single file sees only itself (dangling level): {errors:?}"
+        );
+        assert!(
+            run_validate_command(&config_path, &agents_path, false).is_err(),
+            "explicit --config with a dangling level must fail"
+        );
+    }
+
+    #[test]
+    fn test_run_validate_loaded_surfaces_validation_failure() {
+        // End-to-end through run_validate_loaded with a merged config: the
+        // ghost-provider finding fails the command.
+        let tmp = temp_project_with_valid_config();
+        let openslate_dir = tmp.path().join(".openslate");
+        let config =
+            openslate_app::wiring::load_config_layered(&openslate_dir.join("openslate.toml"), None)
+                .expect("load");
+        let agents_path = openslate_dir.join("agents");
+        // Corrupt a provider reference to force a validation failure.
+        let mut config = config;
+        if let Some(m) = config.models.get_mut("main") {
+            m.provider = "ghost".into();
+        }
+        let result = run_validate_loaded(
+            config,
+            &openslate_dir.join("openslate.toml"),
+            &agents_path,
+            false,
+        );
+        assert!(result.is_err(), "ghost provider must fail validate");
     }
 
     #[test]

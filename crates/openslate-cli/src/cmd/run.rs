@@ -76,6 +76,7 @@ fn extract_final_assistant_message(messages: &[openslate_core::types::Message]) 
 }
 
 /// Format and write the result to output.
+#[allow(clippy::too_many_arguments)]
 fn write_result(
     content: &str,
     result: &openslate_core::run_manager::ManagedRunResult,
@@ -694,9 +695,9 @@ async fn persist_trace_to_store(
         let parent_exec = node.parent_execution_id.as_ref().map(|id| id.to_string());
         store
             .insert_execution_node(
-                &node.id.to_string(),
-                &node.run_id.to_string(),
-                &node.agent_id.to_string(),
+                node.id.as_ref(),
+                node.run_id.as_ref(),
+                node.agent_id.as_ref(),
                 parent_exec.as_deref(),
                 node.parent_call_id.as_deref(),
                 node_status,

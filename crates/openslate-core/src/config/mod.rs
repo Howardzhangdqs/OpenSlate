@@ -15,12 +15,14 @@
 //! | `prompts`   | `PromptsConfig`     | no       | Prompt template paths              |
 //! | `limits`    | `LimitsConfig`      | no       | Execution limit defaults           |
 //! | `providers` | `Map<String, ProviderConfig>` | yes | LLM provider endpoints |
-//! | `models`    | `Map<String, ModelConfig>`    | yes | Named model aliases (`main`, `fast` required) |
+//! | `models`    | `Map<String, ModelConfig>`    | yes | Model library entries (each binds provider + model id) |
+//! | `levels`    | `Map<String, String>`         | no  | Model level → model library entry name (legacy configs without `[levels]` treat each `models` key directly as an alias) |
 //! | `trace`     | `TraceConfig`       | no       | Observability settings             |
 //! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
 //! | `skills`    | `SkillsConfig`      | no       | Skill discovery / injection        |
 //! | `ptc`       | `PtcConfig`         | no       | Programmatic Tool Calling settings |
 //! | `approval`  | `Option<ApprovalConfig>` | no  | Tool approval gating               |
+//! | `tui`       | `TuiConfig`         | no       | TUI frontend (icon overrides)      |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -35,6 +37,8 @@
 //! [`validation::validate_strict`] for errors + warnings, or
 //! [`validation::validate_config_full`] for a structured result.
 
+pub mod merge;
+pub mod persist;
 pub mod validation;
 
 use std::collections::{BTreeMap, HashMap};
@@ -62,6 +66,15 @@ pub struct OpenSlateConfig {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
+    /// Model levels (`[levels]`): level name → model library entry name
+    /// (model-mgmt-1). Levels are what agents reference (`main`, `fast`, …);
+    /// an entry in `[models]` binds a provider + concrete model id and is the
+    /// shared library. Resolution precedence: a name found in `levels` is
+    /// mapped to its entry first; names absent from `levels` fall back to the
+    /// legacy direct `[models]` lookup, so configs without a `[levels]`
+    /// section keep their exact pre-existing behavior.
+    #[serde(default)]
+    pub levels: HashMap<String, String>,
     #[serde(default)]
     pub trace: Option<TraceConfig>,
     /// MCP (Model Context Protocol) client servers.
@@ -82,6 +95,10 @@ pub struct OpenSlateConfig {
     /// interactivity and `--yes`.
     #[serde(default)]
     pub approval: Option<ApprovalConfig>,
+    /// TUI frontend settings (`[tui]` — icon overrides). The section
+    /// is TUI-only; other binaries ignore it.
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 /// Project metadata.
@@ -331,6 +348,29 @@ impl Default for SkillsConfig {
             max_list_chars: 8000,
         }
     }
+}
+
+/// TUI frontend settings (`[tui]`). Only `openslate-tui` consumes this
+/// section; every other binary ignores it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TuiConfig {
+    /// Icon glyph overrides.
+    pub icons: TuiIconsConfig,
+}
+
+/// Per-slot icon glyph overrides (icons-4). Any default codepoint
+/// table bets against some user's font — per-slot overrides let
+/// missing glyphs self-heal: the TUI patches each named slot of the
+/// CLI-selected tier. Keys are `IconSet` field names (`branch`,
+/// `brand`, `thinking`, …); unknown keys and empty values are ignored
+/// with a startup warning. Values may be multi-char; TOML
+/// `\uXXXX`/`\UXXXXXXXX` escapes or literal glyphs both work.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TuiIconsConfig {
+    /// Slot name → replacement glyph (empty map by default).
+    pub overrides: HashMap<String, String>,
 }
 
 /// Programmatic Tool Calling (PTC) settings — see PTC_PLAN.md.
@@ -999,6 +1039,55 @@ telepathy = true
         );
         assert!(
             msg.contains("telepathy"),
+            "error should name the offending field, got: {msg}"
+        );
+    }
+
+    // ── [tui] parse tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_tui_defaults_when_section_absent() {
+        let config = parse_openslate_toml("").expect("empty toml should parse");
+        assert!(
+            config.tui.icons.overrides.is_empty(),
+            "no [tui] section = empty override map"
+        );
+    }
+
+    #[test]
+    fn parse_tui_icon_overrides() {
+        let toml = r#"
+[tui.icons]
+overrides = { branch = "\uF418", brand = "★" }
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.tui.icons.overrides.len(), 2);
+        assert_eq!(
+            config.tui.icons.overrides.get("branch").map(String::as_str),
+            Some("\u{F418}"),
+            "TOML \\uXXXX escape decodes to the PUA codepoint"
+        );
+        assert_eq!(
+            config.tui.icons.overrides.get("brand").map(String::as_str),
+            Some("★"),
+            "literal glyphs pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn parse_tui_unknown_field_rejected() {
+        let toml = r#"
+[tui.icons]
+foo = 1
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "expected 'unknown field' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("foo"),
             "error should name the offending field, got: {msg}"
         );
     }

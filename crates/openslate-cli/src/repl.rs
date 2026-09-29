@@ -183,7 +183,7 @@ impl SlashCommand {
 }
 
 #[derive(Debug, Clone)]
-struct SessionStats {
+pub(crate) struct SessionStats {
     total_steps: u32,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -1419,6 +1419,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -1447,6 +1448,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -1475,6 +1477,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -1514,6 +1517,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -1531,6 +1535,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -1548,6 +1553,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -2131,6 +2137,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -2167,6 +2174,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -2211,6 +2219,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };
@@ -2535,6 +2544,7 @@ max_tool_calls = 20
             manager,
             skills: openslate_core::skills::SkillsCatalog::default(),
             config_path: tmp.path().join(".openslate/openslate.toml"),
+            global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
         };

@@ -83,6 +83,14 @@ max_context_tokens = 128000
 supports_vision = true
 supports_tool_call = true
 
+# Model levels: level name -> model library entry ([models] key). Levels are
+# what agents reference; here each level points at a same-named entry, which
+# keeps this fixture compatible with both the legacy layout (each [models]
+# key IS the alias) and the new two-layer schema.
+[levels]
+main = "main"
+fast = "fast"
+
 [trace]
 enabled = true
 store_sqlite = true
@@ -126,3 +134,13 @@ url = "http://localhost:8000/mcp"
 # [approval]
 # policy = "auto_except"
 # tools = ["shell", "run_code"]
+
+# TUI frontend — per-slot icon glyph overrides (icons-4). Any default
+# codepoint table bets against some user's font; override just the
+# slots your font misses (stacks on the --icons tier). Keys are
+# IconSet field names (branch/brand/thinking/...); unknown keys or
+# empty values are ignored with a startup warning. Values may be
+# multi-char; TOML \uXXXX escapes or literal glyphs both work.
+# [tui.icons.overrides]
+# branch = "\uF418"   # Nerd Font PUA via escape (nf-oct-git_branch)
+# brand = "★"         # literal glyph works too

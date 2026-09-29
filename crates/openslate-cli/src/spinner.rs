@@ -371,16 +371,15 @@ fn build_summary_line(model: &str, s: &LiveState, success: bool) -> String {
     format!("{} {}", mark, parts.join(" · "))
 }
 
-/// Token segment in the user's format:
-/// `↑569 ↓514r600` (content 514, reasoning 600), `↑569 ↓r600` (reasoning only),
-/// `↑569 ↓514` (content only), or `↓0` (nothing yet).
-/// Format the token segment: `↑{input} ↓{output}` (input omitted if absent).
+/// Token segment in the user's format: `↑569 ↓514r600` (content 514,
+/// reasoning 600), `↑569 ↓r600` (reasoning only), `↑569 ↓514` (content
+/// only), or `↓0` (nothing yet).
 ///
-/// `output` is the provider's accurate `completion_tokens` (includes reasoning
-/// + content + tool_call). The reasoning/content split is NOT shown because
-/// internlm (and most OpenAI-compatible providers) do not return a
-/// `reasoning_tokens` breakdown — showing a `len()/4` estimated split would be
-/// misleading (e.g. "Hello" showing 20 content tokens).
+/// `output` is the provider's accurate `completion_tokens` (includes
+/// reasoning + content + tool_call). The reasoning/content split is NOT
+/// shown because internlm (and most OpenAI-compatible providers) do not
+/// return a `reasoning_tokens` breakdown — showing a `len()/4` estimated
+/// split would be misleading (e.g. "Hello" showing 20 content tokens).
 fn token_segment(input: &Option<u32>, output: u64) -> String {
     let mut seg = String::new();
     if let Some(in_tok) = input {

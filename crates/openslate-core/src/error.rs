@@ -51,6 +51,11 @@ pub enum ConfigError {
     #[error("invalid provider reference: {0}")]
     InvalidProviderRef(String),
 
+    /// A `[levels]` mapping points at a model entry that does not exist.
+    /// The payload reads like `level 'main' points to unknown model entry 'x'`.
+    #[error("invalid level reference: {0}")]
+    InvalidLevelRef(String),
+
     #[error("duplicate agent id: {0}")]
     DuplicateAgentId(String),
 
@@ -297,6 +302,15 @@ mod tests {
         assert_eq!(
             format!("{}", ConfigError::InvalidProviderRef("bad".into())),
             "invalid provider reference: bad"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                ConfigError::InvalidLevelRef(
+                    "level 'main' points to unknown model entry 'x'".into()
+                )
+            ),
+            "invalid level reference: level 'main' points to unknown model entry 'x'"
         );
         assert_eq!(
             format!("{}", ConfigError::DuplicateAgentId("a1".into())),

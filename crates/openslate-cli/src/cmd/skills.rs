@@ -1,13 +1,17 @@
 //! `openslate skills` command — list discovered agent skills.
 //!
-//! Lightweight: resolves + parses `openslate.toml`, discovers `SKILL.md`
-//! catalogs from the same sources the run wiring uses (no sqlite, no
-//! providers, no MCP connections), and prints a table. Discovery warnings go
-//! to stderr prefixed `WARN`; the listing goes to stdout.
+//! Lightweight: takes the already-loaded config from main (default discovery
+//! merges the user-global library underneath the active config; explicit
+//! `--config` stays single-file — see `wiring::load_effective_config`),
+//! discovers `SKILL.md` catalogs from the same sources the run wiring uses
+//! (no sqlite, no providers, no MCP connections), and prints a table.
+//! Discovery warnings go to stderr prefixed `WARN`; the listing goes to
+//! stdout.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use openslate_core::config::OpenSlateConfig;
 use openslate_core::skills::{discover_skills, SkillsCatalog};
 
 /// Width cap for the description column (long first lines get ellipsized).
@@ -75,9 +79,11 @@ pub(crate) fn render_skills_listing(catalog: &SkillsCatalog, sources: &[PathBuf]
 
 /// Run the skills command: load config, discover skills from the standard
 /// sources, print warnings (stderr) and the listing (stdout).
-pub fn run_skills_command(config_path: &Path) -> Result<()> {
-    let config = crate::wiring::load_config(config_path)?;
-
+/// Run the skills command: discover skills from the standard sources for the
+/// (already loaded, possibly globally merged) `config`, print warnings
+/// (stderr) and the listing (stdout). `config_path` locates the active
+/// config dir for the skill discovery sources.
+pub fn run_skills_command(config_path: &Path, config: OpenSlateConfig) -> Result<()> {
     if !config.skills.enabled {
         println!("Skills are disabled ([skills] enabled = false)");
         return Ok(());
@@ -188,7 +194,8 @@ model = "m1"
         fs::write(&toml_path, format!("{base}\n[skills]\nenabled = false\n")).expect("write");
 
         // Prints the disabled notice and exits 0 — even with skills present.
-        let result = run_skills_command(&toml_path);
+        let config = crate::wiring::load_config(&toml_path).expect("load config");
+        let result = run_skills_command(&toml_path, config);
         assert!(
             result.is_ok(),
             "disabled skills is not an error: {result:?}"
@@ -210,7 +217,8 @@ model = "m1"
         fs::write(bad_dir.join("SKILL.md"), "name: bad\n(no closing ---\n").expect("write bad");
 
         let toml_path = openslate_dir.join("openslate.toml");
-        let result = run_skills_command(&toml_path);
+        let config = crate::wiring::load_config(&toml_path).expect("load config");
+        let result = run_skills_command(&toml_path, config);
         assert!(
             result.is_ok(),
             "a broken skill must not fail the command: {result:?}"

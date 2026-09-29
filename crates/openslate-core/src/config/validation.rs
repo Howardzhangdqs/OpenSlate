@@ -69,19 +69,24 @@ impl ValidationResult {
 pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    // 1. models.main must exist
-    if !config.models.contains_key("main") {
+    // 1. model level `main` must be resolvable: either a `[models]` entry
+    //    named `main` (legacy layout) or a `levels.main` mapping to any entry
+    if !config.models.contains_key("main") && !config.levels.contains_key("main") {
         errors.push(ValidationError {
-            field: "models.main".into(),
-            message: "Required model alias 'main' is missing".into(),
+            field: "levels.main".into(),
+            message: "Required model level 'main' is missing — define a [models.main] entry \
+                      directly, or map it via [levels] main = \"<model entry>\""
+                .into(),
         });
     }
 
-    // 2. models.fast must exist
-    if !config.models.contains_key("fast") {
+    // 2. model level `fast` must be resolvable (same two ways as `main`)
+    if !config.models.contains_key("fast") && !config.levels.contains_key("fast") {
         errors.push(ValidationError {
-            field: "models.fast".into(),
-            message: "Required model alias 'fast' is missing".into(),
+            field: "levels.fast".into(),
+            message: "Required model level 'fast' is missing — define a [models.fast] entry \
+                      directly, or map it via [levels] fast = \"<model entry>\""
+                .into(),
         });
     }
 
@@ -144,9 +149,11 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
         }
     }
 
-    // 7. Agent model references must exist as model aliases
+    // 7. Agent model references must exist — as a `[models]` entry or as a
+    //    `[levels]` name (levels are what agents reference under the
+    //    model-mgmt-1 two-layer schema).
     for agent in &agents.agents {
-        if !config.models.contains_key(&agent.model) {
+        if !config.models.contains_key(&agent.model) && !config.levels.contains_key(&agent.model) {
             errors.push(ValidationError {
                 field: format!("agents.{}.model", agent.id),
                 message: format!(
@@ -276,6 +283,17 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
     //     rejected with the floor stated in the message. Enforced both
     //     here and at config load (`parse_openslate_toml`).
     errors.extend(ptc_floor_errors(&config.ptc));
+
+    // 17. Every `[levels]` value must reference an existing `[models]` entry
+    //     (the level would otherwise be unresolvable at use time).
+    for (name, entry) in &config.levels {
+        if !config.models.contains_key(entry) {
+            errors.push(ValidationError {
+                field: format!("levels.{name}"),
+                message: format!("Level '{name}' points to non-existent model entry '{entry}'"),
+            });
+        }
+    }
 
     errors
 }
@@ -700,8 +718,10 @@ max_output_bytes = 65536
         config.models.remove("main");
         let errors = validate_config(&config, &valid_agents());
         assert!(
-            errors.iter().any(|e| e.field == "models.main"),
-            "{errors:?}"
+            errors.iter().any(|e| e.field == "levels.main"
+                && e.message.contains("[models.main]")
+                && e.message.contains("[levels]")),
+            "field is levels.main and message explains both setups: {errors:?}"
         );
     }
 
@@ -711,9 +731,82 @@ max_output_bytes = 65536
         config.models.remove("fast");
         let errors = validate_config(&config, &valid_agents());
         assert!(
-            errors.iter().any(|e| e.field == "models.fast"),
+            errors.iter().any(|e| e.field == "levels.fast"
+                && e.message.contains("[models.fast]")
+                && e.message.contains("[levels]")),
+            "field is levels.fast and message explains both setups: {errors:?}"
+        );
+    }
+
+    // ── Rule 1/2 (new schema): a [levels] mapping satisfies the required
+    // ── levels without a same-named [models] entry.
+
+    #[test]
+    fn level_mapping_satisfies_required_main_and_fast() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.glm5]
+provider = "zhipu"
+model = "m1"
+
+[models.mini]
+provider = "zhipu"
+model = "m2"
+
+[levels]
+main = "glm5"
+fast = "mini"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors.is_empty(),
+            "level-mapped main/fast are valid: {errors:?}"
+        );
+    }
+
+    // ── Rule 17: [levels] values must reference existing [models] entries ─
+
+    #[test]
+    fn levels_unknown_entry_rejected() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[levels]
+deep = "ghost"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors.iter().any(|e| e.field == "levels.deep"
+                && e.message.contains("ghost")
+                && e.message.contains("non-existent")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn levels_self_pointing_entries_valid() {
+        // Self-referencing levels (entry name == level name) — the backward
+        // compatible layout — must produce no rule-17 errors.
+        let mut config = valid_config();
+        config.levels.insert("main".into(), "main".into());
+        config.levels.insert("fast".into(), "fast".into());
+        let errors = validate_config(&config, &valid_agents());
+        assert!(errors.is_empty(), "self-pointing levels valid: {errors:?}");
     }
 
     // ── Rule 3: model → provider reference ───────────────────────────────
@@ -825,6 +918,20 @@ max_output_bytes = 65536
                 .iter()
                 .any(|e| e.field == "agents.root.model" && e.message.contains("nonexistent")),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn agent_may_reference_a_level_only_name() {
+        // "deep" exists only as a level (mapped to entry "main") — agents
+        // reference levels, so this must pass rule 7.
+        let mut config = valid_config();
+        config.levels.insert("deep".into(), "main".into());
+        let agents = single_agent("root", "Root", "deep", vec![], vec![], "p");
+        let errors = validate_config(&config, &agents);
+        assert!(
+            !errors.iter().any(|e| e.field == "agents.root.model"),
+            "level-only agent model reference is valid: {errors:?}"
         );
     }
 

@@ -16,6 +16,7 @@ use openslate_core::agent_tree::AgentTree;
 use openslate_core::approval::{
     ApprovalCallback, ApprovalDecision, ApprovalManager, ApprovalPolicy, ApprovalRequest, RiskLevel,
 };
+use openslate_core::config::merge::merge_configs;
 use openslate_core::config::validation::validate_config;
 use openslate_core::config::{
     parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig,
@@ -46,6 +47,11 @@ pub struct AppContext {
     pub mcp_connections: openslate_core::mcp::McpConnectionGuard,
     /// Resolved config file path (for diagnostics).
     pub config_path: std::path::PathBuf,
+    /// User-global config file that was merged underneath the active one
+    /// (model-mgmt-1). `None` when there is no global library or merging is
+    /// not in play (explicit `--config`, single-file discovery). The TUI
+    /// model-management layer writes the global library through this path.
+    pub global_config_path: Option<std::path::PathBuf>,
     /// Resolved agents file path.
     pub agents_path: std::path::PathBuf,
 }
@@ -90,6 +96,95 @@ pub fn resolve_config_file(config_flag: Option<&str>) -> Result<std::path::PathB
         );
     }
     Ok(paths.config_file)
+}
+
+/// Default-discovery config file selection (model-mgmt-1 global→local
+/// layering).
+///
+/// Returns `(active_config_file, global_config_file)`:
+/// - no local `.openslate/` dir → single-file semantics on the global file
+///   (exactly the pre-layering behavior);
+/// - local + global file both exist → `(local, Some(global))`; the caller
+///   merges the global library underneath the active config;
+/// - only one of the two exists → that file alone (in particular, a local
+///   `.openslate/` dir without its own `openslate.toml` falls back to the
+///   global file instead of failing);
+/// - neither exists → the would-be active path is returned; the caller
+///   reports the missing-file error for it.
+///
+/// Pure on its arguments (no env reads), so tests can drive it with temp
+/// dirs instead of mutating `XDG_CONFIG_HOME` process-wide. Public so the
+/// CLI's `validate` command (which keeps its own legacy missing-file error
+/// wording) composes the same discovery as `build_app_context`.
+pub fn select_config_files(
+    local_config_dir: Option<&Path>,
+    global_config_dir: &Path,
+) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    let global_file = global_config_dir.join("openslate.toml");
+    let Some(local_dir) = local_config_dir else {
+        return (global_file, None);
+    };
+    let local_file = local_dir.join("openslate.toml");
+    match (global_file.is_file(), local_file.is_file()) {
+        (true, true) => (local_file, Some(global_file)),
+        (true, false) => (global_file, None),
+        (false, true) | (false, false) => (local_file, None),
+    }
+}
+
+/// Load the active config, merged over the global library when one was found.
+/// Public for the same reason as [`select_config_files`] (the `validate`
+/// command composes it to keep its own error wording).
+pub fn load_config_layered(active: &Path, global: Option<&Path>) -> Result<OpenSlateConfig> {
+    let config = load_config(active)?;
+    match global {
+        Some(global_path) => {
+            let global_cfg = load_config(global_path)?;
+            tracing::debug!(
+                "Merging global config {} underneath {}",
+                global_path.display(),
+                active.display()
+            );
+            Ok(merge_configs(&global_cfg, &config))
+        }
+        None => Ok(config),
+    }
+}
+
+/// Shared entry for every command (run/chat/tui via [`build_app_context`],
+/// plus the `skills` command): resolve + load the effective config.
+///
+/// Returns `(active_config_path, global_config_path, effective_config)`:
+/// - explicit `--config` → single-file semantics, no merging, global path
+///   is `None` (missing file → `Config file not found: …`);
+/// - default discovery → the global library merged underneath the active
+///   config; no config file at all → the standard
+///   `No openslate.toml found. Expected at …` error.
+pub fn load_effective_config(
+    config_flag: Option<&str>,
+) -> Result<(
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+    OpenSlateConfig,
+)> {
+    let (config_path, global_config_path) = match config_flag {
+        Some(_) => (resolve_config_file(config_flag)?, None),
+        None => {
+            let cwd = std::env::current_dir().context("Failed to get current directory")?;
+            let paths = resolve_paths(&cwd);
+            let (path, global) =
+                select_config_files(paths.local_config_dir.as_deref(), &paths.global_config_dir);
+            if !path.exists() {
+                anyhow::bail!(
+                    "No openslate.toml found. Expected at {}. Run `openslate init` to create one.",
+                    path.display()
+                );
+            }
+            (path, global)
+        }
+    };
+    let config = load_config_layered(&config_path, global_config_path.as_deref())?;
+    Ok((config_path, global_config_path, config))
 }
 
 /// Resolve agents directory path from the config file's parent directory.
@@ -330,34 +425,44 @@ async fn init_store(
     Ok(Some(store))
 }
 
-/// Build the full application context from CLI parameters.
-pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> {
-    // 1. Resolve config file path
-    let config_path = resolve_config_file(config_flag)?;
-    tracing::debug!("Using config: {}", config_path.display());
-
-    // 1.5. Auto-load .env from the config file's directory. Does NOT override
-    //      already-set env vars (so explicit shell exports win). Lets users keep
-    //      provider API keys out of the committed config without exporting them
-    //      in every shell. Missing/malformed .env is a soft warning, not fatal.
-    if let Some(dir) = config_path.parent() {
-        let env_path = dir.join(".env");
-        if env_path.is_file() {
-            match dotenvy::from_path(&env_path) {
-                Ok(()) => tracing::debug!("Loaded .env from {}", env_path.display()),
-                Err(e) => tracing::warn!("Failed to load .env at {}: {}", env_path.display(), e),
-            }
+/// Auto-load a `.env` file from `dir` (soft-fail). Existing env vars are
+/// never overridden, so the FIRST file that sets a var wins.
+fn load_dotenv(dir: Option<&Path>) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let env_path = dir.join(".env");
+    if env_path.is_file() {
+        match dotenvy::from_path(&env_path) {
+            Ok(()) => tracing::debug!("Loaded .env from {}", env_path.display()),
+            Err(e) => tracing::warn!("Failed to load .env at {}: {}", env_path.display(), e),
         }
     }
+}
+
+/// Build the full application context from CLI parameters.
+pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> {
+    // 1. Resolve + load config files via the shared entry (model-mgmt-1):
+    //    an explicit `--config` keeps the exact single-file semantics (no
+    //    global library, no merging); the default discovery layers the
+    //    global library underneath the active config.
+    let (config_path, global_config_path, config) = load_effective_config(config_flag)?;
+    tracing::debug!("Using config: {}", config_path.display());
+
+    // 1.5. Auto-load .env from the global config dir FIRST, then the active
+    //      config dir. dotenvy does NOT override already-set env vars, so
+    //      explicit shell exports win over both files and the local file
+    //      wins over the global one. Missing/malformed .env is a soft
+    //      warning, not fatal. (Loaded after the config parse on purpose —
+    //      parsing reads no env vars, so the order is behavior-neutral.)
+    load_dotenv(global_config_path.as_deref().and_then(Path::parent));
+    load_dotenv(config_path.parent());
 
     let agents_path = resolve_agents_dir(&config_path);
     tracing::debug!("Using agents: {}", agents_path.display());
 
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
     let paths = resolve_paths(&cwd);
-
-    // 2. Load config
-    let config = load_config(&config_path)?;
 
     // 3. Load agents
     let agents = load_agents(&agents_path)?;
@@ -564,6 +669,7 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
         skills,
         mcp_connections,
         config_path,
+        global_config_path,
         agents_path,
     })
 }
@@ -1115,5 +1221,138 @@ model = "m1"
             apply_approval(&mut manager, &cfg, false, false),
             ApprovalPolicy::Auto
         );
+    }
+
+    // ── Default-discovery config layering (model-mgmt-1) ─────────────────
+
+    fn write_minimal_config(dir: &Path, model_id: &str) {
+        fs::create_dir_all(dir).expect("mkdir");
+        fs::write(
+            dir.join("openslate.toml"),
+            format!(
+                "[providers.p]\nbase_url = \"https://example.com\"\napi_key_env = \"K\"\n\n[models.main]\nprovider = \"p\"\nmodel = \"{model_id}\"\n"
+            ),
+        )
+        .expect("write toml");
+    }
+
+    #[test]
+    fn test_select_config_files_without_local_dir_is_single_file() {
+        // No local .openslate/ → the global file alone (legacy semantics).
+        let global = tempfile::TempDir::new().expect("tmp");
+        let (active, global_path) = select_config_files(None, global.path());
+        assert_eq!(active, global.path().join("openslate.toml"));
+        assert_eq!(global_path, None);
+    }
+
+    #[test]
+    fn test_select_config_files_both_present_selects_merge_pair() {
+        let global = tempfile::TempDir::new().expect("tmp");
+        let project = tempfile::TempDir::new().expect("tmp");
+        let local = project.path().join(".openslate");
+        fs::create_dir(&local).expect("mkdir");
+        write_minimal_config(global.path(), "global-model");
+        write_minimal_config(&local, "local-model");
+
+        let (active, global_path) = select_config_files(Some(&local), global.path());
+        assert_eq!(active, local.join("openslate.toml"));
+        assert_eq!(
+            global_path.as_deref(),
+            Some(global.path().join("openslate.toml").as_path())
+        );
+    }
+
+    #[test]
+    fn test_select_config_files_global_only_falls_back() {
+        // Local .openslate/ dir exists but has no openslate.toml; the global
+        // file exists → the global file is used alone.
+        let global = tempfile::TempDir::new().expect("tmp");
+        let project = tempfile::TempDir::new().expect("tmp");
+        let local = project.path().join(".openslate");
+        fs::create_dir(&local).expect("mkdir");
+        write_minimal_config(global.path(), "global-model");
+
+        let (active, global_path) = select_config_files(Some(&local), global.path());
+        assert_eq!(active, global.path().join("openslate.toml"));
+        assert_eq!(global_path, None);
+    }
+
+    #[test]
+    fn test_select_config_files_local_only() {
+        let global = tempfile::TempDir::new().expect("tmp");
+        let project = tempfile::TempDir::new().expect("tmp");
+        let local = project.path().join(".openslate");
+        write_minimal_config(&local, "local-model");
+
+        let (active, global_path) = select_config_files(Some(&local), global.path());
+        assert_eq!(active, local.join("openslate.toml"));
+        assert_eq!(global_path, None);
+    }
+
+    #[test]
+    fn test_select_config_files_neither_reports_local_path() {
+        let global = tempfile::TempDir::new().expect("tmp");
+        let project = tempfile::TempDir::new().expect("tmp");
+        let local = project.path().join(".openslate");
+        fs::create_dir(&local).expect("mkdir");
+
+        let (active, global_path) = select_config_files(Some(&local), global.path());
+        assert_eq!(
+            active,
+            local.join("openslate.toml"),
+            "error names this path"
+        );
+        assert_eq!(global_path, None);
+    }
+
+    #[test]
+    fn test_load_config_layered_merges_global_under_local() {
+        let global = tempfile::TempDir::new().expect("tmp");
+        let local = tempfile::TempDir::new().expect("tmp");
+        let global_file = global.path().join("openslate.toml");
+        let local_file = local.path().join("openslate.toml");
+        fs::write(
+            &global_file,
+            "[providers.g]\nbase_url = \"https://g.example.com\"\napi_key_env = \"GK\"\n\n[models.gentry]\nprovider = \"g\"\nmodel = \"g-model\"\n\n[levels]\nmain = \"gentry\"\n",
+        )
+        .expect("global toml");
+        fs::write(
+            &local_file,
+            "[providers.g]\nbase_url = \"https://local.example.com\"\napi_key_env = \"LK\"\n\n[models.lentry]\nprovider = \"g\"\nmodel = \"l-model\"\n\n[levels]\nmain = \"lentry\"\n",
+        )
+        .expect("local toml");
+
+        let merged = load_config_layered(&local_file, Some(&global_file)).expect("layered");
+
+        // Local entries win wholesale; global-only entries survive; levels
+        // remapped by local.
+        assert_eq!(
+            merged.providers.get("g").expect("provider").base_url,
+            "https://local.example.com"
+        );
+        assert!(merged.models.contains_key("gentry"), "global-only model");
+        assert!(merged.models.contains_key("lentry"), "local model");
+        assert_eq!(
+            merged.levels.get("main").map(String::as_str),
+            Some("lentry")
+        );
+        let resolved =
+            openslate_core::model_config::resolve_model(&merged, "main").expect("resolve");
+        assert_eq!(resolved.model_id, "l-model");
+
+        // Single-file mode (no global) is unchanged.
+        let plain = load_config_layered(&local_file, None).expect("plain");
+        assert!(!plain.models.contains_key("gentry"));
+    }
+
+    #[tokio::test]
+    async fn test_build_app_context_explicit_config_has_no_global_path() {
+        // An explicit --config bypasses discovery entirely: no global library
+        // is read, none is reported.
+        let tmp = temp_project_isolated_db();
+        let config_path = tmp.path().join(".openslate/openslate.toml");
+        let ctx = build_app_context(config_path.to_str()).await.expect("ctx");
+        assert!(ctx.global_config_path.is_none());
+        assert_eq!(ctx.config_path, config_path);
     }
 }

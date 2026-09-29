@@ -142,9 +142,9 @@ where
         // and almost every line is INFO, so the level/target prefix only
         // added noise. ERROR/WARN tint the timestamp red/yellow so problems
         // still stand out.
-        let ts_color = match record.metadata().level() {
-            &tracing::Level::ERROR => "\x1b[31m",
-            &tracing::Level::WARN => "\x1b[33m",
+        let ts_color = match *record.metadata().level() {
+            tracing::Level::ERROR => "\x1b[31m",
+            tracing::Level::WARN => "\x1b[33m",
             _ => DIM,
         };
         write!(
@@ -285,7 +285,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_directive));
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
-        .event_format(SimpleFormatter::default())
+        .event_format(SimpleFormatter)
         .init();
 
     match cli.command {
@@ -294,14 +294,18 @@ async fn main() -> Result<()> {
             run_init(&cwd, name.as_deref())?;
         }
         Commands::Validate { strict } => {
-            let config_path = cmd::validate::resolve_config_path(cli.config.as_deref())?;
-            let agents_path =
-                cmd::validate::resolve_agents_path(config_path.parent().unwrap_or(Path::new(".")));
-            cmd::validate::run_validate_command(&config_path, &agents_path, strict)?;
+            // Default discovery merges the user-global library underneath
+            // the active config (model-mgmt-1); explicit --config keeps the
+            // legacy single-file semantics (both handled inside).
+            cmd::validate::run_validate(cli.config.as_deref(), strict)?;
         }
         Commands::Skills => {
-            let config_path = wiring::resolve_config_file(cli.config.as_deref())?;
-            cmd::skills::run_skills_command(&config_path)?;
+            let (config_path, global_config_path, config) =
+                wiring::load_effective_config(cli.config.as_deref())?;
+            if let Some(global_path) = &global_config_path {
+                tracing::debug!("merged global library: {}", global_path.display());
+            }
+            cmd::skills::run_skills_command(&config_path, config)?;
         }
         Commands::Run {
             agent,

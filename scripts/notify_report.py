@@ -3,12 +3,13 @@
 
 用法：
   scripts/notify_report.py <report.json>
+标题：有进行中/排队中任务时 `[OPS] (进行中数/排队中数) <headline>`；两者皆空时 `[OPS] 任务全部完成`。
 JSON 字段：
-  headline    str            标题后半段（自动拼前缀 [OpenSlate] 任务进度通知：）
+  headline    str            任务简述（进行中状态用于标题）
   subline     str?           题头下小字（默认当前时间）
   in_progress [{title,desc}] 进行中（title 必填，desc 一段话简述可空）
   queued      [str]          排队中（每项一行）
-  recent      [{id,desc}]    最近完成（建议 ≤5，表格渲染）
+  recent      [str]          最近完成（建议 ≤5，每项一行；兼容传 {desc} 对象，id 不再展示）
   baseline    str            测试基线脚注（如 "281 passed · clippy 0 · fmt clean"）
 SMTP 凭据运行时从 ~/.mailrc 的 mta= 解析；发送前强制自检并打印出站头。
 """
@@ -28,12 +29,9 @@ def esc(x: str) -> str:
 
 def build_report(r: dict) -> str:
     sub = r.get('subline') or datetime.now().strftime('%Y-%m-%d · orchestrator 自动通知')
-    rows = []
-    for it in r.get('recent', []):
-        rows.append(
-            f'<tr><td style="padding:6px 8px;border-bottom:1px solid #f1f3f4;'
-            f'white-space:nowrap;color:#188038;font-weight:600;">{esc(it["id"])}</td>'
-            f'<td style="padding:6px 8px;border-bottom:1px solid #f1f3f4;">{esc(it["desc"])}</td></tr>')
+    recent = ''.join(
+        f'<div>✔ {esc(i if isinstance(i, str) else i.get("desc", ""))}</div>'
+        for i in r.get('recent', [])) or '<div>✔ 无</div>'
     cards = []
     for it in r.get('in_progress', []):
         desc = (f'<p style="color:#3c4043;font-size:13px;line-height:1.7;margin:8px 0 0 0;">'
@@ -60,7 +58,7 @@ def build_report(r: dict) -> str:
   <div style="font-size:15px;font-weight:600;color:#e8710a;border-left:4px solid #e8710a;padding-left:10px;margin-bottom:10px;">📋 排队中</div>
   <div style="margin-bottom:22px;font-size:13px;color:#3c4043;line-height:1.9;">{queued}</div>
   <div style="font-size:15px;font-weight:600;color:#188038;border-left:4px solid #188038;padding-left:10px;margin-bottom:10px;">✅ 最近完成</div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px;color:#3c4043;">{''.join(rows)}</table>
+  <div style="margin-bottom:22px;font-size:13px;color:#3c4043;line-height:1.9;">{recent}</div>
 </div>
 <div style="background:#f8f9fa;border-top:1px solid #e8eaed;padding:12px 24px;font-size:12px;color:#5f6368;">
   测试基线：{baseline} ｜ 全量任务记录见 .slim/deepwork/agent-tui.md
@@ -68,9 +66,16 @@ def build_report(r: dict) -> str:
 </div></body></html>"""
 
 
+def build_subject(r: dict) -> str:
+    n_ip, n_q = len(r.get('in_progress') or []), len(r.get('queued') or [])
+    if n_ip or n_q:
+        return f"[OPS] ({n_ip}/{n_q}) {r['headline']}"
+    return '[OPS] 任务全部完成'
+
+
 def main() -> None:
     r = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-    subject = f"[OpenSlate] 任务进度通知：{r['headline']}"
+    subject = build_subject(r)
     body = build_report(r)
 
     msg = EmailMessage()

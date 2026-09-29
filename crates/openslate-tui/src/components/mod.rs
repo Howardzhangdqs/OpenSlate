@@ -14,6 +14,7 @@ pub mod agents;
 pub mod approval;
 pub mod help;
 pub mod input;
+pub mod models;
 pub mod session;
 pub mod status;
 pub mod transcript;
@@ -22,6 +23,7 @@ pub use agents::AgentsComponent;
 pub use approval::ApprovalComponent;
 pub use help::HelpComponent;
 pub use input::InputComponent;
+pub use models::ModelsComponent;
 pub use session::SessionComponent;
 pub use status::{RunState, StatusComponent};
 pub use transcript::TranscriptComponent;
@@ -81,6 +83,10 @@ pub struct RunInfo {
     /// pops; calibrated to 0 on `TurnDone` (the execution tree's nodes
     /// are all terminal post-turn). Pairs with [`ConfigSummary::max_depth`].
     pub depth_cur: u32,
+    /// Remaining context headroom as a percentage (restyle-1 status
+    /// line meter). `None` while no usage snapshot exists — the meter
+    /// segment only renders with data.
+    pub context_remaining: Option<u8>,
 }
 
 /// Static-ish configuration summary the components may display.
@@ -98,6 +104,11 @@ pub struct ConfigSummary {
     pub max_tool_calls: u32,
     /// Backing session run id (once a turn has been submitted).
     pub run_id: Option<String>,
+    /// All configured model aliases, sorted (slash-1): the `/model`
+    /// argument completion's dynamic choices. Sorted because the
+    /// backing map iterates unordered and the list must rank
+    /// deterministically.
+    pub model_aliases: Vec<String>,
 }
 
 /// The context every component sees on `handle`/`render`. Owned snapshot

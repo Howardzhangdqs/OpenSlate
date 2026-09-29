@@ -202,6 +202,11 @@ fn test_manager() -> RunManager {
     RunManager::new(test_config(), tree, registry, SkillsCatalog::default())
 }
 
+/// Theme slot accessor for color assertions (theme-1).
+fn theme() -> openslate_tui::theme::Theme {
+    openslate_tui::theme::Theme::new()
+}
+
 /// Real temp project for `build_app_context` (config + agents + store).
 /// The `[database]` path is ABSOLUTE inside the tempdir — a relative path
 /// would be resolved against the user's global data dir, leaking test
@@ -717,9 +722,8 @@ async fn first_token_feeds_the_live_stats_row_during_answer_streaming() {
     app.dispatch(Action::Engine(TuiEvent::Delta("partial".into())))
         .await;
 
-    let theme = openslate_tui::theme::Theme::new();
     let render_ctx = openslate_tui::components::AppCtx {
-        theme,
+        theme: theme(),
         focus: openslate_tui::components::Focus::Transcript,
         run: openslate_tui::components::RunInfo {
             state: RunState::Thinking,
@@ -731,6 +735,7 @@ async fn first_token_feeds_the_live_stats_row_during_answer_streaming() {
             elapsed: None,
             tool_calls_cur: 0,
             depth_cur: 0,
+            context_remaining: None,
         },
         config: openslate_tui::components::ConfigSummary {
             model_alias: "main".into(),
@@ -739,6 +744,7 @@ async fn first_token_feeds_the_live_stats_row_during_answer_streaming() {
             max_depth: 4,
             max_tool_calls: 20,
             run_id: None,
+            model_aliases: Vec::new(),
         },
         size: (30, 5),
         notice: None,
@@ -782,7 +788,7 @@ async fn first_token_feeds_the_live_stats_row_during_answer_streaming() {
     let x = stats_row.find('t').unwrap() as u16;
     assert_eq!(
         terminal.backend().buffer().cell((x, y)).unwrap().style().fg,
-        Some(ratatui::style::Color::DarkGray)
+        theme().muted.fg
     );
 }
 
@@ -985,7 +991,7 @@ fn coalesce_deltas_merges_only_adjacent_deltas() {
 }
 
 /// Deferred auto-compact (review item 7): when `needs_compact` fires,
-/// `StartTurn` returns WITHOUT spawning the engine (the ` compacting…`
+/// `StartTurn` returns WITHOUT spawning the engine (the ` compacting…`
 /// badge paints on the draw between dispatch rounds) and the blocking
 /// summary call + turn spawn run on the NEXT dispatched action — never a
 /// silent freeze on a slow provider.
@@ -1163,15 +1169,15 @@ async fn wheel_scroll_targets_transcript_not_input_history() {
     assert!(!app.transcript_pinned());
 
     // A wheel notch up pins the transcript (scrolls the chat) …
-    app.dispatch(Action::WheelScrollUp).await;
+    app.dispatch(Action::WheelScrollUp(40, 2)).await;
     assert!(app.transcript_pinned());
 
     // … and leaves the input editor (and history) untouched.
     assert_eq!(app.input_text(), "a");
 
     // Wheel back down reaches the bottom and re-follows the live tail.
-    app.dispatch(Action::WheelScrollDown).await;
-    app.dispatch(Action::WheelScrollDown).await;
+    app.dispatch(Action::WheelScrollDown(40, 2)).await;
+    app.dispatch(Action::WheelScrollDown(40, 2)).await;
     assert!(!app.transcript_pinned());
 }
 
@@ -1370,9 +1376,8 @@ async fn streaming_delta_renders_markdown_styles_before_flush() {
     );
 
     // Draw the transcript exactly like a frame would.
-    let theme = openslate_tui::theme::Theme::new();
     let render_ctx = openslate_tui::components::AppCtx {
-        theme,
+        theme: theme(),
         focus: openslate_tui::components::Focus::Transcript,
         run: openslate_tui::components::RunInfo {
             state: RunState::Thinking,
@@ -1384,6 +1389,7 @@ async fn streaming_delta_renders_markdown_styles_before_flush() {
             elapsed: None,
             tool_calls_cur: 0,
             depth_cur: 0,
+            context_remaining: None,
         },
         config: openslate_tui::components::ConfigSummary {
             model_alias: "main".into(),
@@ -1392,6 +1398,7 @@ async fn streaming_delta_renders_markdown_styles_before_flush() {
             max_depth: 4,
             max_tool_calls: 20,
             run_id: None,
+            model_aliases: Vec::new(),
         },
         size: (30, 4),
         notice: None,
@@ -1417,7 +1424,7 @@ async fn streaming_delta_renders_markdown_styles_before_flush() {
     }
     let (x, y, style) = found.expect("'L' of Live rendered");
     let _ = (x, y);
-    assert_eq!(style.fg, Some(ratatui::style::Color::Cyan));
+    assert_eq!(style.fg, theme().md_heading.fg);
     assert!(style.add_modifier.contains(ratatui::style::Modifier::BOLD));
     // …and the live tail cursor (▍, running yellow) closes the row.
     let mut cursor = None;
@@ -1430,7 +1437,7 @@ async fn streaming_delta_renders_markdown_styles_before_flush() {
     }
     assert_eq!(
         cursor.expect("tail cursor rendered").fg,
-        Some(ratatui::style::Color::Yellow)
+        theme().tool_running.fg
     );
 }
 
@@ -1684,7 +1691,7 @@ async fn turn_done_err_rebuilds_from_store_dropping_live_entries() {
     assert_eq!(app.history()[0].content, "hello");
 }
 
-// ─── fix-13: OSC 52 clipboard copy ─────────────────────────────────────────
+// ─── fix-13 + copy-1: the three-path copy chain ────────────────────────────
 
 use openslate_tui::clipboard;
 
@@ -1708,17 +1715,50 @@ fn written_payloads(seen: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
     seen.lock().expect("sink lock").clone()
 }
 
-/// Fresh app on a temp project with the capturing sink installed.
+/// Fresh app on a temp project with the capturing sink installed and
+/// the copy-file leg redirected into the tempdir (hermetic — no test
+/// writes the real `~/.local/share/openslate/last-copy.md`). The
+/// provider factory always FAILS, so a plain-text StartTurn pushes
+/// the user transcript entry and restores the editor without spawning
+/// an engine task (no background events racing the assertions).
 async fn copy_test_app() -> (App, Arc<std::sync::Mutex<Vec<String>>>, tempfile::TempDir) {
     let tmp = temp_project();
     let config_path = tmp.path().join(".openslate/openslate.toml");
     let ctx = build_app_context(config_path.to_str())
         .await
         .expect("build app context");
-    let mut app = App::new(ctx);
+    let factory = move |_config: &openslate_core::config::OpenSlateConfig, _alias: &str| {
+        Err::<Box<dyn ModelProvider>, anyhow::Error>(anyhow::anyhow!("offline fixture"))
+    };
+    let mut app = App::with_provider_factory(ctx, std::sync::Arc::new(factory));
     let (seen, sink) = capturing_sink();
     app.set_clipboard_sink(sink);
+    app.set_copy_file_dir(tmp.path().join("copy-out"));
     (app, seen, tmp)
+}
+
+/// The copy file's expected location for a [`copy_test_app`] tempdir.
+fn copy_file(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    tmp.path().join("copy-out").join("last-copy.md")
+}
+
+/// The chain notice's deterministic shape: `copied N [of M] chars ->
+/// <file> (+osc52)`. The optional `+<tool>` tail only appears when a
+/// real clipboard tool exists AND its run exited 0 — none does on the
+/// dev/CI container, so both shapes are accepted by name of the
+/// detected tool.
+fn assert_copy_notice(notice: Option<&str>, copied: usize, total: usize, file: &std::path::Path) {
+    let notice = notice.expect("copy posts a notice");
+    let count = if copied < total {
+        format!("copied {copied} of {total} chars")
+    } else {
+        format!("copied {copied} chars")
+    };
+    let core = format!("{count} -> {}", file.display());
+    let ok = notice == format!("{core} (+osc52)")
+        || clipboard::detect_clipboard_tool()
+            .is_some_and(|tool| notice == format!("{core} (+osc52 +{tool})"));
+    assert!(ok, "unexpected notice {notice:?} (expected core {core:?})");
 }
 
 /// Commit an assistant entry through the engine-event seam: a Delta
@@ -1729,17 +1769,45 @@ async fn commit_assistant(app: &mut App, text: String) {
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
 }
 
+/// A TurnDone(Ok) carrying only a tool result (folded into the live
+/// matching entry by name) — hands back a spare manager so the App
+/// stays usable for the next turn.
+fn tool_fold_turn_done(content: &str) -> TuiEvent {
+    let summary = openslate_tui::event::TurnSummary {
+        run_id: RunId("copy-tool".into()),
+        status: openslate_core::types::RunStatus::Completed,
+        messages: vec![Message {
+            role: MessageRole::Tool,
+            content: content.to_owned(),
+            tool_call_id: None,
+            name: Some("read_file".into()),
+            tool_calls: None,
+        }],
+        total_steps: 1,
+        total_input_tokens: 10,
+        total_output_tokens: 5,
+        total_cost_usd: 0.0,
+        execution_tree: openslate_core::execution::ExecutionTree::new(
+            RunId("copy-tool".into()),
+            AgentId("root".into()),
+        ),
+        model: "mock-model".into(),
+    };
+    TuiEvent::TurnDone(Ok((summary, test_manager())))
+}
+
 /// Empty state: Ctrl+Y with no assistant output posts the
-/// `nothing to copy` notice and never touches the write channel.
+/// `nothing to copy` notice and never touches ANY write channel.
 #[tokio::test]
 async fn copy_last_without_assistant_output_notices_nothing() {
-    let (mut app, seen, _tmp) = copy_test_app().await;
+    let (mut app, seen, tmp) = copy_test_app().await;
     app.dispatch(Action::CopyLast).await;
     assert_eq!(app.status_notice(), Some("nothing to copy"));
     assert!(
         written_payloads(&seen).is_empty(),
         "no payload written without assistant output"
     );
+    assert!(!copy_file(&tmp).exists(), "no copy file written");
 
     // A user message alone is not assistant output either.
     app.dispatch(Action::StartTurn("/copy".into())).await; // no-op copy
@@ -1747,13 +1815,15 @@ async fn copy_last_without_assistant_output_notices_nothing() {
     assert!(written_payloads(&seen).is_empty());
 }
 
-/// Happy path: Ctrl+Y writes the OSC 52 payload of the last assistant
-/// entry's RAW markdown (asterisks intact — entries store the original
-/// text; markdown rendering happens at draw time) and confirms with an
-/// ASCII notice. `/copy` takes the same path.
+/// Happy path: the chain writes the OSC 52 payload of the last
+/// assistant entry's RAW markdown (asterisks intact — entries store
+/// the original text; markdown rendering happens at draw time), lands
+/// the SAME text in the copy file, and the notice names the file path
+/// plus `(+osc52)` (sent — not receipt-claimed). `/copy` takes the
+/// same path.
 #[tokio::test]
-async fn copy_last_sends_osc52_payload_and_notices() {
-    let (mut app, seen, _tmp) = copy_test_app().await;
+async fn copy_last_runs_osc52_and_file_legs() {
+    let (mut app, seen, tmp) = copy_test_app().await;
     commit_assistant(&mut app, "Hello **world**".into()).await;
     // A later reasoning block must NOT shadow the assistant entry.
     app.dispatch(Action::Engine(TuiEvent::Reasoning("musing".into())))
@@ -1767,7 +1837,12 @@ async fn copy_last_sends_osc52_payload_and_notices() {
         clipboard::osc52_payload("Hello **world**"),
         "payload carries the raw markdown"
     );
-    assert_eq!(app.status_notice(), Some("copied 15 chars"));
+    assert_eq!(
+        std::fs::read_to_string(copy_file(&tmp)).expect("copy file"),
+        "Hello **world**",
+        "the file leg carries the same text"
+    );
+    assert_copy_notice(app.status_notice(), 15, 15, &copy_file(&tmp));
 
     // `/copy` — the slash alias writes the same payload again.
     let (seen2, sink2) = capturing_sink();
@@ -1778,32 +1853,33 @@ async fn copy_last_sends_osc52_payload_and_notices() {
         vec![clipboard::osc52_payload("Hello **world**")],
         "/copy aliases Ctrl+Y"
     );
-    assert_eq!(app.status_notice(), Some("copied 15 chars"));
+    assert_copy_notice(app.status_notice(), 15, 15, &copy_file(&tmp));
 }
 
 /// The last entry WINS: a second assistant block replaces the copy
-/// source.
+/// source on EVERY leg.
 #[tokio::test]
 async fn copy_last_takes_the_most_recent_assistant_block() {
-    let (mut app, seen, _tmp) = copy_test_app().await;
+    let (mut app, _seen, tmp) = copy_test_app().await;
     commit_assistant(&mut app, "first answer".into()).await;
     commit_assistant(&mut app, "second **answer**".into()).await;
 
     app.dispatch(Action::CopyLast).await;
     assert_eq!(
-        written_payloads(&seen),
-        vec![clipboard::osc52_payload("second **answer**")]
+        std::fs::read_to_string(copy_file(&tmp)).expect("copy file"),
+        "second **answer**",
+        "the file leg holds the LATEST block"
     );
-    assert_eq!(app.status_notice(), Some("copied 17 chars"));
+    assert_copy_notice(app.status_notice(), 17, 17, &copy_file(&tmp));
 }
 
-/// Length cap: >32 KiB assistant text truncates to 32 KiB and the
-/// notice says how much was taken of how much existed. A CJK char
-/// straddling the cap boundary is never split (char-boundary-safe
+/// Length cap: >32 KiB assistant text truncates to 32 KiB on ALL legs
+/// and the notice says how much was taken of how much existed. A CJK
+/// char straddling the cap boundary is never split (char-boundary-safe
 /// walk-back shows up as N of M chars too).
 #[tokio::test]
 async fn copy_last_truncates_at_32_kib() {
-    let (mut app, seen, _tmp) = copy_test_app().await;
+    let (mut app, seen, tmp) = copy_test_app().await;
     commit_assistant(&mut app, "y".repeat(clipboard::COPY_MAX_BYTES + 5)).await;
     app.dispatch(Action::CopyLast).await;
     let expected = "y".repeat(clipboard::COPY_MAX_BYTES);
@@ -1812,14 +1888,17 @@ async fn copy_last_truncates_at_32_kib() {
         vec![clipboard::osc52_payload(&expected)]
     );
     assert_eq!(
-        app.status_notice(),
-        Some("copied 32768 of 32773 chars"),
-        "truncation notice reports N of M"
+        std::fs::read_to_string(copy_file(&tmp))
+            .expect("copy file")
+            .len(),
+        clipboard::COPY_MAX_BYTES,
+        "the file leg truncates identically"
     );
+    assert_copy_notice(app.status_notice(), 32768, 32773, &copy_file(&tmp));
 
     // CJK straddle: 32767 ASCII bytes + two 3-byte chars = 32769 chars;
     // the cut walks back to 32767 bytes (no partial char).
-    let (mut app, seen, _tmp) = copy_test_app().await;
+    let (mut app, seen, tmp) = copy_test_app().await;
     let mut text = "a".repeat(clipboard::COPY_MAX_BYTES - 1);
     text.push_str("中中");
     commit_assistant(&mut app, text).await;
@@ -1829,15 +1908,140 @@ async fn copy_last_truncates_at_32_kib() {
         written_payloads(&seen),
         vec![clipboard::osc52_payload(&expected)]
     );
-    assert_eq!(app.status_notice(), Some("copied 32767 of 32769 chars"));
+    assert_eq!(
+        std::fs::read_to_string(copy_file(&tmp)).expect("copy file"),
+        expected
+    );
+    assert_copy_notice(app.status_notice(), 32767, 32769, &copy_file(&tmp));
 }
 
-/// A failing sink write must not claim success.
+/// EVERY leg failing → `clipboard write failed`: the sink reports
+/// failure AND the file dir is blocked (a regular FILE where the dir
+/// should be). The tool leg is environment-dependent — on machines
+/// without a clipboard tool (the dev/CI container) the notice is
+/// exactly the failure string; with one it may rescue, so only the
+/// deterministic absences are asserted there.
 #[tokio::test]
-async fn copy_last_reports_write_failures() {
-    let (mut app, _seen, _tmp) = copy_test_app().await;
+async fn copy_all_legs_failed_notices_failure() {
+    let (mut app, _seen, tmp) = copy_test_app().await;
     commit_assistant(&mut app, "answer".into()).await;
     app.set_clipboard_sink(Box::new(|_| false));
+    // Block the file leg: a regular FILE at the copy dir path makes
+    // create_dir_all fail.
+    std::fs::write(tmp.path().join("copy-out"), b"not a dir").expect("blocker");
+
     app.dispatch(Action::CopyLast).await;
-    assert_eq!(app.status_notice(), Some("clipboard write failed"));
+    let notice = app.status_notice().expect("notice").to_owned();
+    assert!(!notice.contains("->"), "file leg failed: {notice}");
+    assert!(
+        !notice.contains("(+osc52)"),
+        "sink reported failure: {notice}"
+    );
+    if clipboard::detect_clipboard_tool().is_none() {
+        assert_eq!(notice, "clipboard write failed");
+    }
+}
+
+/// `/copy all`: the whole transcript as plain text — user messages
+/// `> `-prefixed, assistant text verbatim, tool entries one-line
+/// summaries with the retained output's line count (P2) — riding the
+/// same chain (payload + file contents + notice).
+#[tokio::test]
+async fn copy_all_renders_the_transcript_as_plain_text() {
+    let (mut app, seen, tmp) = copy_test_app().await;
+    // User entry: the offline factory pushes it and bails cleanly.
+    app.dispatch(Action::StartTurn("hello user".into())).await;
+    commit_assistant(&mut app, "first answer".into()).await;
+
+    // A tool call whose output folds in at the TurnDone merge.
+    app.dispatch(Action::Engine(TuiEvent::ToolStart {
+        name: "read_file".into(),
+        args: r#"{"path":"a.rs"}"#.into(),
+    }))
+    .await;
+    app.dispatch(Action::Engine(TuiEvent::ToolEnd {
+        name: "read_file".into(),
+        bytes: 12,
+        truncated: false,
+    }))
+    .await;
+    commit_assistant(&mut app, "final answer".into()).await;
+    app.dispatch(Action::Engine(tool_fold_turn_done("line1\nline2")))
+        .await;
+    assert!(
+        app.transcript()
+            .last_tool_output()
+            .is_some_and(|t| t == "line1\nline2"),
+        "fixture: the tool output folded in"
+    );
+
+    app.dispatch(Action::StartTurn("/copy all".into())).await;
+    let expected = "> hello user\n\nfirst answer\n\n\
+                    [tool] read_file({\"path\":\"a.rs\"}) · 2 output lines\n\
+                    final answer\n\n";
+    let n = expected.chars().count();
+    assert_eq!(
+        written_payloads(&seen),
+        vec![clipboard::osc52_payload(expected)],
+        "the plain-text rendering rides the OSC 52 leg"
+    );
+    assert_eq!(
+        std::fs::read_to_string(copy_file(&tmp)).expect("copy file"),
+        expected,
+        "the plain-text rendering lands in the file verbatim"
+    );
+    assert_copy_notice(app.status_notice(), n, n, &copy_file(&tmp));
+}
+
+/// `/copy tool`: the most recent tool call's retained output text
+/// (fix-25 detail storage, filled by the turn's merge). No tool (or
+/// no retained output) → `nothing to copy`.
+#[tokio::test]
+async fn copy_tool_takes_the_last_tool_output() {
+    let (mut app, seen, tmp) = copy_test_app().await;
+    // Nothing at all.
+    app.dispatch(Action::StartTurn("/copy tool".into())).await;
+    assert_eq!(app.status_notice(), Some("nothing to copy"));
+    assert!(written_payloads(&seen).is_empty());
+    assert!(!copy_file(&tmp).exists());
+
+    // A folded tool output.
+    app.dispatch(Action::Engine(TuiEvent::ToolStart {
+        name: "read_file".into(),
+        args: "{}".into(),
+    }))
+    .await;
+    app.dispatch(Action::Engine(TuiEvent::ToolEnd {
+        name: "read_file".into(),
+        bytes: 14,
+        truncated: false,
+    }))
+    .await;
+    app.dispatch(Action::Engine(tool_fold_turn_done("file body here")))
+        .await;
+
+    app.dispatch(Action::StartTurn("/copy tool".into())).await;
+    assert_eq!(
+        std::fs::read_to_string(copy_file(&tmp)).expect("copy file"),
+        "file body here",
+        "the tool output text lands in the file"
+    );
+    assert_eq!(
+        written_payloads(&seen),
+        vec![clipboard::osc52_payload("file body here")]
+    );
+    assert_copy_notice(app.status_notice(), 14, 14, &copy_file(&tmp));
+}
+
+/// `/copy` with an unknown argument shows the usage notice and
+/// copies nothing.
+#[tokio::test]
+async fn copy_with_unknown_arg_shows_usage() {
+    let (mut app, seen, tmp) = copy_test_app().await;
+    commit_assistant(&mut app, "answer".into()).await;
+    app.dispatch(Action::StartTurn("/copy everything".into()))
+        .await;
+    assert_eq!(app.status_notice(), Some("usage: /copy [all|tool]"));
+    assert!(written_payloads(&seen).is_empty(), "no OSC 52 write");
+    assert!(!copy_file(&tmp).exists(), "no copy file written");
 }

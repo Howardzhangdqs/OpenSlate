@@ -1,25 +1,28 @@
 //! Transcript — the conversation view (chat main region).
 //!
 //! Data model and Action consumption were frozen in P2b; this module
-//! implements the full P3 lane-a rendering:
+//! implements the full P3 lane-a rendering (restyle-1: minimax-code
+//! visual language):
 //!
-//! * entry rendering per the borderless spec (Wave 2 lane-a): user
-//!   messages carry a Cyan `┃` bar over the block's full height with
-//!   the body hanging-indented 2 columns (no `you:` text label —
-//!   identity lives in the bar, opencode language), assistant text is
-//!   default-foreground indented 2 (aligned with the user body column),
-//!   reasoning keeps its dim `┆` gutter, tool lines are single-line
-//!   entries `{icon} name(args≤40列)` with the opencode icon table —
-//!   all Nerd Font PUA glyphs, width exactly 1 column (terminal
-//!    shell /  read /  write-edit /  glob-grep /
-//!    other) — + status + elapsed + bytes, ` agent` link-icon
-//!   delegation markers (Magenta), approval outcome lines (Nerd
-//!   hand icon), one-blank-line step separators
-//!   ([`TranscriptComponent::step_end`]), and the ` model · Ns`
-//!   cube-icon end-of-turn marker fed by
-//!   [`TranscriptComponent::set_turn_meta`]. Spacing: block entries
-//!   (user/assistant/turn marker) get one blank line before them;
-//!   runs of single-line tool rows stay compact;
+//! * user messages render as full-width #262626 background bands —
+//!   body width = area−4, 2-column left indent, BOLD signal `› `
+//!   anchor on the first content row, one blank band row above and
+//!   below; assistant text carries the text-colored `● ` anchor on
+//!   its first display row with the body indented 2 (no background);
+//!   reasoning keeps fix-23/24's collapsed-single-line shape behind
+//!   an accent `• ` marker (BOLD muted summary); tool rows are
+//!   single-line entries `├/└ ` (dim line-color connector) + status
+//!   marker (`•` running accent / `✓` success / `×` error) + BOLD
+//!   English verb ([`tool_verb`]) + muted args summary + a muted
+//!   ` · N output lines`-style suffix; icons-5 splits the marker
+//!   semantics — reasoning rows take [`IconSet::reasoning`] (the
+//!   brain in nerd) while tool-running keeps [`IconSet::bullet`] (the
+//!   gear); unicode/ascii render both as the same `•`/`*`; delegation markers render
+//!   `● agent Running` / `✓ agent Done`; approval outcomes are
+//!   `✓/×/! tool — decision`; the turn-end marker is
+//!   `└ model · Ns · ↑in ↓out · ⚡ tok/s` (muted, ⚡ signal);
+//! * all glyphs are pure Unicode (no Nerd Font PUA), one-blank-line
+//!   step separators ([`TranscriptComponent::step_end`]);
 //! * the A4 ruling (locked): LIVE tool entries only ever show Yellow
 //!   running (icon + name, spinner) or muted check-icon done — core's
 //!   `ToolEnd` carries no success flag. The times-icon failure state
@@ -44,12 +47,39 @@
 //!   SURVIVE (the wholesale [`TranscriptComponent::rebuild`] remains
 //!   the recovery fallback — the Err store-reload path, a future
 //!   /resume, auto-compact);
+//! * reasoning collapse (fix-23, summary rule reworked in fix-24):
+//!   every reasoning block — committed entry or live streaming
+//!   buffer — renders COLLAPSED to one dim summary row by default
+//!   ([`reasoning_summary`]: the block flattened to one line — lines
+//!   trimmed, blanks dropped, joined with single spaces — cut to the
+//!   available columns from the TAIL, a leading `…` marking dropped
+//!   text); clicking the row expands it to the full `┆` gutter block
+//!   and clicking the expanded block collapses it again (hit rects
+//!   ride the render-records/handle-consumes pattern of
+//!   [`TranscriptComponent::hint_hit_rect`], see
+//!   [`TranscriptComponent::reasoning_hit_rects`]); an expanded
+//!   streaming block commits expanded
+//!   ([`TranscriptComponent::flush_streaming_to_entries`]), and
+//!   rebuild/merge//new reset the expansion state;
+//! * tool row expansion (fix-25): every ToolCall entry retains its
+//!   FULL call and output text ([`ToolEntryDetail`], storage-capped
+//!   4KB/8KB) — args from the live `ToolStart`/rebuild, output from
+//!   the fold paths (the live `ToolEnd` carries bytes only, core's
+//!   callback surface is textless) — and CLICKING the row expands a
+//!   dim indent-2 detail block: `调用 {name}` then the wrapped args,
+//!   `输出` then the wrapped output (运行行内占位 运行中…、（待回
+//!   填）、（空）), each section capped at 30 rows behind a
+//!   `…（共 N 行）` marker. The click lifecycle mirrors the reasoning
+//!   toggle ([`TranscriptComponent::tool_hit_rects`], hit order
+//!   hint → reasoning → tool) and rebuild/merge//new reset it too;
 //! * scroll pinning: auto-follow at the bottom while content streams;
 //!   any user scroll-up pins (new content stops following and a
-//!   `↓ 新内容` hint appears at the bottom-right — CLICKABLE, see
-//!   [`TranscriptComponent::hint_hit_rect`]); `G`/`End`/
-//!   `ScrollBottom`/`Esc` release the pin, as does scrolling back down
-//!   to the bottom;
+//!   `+N ↓ 回到底部` hint appears at the bottom-right — CLICKABLE, see
+//!   [`TranscriptComponent::hint_hit_rect`]; N counts the rendered
+//!   rows below the pin, folded blocks included — fix-25 moved the
+//!   count to a `+N` prefix on the fix-23 jump-back copy);
+//!   `G`/`End`/`ScrollBottom`/`Esc` release the pin, as does
+//!   scrolling back down to the bottom;
 //! * manual word wrap ([`wrap_to_width`]): word boundaries preserved
 //!   where possible, CJK breaks per character — so scroll offsets are
 //!   computed against the exact same wrapped line set that renders;
@@ -93,20 +123,35 @@
 //!   NO live row (the status-bar spinner is the activity signal
 //!   there); `RequestEnd` clears it and the held exact line takes
 //!   over (above).
+//! * drag-to-select (select-1): hold the left button and drag to
+//!   select transcript text (tmux copy-mode style) — the selection
+//!   lives in LOGICAL space ([`LogicalPos`]: entry/streaming block +
+//!   row-in-block + display column, attributed per row by
+//!   [`Self::layout_lines`]), so scrolling, resize re-wraps and
+//!   streaming appends re-map it every frame instead of
+//!   invalidating it. Release AUTO-COPIES the covered text through
+//!   the App's copy chain (OSC 52 + `last-copy.md` + clipboard
+//!   tool — the same notice as `/copy`); a press that never drags
+//!   still fires the legacy positional click (hint jump / row
+//!   expansion), so every fix-17/23/25 click behavior survives
+//!   unchanged. Highlighting is a post-render style pass
+//!   ([`Self::paint_selection`]) painting `theme.selection_bg` over
+//!   whole glyph cells (a wide char's halves never split); Esc, a
+//!   new press, rebuild/merge//new and overlay opens clear it.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::status::SPINNER_FRAMES;
 use super::{AppCtx, Component, Focus};
 use crate::action::Action;
+use crate::icons::localize;
 use crate::theme::Theme;
 use openslate_core::types::{Message, MessageRole, Usage};
 
@@ -115,6 +160,132 @@ use openslate_core::types::{Message, MessageRole, Usage};
 /// one-token block microseconds old would render a five-digit tok/s)
 /// and the segment is suppressed until the clock makes it meaningful.
 const LIVE_RATE_FLOOR_SECS: f64 = 0.3;
+
+/// Storage cap for retained tool ARGUMENTS (fix-25): the expandable
+/// detail keeps the full call text up to this many BYTES (marker
+/// included); beyond it the text cuts at a char boundary and the
+/// [`STORE_TRUNCATED_MARKER`] names the cut.
+const ARGS_STORE_CAP: usize = 4 * 1024;
+/// Storage cap for retained tool OUTPUT (fix-25), marker included.
+const OUTPUT_STORE_CAP: usize = 8 * 1024;
+/// Marker appended to retained detail text that hit its storage cap.
+const STORE_TRUNCATED_MARKER: &str = "\n…（已截断）";
+
+/// splash-1 (rev): the empty-session wordmark art, ANSI Shadow style
+/// (the minimax-code hero look — `█` blocks over `╗ ║ ╔ ╝ ╚ ═` shadow
+/// corners), BYTE-FROZEN — the contract test pins every line of both
+/// tiers verbatim; do not touch a glyph. Pure BMP box/block glyphs +
+/// space (no PUA, no ASCII-art punctuation), rows rstripped, every
+/// row padded to the tier width at render time. The unicode/nerd
+/// icon tiers show the art; the pure-ASCII icon tier never does
+/// (straight to the legacy wordmark fallback).
+const SPLASH_ART_FULL: [&str; 6] = [
+    " ██████╗ ██████╗ ███████╗███╗   ██╗███████╗██╗      █████╗ ████████╗███████╗",
+    "██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██║     ██╔══██╗╚══██╔══╝██╔════╝",
+    "██║   ██║██████╔╝█████╗  ██╔██╗ ██║███████╗██║     ███████║   ██║   █████╗",
+    "██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║╚════██║██║     ██╔══██║   ██║   ██╔══╝",
+    "╚██████╔╝██║     ███████╗██║ ╚████║███████║███████╗██║  ██║   ██║   ███████╗",
+    " ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝",
+];
+
+/// The full tier's block width in columns (the widest art row):
+/// `OpenSlate`.
+const SPLASH_FULL_WIDTH: u16 = 76;
+
+/// splash-1 (rev): the medium tier — `Slate` — for narrow (but not
+/// tiny) main columns; same glyph contract as the full tier.
+const SPLASH_ART_MEDIUM: [&str; 6] = [
+    "███████╗██╗      █████╗ ████████╗███████╗",
+    "██╔════╝██║     ██╔══██╗╚══██╔══╝██╔════╝",
+    "███████╗██║     ███████║   ██║   █████╗",
+    "╚════██║██║     ██╔══██║   ██║   ██╔══╝",
+    "███████║███████╗██║  ██║   ██║   ███████╗",
+    "╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝",
+];
+
+/// The medium tier's block width in columns: `Slate`.
+const SPLASH_MEDIUM_WIDTH: u16 = 41;
+
+/// The splash block's height: art 6 + blank 1 + hint 1.
+const SPLASH_ROWS: u16 = 8;
+
+/// The full tier's minimum MAIN width: 76 art + a 2-column margin
+/// each side (the minimax hero.ts ladder threshold).
+const SPLASH_FULL_MIN_WIDTH: u16 = 80;
+
+/// The medium tier's minimum MAIN width: 41 art + the same margin.
+const SPLASH_MEDIUM_MIN_WIDTH: u16 = 45;
+
+/// The splash's minimum MAIN height (block 8 + one blank row above
+/// and below); below it the legacy wordmark fallback renders.
+const SPLASH_MIN_HEIGHT: u16 = 10;
+
+/// splash-1 (rev): the size ladder's picked tier — which wordmark
+/// block [`TranscriptComponent::render_splash`] paints. `None` (from
+/// [`SplashTier::pick`]) means the legacy `✦ OpenSlate` wordmark
+/// fallback in the flow path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplashTier {
+    /// The full `OpenSlate` wordmark (76 wide) — main width ≥ 80.
+    Full,
+    /// The compact `Slate` wordmark (41 wide) — main width ≥ 45.
+    Medium,
+}
+
+impl SplashTier {
+    fn art(self) -> &'static [&'static str; 6] {
+        match self {
+            Self::Full => &SPLASH_ART_FULL,
+            Self::Medium => &SPLASH_ART_MEDIUM,
+        }
+    }
+
+    fn width(self) -> u16 {
+        match self {
+            Self::Full => SPLASH_FULL_WIDTH,
+            Self::Medium => SPLASH_MEDIUM_WIDTH,
+        }
+    }
+
+    /// Pick the tier for a main area (the minimax hero ladder; the
+    /// micro single-letter tier is deliberately cut — our min-size
+    /// guard floors the real area at 60×12): roomy widths take the
+    /// full wordmark, medium widths the compact one; narrower areas,
+    /// short areas, and the pure-ASCII icon tier (the art's box/block
+    /// glyphs are exactly what that tier exists to avoid) all fall
+    /// back to `None`.
+    fn pick(width: u16, height: u16, ascii: bool) -> Option<Self> {
+        if ascii || height < SPLASH_MIN_HEIGHT {
+            return None;
+        }
+        if width >= SPLASH_FULL_MIN_WIDTH {
+            Some(Self::Full)
+        } else if width >= SPLASH_MEDIUM_MIN_WIDTH {
+            Some(Self::Medium)
+        } else {
+            None
+        }
+    }
+}
+
+/// The empty-session hint line (splash-1): shared verbatim by the
+/// splash and the narrow/short fallback (same copy, muted style,
+/// localize treatment).
+const EMPTY_SESSION_HINT: &str = "空会话 — 输入 prompt 开始,Enter 发送";
+
+/// Retain `s` up to `cap` BYTES (marker included) for the expandable
+/// tool detail (fix-25). Byte-budgeted, cut at a UTF-8 char boundary
+/// so the total stays within `cap`.
+fn cap_stored_text(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_owned();
+    }
+    let mut end = cap.saturating_sub(STORE_TRUNCATED_MARKER.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &s[..end], STORE_TRUNCATED_MARKER)
+}
 
 /// Status of a tool entry line. Live transitions are Running → Done only
 /// (A4); [`ToolEntryStatus::Failed`] is produced exclusively by the
@@ -140,6 +311,24 @@ pub enum ToolEntryStatus {
     Failed { summary: String },
 }
 
+/// fix-25: retained FULL call/output text behind a tool row, shown
+/// when the entry is click-expanded. `args` is the complete argument
+/// string ([`ARGS_STORE_CAP`]-capped) — the single-line row keeps its
+/// 40-column preview. `output` is the complete tool output
+/// ([`OUTPUT_STORE_CAP`]-capped): `None` until a path that carries
+/// text observes it — the LIVE `ToolEnd` event only reports bytes
+/// (core's `ProgressCallback` carries no output text), so a live-path
+/// entry fills at `merge_turn`/`rebuild` from its Tool message
+/// (`fold_tool_outcome`/`fold_tool_outcomes_merge`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolEntryDetail {
+    /// Full arguments, storage-capped.
+    pub args: String,
+    /// Full output, storage-capped; `None` = no text observed yet
+    /// (Running, or a live-path Done awaiting the turn's fold).
+    pub output: Option<String>,
+}
+
 /// One transcript line-item. Frozen data model (fields may gain `..`
 /// patterns externally; variant shapes are append-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,17 +342,22 @@ pub enum TranscriptEntry {
     Reasoning(String),
     /// Tool call line: `{icon} name(args≤40列)` + status (icon from the
     /// semantic table, [`tool_icon`]). `call_id` links the rebuild
-    /// path's Tool-role result messages back to this entry.
+    /// path's Tool-role result messages back to this entry. `detail`
+    /// (fix-25) retains the full args/output for the click-expanded
+    /// view.
     ToolCall {
         name: String,
         args: String,
         status: ToolEntryStatus,
         call_id: Option<String>,
+        detail: ToolEntryDetail,
     },
     /// Approval outcome line.
     Approval { tool_name: String, decision: String },
-    /// Delegation marker ` agent` (Nerd link icon, Magenta).
-    Delegate { agent: String },
+    /// Delegation marker (restyle-1): `● agent Running` while the
+    /// child runs, `✓ agent Done` once its `call_agent` ToolEnd
+    /// arrives (FIFO, mirroring the agents panel).
+    Delegate { agent: String, done: bool },
     /// Step separator (one blank line) — pushed by
     /// [`TranscriptComponent::step_end`], live-only (the rebuild emits a
     /// clean structure without separators).
@@ -191,6 +385,96 @@ struct TurnMeta {
     elapsed_secs: u64,
     /// Aggregate `(input, output)` tokens, when the turn reported any.
     tokens: Option<(u64, u64)>,
+}
+
+// ── select-1: drag-to-select (tmux copy-mode style) ───────────────────
+//
+// The selection lives in LOGICAL space — block (committed entry or
+// the streaming tail) + row-within-block + display column — never in
+// screen coordinates, so scrolling, resize re-wraps and streaming
+// appends re-map it deterministically every frame instead of
+// invalidating it. `layout_lines_at` records the per-row block
+// attribution (`line_blocks`, the same render-records/handle-consumes
+// pattern as the fix-23/25 hit rects); the screen⇄logical mapping is
+// computed against the LAST render's geometry (`sel_area`/`sel_scroll`).
+
+/// Which rendered block a logical position refers to: a committed
+/// entry (index into `entries`) or the live streaming tail (the
+/// trailing marker fallback + reasoning/answer streaming rows, one
+/// contiguous run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionBlock {
+    Entry(usize),
+    Streaming,
+}
+
+/// A selection position in logical space (select-1): block + row
+/// within the block's rendered lines + display column within that
+/// row. `row` clamps to the block's CURRENT row span at map time, so
+/// a re-wrap degrades to the nearest row rather than dying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogicalPos {
+    block: SelectionBlock,
+    row: usize,
+    col: usize,
+}
+
+/// The drag-to-select state machine (select-1):
+/// `Normal` → (press) `Pending` → (≥1-cell drag) `Selecting` →
+/// (release) `Selected` (highlight persists) → (clear trigger) `Normal`.
+/// A `Pending` release never dragged → the legacy positional click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SelectionState {
+    /// No selection.
+    #[default]
+    Normal,
+    /// Button down, anchor recorded, not yet dragged past one cell:
+    /// the legacy Click stays suppressed until release proves no
+    /// drag happened. `down` holds the press's screen cell for the
+    /// displacement threshold.
+    Pending {
+        anchor: LogicalPos,
+        down: (u16, u16),
+    },
+    /// Dragging: the cursor tracks every drag event.
+    Selecting {
+        anchor: LogicalPos,
+        cursor: LogicalPos,
+    },
+    /// Released with a selection: the highlight persists until a
+    /// clear trigger (Esc, a new press, rebuild/merge//new, an
+    /// overlay opening).
+    Selected {
+        anchor: LogicalPos,
+        cursor: LogicalPos,
+    },
+}
+
+impl SelectionState {
+    /// The `(anchor, cursor)` pair while a selection is on screen
+    /// (`Selecting` or `Selected`); `None` in `Normal`/`Pending`.
+    fn range(&self) -> Option<(LogicalPos, LogicalPos)> {
+        match *self {
+            SelectionState::Selecting { anchor, cursor }
+            | SelectionState::Selected { anchor, cursor } => Some((anchor, cursor)),
+            _ => None,
+        }
+    }
+}
+
+/// What a left-button release should do (select-1) — the App's
+/// [`Action::MouseUp`] routing consumes this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionEnd {
+    /// The press never dragged: the caller dispatches the legacy
+    /// positional [`Action::Click`] (hint jump / row expansion /
+    /// inert miss — every fix-17/23/25 behavior).
+    Click,
+    /// The drag completed a selection; carries the extracted text
+    /// (row texts joined with `\n`, boundary rows char-sliced by
+    /// display column — byte-capping is the copy chain's job). The
+    /// highlight persists as `Selected`.
+    Selected(String),
 }
 
 /// The conversation view. Holds committed entries plus the live streaming
@@ -246,13 +530,82 @@ pub struct TranscriptComponent {
     /// (interior mutability — `Component::render` takes `&self`).
     viewport: Cell<(u16, u16)>,
     /// Terminal-absolute hit rectangle of the last-rendered
-    /// `↓ 新内容 +N` hint (the hint's own row, its right-aligned span
+    /// `+N ↓ 回到底部` hint (the hint's own row, its right-aligned span
     /// widened 2 columns each side); `None` whenever the hint did NOT
     /// render (following, nothing below, zero-height viewport). `handle`
     /// hit-tests [`Action::Click`] against it — a hit returns
     /// [`Action::ScrollBottom`] (the existing follow-restore action).
     /// Interior mutability like `viewport` (render takes `&self`).
     hint_hit_rect: Cell<Option<Rect>>,
+    /// interactive-1: whether the jump hint renders HOVERED (the App's
+    /// `MouseMove` hit-test feeds this before each render via
+    /// [`TranscriptComponent::set_hint_hovered`]; pure presentation —
+    /// the click behavior is the pre-existing fix-17 path).
+    hint_hovered: bool,
+    /// fix-23: entries whose Reasoning blocks render EXPANDED (the
+    /// full `┆` gutter block) — every other reasoning block collapses
+    /// to one summary row ([`reasoning_summary`]). Keyed by entry
+    /// index; cleared by rebuild/merge//new (indices die with the
+    /// entries).
+    expanded_reasoning: HashSet<usize>,
+    /// fix-23: whether the LIVE streaming reasoning block renders
+    /// expanded (its own toggle — independent of the committed
+    /// entries' state). Resets with the buffers (begin/clear/flush).
+    streaming_reasoning_expanded: bool,
+    /// fix-23 hit-test records: `(entry index, layout start row, row
+    /// count)` of every committed Reasoning block this layout pass
+    /// produced — a collapsed block spans its single summary row, an
+    /// expanded one its whole block. [`Self::render`] converts them
+    /// into terminal-absolute Rects (`reasoning_hit_rects`).
+    /// Interior mutability because `layout_lines` takes `&self`;
+    /// cleared at the top of every pass (scroll actions re-run the
+    /// layout between frames — without the clear, records accumulate).
+    reasoning_rows: RefCell<Vec<(usize, usize, usize)>>,
+    /// The streaming reasoning block's `(start row, row count)` in
+    /// the same-pass coordinates — `None` when no live block renders.
+    streaming_reasoning_rows: Cell<Option<(usize, usize)>>,
+    /// fix-23: TERMINAL-ABSOLUTE hit rects (entry index → Rect) of
+    /// the committed reasoning blocks the LAST RENDER drew (clipped
+    /// to the viewport). `handle`'s [`Action::Click`] toggles the
+    /// entry's expansion on a hit. Rewritten unconditionally every
+    /// render (empty when nothing renders) — the same
+    /// render-records/handle-consumes pattern as
+    /// [`Self::hint_hit_rect`].
+    reasoning_hit_rects: RefCell<Vec<(usize, Rect)>>,
+    /// The streaming reasoning block's terminal-absolute hit rect
+    /// (same lifecycle as `reasoning_hit_rects`).
+    streaming_reasoning_hit_rect: Cell<Option<Rect>>,
+    /// fix-25: entries whose ToolCall rows render EXPANDED — the head
+    /// line plus the dim call/output detail block — same click-toggle
+    /// lifecycle as `expanded_reasoning`; cleared by
+    /// rebuild/merge//new.
+    expanded_tools: HashSet<usize>,
+    /// fix-25 hit-test records: `(entry index, layout start row, row
+    /// count)` of every ToolCall entry this pass produced — collapsed
+    /// covers the head row, expanded the head + detail block. Mirrors
+    /// `reasoning_rows`.
+    tool_rows: RefCell<Vec<(usize, usize, usize)>>,
+    /// fix-25: TERMINAL-ABSOLUTE hit rects (entry index → Rect) of
+    /// the ToolCall entries the LAST RENDER drew (clipped to the
+    /// viewport); `handle`'s [`Action::Click`] toggles expansion on
+    /// a hit. Mirrors `reasoning_hit_rects`.
+    tool_hit_rects: RefCell<Vec<(usize, Rect)>>,
+    /// select-1: one block id ([`SelectionBlock`]) per emitted row,
+    /// recorded by every `layout_lines` pass — the selection's
+    /// screen⇄logical mapping source (same render-records pattern
+    /// as `reasoning_rows`; cleared at the top of every pass).
+    line_blocks: RefCell<Vec<SelectionBlock>>,
+    /// select-1: the area the LAST RENDER drew into — the origin the
+    /// screen⇄logical mapping converts against. Interior mutability
+    /// like `viewport` (render takes `&self`).
+    sel_area: Cell<Option<Rect>>,
+    /// select-1: the effective scroll offset the last render used
+    /// (mapping rows against anything else would misalign under
+    /// pinning).
+    sel_scroll: Cell<usize>,
+    /// select-1: the drag-to-select state (logical positions). See
+    /// [`SelectionState`] for the transitions and clear triggers.
+    selection: SelectionState,
     /// Entries-index the turn marker renders BEFORE (recorded by
     /// `merge_turn`/`rebuild` at the finished turn's tail). Keeps the
     /// marker ABOVE the next turn's content: the marker used to render
@@ -279,6 +632,32 @@ impl TranscriptComponent {
         &self.entries
     }
 
+    /// interactive-1: the last-rendered `+N ↓ 回到底部` hint's hit
+    /// rectangle (`None` whenever the hint did not render) — the
+    /// App's hover hit-test source.
+    pub fn hint_rect(&self) -> Option<Rect> {
+        self.hint_hit_rect.get()
+    }
+
+    /// interactive-1: toggle the jump hint's hovered presentation for
+    /// the next render (fed from the App's hover state).
+    pub fn set_hint_hovered(&mut self, hovered: bool) {
+        self.hint_hovered = hovered;
+    }
+
+    /// Read-only access to the most recent RETAINED tool output
+    /// (fix-25's [`ToolEntryDetail`] storage — the `/copy tool`
+    /// source). Scans from the tail, so a live-path entry whose output
+    /// has not folded in yet (`None` until the turn's merge/rebuild)
+    /// falls back to the last entry that DOES have output. `None` when
+    /// no tool entry ever retained text.
+    pub fn last_tool_output(&self) -> Option<&str> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::ToolCall { detail, .. } => detail.output.as_deref(),
+            _ => None,
+        })
+    }
+
     /// Live streaming buffer (answer deltas only).
     pub fn streaming_text(&self) -> &str {
         &self.streaming
@@ -287,6 +666,16 @@ impl TranscriptComponent {
     /// Whether the view is pinned (not following the tail).
     pub fn is_pinned(&self) -> bool {
         !self.follow
+    }
+
+    /// Whether the transcript holds NOTHING renderable — no committed
+    /// entries, no streaming buffers, no pending turn meta (splash-1:
+    /// gates the splash / fallback empty-state render).
+    fn is_blank(&self) -> bool {
+        self.entries.is_empty()
+            && self.streaming.is_empty()
+            && self.streaming_reasoning.is_empty()
+            && self.turn_meta.is_none()
     }
 
     /// A user message was submitted (live path; the rebuild after
@@ -306,6 +695,7 @@ impl TranscriptComponent {
         self.flush_pending_step_meta();
         self.streaming.clear();
         self.streaming_reasoning.clear();
+        self.streaming_reasoning_expanded = false;
         self.reasoning_started = None;
         self.answer_started = None;
         self.live_ttft = None;
@@ -354,6 +744,7 @@ impl TranscriptComponent {
         if name == "call_agent" {
             self.entries.push(TranscriptEntry::Delegate {
                 agent: super::status::delegate_target(args),
+                done: false,
             });
             self.flush_pending_step_meta();
             return;
@@ -364,6 +755,13 @@ impl TranscriptComponent {
             args: args_preview(args),
             status: ToolEntryStatus::Running,
             call_id: None,
+            // fix-25: retain the FULL args for the expanded view (the
+            // live ToolStart event carries them complete); output
+            // fills at merge/rebuild (live ToolEnd has bytes only).
+            detail: ToolEntryDetail {
+                args: cap_stored_text(args, ARGS_STORE_CAP),
+                output: None,
+            },
         });
         self.running_since.insert(index, Instant::now());
         self.flush_pending_step_meta();
@@ -371,7 +769,19 @@ impl TranscriptComponent {
 
     /// A tool finished: mark the LAST running entry with this name Done
     /// (A4: no failure state on the live path — the rebuild decides).
+    /// A `call_agent` end additionally completes the OLDEST still-live
+    /// Delegate marker (FIFO — same pairing as the agents panel).
     pub fn tool_end(&mut self, name: &str, bytes: usize, truncated: bool) {
+        if name == "call_agent" {
+            for entry in &mut self.entries {
+                if let TranscriptEntry::Delegate { done, .. } = entry {
+                    if !*done {
+                        *done = true;
+                        break;
+                    }
+                }
+            }
+        }
         for (index, entry) in self.entries.iter_mut().enumerate().rev() {
             if let TranscriptEntry::ToolCall {
                 name: entry_name,
@@ -425,19 +835,33 @@ impl TranscriptComponent {
     /// leading/trailing empty gutter rows (matching the live view).
     fn flush_streaming_to_entries(&mut self) {
         let reasoning = std::mem::take(&mut self.streaming_reasoning);
+        // fix-23: an expanded live block commits EXPANDED (no visual
+        // jump at the boundary); the flag resets with the buffer (the
+        // next streaming block starts collapsed).
+        let reasoning_was_expanded = self.streaming_reasoning_expanded;
+        self.streaming_reasoning_expanded = false;
         self.reasoning_started = None;
         self.answer_started = None;
         if !reasoning.trim().is_empty() {
-            self.entries
-                .push(TranscriptEntry::Reasoning(trim_edge_blank_lines(
-                    &reasoning,
-                )));
+            self.commit_reasoning(trim_edge_blank_lines(&reasoning), reasoning_was_expanded);
         }
         let answer = std::mem::take(&mut self.streaming);
         if !answer.trim().is_empty() {
             self.entries
                 .push(TranscriptEntry::Assistant(trim_edge_blank_lines(&answer)));
         }
+    }
+
+    /// Commit one Reasoning entry (fix-23's flush/finish paths),
+    /// carrying the live block's expansion state: a block the reader
+    /// had expanded while it streamed lands in `expanded_reasoning`,
+    /// so the boundary flush never collapses text the user is
+    /// reading.
+    fn commit_reasoning(&mut self, text: String, was_expanded: bool) {
+        if was_expanded {
+            self.expanded_reasoning.insert(self.entries.len());
+        }
+        self.entries.push(TranscriptEntry::Reasoning(text));
     }
 
     /// A model request completed (`Usage` already stored, `RequestEnd`
@@ -478,6 +902,10 @@ impl TranscriptComponent {
         self.flush_pending_step_meta();
         let reasoning_raw = std::mem::take(&mut self.streaming_reasoning);
         let reasoning_started = self.reasoning_started.take();
+        // fix-23: the live block's expansion rides the commit (see
+        // `commit_reasoning`); the flag resets with the buffers.
+        let reasoning_was_expanded = self.streaming_reasoning_expanded;
+        self.streaming_reasoning_expanded = false;
         let answer_raw = std::mem::take(&mut self.streaming);
         self.answer_started = None;
         self.live_ttft = None;
@@ -497,7 +925,7 @@ impl TranscriptComponent {
             // the usage line is HELD (fix-19) for the boundary that
             // decides its position.
             if has_reasoning {
-                self.entries.push(TranscriptEntry::Reasoning(reasoning));
+                self.commit_reasoning(reasoning, reasoning_was_expanded);
                 if let Some(started) = reasoning_started {
                     self.entries.push(TranscriptEntry::Meta(meta_reasoning_line(
                         chars,
@@ -518,11 +946,11 @@ impl TranscriptComponent {
             // with no output block between them.
             match (has_reasoning, usage) {
                 (true, Some(usage)) => {
-                    self.entries.push(TranscriptEntry::Reasoning(reasoning));
+                    self.commit_reasoning(reasoning, reasoning_was_expanded);
                     self.pending_step_meta = Some(meta_merged_line(chars, &usage, ttft, elapsed));
                 }
                 (true, None) => {
-                    self.entries.push(TranscriptEntry::Reasoning(reasoning));
+                    self.commit_reasoning(reasoning, reasoning_was_expanded);
                     if let Some(started) = reasoning_started {
                         self.entries.push(TranscriptEntry::Meta(meta_reasoning_line(
                             chars,
@@ -572,6 +1000,7 @@ impl TranscriptComponent {
     pub fn clear_streaming(&mut self) {
         self.streaming.clear();
         self.streaming_reasoning.clear();
+        self.streaming_reasoning_expanded = false;
         self.reasoning_started = None;
         self.answer_started = None;
         self.live_ttft = None;
@@ -601,7 +1030,7 @@ impl TranscriptComponent {
     /// Tool-role result messages do NOT create entries — they fold back
     /// into their matching ToolCall entry ([`fold_tool_outcome`]):
     /// success refines `bytes`/`truncated`, failure markers flip the
-    /// entry to  Failed (the A4 heuristic).
+    /// entry to Failed (the A4 heuristic).
     ///
     /// The pin decision the user made while streaming SURVIVES the
     /// rebuild (a pin is only released explicitly — G/End/Esc/scroll to
@@ -648,6 +1077,12 @@ impl TranscriptComponent {
         }
         self.entries = entries;
         self.clear_streaming();
+        // fix-23/fix-25: entry indices died with the old entries —
+        // every reasoning block and tool row re-derives collapsed.
+        // select-1: the logical block ids died with them.
+        self.expanded_reasoning.clear();
+        self.expanded_tools.clear();
+        self.clear_selection();
         // The rebuild re-derives everything from messages: a held
         // step meta (live-only state, like the reasoning entries) is
         // dropped — the turn marker's aggregates are this path's
@@ -756,6 +1191,13 @@ impl TranscriptComponent {
         // message once that entry appears.
         self.running_since.clear();
         self.marker_at = Some(self.entries.len());
+        // fix-23/fix-25: conservative reset (indices are technically
+        // stable on this append-only path, but the finished turn's
+        // record reads cleaner re-collapsed). select-1: the turn
+        // boundary clears any selection too.
+        self.expanded_reasoning.clear();
+        self.expanded_tools.clear();
+        self.clear_selection();
     }
 
     /// Clear everything (`/new`). The turn marker goes too — a fresh
@@ -764,6 +1206,9 @@ impl TranscriptComponent {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.clear_streaming();
+        self.expanded_reasoning.clear();
+        self.expanded_tools.clear();
+        self.clear_selection();
         self.pending_step_meta = None;
         self.turn_meta = None;
         self.marker_at = None;
@@ -822,29 +1267,54 @@ impl TranscriptComponent {
         theme: &Theme,
         spinner_frame: usize,
     ) -> Vec<Line<'static>> {
-        self.layout_lines_at(width, theme, spinner_frame, Instant::now())
+        // `spinner_frame` rides the signature for call-site stability;
+        // restyle-1 moved the spinner to the status line (tool rows no
+        // longer animate), so it forwards unused.
+        let _ = spinner_frame;
+        self.layout_lines_at(width, theme, Instant::now())
     }
 
     /// [`Self::layout_lines`] with an injectable clock — the test
     /// seam for the time-derived rows (fix-19's live rate needs
     /// deterministic instants; production always passes `now`).
-    fn layout_lines_at(
-        &self,
-        width: usize,
-        theme: &Theme,
-        spinner_frame: usize,
-        now: Instant,
-    ) -> Vec<Line<'static>> {
+    fn layout_lines_at(&self, width: usize, theme: &Theme, now: Instant) -> Vec<Line<'static>> {
+        // fix-23/fix-25: fresh hit-test records every pass — `render`
+        // converts THIS pass's records into terminal rects, and
+        // scroll actions re-run the layout between frames (without
+        // the clear, records would accumulate into duplicates).
+        // select-1: same lifecycle for the per-row block attribution.
+        self.reasoning_rows.borrow_mut().clear();
+        self.streaming_reasoning_rows.set(None);
+        self.tool_rows.borrow_mut().clear();
+        self.line_blocks.borrow_mut().clear();
         let width = width.max(1);
         let mut out: Vec<Line<'static>> = Vec::new();
 
-        let is_empty = self.entries.is_empty()
-            && self.streaming.is_empty()
-            && self.streaming_reasoning.is_empty()
-            && self.turn_meta.is_none();
+        let is_empty = self.is_blank();
         if is_empty {
+            // The flow-path empty state (splash-1): the legacy
+            // wordmark + hint. On roomy areas `render` paints the
+            // centered ASCII splash INSTEAD (see `render_splash`) —
+            // this branch stays byte-identical for the narrow/short
+            // fallback (and any layout_lines consumer).
+            let g = theme.icons.set();
+            let mut spans = vec![Span::styled(format!("{} ", g.brand), theme.tool_running)];
+            let tones = [
+                theme.wordmark_highlight.fg,
+                theme.tool_running.fg,
+                theme.wordmark_shadow.fg,
+            ];
+            for (i, ch) in "OpenSlate".chars().enumerate() {
+                // `tones` are `Option<Color>` (the theme slots' fg) —
+                // `None` (never in practice) falls back to the brand.
+                let tone = tones[(i / 2).min(tones.len() - 1)].unwrap_or_default();
+                spans.push(Span::styled(ch.to_string(), Style::new().fg(tone)));
+            }
+            out.push(Line::from(spans));
             out.push(Line::from(Span::styled(
-                "空会话 — 输入 prompt 开始,Enter 发送",
+                // The em-dash is chrome — localize (identity outside
+                // the ascii tier).
+                localize(EMPTY_SESSION_HINT, &g),
                 theme.muted,
             )));
             return out;
@@ -868,42 +1338,26 @@ impl TranscriptComponent {
         let marker_at = self.marker_at.filter(|_| self.turn_meta.is_some());
         let mut emitted_marker = false;
         for (index, entry) in self.entries.iter().enumerate() {
+            // select-1: attribute every row this iteration emits
+            // (the marker's block gap, if any, plus the entry's own
+            // rows) to this entry's selection block.
+            let block_start = out.len();
             // The marker of the LAST finished turn renders at its
             // recorded position (merge_turn/rebuild) — above the
             // next turn's entries, never below them.
             if !emitted_marker && marker_at == Some(index) {
                 emitted_marker = true;
-                if let Some(TurnMeta {
-                    model,
-                    elapsed_secs: secs,
-                    tokens,
-                }) = &self.turn_meta
-                {
+                if let Some(meta) = &self.turn_meta {
                     gap_before_block(&mut out);
-                    let mut text = format!(" {model} · {secs}秒");
-                    if let Some((input, output)) = tokens {
-                        text.push_str(&format!(" · ↑{input} ↓{output}"));
-                    }
-                    out.push(Line::from(vec![
-                        Span::styled("".to_owned(), theme.turn_marker),
-                        Span::styled(text, theme.muted),
-                    ]));
+                    out.push(turn_marker_line(meta, theme));
                 }
             }
             match entry {
                 TranscriptEntry::User(text) => {
                     gap_before_block(&mut out);
-                    // Cyan `┃` bar over the block's FULL height; the
-                    // body hangs at column 2 (the bar replaces the old
-                    // `you:` text label — opencode identity language).
-                    push_gutter_block(
-                        &mut out,
-                        "┃ ",
-                        theme.user_label,
-                        text,
-                        theme.assistant,
-                        width,
-                    );
+                    // restyle-1: full-width #262626 background band with
+                    // a BOLD signal `› ` anchor (minimax user message).
+                    push_user_band(&mut out, text, theme, width);
                 }
                 TranscriptEntry::Assistant(text) => {
                     gap_before_block(&mut out);
@@ -916,18 +1370,31 @@ impl TranscriptComponent {
                     // every soft line still wraps (word boundaries, CJK
                     // per character) except fenced-code lines, which
                     // stay verbatim and clip.
-                    push_markdown_block(&mut out, text, theme, width, None);
+                    push_markdown_block(&mut out, text, theme, width, None, true);
                 }
-                TranscriptEntry::Reasoning(text) => push_gutter_block(
-                    &mut out,
-                    "┆ ",
-                    theme.reasoning,
-                    text,
-                    theme.reasoning,
-                    width,
-                ),
+                TranscriptEntry::Reasoning(text) => {
+                    // fix-23: collapsed to one dim summary row by
+                    // default; the full `┆` gutter block only while
+                    // expanded (click-toggled via
+                    // `reasoning_hit_rects`). The block's layout span
+                    // records for the click hit-test — collapsed
+                    // covers its single row, expanded the whole block.
+                    let start = out.len();
+                    if self.expanded_reasoning.contains(&index) {
+                        push_reasoning_block(&mut out, text, theme, width);
+                    } else {
+                        out.push(collapsed_reasoning_line(text, width, theme));
+                    }
+                    self.reasoning_rows
+                        .borrow_mut()
+                        .push((index, start, out.len() - start));
+                }
                 TranscriptEntry::ToolCall {
-                    name, args, status, ..
+                    name,
+                    args,
+                    status,
+                    detail,
+                    ..
                 } => {
                     let running_for = if matches!(status, ToolEntryStatus::Running) {
                         self.running_since
@@ -936,58 +1403,96 @@ impl TranscriptComponent {
                     } else {
                         None
                     };
-                    let spinner = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+                    // restyle-1: `├` while another execution row follows
+                    // (tool/delegation run continues), `└` to close it.
+                    let connected = matches!(
+                        self.entries.get(index + 1),
+                        Some(TranscriptEntry::ToolCall { .. })
+                            | Some(TranscriptEntry::Delegate { .. })
+                    );
+                    // fix-25: the row's layout span records for the
+                    // click hit-test — collapsed covers the head row,
+                    // expanded the head + detail block.
+                    let start = out.len();
                     push_tool_entry(
                         &mut out,
-                        &format!("{} {name}({args})", tool_icon(name)),
+                        name,
+                        args,
                         status,
                         running_for,
+                        detail.output.as_ref().map(|t| t.lines().count()),
                         theme,
-                        spinner,
                         width,
+                        connected,
                     );
+                    if self.expanded_tools.contains(&index) {
+                        push_tool_detail(
+                            &mut out,
+                            name,
+                            detail,
+                            matches!(status, ToolEntryStatus::Running),
+                            theme,
+                            width,
+                            connected,
+                        );
+                    }
+                    self.tool_rows
+                        .borrow_mut()
+                        .push((index, start, out.len() - start));
                 }
                 TranscriptEntry::Approval {
                     tool_name,
                     decision,
                 } => push_approval_line(&mut out, tool_name, decision, theme, width),
-                TranscriptEntry::Delegate { agent } => out.push(Line::from(Span::styled(
-                    format!(" {agent}"),
-                    theme.delegate,
-                ))),
+                TranscriptEntry::Delegate { agent, done } => {
+                    let g = theme.icons.set();
+                    let (marker, mstyle, label) = if *done {
+                        (g.check, theme.tool_success, "Done")
+                    } else {
+                        (g.delegate, theme.delegate, "Running")
+                    };
+                    out.push(Line::from(vec![
+                        Span::styled(format!("{marker} "), mstyle),
+                        Span::styled(agent.clone(), theme.header),
+                        Span::styled(format!(" {label}"), theme.muted),
+                    ]));
+                }
                 // Step separator: one blank line (the borderless spec
                 // retired the full-width `─` rule).
                 TranscriptEntry::StepBreak => out.push(Line::from("")),
                 // Per-request telemetry (dim, indented 2 — single-line
                 // entry: no block gap).
                 TranscriptEntry::Meta(text) => {
-                    out.push(Line::from(Span::styled(format!("  {text}"), theme.muted)))
+                    // Stored fix-16 lines carry unicode chrome (↑↓·…) —
+                    // localize for the ascii tier.
+                    let g = theme.icons.set();
+                    out.push(Line::from(Span::styled(
+                        format!("  {}", localize(text, &g)),
+                        theme.muted,
+                    )))
                 }
+            }
+            // select-1: the rows this iteration emitted (marker gap +
+            // entry rows) become the entry's selection block span.
+            for _ in block_start..out.len() {
+                self.line_blocks
+                    .borrow_mut()
+                    .push(SelectionBlock::Entry(index));
             }
         }
         // End-of-turn marker, trailing fallback: renders when no
         // in-loop position emitted it yet (fresh transcript, or
-        // set_turn_meta without merge_turn/rebuild). Nerd cube icon
-        // Cyan, the rest muted, `·` (U+00B7) between model and
-        // seconds; the aggregate token totals are the recovery
-        // rebuild path's usage display (the merge path keeps the
-        // per-request meta lines above this marker).
+        // set_turn_meta without merge_turn/rebuild). restyle-1:
+        // `└ model · Ns · ↑in ↓out · ⚡ tok/s` — muted throughout, the
+        // ⚡ span signal (see [`turn_marker_line`]).
+        // select-1: everything below the committed entries (this
+        // fallback marker + the live streaming blocks) is ONE tail
+        // block.
+        let tail_start = out.len();
         if !emitted_marker {
-            if let Some(TurnMeta {
-                model,
-                elapsed_secs: secs,
-                tokens,
-            }) = &self.turn_meta
-            {
+            if let Some(meta) = &self.turn_meta {
                 gap_before_block(&mut out);
-                let mut text = format!(" {model} · {secs}秒");
-                if let Some((input, output)) = tokens {
-                    text.push_str(&format!(" · ↑{input} ↓{output}"));
-                }
-                out.push(Line::from(vec![
-                    Span::styled("".to_owned(), theme.turn_marker),
-                    Span::styled(text, theme.muted),
-                ]));
+                out.push(turn_marker_line(meta, theme));
             }
         }
         // Live streaming blocks render through an EDGE-TRIMMED view of
@@ -998,14 +1503,19 @@ impl TranscriptComponent {
         // blank lines (paragraph separators) survive.
         let reasoning_view = trim_edge_blank_lines(&self.streaming_reasoning);
         if !reasoning_view.trim().is_empty() {
-            push_gutter_block(
-                &mut out,
-                "┆ ",
-                theme.reasoning,
-                &reasoning_view,
-                theme.reasoning,
-                width,
-            );
+            // fix-23: the live reasoning block collapses to a
+            // summary row that re-renders with every delta (always
+            // the current last line) unless click-expanded — the
+            // streaming block's layout span records like a committed
+            // entry's.
+            let start = out.len();
+            if self.streaming_reasoning_expanded {
+                push_reasoning_block(&mut out, &reasoning_view, theme, width);
+            } else {
+                out.push(collapsed_reasoning_line(&reasoning_view, width, theme));
+            }
+            self.streaming_reasoning_rows
+                .set(Some((start, out.len() - start)));
         }
         let answer_view = trim_edge_blank_lines(&self.streaming);
         if !answer_view.trim().is_empty() {
@@ -1026,7 +1536,14 @@ impl TranscriptComponent {
             // and the HELD exact line takes over (below the step's
             // tool rows). Reasoning-only streaming shows no row.
             if let Some(stats) = self.live_stats_line(&answer_view, now) {
-                out.push(Line::from(Span::styled(format!("  {stats}"), theme.muted)));
+                // The `·` separator is chrome — localize (identity
+                // outside the ascii tier), like the committed Meta
+                // rows above.
+                let g = theme.icons.set();
+                out.push(Line::from(Span::styled(
+                    format!("  {}", localize(&stats, &g)),
+                    theme.muted,
+                )));
             }
             push_markdown_block(
                 &mut out,
@@ -1034,7 +1551,15 @@ impl TranscriptComponent {
                 theme,
                 width,
                 Some(theme.tool_running),
+                true,
             );
+        }
+        // select-1: attribute the tail rows (trailing marker fallback
+        // + streaming blocks) to the streaming selection block.
+        for _ in tail_start..out.len() {
+            self.line_blocks
+                .borrow_mut()
+                .push(SelectionBlock::Streaming);
         }
         out
     }
@@ -1069,6 +1594,245 @@ impl TranscriptComponent {
             Some(segments.join(" · "))
         }
     }
+
+    // ── select-1: drag-to-select ───────────────────────────────────
+
+    /// Left-button press at terminal `(col, row)` (select-1): clear
+    /// any previous selection and record the anchor. No-op before
+    /// the first render or on an empty transcript (no geometry to
+    /// map against) — the following release then behaves as a plain
+    /// click.
+    pub fn selection_begin(&mut self, col: u16, row: u16) {
+        self.selection = match self.map_screen_to_logical(col, row) {
+            Some(anchor) => SelectionState::Pending {
+                anchor,
+                down: (col, row),
+            },
+            None => SelectionState::Normal,
+        };
+    }
+
+    /// Pointer motion while pressed (select-1). The FIRST ≥1-cell
+    /// displacement promotes a `Pending` press into a live selection
+    /// (click suppression locks in for the gesture); the cursor then
+    /// tracks every event. Returns whether a selection is active.
+    pub fn selection_drag(&mut self, col: u16, row: u16) -> bool {
+        let mapped = self.map_screen_to_logical(col, row);
+        let prior = std::mem::take(&mut self.selection);
+        self.selection = match (prior, mapped) {
+            // Threshold crossed (a different cell than the press):
+            // the press becomes a live selection with the ORIGINAL
+            // anchor.
+            (SelectionState::Pending { anchor, down }, Some(cursor)) if down != (col, row) => {
+                SelectionState::Selecting { anchor, cursor }
+            }
+            // Mid-drag cursor update; a mapping blip (no layout —
+            // practically unreachable between renders) keeps the
+            // last cursor rather than killing the gesture.
+            (SelectionState::Selecting { anchor, cursor }, next) => SelectionState::Selecting {
+                anchor,
+                cursor: next.unwrap_or(cursor),
+            },
+            // Same-cell motion, no gesture in flight, or a press
+            // that never mapped: unchanged.
+            (other, _) => other,
+        };
+        matches!(self.selection, SelectionState::Selecting { .. })
+    }
+
+    /// Left-button release (select-1): a press that never dragged
+    /// reports [`SelectionEnd::Click`] (the caller dispatches the
+    /// legacy positional click); a completed selection extracts the
+    /// covered text and persists the highlight as `Selected`.
+    pub fn selection_end(&mut self, theme: &Theme) -> SelectionEnd {
+        let prior = std::mem::take(&mut self.selection);
+        match prior {
+            SelectionState::Selecting { anchor, cursor } => {
+                let text = self.extract_selection_text(theme, &anchor, &cursor);
+                self.selection = SelectionState::Selected { anchor, cursor };
+                SelectionEnd::Selected(text)
+            }
+            // A pending release never dragged → the click path (the
+            // `take` already reset the gesture state).
+            SelectionState::Pending { .. } | SelectionState::Normal => SelectionEnd::Click,
+            // A release with no gesture of ours preceding it (the
+            // press was swallowed by a modal): keep any persisted
+            // highlight, still behave as a click.
+            selected @ SelectionState::Selected { .. } => {
+                self.selection = selected;
+                SelectionEnd::Click
+            }
+        }
+    }
+
+    /// Drop any selection (select-1 clear trigger: Esc, a new press,
+    /// rebuild/merge//new, an overlay opening). No-op in `Normal`.
+    pub fn clear_selection(&mut self) {
+        self.selection = SelectionState::Normal;
+    }
+
+    /// Map a terminal `(col, row)` into logical space against the
+    /// LAST RENDER's geometry (`sel_area` + `sel_scroll` + the
+    /// `line_blocks` attribution that render recorded). Rows outside
+    /// the viewport clamp into it (dragging off the edges selects
+    /// the edge rows — no auto-scroll, that is P2); columns clamp to
+    /// the area. `None` when nothing renders.
+    fn map_screen_to_logical(&self, col: u16, row: u16) -> Option<LogicalPos> {
+        let area = self.sel_area.get()?;
+        let blocks = self.line_blocks.borrow();
+        if blocks.is_empty() || area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let vy = row.saturating_sub(area.y).min(area.height - 1) as usize;
+        let layout_row = (vy + self.sel_scroll.get()).min(blocks.len() - 1);
+        let block = blocks[layout_row];
+        // Block occurrences are contiguous and unique per pass — the
+        // FIRST occurrence is the block's start row.
+        let start = blocks.iter().position(|b| *b == block)?;
+        let col_in_line = (col.saturating_sub(area.x)).min(area.width - 1) as usize;
+        Some(LogicalPos {
+            block,
+            row: layout_row - start,
+            col: col_in_line,
+        })
+    }
+
+    /// Map a logical position back to a `(layout row, column)` pair
+    /// against the CURRENT `line_blocks` attribution — the per-frame
+    /// deterministic logical→screen direction. `row` clamps into the
+    /// block's current span (a resize re-wrap degrades to the
+    /// nearest row); `None` when the block no longer renders.
+    fn map_logical_to_layout(&self, pos: &LogicalPos) -> Option<(usize, usize)> {
+        let blocks = self.line_blocks.borrow();
+        let start = blocks.iter().position(|b| *b == pos.block)?;
+        let span = blocks.iter().filter(|b| **b == pos.block).count();
+        Some((start + pos.row.min(span - 1), pos.col))
+    }
+
+    /// The selection's plain text (select-1): the covered rows'
+    /// concatenated span text — boundary rows char-sliced by display
+    /// column ([`slice_by_cols`], wide chars whole), middle rows in
+    /// full — joined with `\n`. Runs one fresh layout pass (the
+    /// same deterministic pipeline the renderer uses); byte-capping
+    /// to the 32 KiB copy budget is the App's copy chain's job.
+    fn extract_selection_text(
+        &self,
+        theme: &Theme,
+        anchor: &LogicalPos,
+        cursor: &LogicalPos,
+    ) -> String {
+        let (w, _) = self.viewport.get();
+        if w == 0 {
+            return String::new();
+        }
+        let lines = self.layout_lines(w as usize, theme, 0);
+        let (Some((r1, c1)), Some((r2, c2))) = (
+            self.map_logical_to_layout(anchor),
+            self.map_logical_to_layout(cursor),
+        ) else {
+            return String::new();
+        };
+        let ((r1, c1), (r2, c2)) = if (r1, c1) <= (r2, c2) {
+            ((r1, c1), (r2, c2))
+        } else {
+            ((r2, c2), (r1, c1))
+        };
+        let mut rows: Vec<String> = Vec::with_capacity(r2.saturating_sub(r1) + 1);
+        for (i, line) in lines.iter().enumerate().skip(r1).take(r2 - r1 + 1) {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            // [start, end) display-column window: the first row keeps
+            // only its tail from the anchor column, the last row its
+            // head to the cursor column (inclusive → +1), single-row
+            // selections both.
+            let (start, end) = if i == r1 && i == r2 {
+                (c1, c2 + 1)
+            } else if i == r1 {
+                (c1, usize::MAX)
+            } else if i == r2 {
+                (0, c2 + 1)
+            } else {
+                (0, usize::MAX)
+            };
+            // Trailing whitespace trims per row (tmux copy-mode
+            // convention): full-width band rows pad out to the area
+            // width with spaces — that padding is OUR paint artifact,
+            // never content the reader chose.
+            rows.push(slice_by_cols(&text, start, end).trim_end().to_owned());
+        }
+        rows.join("\n")
+    }
+
+    /// The selection highlight overlay (select-1, post-render style
+    /// pass): map the anchor/cursor through THIS frame's attribution,
+    /// then paint the covered cells' background with
+    /// `theme.selection_bg` — glyphs and their own styles stay
+    /// untouched. The first/last rows take the column range between
+    /// the boundary and the area edge, middle rows the full width;
+    /// boundaries widen onto whole glyphs (a wide char's halves are
+    /// never split — no half-character highlight).
+    fn paint_selection(&self, f: &mut Frame, area: Rect, scroll: usize, theme: &Theme) {
+        let Some((anchor, cursor)) = self.selection.range() else {
+            return; // Normal/Pending — nothing on screen
+        };
+        let (Some((r1, c1)), Some((r2, c2))) = (
+            self.map_logical_to_layout(&anchor),
+            self.map_logical_to_layout(&cursor),
+        ) else {
+            return;
+        };
+        let ((r1, c1), (r2, c2)) = if (r1, c1) <= (r2, c2) {
+            ((r1, c1), (r2, c2))
+        } else {
+            ((r2, c2), (r1, c1))
+        };
+        let Some(bg) = theme.selection_bg.bg else {
+            return;
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let buf = f.buffer_mut();
+        let right = area.x + area.width - 1;
+        let visible_end = scroll.saturating_add(area.height as usize);
+        for layout_row in r1..=r2 {
+            if layout_row < scroll || layout_row >= visible_end {
+                continue; // scrolled out of the viewport — not painted
+            }
+            let y = area.y + (layout_row - scroll) as u16;
+            let clamp = |c: usize| {
+                area.x
+                    .saturating_add(c.min(u16::MAX as usize) as u16)
+                    .min(right)
+            };
+            let mut x1 = if layout_row == r1 { clamp(c1) } else { area.x };
+            let mut x2 = if layout_row == r2 { clamp(c2) } else { right };
+            // Whole-glyph alignment: ratatui 0.30 renders a wide
+            // glyph as a lead cell (symbol width ≥2) followed by
+            // RESET trailing cells — a boundary landing on a
+            // trailing cell pulls the lead cell in, a boundary on a
+            // lead cell pulls its trailing cell in (a wide char's
+            // halves are never split — no half-character highlight).
+            let wide_lead = |x: u16| {
+                buf.cell((x, y))
+                    .is_some_and(|cell| str_width(cell.symbol()) >= 2)
+            };
+            if x1 > area.x && wide_lead(x1 - 1) {
+                x1 -= 1;
+            }
+            if x2 < right && wide_lead(x2) {
+                x2 += 1;
+            }
+            for x in x1..=x2 {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(bg);
+                }
+            }
+        }
+    }
 }
 
 /// Map one message to transcript entries (rebuild path, non-Tool roles).
@@ -1082,11 +1846,19 @@ fn entry_from_message(msg: &Message) -> Vec<TranscriptEntry> {
         MessageRole::Assistant => {
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
+                    let args_text = tc.arguments.to_string();
                     out.push(TranscriptEntry::ToolCall {
                         name: tc.name.clone(),
-                        args: args_preview(&tc.arguments.to_string()),
+                        args: args_preview(&args_text),
                         status: ToolEntryStatus::Running,
                         call_id: Some(tc.id.0.clone()),
+                        // fix-25: full args retained (rebuilt from the
+                        // message); output fills when the Tool-role
+                        // result folds in below.
+                        detail: ToolEntryDetail {
+                            args: cap_stored_text(&args_text, ARGS_STORE_CAP),
+                            output: None,
+                        },
                     });
                 }
             }
@@ -1103,14 +1875,20 @@ fn entry_from_message(msg: &Message) -> Vec<TranscriptEntry> {
 /// open ToolCall entry (matched by `tool_call_id`, falling back to tool
 /// name for providers that drop ids). Success refines bytes/truncated;
 /// content carrying one of core's failure markers flips the entry to
-///  Failed. Orphan results (no matching call) are dropped silently.
+/// Failed. Orphan results (no matching call) are dropped silently.
 fn fold_tool_outcome(entries: &mut [TranscriptEntry], msg: &Message) {
     let Some(index) = find_tool_entry(entries, msg, MatchDone::No) else {
         return;
     };
     let status = tool_outcome_from_message(msg);
-    if let TranscriptEntry::ToolCall { status: s, .. } = &mut entries[index] {
+    if let TranscriptEntry::ToolCall {
+        status: s, detail, ..
+    } = &mut entries[index]
+    {
         *s = status;
+        // fix-25: the fold is the one path that sees the FULL output
+        // text — retain it (capped) for the expanded view.
+        detail.output = Some(cap_stored_text(&msg.content, OUTPUT_STORE_CAP));
     }
 }
 
@@ -1193,7 +1971,7 @@ fn tool_outcome_from_message(msg: &Message) -> ToolEntryStatus {
 fn fold_tool_outcomes_merge(entries: &mut [TranscriptEntry], messages: &[Message]) {
     // Resolve every fold target BEFORE mutating (the plan indices are
     // unique — an entry is consumed at most once).
-    let mut plan: Vec<(usize, ToolEntryStatus)> = Vec::new();
+    let mut plan: Vec<(usize, ToolEntryStatus, String)> = Vec::new();
     let mut consumed: HashSet<usize> = HashSet::new();
     let mut cursors: HashMap<&str, usize> = HashMap::new();
 
@@ -1251,12 +2029,23 @@ fn fold_tool_outcomes_merge(entries: &mut [TranscriptEntry], messages: &[Message
             },
             (_, outcome) => outcome,
         };
-        plan.push((index, status));
+        plan.push((
+            index,
+            status,
+            cap_stored_text(&msg.content, OUTPUT_STORE_CAP),
+        ));
     }
 
-    for (index, status) in plan {
-        if let TranscriptEntry::ToolCall { status: s, .. } = &mut entries[index] {
+    for (index, status, output) in plan {
+        if let TranscriptEntry::ToolCall {
+            status: s, detail, ..
+        } = &mut entries[index]
+        {
             *s = status;
+            // fix-25: the merge fold is where a LIVE-path entry (whose
+            // ToolEnd carried bytes only) finally receives its full
+            // output text.
+            detail.output = Some(output);
         }
     }
 }
@@ -1317,6 +2106,47 @@ fn first_line_summary(s: &str) -> String {
     }
     out.push('…');
     out
+}
+
+/// The COLLAPSED reasoning summary (fix-23, rule reworked in fix-24):
+/// the whole block FLATTENED to one line — every line trimmed, blank
+/// lines dropped, joined with a SINGLE space (in-line spaces survive,
+/// so English reads naturally; newlines become spaces) — then cut to
+/// `avail` DISPLAY columns from the TAIL: the row always shows the
+/// latest end of the thinking, and a leading `…` marks that earlier
+/// text was dropped (the ellipsis sits on the truncation side). The
+/// cut walks characters accumulating unicode widths — char-boundary
+/// safety is NOT width safety (CJK wide chars, the status.rs
+/// lesson). An all-blank block summarizes to the empty string (such
+/// blocks never commit; the live view skips them entirely).
+fn reasoning_summary(text: &str, avail: usize, ellipsis: &str) -> String {
+    let flat: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if str_width(&flat) <= avail {
+        return flat;
+    }
+    // Tail cut: keep the END (the latest thinking), reserving one
+    // column for the leading ellipsis. A whitespace run landing at
+    // the cut is trimmed — only whitespace is ever dropped, never
+    // content.
+    let budget = avail.saturating_sub(1);
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for ch in flat.chars().rev() {
+        let cw = char_width(ch);
+        if used + cw > budget {
+            break;
+        }
+        kept.push(ch);
+        used += cw;
+    }
+    kept.reverse(); // the walk collected tail-first
+    let tail: String = kept.into_iter().collect();
+    format!("{ellipsis}{}", tail.trim_start())
 }
 
 /// Args preview clamped to ~40 columns (UTF-8 boundary safe).
@@ -1556,9 +2386,13 @@ fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
 /// with its inline styles intact; list and quote items HANG —
 /// continuation rows align under the body via
 /// [`crate::md::hang_width`]; fenced-code lines stay verbatim and CLIP
-/// (no wrap); a horizontal rule expands to a dim full-width line;
-/// pipe tables render as aligned columns ([`crate::md::table_lines`])
-/// with the header row BOLD.
+/// (no wrap); a horizontal rule expands to a dim line capped at
+/// `min(width, 80)` (restyle-1); pipe tables render as aligned columns
+/// ([`crate::md::table_lines`]) with the header row BOLD.
+///
+/// `anchor` (restyle-1) replaces the FIRST display row's indent with
+/// the text-colored `● ` assistant anchor — both committed entries and
+/// the live streaming block carry it.
 ///
 /// `cursor` (streaming only) appends a `▍` tail-cursor span to the
 /// block's LAST display row — the live-output signal now that the
@@ -1574,14 +2408,20 @@ fn push_markdown_block(
     theme: &Theme,
     width: usize,
     cursor: Option<Style>,
+    anchor: bool,
 ) {
     const INDENT: &str = "  ";
+    let block_start = out.len();
     let avail = width.saturating_sub(str_width(INDENT)).max(1);
+    let g_icons = theme.icons.set();
     let styles = crate::md::MdStyles {
         text: theme.assistant,
         heading: theme.md_heading,
         code: theme.md_code,
         dim: theme.muted,
+        link: theme.md_link,
+        quote_prefix: g_icons.vertical,
+        bullet: g_icons.bullet,
     };
     let mut last_was_code = false;
     for line in crate::md::parse(text, &styles) {
@@ -1591,7 +2431,7 @@ fn push_markdown_block(
                 // List/quote hanging indent: the `• `/`N. `/`> `
                 // prefix pins row 0; wrapped rows align under the
                 // BODY by indenting the prefix width.
-                let hang = crate::md::hang_width(&spans);
+                let hang = crate::md::hang_width(&spans, styles.quote_prefix, styles.bullet);
                 let (prefix, body): (Option<Span<'static>>, Vec<Span<'static>>) = if hang > 0 {
                     let mut body = spans;
                     let prefix = body.remove(0);
@@ -1629,12 +2469,16 @@ fn push_markdown_block(
             }
             crate::md::MdLine::Hr => {
                 last_was_code = false;
-                // Full-width dim rule: 2-col indent + (avail) rule
-                // glyphs covers the whole content row.
-                out.push(Line::from(Span::styled(
-                    format!("{INDENT}{}", "─".repeat(avail)),
-                    theme.muted,
-                )));
+                // restyle-1: dim rule capped at min(width, 80); the
+                // row splits into indent + rule spans so the assistant
+                // anchor can replace the leading indent. theme-1: the
+                // stroke comes from the icon tier.
+                let rule_len = avail.min(80);
+                let h = theme.icons.set().horizontal;
+                out.push(Line::from(vec![
+                    Span::styled(INDENT.to_owned(), theme.muted),
+                    Span::styled(h.repeat(rule_len), theme.muted),
+                ]));
             }
             crate::md::MdLine::Table(rows) => {
                 last_was_code = false;
@@ -1655,9 +2499,20 @@ fn push_markdown_block(
         if !last_was_code && !ends_in_open_fence {
             if let Some(last) = out.last_mut() {
                 if last.width() < width {
-                    last.spans.push(Span::styled("▍", style));
+                    last.spans
+                        .push(Span::styled(theme.icons.set().cursor.to_owned(), style));
                 }
             }
+        }
+    }
+    // restyle-1: the assistant anchor — the FIRST display row's indent
+    // span (always exactly `INDENT`, every row starts with it) becomes
+    // the text-colored `● ` marker.
+    if anchor && out.len() > block_start {
+        let first = &mut out[block_start];
+        if first.spans[0].content == INDENT {
+            first.spans[0] =
+                Span::styled(format!("{} ", theme.icons.set().anchor), theme.assistant);
         }
     }
 }
@@ -1746,157 +2601,446 @@ fn format_secs(secs: f64) -> String {
     }
 }
 
-/// Gutter block: EVERY display line carries the gutter (`┃ ` user
-/// bar, `┆ ` reasoning; the assistant's `"  "` indent is handled by
-/// [`push_markdown_block`]) so multi-line blocks read as one visual
-/// unit.
-fn push_gutter_block(
-    out: &mut Vec<Line<'static>>,
-    gutter: &str,
-    gutter_style: Style,
-    body: &str,
-    body_style: Style,
-    width: usize,
-) {
-    let avail = width.saturating_sub(str_width(gutter)).max(1);
-    for logical in body.split('\n') {
+/// One COLLAPSED reasoning row (fix-23): a BOLD muted flattened
+/// summary behind an accent `• ` marker — the block's entire
+/// on-screen footprint while collapsed (a `Meta` estimate line may
+/// follow as its own entry). restyle-1: the marker is accent, the
+/// summary bold muted. icons-5: the marker is `g.reasoning` (brain in
+/// nerd) — semantic split from the tool-running `g.bullet` gear.
+fn collapsed_reasoning_line(text: &str, width: usize, theme: &Theme) -> Line<'static> {
+    let g = theme.icons.set();
+    let mark = format!("{} ", g.reasoning);
+    let ellipsis = g.ellipsis;
+    let avail = width.saturating_sub(str_width(&mark)).max(1);
+    Line::from(vec![
+        Span::styled(mark, theme.tool_running),
+        Span::styled(
+            reasoning_summary(text, avail, ellipsis),
+            theme.reasoning.add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+/// One full-width band row: `spans` padded out to `width` with
+/// background-styled spaces so the band color covers the whole row.
+fn band_line(spans: Vec<Span<'static>>, width: usize, bg: Style) -> Line<'static> {
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    let mut spans = spans;
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
+    Line::from(spans)
+}
+
+/// The user message band (restyle-1, minimax): full-width #262626
+/// background with one blank band row above and below; body width =
+/// `width - 4`, 2-column left indent, BOLD signal `› ` anchor on
+/// the first content row.
+fn push_user_band(out: &mut Vec<Line<'static>>, text: &str, theme: &Theme, width: usize) {
+    let bg = theme.user_message_bg;
+    let anchor = theme.user_label.patch(bg);
+    let body = theme.assistant.patch(bg);
+    out.push(band_line(Vec::new(), width, bg));
+    let avail = width.saturating_sub(4).max(1);
+    let prompt = theme.icons.set().prompt;
+    for (i, seg) in wrap_to_width(text, avail).into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = if i == 0 {
+            vec![
+                Span::styled("  ".to_owned(), bg),
+                Span::styled(format!("{prompt} "), anchor),
+            ]
+        } else {
+            vec![Span::styled("    ".to_owned(), bg)]
+        };
+        spans.push(Span::styled(seg, body));
+        out.push(band_line(spans, width, bg));
+    }
+    out.push(band_line(Vec::new(), width, bg));
+}
+
+/// The EXPANDED reasoning block (fix-23): an accent `• ` marker
+/// on the first display row, 2-column indent continuations — muted
+/// throughout (restyle-1 replaces the old `┆` gutter). icons-5: the
+/// marker is `g.reasoning` (brain in nerd), split from the
+/// tool-running `g.bullet` gear.
+fn push_reasoning_block(out: &mut Vec<Line<'static>>, text: &str, theme: &Theme, width: usize) {
+    let marker = format!("{} ", theme.icons.set().reasoning);
+    let start = out.len();
+    let avail = width.saturating_sub(2).max(1);
+    for logical in text.split('\n') {
         for seg in wrap_to_width(logical, avail) {
             out.push(Line::from(vec![
-                Span::styled(gutter.to_owned(), gutter_style),
-                Span::styled(seg, body_style),
+                Span::styled("  ".to_owned(), theme.reasoning),
+                Span::styled(seg, theme.reasoning),
             ]));
         }
     }
-}
-
-/// Semantic icon for a tool line (opencode's table), all Nerd Font
-/// PUA glyphs — width exactly 1 column, no emoji presentation
-/// variants: terminal shell, eye read, pencil write/edit, search
-/// glob/grep, cog everything else. Matched by substring so
-/// prefixed/sibling names (`read_skill`, `filesystem_bash`, …) land
-/// on the right glyph; `call_agent` never reaches here (it becomes a
-/// delegation marker).
-fn tool_icon(name: &str) -> &'static str {
-    if name.contains("shell") || name.contains("bash") {
-        ""
-    } else if name.contains("read") {
-        ""
-    } else if name.contains("write") || name.contains("edit") {
-        ""
-    } else if name.contains("glob") || name.contains("grep") {
-        ""
-    } else {
-        ""
+    if out.len() > start {
+        out[start].spans[0] = Span::styled(marker, theme.tool_running);
     }
 }
 
-/// One tool entry line: `head` is `{icon} name(args)` (icon from the
-/// semantic table, [`tool_icon`]). The head style follows the status —
-/// Running → Yellow (icon + name + args all Yellow), Done → DarkGray
-/// muted (the whole line recedes,  keeps its Green accent), Failed
-/// → default head with  Red + summary. Status spans join the last head
-/// line when they fit, else start their own indented line.
+/// The end-of-turn marker line (restyle-1):
+/// `└ model · Ns · ↑in ↓out · ⚡ R tok/s` — muted throughout;
+/// the `⚡` span carries signal. The token/rate tail renders only
+/// when the turn reported usage (the recovery rebuild path's usage
+/// display); the rate = aggregate output tokens / elapsed seconds.
+/// ascii-turn-1: the pure-ASCII tier renders dedicated chrome here —
+/// prefix `+` and `-` separators (user request) instead of the shared
+/// `elbow`/`dot` slots, which other rows (tool connectors, exit
+/// keys) keep as `` ` ``/`.`; unicode/nerd render the shared slots
+/// verbatim.
+fn turn_marker_line(meta: &TurnMeta, theme: &Theme) -> Line<'static> {
+    let g = theme.icons.set();
+    let (prefix, sep) = if g.ascii {
+        ("+", "-")
+    } else {
+        (g.elbow, g.dot)
+    };
+    let mut spans = vec![
+        Span::styled(format!("{prefix} "), theme.turn_marker),
+        Span::styled(
+            format!("{} {} {}s", meta.model, sep, meta.elapsed_secs),
+            theme.turn_marker,
+        ),
+    ];
+    if let Some((input, output)) = meta.tokens {
+        spans.push(Span::styled(
+            format!(" {} {}{} {}{}", sep, g.up, input, g.down, output),
+            theme.turn_marker,
+        ));
+        if meta.elapsed_secs > 0 {
+            let rate = (output as f64 / meta.elapsed_secs as f64).round() as u64;
+            spans.push(Span::styled(format!(" {sep} "), theme.turn_marker));
+            spans.push(Span::styled(format!("{} ", g.zap), theme.tool_running));
+            spans.push(Span::styled(format!("{rate} tok/s"), theme.turn_marker));
+        }
+    }
+    Line::from(spans)
+}
+
+/// The English verb for a tool row (restyle-1 spec table): running
+/// → present participle, done/failed → past. Unknown tools
+/// render `Using/Used <name>`. `call_agent` rows only exist on the
+/// rebuild path (live delegations become [`TranscriptEntry::Delegate`]
+/// markers).
+fn tool_verb(name: &str, running: bool) -> String {
+    let (present, past): (&str, &str) = if name == "call_agent" {
+        ("Delegating", "Delegated")
+    } else if name.contains("read") {
+        ("Reading", "Read")
+    } else if name.contains("write") || name.contains("edit") {
+        ("Writing", "Wrote")
+    } else if name.contains("shell") || name.contains("bash") {
+        ("Running", "Ran")
+    } else if name.contains("glob") || name.contains("grep") || name.contains("search") {
+        ("Searching", "Searched")
+    } else {
+        return format!("{} {name}", if running { "Using" } else { "Used" });
+    };
+    (if running { present } else { past }).to_owned()
+}
+
+/// Truncate `s` to at most `max_cols` display columns, appending
+/// `…` when cut (CJK-safe whole-char walk).
+fn truncate_cols(s: &str, max_cols: usize, ellipsis: &str) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if str_width(s) <= max_cols {
+        return s.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = char_width(ch);
+        if used + cw > max_cols - 1 {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push_str(ellipsis);
+    out
+}
+
+/// select-1: char-level slice of one rendered row's text by
+/// DISPLAY-column range `[start, end)` — the same unicode-width walk
+/// as [`truncate_cols`], but a wide char straddling either boundary
+/// is included WHOLE (round outward; a selection boundary never cuts
+/// half a character).
+fn slice_by_cols(text: &str, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let cw = char_width(ch);
+        // The char occupies [col, col+cw); keep it where that range
+        // intersects [start, end).
+        if col + cw > start && col < end {
+            out.push(ch);
+        }
+        col += cw;
+    }
+    out
+}
+
+/// One tool entry row (restyle-1): a dim `├ `/`└ ` connector +
+/// status marker (`•` running accent / `✓` success /
+/// `×` error) + BOLD English verb ([`tool_verb`]) + a muted
+/// args summary (truncating when the row overflows — rows never
+/// wrap), then a muted suffix (` · N output lines` / live elapsed /
+/// error summary) that joins the row when it fits or lands on its
+/// own indented row below.
+#[allow(clippy::too_many_arguments)]
 fn push_tool_entry(
     out: &mut Vec<Line<'static>>,
-    head: &str,
+    name: &str,
+    args: &str,
     status: &ToolEntryStatus,
     running_for: Option<Duration>,
+    output_lines: Option<usize>,
     theme: &Theme,
-    spinner: char,
     width: usize,
+    connected: bool,
 ) {
-    let head_style = match status {
-        ToolEntryStatus::Running => theme.tool_running,
-        ToolEntryStatus::Done { .. } => theme.muted,
-        ToolEntryStatus::Failed { .. } => theme.assistant,
-    };
-    let head_rows = wrap_to_width(head, width);
-    let mut lines: Vec<Line<'static>> = head_rows
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, head_style)))
-        .collect();
-    let (status_spans, status_width) = status_spans(status, theme, spinner, running_for);
-    let last_width = lines.last().map(|l| l.width()).unwrap_or(0);
-    if last_width + 1 + status_width <= width {
-        if let Some(last) = lines.last_mut() {
-            last.spans.extend(status_spans);
-        }
+    let g = theme.icons.set();
+    let connector = if connected {
+        format!("{} ", g.tee)
     } else {
-        let mut line = Line::from(Span::raw("  "));
-        line.spans.extend(status_spans);
-        lines.push(line);
+        format!("{} ", g.elbow)
+    };
+    let running = matches!(status, ToolEntryStatus::Running);
+    let (marker, marker_style) = match status {
+        // icons-5: tool-running deliberately keeps `g.bullet` (the
+        // gear) — the reasoning rows split off to `g.reasoning`.
+        ToolEntryStatus::Running => (g.bullet, theme.tool_running),
+        ToolEntryStatus::Done { .. } => (g.check, theme.tool_success),
+        ToolEntryStatus::Failed { .. } => (g.cross, theme.tool_failure),
+    };
+    let verb_style = match status {
+        ToolEntryStatus::Failed { .. } => theme.tool_failure.add_modifier(Modifier::BOLD),
+        _ => theme.header,
+    };
+    let mut head: Vec<Span<'static>> = vec![
+        Span::styled(connector.to_owned(), theme.line),
+        Span::styled(format!("{marker} "), marker_style),
+        Span::styled(tool_verb(name, running), verb_style),
+    ];
+    // Args summary: muted, truncated to the remaining row budget
+    // (localize maps the stored preview's unicode chrome for the
+    // ascii tier).
+    let mut args_text = localize(args.trim(), &g);
+    if !args_text.is_empty() {
+        let used: usize = head.iter().map(|sp| sp.width()).sum();
+        let budget = width.saturating_sub(used + 1);
+        if str_width(&args_text) > budget {
+            args_text = if budget >= 2 {
+                truncate_cols(&args_text, budget, g.ellipsis)
+            } else {
+                String::new()
+            };
+        }
+        if !args_text.is_empty() {
+            head.push(Span::styled(format!(" {args_text}"), theme.muted));
+        }
     }
-    out.extend(lines);
+    let (suffix_spans, suffix_width) = status_suffix(status, running_for, output_lines, theme, &g);
+    let head_width: usize = head.iter().map(|sp| sp.width()).sum();
+    if head_width + suffix_width <= width {
+        let mut line = Line::from(head);
+        line.spans.extend(suffix_spans);
+        out.push(line);
+    } else {
+        out.push(Line::from(head));
+        let mut line = Line::from(Span::styled("  ".to_owned(), theme.muted));
+        line.spans.extend(suffix_spans);
+        out.push(line);
+    }
 }
 
-/// Status spans for a tool entry: glyph (colored) + trailing detail
-/// (muted). Returns the spans and their total display width (for the
-/// fit check in [`push_tool_entry`]).
-fn status_spans(
+/// The muted status suffix of a tool row: Running → live elapsed;
+/// Done → ` · N output lines` when the folded output text is
+/// known (`no output` when empty), else the byte count; Failed → the
+/// first-line error summary in error color.
+fn status_suffix(
     status: &ToolEntryStatus,
-    theme: &Theme,
-    spinner: char,
     running_for: Option<Duration>,
+    output_lines: Option<usize>,
+    theme: &Theme,
+    g: &crate::icons::IconSet,
 ) -> (Vec<Span<'static>>, usize) {
+    let dot = g.dot;
     match status {
         ToolEntryStatus::Running => {
-            let glyph = format!(" {spinner}");
-            let detail = format!(
-                " {}",
+            let text = format!(
+                " {dot} {}",
                 format_ms(running_for.map(|d| d.as_millis() as u64).unwrap_or(0))
             );
-            let width = str_width(&glyph) + str_width(&detail);
-            (
-                vec![
-                    Span::styled(glyph, theme.tool_running),
-                    Span::styled(detail, theme.muted),
-                ],
-                width,
-            )
+            let w = str_width(&text);
+            (vec![Span::styled(text, theme.muted)], w)
         }
         ToolEntryStatus::Done {
             bytes,
             truncated,
             elapsed_ms,
         } => {
-            let glyph = " ".to_owned();
-            let mut detail_parts: Vec<String> = Vec::new();
+            let mut text = match output_lines {
+                Some(0) => format!(" {dot} no output"),
+                Some(1) => format!(" {dot} 1 output line"),
+                Some(n) => format!(" {dot} {n} output lines"),
+                None => format!(" {dot} {}", format_bytes(*bytes)),
+            };
             if let Some(ms) = elapsed_ms {
-                detail_parts.push(format_ms(*ms));
+                text.push_str(&format!(" {dot} {}", format_ms(*ms)));
             }
-            detail_parts.push(format_bytes(*bytes));
             if *truncated {
-                detail_parts.push("…".to_owned());
+                text.push_str(g.ellipsis);
             }
-            let detail = format!(" {}", detail_parts.join(" "));
-            let width = str_width(&glyph) + str_width(&detail);
-            (
-                vec![
-                    Span::styled(glyph, theme.tool_success),
-                    Span::styled(detail, theme.muted),
-                ],
-                width,
-            )
+            let w = str_width(&text);
+            (vec![Span::styled(text, theme.muted)], w)
         }
         ToolEntryStatus::Failed { summary } => {
-            let glyph = " ".to_owned();
-            let detail = format!(" {summary}");
-            let width = str_width(&glyph) + str_width(&detail);
-            (
-                vec![
-                    Span::styled(glyph, theme.tool_failure),
-                    Span::styled(detail, theme.tool_failure),
-                ],
-                width,
-            )
+            // The stored failure summary carries unicode chrome —
+            // localize (identity outside the ascii tier).
+            let text = format!(" {dot} {}", localize(summary, g));
+            let w = str_width(&text);
+            (vec![Span::styled(text, theme.tool_failure)], w)
         }
     }
 }
 
-/// Approval outcome line: ` tool — decision` (Nerd hand icon, width 1
-/// — the old U+270B ✋ rendered 2-wide on emoji terminals and shifted
-/// the wrap math), the decision tinted by semantics (approved green /
-/// denied red / else approval yellow).
+/// Display-row cap per section of the expanded tool detail (fix-25):
+/// args and output each show at most this many wrapped rows, then a
+/// `…（共 N 行）` marker names the section's true row count.
+const TOOL_DETAIL_MAX_ROWS: usize = 30;
+
+/// The EXPANDED tool entry's detail block (fix-25): a dim block in two
+/// sections — `调用 {name}` + the full args wrapped to the width,
+/// then `输出` + the full output wrapped. restyle-1: rows carry
+/// the `│   ` dim rail prefix while the entry connects to a following
+/// execution row (`├`), `    ` when it closes the run (`└`).
+/// Graceful output degradation: Running → `运行中…`; a
+/// live-path Done whose text only arrives at merge/rebuild →
+/// `（待回填）`; an empty return → `（空）`.
+fn push_tool_detail(
+    out: &mut Vec<Line<'static>>,
+    name: &str,
+    detail: &ToolEntryDetail,
+    running: bool,
+    theme: &Theme,
+    width: usize,
+    connected: bool,
+) {
+    let g = theme.icons.set();
+    let prefix = if connected {
+        format!("{}   ", g.vertical)
+    } else {
+        "    ".to_owned()
+    };
+    let avail = width.saturating_sub(str_width(&prefix)).max(1);
+    out.push(Line::from(Span::styled(
+        format!("{prefix}调用 {name}"),
+        theme.muted,
+    )));
+    push_capped_section(out, &detail.args, theme, avail, &prefix, width);
+    out.push(Line::from(Span::styled(
+        format!("{prefix}输出"),
+        theme.muted,
+    )));
+    match &detail.output {
+        None => {
+            let placeholder = if running {
+                // The ellipsis is chrome — the tier's glyph (ascii
+                // renders `...`).
+                format!("运行中{}", g.ellipsis)
+            } else {
+                "（待回填）".to_owned()
+            };
+            out.push(Line::from(Span::styled(
+                format!("{prefix}{placeholder}"),
+                theme.muted,
+            )));
+        }
+        Some(text) if text.trim().is_empty() => out.push(Line::from(Span::styled(
+            format!("{prefix}（空）"),
+            theme.muted,
+        ))),
+        Some(text) => push_capped_section(out, text, theme, avail, &prefix, width),
+    }
+}
+
+/// One detail section's wrapped rows (muted, rail-prefixed), capped at
+/// [`TOOL_DETAIL_MAX_ROWS`] display rows; the `…（共 N 行）` marker
+/// names the section's true wrapped-row count when the cap cut it.
+///
+/// P1 (restyle-1): diff-shaped lines (leading `+`/`-`, as emitted by
+/// edit/patch tools) render as full-width red/green background bands —
+/// [`Theme::diff_added_bg`] / [`Theme::diff_removed_bg`] — with the
+/// +/- marker column colored (success/error); every wrapped row of the
+/// band carries the background.
+fn push_capped_section(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    theme: &Theme,
+    avail: usize,
+    prefix: &str,
+    width: usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+    // Pre-wrap every logical line, remembering its diff band.
+    let mut rows: Vec<(String, Option<Style>)> = Vec::new();
+    for logical in text.split('\n') {
+        let band = match logical.chars().next() {
+            Some('+') => Some(theme.diff_added_bg),
+            Some('-') if !logical.starts_with("---") => Some(theme.diff_removed_bg),
+            _ => None,
+        };
+        for seg in wrap_to_width(logical, avail) {
+            rows.push((seg, band));
+        }
+    }
+    let total = rows.len();
+    let mut capped = false;
+    if total > TOOL_DETAIL_MAX_ROWS {
+        rows.truncate(TOOL_DETAIL_MAX_ROWS);
+        capped = true;
+    }
+    for (row, band) in rows {
+        let (fg, glyph_style) = match (&row.chars().next(), band) {
+            (Some('+'), Some(_)) => (theme.assistant, theme.tool_success),
+            (Some('-'), Some(_)) => (theme.assistant, theme.tool_failure),
+            _ => (theme.muted, theme.muted),
+        };
+        let mut spans = match band {
+            Some(bg) => vec![Span::styled(prefix.to_owned(), theme.muted.patch(bg))],
+            None => vec![Span::styled(prefix.to_owned(), theme.muted)],
+        };
+        match band {
+            Some(bg) => {
+                // Diff band: marker colored, body text-colored, the row
+                // (rail prefix included) bg-padded to the FULL width.
+                let head = row.chars().next().unwrap();
+                spans.push(Span::styled(head.to_string(), glyph_style.patch(bg)));
+                let body = row.chars().skip(1).collect::<String>();
+                spans.push(Span::styled(body, fg.patch(bg)));
+                let used: usize = spans.iter().map(|sp| sp.width()).sum();
+                spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), bg));
+            }
+            None => spans.push(Span::styled(row, theme.muted)),
+        }
+        out.push(Line::from(spans));
+    }
+    if capped {
+        let ellipsis = theme.icons.set().ellipsis;
+        out.push(Line::from(Span::styled(
+            format!("{prefix}{ellipsis}（共 {total} 行）"),
+            theme.muted,
+        )));
+    }
+}
+
+/// Approval outcome line (restyle-1): `✓/×/! tool — decision`
+/// — approved green, denied red, else warning.
 fn push_approval_line(
     out: &mut Vec<Line<'static>>,
     tool_name: &str,
@@ -1904,23 +3048,27 @@ fn push_approval_line(
     theme: &Theme,
     width: usize,
 ) {
-    let decision_style = match decision {
-        "approved" => theme.tool_success,
-        "denied" => theme.tool_failure,
-        _ => theme.approval,
+    let g = theme.icons.set();
+    let (marker, style) = match decision {
+        "approved" => (g.check, theme.tool_success),
+        "denied" => (g.cross, theme.tool_failure),
+        _ => (g.warn, theme.warning),
     };
-    let text = format!(" {tool_name} — {decision}");
+    // The em-dash is unicode chrome — localize (identity outside
+    // the ascii tier).
+    let text = localize(&format!("{marker} {tool_name} — {decision}"), &g);
     for (i, seg) in wrap_to_width(&text, width).into_iter().enumerate() {
         if i == 0 {
-            if let Some(rest) = seg.strip_prefix(" ") {
+            let prefix = format!("{marker} ");
+            if let Some(rest) = seg.strip_prefix(&prefix) {
                 out.push(Line::from(vec![
-                    Span::styled(" ".to_owned(), theme.approval),
-                    Span::styled(rest.to_owned(), decision_style),
+                    Span::styled(prefix, style),
+                    Span::styled(rest.to_owned(), style),
                 ]));
                 continue;
             }
         }
-        out.push(Line::from(Span::styled(seg, decision_style)));
+        out.push(Line::from(Span::styled(seg, style)));
     }
 }
 
@@ -1984,29 +3132,83 @@ impl Component for TranscriptComponent {
                 self.follow = false;
                 self.scroll = 0;
             }
-            Action::ScrollBottom | Action::DismissOverlay => {
-                // Esc/G/End: cancel pinning, follow the tail again.
+            Action::ScrollBottom => {
+                // G/End: cancel pinning, follow the tail again.
                 self.follow = true;
             }
+            Action::DismissOverlay => {
+                // Esc: cancel pinning, follow the tail again — and
+                // drop any text selection (select-1's clear trigger;
+                // the App also clears it for the no-overlay case
+                // regardless of which component holds focus).
+                self.follow = true;
+                self.clear_selection();
+            }
             Action::Click(column, row) => {
-                // A click inside the last-rendered `↓ 新内容 +N`
-                // hint rectangle jumps back to the bottom. The
-                // returned ScrollBottom IS the existing follow-restore
-                // action (the App feeds it straight back here) — the
-                // hit test itself does not mutate the pin state. No
-                // hint / following / miss → inert (positional clicks
-                // never scroll or focus).
-                return match self.hint_hit_rect.get() {
-                    Some(rect)
-                        if rect.x <= *column
+                // fix-17/23/25 click routing, in priority order:
+                // 1. the last-rendered `+N ↓ 回到底部` hint rectangle —
+                //    a hit returns ScrollBottom (the EXISTING
+                //    follow-restore action the App feeds straight back
+                //    here); the hit test itself does not mutate the
+                //    pin state;
+                // 2. a reasoning block's hit rectangle — toggle its
+                //    expansion (collapsed summary ⇄ full `┆` block),
+                //    consumed in-component (None — the App must not
+                //    react), committed entries first, then the
+                //    streaming block;
+                // 3. a tool entry's hit rectangle — toggle its detail
+                //    block (collapsed head row ⇄ head + call/output);
+                // 4. miss → inert (positional clicks never scroll,
+                //    focus, or pin).
+                if let Some(rect) = self.hint_hit_rect.get() {
+                    if rect.x <= *column
+                        && *column < rect.x + rect.width
+                        && rect.y <= *row
+                        && *row < rect.y + rect.height
+                    {
+                        return Some(Action::ScrollBottom);
+                    }
+                }
+                if let Some(&(entry_index, _)) =
+                    self.reasoning_hit_rects.borrow().iter().find(|(_, rect)| {
+                        rect.x <= *column
                             && *column < rect.x + rect.width
                             && rect.y <= *row
-                            && *row < rect.y + rect.height =>
-                    {
-                        Some(Action::ScrollBottom)
+                            && *row < rect.y + rect.height
+                    })
+                {
+                    if !self.expanded_reasoning.remove(&entry_index) {
+                        self.expanded_reasoning.insert(entry_index);
                     }
-                    _ => None,
-                };
+                    return None;
+                }
+                if let Some(rect) = self.streaming_reasoning_hit_rect.get() {
+                    if rect.x <= *column
+                        && *column < rect.x + rect.width
+                        && rect.y <= *row
+                        && *row < rect.y + rect.height
+                    {
+                        self.streaming_reasoning_expanded = !self.streaming_reasoning_expanded;
+                        return None;
+                    }
+                }
+                // 3. a tool entry's hit rectangle — toggle its detail
+                //    block (collapsed head row ⇄ head + call/output),
+                //    consumed in-component like the reasoning toggle.
+                if let Some(&(entry_index, _)) =
+                    self.tool_hit_rects.borrow().iter().find(|(_, rect)| {
+                        rect.x <= *column
+                            && *column < rect.x + rect.width
+                            && rect.y <= *row
+                            && *row < rect.y + rect.height
+                    })
+                {
+                    if !self.expanded_tools.remove(&entry_index) {
+                        self.expanded_tools.insert(entry_index);
+                    }
+                    return None;
+                }
+                return None;
             }
             _ => return None,
         }
@@ -2021,8 +3223,42 @@ impl Component for TranscriptComponent {
 
         let inner_width = area.width.max(1);
         let visible = area.height;
-        // Remember the geometry for the next handle() (pin math).
+        // Remember the geometry for the next handle() (pin math) —
+        // and, select-1, the area + effective scroll the selection's
+        // screen⇄logical mapping converts against.
         self.viewport.set((inner_width, visible));
+        self.sel_area.set(Some(area));
+
+        // splash-1 (rev): the empty-session splash — the centered
+        // ANSI-Shadow wordmark block, painted DIRECTLY (the flow
+        // Paragraph cannot center vertically), tier picked by the
+        // size ladder: main width ≥ 80 takes the full `OpenSlate`
+        // art, ≥ 45 the compact `Slate` art (each with a 2-column
+        // margin each side), height ≥ 10; everything narrower,
+        // shorter, or on the pure-ASCII icon tier falls through to
+        // the flow path, whose empty branch renders the legacy
+        // wordmark + hint byte-for-byte.
+        let splash = if self.is_blank() {
+            SplashTier::pick(area.width, area.height, ctx.theme.icons.set().ascii)
+        } else {
+            None
+        };
+        if let Some(tier) = splash {
+            // Same record hygiene a layout pass would do (the flow
+            // path's clears live inside layout_lines_at).
+            self.reasoning_rows.borrow_mut().clear();
+            self.streaming_reasoning_rows.set(None);
+            self.tool_rows.borrow_mut().clear();
+            self.line_blocks.borrow_mut().clear();
+            self.sel_scroll.set(0);
+            self.hint_hit_rect.set(None);
+            self.reasoning_hit_rects.replace(Vec::new());
+            self.streaming_reasoning_hit_rect.set(None);
+            self.tool_hit_rects.replace(Vec::new());
+            Self::render_splash(f, area, &ctx.theme, tier);
+            self.paint_selection(f, area, 0, &ctx.theme); // no selection — no-op
+            return;
+        }
 
         let lines = self.layout_lines(inner_width as usize, &ctx.theme, ctx.run.spinner_frame);
         let total = lines.len();
@@ -2032,14 +3268,18 @@ impl Component for TranscriptComponent {
         } else {
             (self.scroll as usize).min(max_scroll)
         };
+        self.sel_scroll.set(scroll);
 
         f.render_widget(Paragraph::new(lines).scroll((clamp_u16(scroll), 0)), area);
 
-        // Pinned with content below the viewport → bottom-right hint.
-        // The hint is CLICKABLE: its span (widened 2 columns each
-        // side, clamped to the hint row) is recorded in
-        // `hint_hit_rect` for `handle`'s Action::Click hit-testing —
-        // cleared to `None` on every render that does not draw it.
+        // Pinned with content below the viewport → bottom-right hint
+        // (fix-23: the count-less `↓ 回到底部` copy replaced the old
+        // counted hint; fix-25 reintroduced the count as a `+N` PREFIX
+        // — rows below the pin, folded blocks included). The hint is
+        // CLICKABLE: its span (widened 2 columns each side, clamped
+        // to the hint row) is recorded in `hint_hit_rect` for
+        // `handle`'s Action::Click hit-testing — cleared to `None` on
+        // every render that does not draw it.
         let mut hint_hit = None;
         if pinned && visible > 0 {
             let below = total.saturating_sub(scroll + visible as usize);
@@ -2050,9 +3290,17 @@ impl Component for TranscriptComponent {
                     width: area.width.saturating_sub(2),
                     height: 1,
                 };
-                let hint_text = format!("↓ 新内容 +{below}");
+                let hint_text = format!("+{below} {} 回到底部", ctx.theme.icons.set().down);
+                // interactive-1: the hovered hint renders in the hover
+                // slot (signal + underline + bold); click behavior is
+                // unchanged (fix-17).
+                let hint_style = if self.hint_hovered {
+                    ctx.theme.hover
+                } else {
+                    ctx.theme.user_label
+                };
                 f.render_widget(
-                    Paragraph::new(Span::styled(hint_text.clone(), ctx.theme.user_label))
+                    Paragraph::new(Span::styled(hint_text.to_owned(), hint_style))
                         .alignment(Alignment::Right),
                     hint_row,
                 );
@@ -2073,6 +3321,110 @@ impl Component for TranscriptComponent {
             }
         }
         self.hint_hit_rect.set(hint_hit);
+
+        // fix-23: convert the reasoning blocks' LAYOUT positions
+        // (entry index, start row, row count — recorded by THIS
+        // frame's `layout_lines` call) into TERMINAL-ABSOLUTE hit
+        // rects, clipped to the viewport — the same
+        // render-records/handle-consumes pattern as `hint_hit_rect`.
+        // Rewritten unconditionally every frame: nothing rendered →
+        // no rects → clicks inert.
+        let row_rect = |start: usize, count: usize| -> Option<Rect> {
+            let visible_end = scroll.saturating_add(visible as usize);
+            let top = start.max(scroll);
+            let bottom = (start + count).min(visible_end);
+            (top < bottom).then(|| Rect {
+                x: area.x,
+                y: area.y + (top - scroll) as u16,
+                width: area.width,
+                height: (bottom - top) as u16,
+            })
+        };
+        let hits = self
+            .reasoning_rows
+            .borrow()
+            .iter()
+            .filter_map(|&(index, start, count)| row_rect(start, count).map(|r| (index, r)))
+            .collect();
+        self.reasoning_hit_rects.replace(hits);
+        self.streaming_reasoning_hit_rect.set(
+            self.streaming_reasoning_rows
+                .get()
+                .and_then(|(start, count)| row_rect(start, count)),
+        );
+        // fix-25: the tool entries' rects, same conversion.
+        let tool_hits = self
+            .tool_rows
+            .borrow()
+            .iter()
+            .filter_map(|&(index, start, count)| row_rect(start, count).map(|r| (index, r)))
+            .collect();
+        self.tool_hit_rects.replace(tool_hits);
+
+        // select-1: the selection highlight overlay — a post-render
+        // style pass over the painted frame (see
+        // [`Self::paint_selection`]); nothing renders without a
+        // selection on screen.
+        self.paint_selection(f, area, scroll, &ctx.theme);
+    }
+}
+
+impl TranscriptComponent {
+    /// splash-1 (rev): paint the empty-session splash — six frozen
+    /// ANSI-Shadow art rows in the minimax hero gradient (rows 1-2
+    /// `wordmark_highlight`, rows 3-4 the signal slot
+    /// [`Theme::tool_running`], rows 5-6 `wordmark_shadow`), every
+    /// row BOLD and padded to the block width so the trailing spaces
+    /// ride the same tone (the hero.ts canvasLine treatment; zero
+    /// hardcoded colors — the ansi board's Indexed values flow
+    /// through the same slots), one blank row, then the muted hint
+    /// centered on the same axis by its own localized width. The
+    /// block (tier-wide, [`SPLASH_ROWS`] tall) is centered in `area`
+    /// both ways (integer division; art rows left-align to the
+    /// block's left edge). Callers guarantee the roomy path
+    /// ([`SplashTier::pick`]).
+    fn render_splash(f: &mut Frame, area: Rect, theme: &Theme, tier: SplashTier) {
+        let top = area.y + (area.height.saturating_sub(SPLASH_ROWS)) / 2;
+        let left = area.x + (area.width.saturating_sub(tier.width())) / 2;
+        let bands = [
+            theme.wordmark_highlight,
+            theme.wordmark_highlight,
+            theme.tool_running, // the signal-tone slot (fg-only)
+            theme.tool_running,
+            theme.wordmark_shadow,
+            theme.wordmark_shadow,
+        ];
+        for (i, (line, style)) in tier.art().iter().zip(bands).enumerate() {
+            // Pad the row to the block width (char count == display
+            // width — every art glyph is a width-1 BMP character) so
+            // the trailing spaces carry the band tone too.
+            let canvas = format!("{line:<width$}", width = tier.width() as usize);
+            f.render_widget(
+                Paragraph::new(Line::styled(canvas, style.add_modifier(Modifier::BOLD))),
+                Rect {
+                    x: left,
+                    y: top + i as u16,
+                    width: tier.width(),
+                    height: 1,
+                },
+            );
+        }
+        // The hint row (row 7 of the block): same copy + muted style
+        // as the fallback path, localized per tier (the ascii board
+        // downgrades the em-dash), centered on the block's axis.
+        let set = theme.icons.set();
+        let hint = localize(EMPTY_SESSION_HINT, &set);
+        let hint_w = str_width(&hint) as u16;
+        let x = area.x + (area.width.saturating_sub(hint_w)) / 2;
+        f.render_widget(
+            Paragraph::new(Span::styled(hint, theme.muted)),
+            Rect {
+                x,
+                y: top + SPLASH_ROWS - 1,
+                width: hint_w.max(1),
+                height: 1,
+            },
+        );
     }
 }
 
@@ -2137,6 +3489,7 @@ mod tests {
                 elapsed: None,
                 tool_calls_cur: 0,
                 depth_cur: 0,
+                context_remaining: None,
             },
             config: ConfigSummary {
                 model_alias: String::new(),
@@ -2145,6 +3498,7 @@ mod tests {
                 max_depth: 4,
                 max_tool_calls: 20,
                 run_id: None,
+                model_aliases: Vec::new(),
             },
             size: (80, 24),
             notice: None,
@@ -2213,6 +3567,40 @@ mod tests {
             } => assert_eq!(*bytes, 2, "bytes come from the folded content"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// `/copy tool` source (copy-1): the getter returns the most
+    /// recent RETAINED output — a tail entry without one (live path,
+    /// folds in at merge/rebuild) falls back to the last entry that
+    /// has text.
+    #[test]
+    fn last_tool_output_prefers_the_latest_retained_output() {
+        let mut t = TranscriptComponent::new();
+        assert_eq!(t.last_tool_output(), None, "no tools at all");
+
+        // Live entries never carry output text (ToolEnd is bytes-only).
+        t.tool_start("read_file", r#"{"path":"a.rs"}"#);
+        t.tool_end("read_file", 10, false);
+        assert_eq!(t.last_tool_output(), None, "live entry has no output yet");
+
+        // Two folded calls: the LATER output wins.
+        t.rebuild(&[
+            msg(MessageRole::User, "go"),
+            assistant_with_call("t1", "read_file"),
+            tool_result("t1", "read_file", "first output"),
+            assistant_with_call("t2", "read_file"),
+            tool_result("t2", "read_file", "second output"),
+        ]);
+        assert_eq!(t.last_tool_output(), Some("second output"));
+
+        // Tail fall-back: a fresh live call (no output yet) after a
+        // folded one does not hide the retained text.
+        t.tool_start("run_shell", r#"{"cmd":"ls"}"#);
+        assert_eq!(
+            t.last_tool_output(),
+            Some("second output"),
+            "live tail falls back to the last retained output"
+        );
     }
 
     #[test]
@@ -2333,7 +3721,8 @@ mod tests {
         assert_eq!(
             t.entries(),
             &[TranscriptEntry::Delegate {
-                agent: "researcher".into()
+                agent: "researcher".into(),
+                done: false
             }]
         );
     }
@@ -2360,23 +3749,25 @@ mod tests {
         t.push_reasoning(" continued");
         let ctx = test_ctx();
         let before = layout_text(&t, 60, &ctx.theme);
-        assert_eq!(before, vec!["┆ first thought continued"]);
+        // fix-24: collapsed to the flattened summary — single-line
+        // blocks keep their spaces ("first thought continued").
+        assert_eq!(before, vec!["• first thought continued"]);
 
-        // Answer deltas begin — the reasoning rows are untouched and
+        // Answer deltas begin — the reasoning row is untouched and
         // the answer appends BELOW (block gap + md-rendered rows; the
         // ▍ tail cursor marks the live row).
         t.push_delta("the answer");
         let after = layout_text(&t, 60, &ctx.theme);
         assert_eq!(
             after,
-            vec!["┆ first thought continued", "", "  the answer▍"],
-            "reasoning block stays intact above the answer block"
+            vec!["• first thought continued", "", "● the answer▍"],
+            "reasoning row stays intact above the answer block"
         );
         // More answer deltas only grow the answer block's tail.
         t.push_delta(" grows");
         assert_eq!(
             layout_text(&t, 60, &ctx.theme),
-            vec!["┆ first thought continued", "", "  the answer grows▍"]
+            vec!["• first thought continued", "", "● the answer grows▍"]
         );
     }
 
@@ -2387,12 +3778,16 @@ mod tests {
     fn multiline_cjk_reasoning_rows_stay_stable_when_answer_starts() {
         let mut t = TranscriptComponent::new();
         t.begin_streaming();
+        // fix-23: wrap stability is an EXPANDED-mode property (the
+        // collapsed view is one summary row by default).
+        t.streaming_reasoning_expanded = true;
         let reasoning = "思考第一行内容较长会自动折行处理".repeat(2);
         t.push_reasoning(&reasoning);
         let ctx = test_ctx();
         let before = layout_text(&t, 20, &ctx.theme); // forces wrapping
         assert!(before.len() > 1, "reasoning wraps: {before:?}");
-        assert!(before.iter().all(|l| l.starts_with("┆")));
+        assert!(before[0].starts_with("•"));
+        assert!(before.iter().skip(1).all(|l| l.starts_with("  ")));
 
         t.push_delta("最终答案");
         let after = layout_text(&t, 20, &ctx.theme);
@@ -2404,7 +3799,7 @@ mod tests {
         // The answer opens with its block gap, then the md-rendered
         // row carrying the tail cursor.
         assert_eq!(after[before.len()], "");
-        assert_eq!(after[before.len() + 1], "  最终答案▍");
+        assert_eq!(after[before.len() + 1], "● 最终答案▍");
         assert_eq!(after.len(), before.len() + 2);
     }
 
@@ -2437,9 +3832,11 @@ mod tests {
 
         let ctx = test_ctx();
         let rows = layout_text(&t, 60, &ctx.theme);
+        // fix-24: collapsed summaries keep spaces — "think A" reads
+        // as "think A" while collapsed.
         let tool_row = rows
             .iter()
-            .position(|r| r.contains("read_file("))
+            .position(|r| r.contains("a.rs"))
             .expect("tool line rendered");
         let reasoning_a = rows
             .iter()
@@ -2479,6 +3876,10 @@ mod tests {
                     args: r#"{"q":"x"}"#.into(),
                     status: ToolEntryStatus::Running,
                     call_id: None,
+                    detail: ToolEntryDetail {
+                        args: r#"{"q":"x"}"#.into(),
+                        output: None,
+                    },
                 },
             ]
         );
@@ -2518,11 +3919,15 @@ mod tests {
                 args: "{}".into(),
                 status: ToolEntryStatus::Running,
                 call_id: None,
+                detail: ToolEntryDetail {
+                    args: "{}".into(),
+                    output: None,
+                },
             }]
         );
         let ctx = test_ctx();
         let rows = layout_text(&t, 40, &ctx.theme);
-        assert!(rows.iter().all(|r| !r.starts_with("┆") || r.trim() != "┆"));
+        assert!(rows.iter().all(|r| r.trim() != "•"));
     }
 
     #[test]
@@ -2581,12 +3986,13 @@ mod tests {
         for i in 0..10 {
             t.push_user(&format!("line{i}")); // one display line each at width 40
         }
-        t.viewport.set((40, 4)); // 10 lines + 9 block gaps = 19 → max scroll 15
+        t.viewport.set((40, 4)); // restyle-1: each user = gap + 3 band
+                                 // rows → 39 total → max scroll 35
         let mut ctx = test_ctx();
 
         t.handle(&Action::ScrollUp, &mut ctx);
         assert!(t.is_pinned());
-        assert_eq!(t.scroll, 14, "unpin starts one line above the bottom");
+        assert_eq!(t.scroll, 34, "unpin starts one line above the bottom");
     }
 
     #[test]
@@ -2598,13 +4004,13 @@ mod tests {
         t.viewport.set((40, 4));
         let mut ctx = test_ctx();
         t.handle(&Action::ScrollUp, &mut ctx);
-        assert_eq!(t.scroll, 14);
+        assert_eq!(t.scroll, 34);
 
         // Streaming content arrives while pinned: the offset must not
-        // move (the hint "↓ 新内容" appears instead — render-level).
+        // move (the hint "↓ 回到底部" appears instead — render-level).
         t.push_delta("brand new content");
-        t.handle(&Action::ScrollUp, &mut ctx); // one more line up: 14 → 13
-        assert_eq!(t.scroll, 13);
+        t.handle(&Action::ScrollUp, &mut ctx); // one more line up: 34 → 33
+        assert_eq!(t.scroll, 33);
 
         // Releasing: G / End / ScrollBottom / Esc all re-follow.
         for action in [Action::ScrollBottom, Action::DismissOverlay] {
@@ -2623,11 +4029,11 @@ mod tests {
         }
         t.viewport.set((40, 4));
         let mut ctx = test_ctx();
-        t.handle(&Action::ScrollPageUp, &mut ctx); // page = 2 → scroll 15-2 = 13
+        t.handle(&Action::ScrollPageUp, &mut ctx); // page = 2 → scroll 35-2 = 33
         assert!(t.is_pinned());
-        assert_eq!(t.scroll, 13);
+        assert_eq!(t.scroll, 33);
 
-        // ScrollDown twice: 13 → 14 (still pinned) → 15 == max → re-follow.
+        // ScrollDown twice: 33 → 34 (still pinned) → 35 == max → re-follow.
         t.handle(&Action::ScrollDown, &mut ctx);
         assert!(t.is_pinned());
         t.handle(&Action::ScrollDown, &mut ctx);
@@ -2645,10 +4051,12 @@ mod tests {
         t.handle(&Action::ScrollTop, &mut ctx);
         assert!(t.is_pinned());
         assert_eq!(t.scroll, 0);
-        // PageDown (page = 2) walks to the bottom: 0 → 2 → … → 14
+        // PageDown (page = 2) walks to the bottom: 0 → 2 → … → 34
         // (still pinned, one above max), then the press that reaches
-        // max 15 re-follows.
-        for expected in [2u16, 4, 6, 8, 10, 12, 14] {
+        // max 35 re-follows.
+        for expected in [
+            2u16, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34,
+        ] {
             t.handle(&Action::ScrollPageDown, &mut ctx);
             assert!(t.is_pinned(), "still pinned at {expected}");
             assert_eq!(t.scroll, expected);
@@ -2686,7 +4094,7 @@ mod tests {
         assert!(!t.is_pinned());
     }
 
-    // ── Hint click (fix-17: `↓ 新内容 +N` is clickable) ────────────────
+    // ── Hint click (fix-17: `↓ 回到底部` is clickable) ────────────────
 
     /// Draw into a fresh TestBackend terminal (records the viewport and
     /// the hint hit rectangle, exactly like a real frame).
@@ -2699,9 +4107,9 @@ mod tests {
 
     /// Ten user lines at 40x6: 19 layout rows, 6 visible, max scroll
     /// 13. Pinned via one ScrollUp → offset 12, `below` = 1 → the hint
-    /// `↓ 新内容 +1` (11 display cols) right-aligns into the row rect
-    /// x=1..39 → text at cols 28..=38; the hit rect widens ±2 cols,
-    /// clamped to the row → cols 26..=38 on the last row (y=5).
+    /// `+1 ↓ 回到底部` (13 display cols) right-aligns into the row rect
+    /// x=1..39 → text at cols 26..=38; the hit rect widens ±2 cols,
+    /// clamped to the row → cols 24..=38 on the last row (y=5).
     fn pinned_with_hint() -> (TranscriptComponent, AppCtx) {
         let mut t = TranscriptComponent::new();
         for i in 0..10 {
@@ -2721,9 +4129,9 @@ mod tests {
         assert_eq!(
             t.hint_hit_rect.get(),
             Some(Rect {
-                x: 26,
+                x: 24,
                 y: 5,
-                width: 13,
+                width: 15,
                 height: 1
             })
         );
@@ -2742,14 +4150,14 @@ mod tests {
     #[test]
     fn hint_click_tolerates_two_columns_of_slack_not_three() {
         let (mut t, mut ctx) = pinned_with_hint();
-        // Text starts at col 28: col 26 (+2 slack) still hits, col 25
+        // Text starts at col 26: col 24 (+2 slack) still hits, col 23
         // (+3) misses; the right edge clamps to the row rect (col 38
         // is the text's last column and also the rect's).
         assert_eq!(
-            t.handle(&Action::Click(26, 5), &mut ctx),
+            t.handle(&Action::Click(24, 5), &mut ctx),
             Some(Action::ScrollBottom)
         );
-        assert_eq!(t.handle(&Action::Click(25, 5), &mut ctx), None);
+        assert_eq!(t.handle(&Action::Click(23, 5), &mut ctx), None);
         assert_eq!(
             t.handle(&Action::Click(38, 5), &mut ctx),
             Some(Action::ScrollBottom)
@@ -2782,6 +4190,901 @@ mod tests {
         assert_eq!(t.hint_hit_rect.get(), None);
         assert_eq!(t.handle(&Action::Click(30, 5), &mut ctx), None);
         assert!(t.is_pinned());
+    }
+
+    // ── select-1: drag-to-select ──────────────────────────────────────
+
+    /// [`render`] but returning the drawn FRONT buffer (the exact
+    /// post-render state — the backend buffer only receives the
+    /// frame diff, which skips cells after wide glyphs by design).
+    /// The seam for the selection overlay's style assertions.
+    fn render_buf(t: &TranscriptComponent, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let ctx = test_ctx();
+        let mut front = None;
+        terminal
+            .draw(|f| {
+                t.render(f, f.area(), &ctx);
+                front = Some(f.buffer_mut().clone());
+            })
+            .unwrap();
+        front.unwrap()
+    }
+
+    /// Two assistant entries at width 40 → 3 layout rows:
+    /// 0=`● alpha beta`, 1=`` (block gap, attributed to entry 1),
+    /// 2=`● gamma`.
+    fn selection_fixture() -> TranscriptComponent {
+        let mut t = TranscriptComponent::new();
+        t.entries
+            .push(TranscriptEntry::Assistant("alpha beta".into()));
+        t.entries.push(TranscriptEntry::Assistant("gamma".into()));
+        t
+    }
+
+    /// A press that releases without displacement reports Click and
+    /// leaves no selection; same-cell motion does NOT count as a
+    /// drag; before the first render the gesture is inert.
+    #[test]
+    fn selection_press_release_without_drag_reports_click() {
+        let mut t = selection_fixture();
+        render(&t, 40, 6);
+        // Press + release on the same cell → the legacy click path.
+        t.selection_begin(2, 0);
+        assert!(matches!(t.selection, SelectionState::Pending { .. }));
+        assert_eq!(t.selection_end(&Theme::new()), SelectionEnd::Click);
+        assert_eq!(t.selection, SelectionState::Normal);
+
+        // Same-cell motion during the press: still a click.
+        t.selection_begin(2, 0);
+        assert!(!t.selection_drag(2, 0), "same-cell motion is not a drag");
+        assert_eq!(t.selection_end(&Theme::new()), SelectionEnd::Click);
+        assert_eq!(t.selection, SelectionState::Normal);
+
+        // No gesture in flight (press never mapped): a release is a
+        // click, and a persisted selection survives it untouched.
+        t.selection = SelectionState::Normal;
+        assert_eq!(t.selection_end(&Theme::new()), SelectionEnd::Click);
+
+        // Before the FIRST render there is no geometry: the press
+        // never anchors, the release still behaves as a click.
+        let mut fresh = selection_fixture();
+        fresh.selection_begin(2, 0);
+        assert_eq!(fresh.selection, SelectionState::Normal);
+        assert_eq!(fresh.selection_end(&Theme::new()), SelectionEnd::Click);
+    }
+
+    /// Down → drag (≥1 cell) → Selecting; Up extracts the covered
+    /// rows' text (boundary rows column-sliced, middle rows whole,
+    /// `\n`-joined) and persists the highlight; a new press drops
+    /// the persisted selection. Direction-agnostic (backwards drag
+    /// normalizes).
+    #[test]
+    fn selection_drag_extracts_and_persists() {
+        let mut t = selection_fixture();
+        render(&t, 40, 6);
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(5, 2), "threshold crossed");
+        assert!(matches!(t.selection, SelectionState::Selecting { .. }));
+        match t.selection_end(&Theme::new()) {
+            SelectionEnd::Selected(text) => {
+                // Row 0 from col 2, blank gap row whole, row 2 to
+                // col 5 inclusive.
+                assert_eq!(text, "alpha beta\n\n● gamm");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(t.selection, SelectionState::Selected { .. }));
+
+        // Backwards (right-to-left, bottom-to-top) covers the same
+        // span — the pair normalizes before extraction.
+        t.selection_begin(5, 2);
+        assert!(t.selection_drag(2, 0));
+        match t.selection_end(&Theme::new()) {
+            SelectionEnd::Selected(text) => assert_eq!(text, "alpha beta\n\n● gamm"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // A new press replaces the persisted selection.
+        t.selection_begin(1, 2);
+        assert!(matches!(t.selection, SelectionState::Pending { .. }));
+    }
+
+    /// Logical anchors survive scrolling: pin away from the tail,
+    /// come back — the extracted text is IDENTICAL at every offset,
+    /// and the highlight follows the rows on screen.
+    #[test]
+    fn selection_survives_scrolling_text_unchanged() {
+        let mut t = TranscriptComponent::new();
+        for i in 0..10 {
+            t.push_user(&format!("line{i}"));
+        }
+        render(&t, 40, 6); // 39 layout rows, following → scroll 33
+                           // Entry i (i≥1) owns 4 rows (gap, band blank, content, band
+                           // blank): entry 8's CONTENT row is layout 33 → screen y=0,
+                           // its trailing band blank layout 34 → y=1.
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(6, 1));
+        let (anchor, cursor) = t.selection.range().expect("selecting");
+        let theme = Theme::new();
+        assert_eq!(
+            t.extract_selection_text(&theme, &anchor, &cursor),
+            "› line8\n"
+        );
+        // Highlight at the following offset: layout 33 → screen y=0.
+        let sel = theme.selection_bg.bg.expect("selection bg color");
+        let buf = render_buf(&t, 40, 6);
+        assert_eq!(buf.cell((2, 0)).unwrap().bg, sel, "highlight at y=0");
+
+        // Pin up two rows (scroll 31): same text, rows moved down.
+        let mut ctx = test_ctx();
+        t.handle(&Action::ScrollUp, &mut ctx);
+        t.handle(&Action::ScrollUp, &mut ctx);
+        assert!(t.is_pinned());
+        assert_eq!(
+            t.extract_selection_text(&theme, &anchor, &cursor),
+            "› line8\n",
+            "text is scroll-invariant"
+        );
+        let buf = render_buf(&t, 40, 6);
+        assert_eq!(buf.cell((2, 2)).unwrap().bg, sel, "highlight moved to y=2");
+        assert_ne!(
+            buf.cell((2, 0)).unwrap().bg,
+            ratatui::style::Color::Rgb(0x2B, 0x64, 0x73),
+            "old position no longer highlighted"
+        );
+
+        // Back to the bottom: still the same text.
+        t.handle(&Action::ScrollDown, &mut ctx);
+        t.handle(&Action::ScrollDown, &mut ctx);
+        assert!(!t.is_pinned(), "scrolled back down re-follows");
+        assert_eq!(
+            t.extract_selection_text(&theme, &anchor, &cursor),
+            "› line8\n"
+        );
+    }
+
+    /// CJK boundaries round OUTWARD: a boundary landing on a wide
+    /// char's second cell includes the whole character — extraction
+    /// never yields half a character.
+    #[test]
+    fn selection_cjk_boundaries_round_outward() {
+        let mut t = TranscriptComponent::new();
+        t.entries.push(TranscriptEntry::Assistant("汉字abc".into()));
+        render(&t, 40, 6);
+        // Row 0 = `● 汉字abc`: ●(0) ' '(1) 汉(2-3) 字(4-5) a(6)…
+        // Anchor on 汉's SECOND cell (col 3) → the whole char joins.
+        t.selection_begin(3, 0);
+        assert!(t.selection_drag(20, 0));
+        match t.selection_end(&Theme::new()) {
+            SelectionEnd::Selected(text) => assert_eq!(text, "汉字abc"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Cursor (end boundary) on 字's second cell (col 5) → both
+        // wide chars whole, `a` excluded.
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(5, 0));
+        match t.selection_end(&Theme::new()) {
+            SelectionEnd::Selected(text) => assert_eq!(text, "汉字"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The highlight overlay paints whole rendered cells of the
+    /// selection background (and nothing else): boundaries landing
+    /// inside wide glyphs widen to cover BOTH cells — the row
+    /// `● 汉字` selected from 汉's second cell to 字's second cell
+    /// lights exactly columns 2..=5.
+    #[test]
+    fn selection_overlay_paints_bg_cells_and_whole_wide_glyphs() {
+        let mut t = TranscriptComponent::new();
+        t.entries.push(TranscriptEntry::Assistant("汉字".into()));
+        render(&t, 40, 6); // establish the anchor geometry
+        t.selection_begin(3, 0); // 汉's second cell
+        assert!(t.selection_drag(5, 0)); // 字's second cell
+        let buf = render_buf(&t, 40, 6);
+        let sel = Theme::new().selection_bg.bg.expect("selection bg color");
+        for x in 2..=5u16 {
+            assert_eq!(
+                buf.cell((x, 0)).unwrap().bg,
+                sel,
+                "cell ({x},0) carries the selection bg"
+            );
+        }
+        for x in [0u16, 1, 6, 7, 39] {
+            assert_eq!(
+                buf.cell((x, 0)).unwrap().bg,
+                ratatui::style::Color::Reset,
+                "cell ({x},0) untouched"
+            );
+        }
+        // Glyphs themselves are untouched (style-only overlay); the
+        // wide glyph's trailing cell (ratatui resets it) is covered
+        // by the lead cell's highlight, symbol untouched.
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "汉");
+        assert_eq!(buf.cell((3, 0)).unwrap().symbol(), " ");
+    }
+
+    /// The clear triggers: Esc (in-component), rebuild, merge and
+    /// /new all drop an in-flight or persisted selection.
+    #[test]
+    fn selection_clear_triggers() {
+        let mut ctx = test_ctx();
+
+        // Esc: the DismissOverlay arm clears (and still re-follows).
+        let mut t = selection_fixture();
+        render(&t, 40, 6);
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(5, 2));
+        t.handle(&Action::DismissOverlay, &mut ctx);
+        assert_eq!(t.selection, SelectionState::Normal);
+
+        // rebuild (the recovery path).
+        let mut t = selection_fixture();
+        render(&t, 40, 6);
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(5, 2));
+        t.selection_end(&Theme::new()); // persisted
+        t.rebuild(&[msg(MessageRole::User, "hi")]);
+        assert_eq!(t.selection, SelectionState::Normal);
+
+        // merge_turn (the TurnDone(Ok) boundary).
+        let mut t = selection_fixture();
+        render(&t, 40, 6);
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(5, 2));
+        t.merge_turn(&[]);
+        assert_eq!(t.selection, SelectionState::Normal);
+
+        // clear (/new).
+        let mut t = selection_fixture();
+        render(&t, 40, 6);
+        t.selection_begin(2, 0);
+        assert!(t.selection_drag(5, 2));
+        t.clear();
+        assert_eq!(t.selection, SelectionState::Normal);
+
+        // The explicit API is always safe.
+        t.clear_selection();
+        assert_eq!(t.selection, SelectionState::Normal);
+    }
+
+    /// Once a drag promoted the press into a selection, the release
+    /// NEVER reports Click — even a press that STARTED on the
+    /// clickable hint row (click suppression for the whole gesture).
+    #[test]
+    fn selection_drag_suppresses_the_click_even_from_the_hint_row() {
+        let (mut t, _ctx) = pinned_with_hint();
+        t.selection_begin(30, 5); // dead-center of the `+1 ↓ 回到底部` hint
+        assert!(matches!(t.selection, SelectionState::Pending { .. }));
+        assert!(t.selection_drag(10, 3), "dragged away → selecting");
+        match t.selection_end(&Theme::new()) {
+            SelectionEnd::Selected(text) => assert!(!text.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(t.is_pinned(), "no ScrollBottom fired — the pin holds");
+
+        // Contrast: a press-release ON the hint (no drag) still
+        // fires the legacy click (the fix-17 regression).
+        t.selection_begin(30, 5);
+        assert_eq!(t.selection_end(&Theme::new()), SelectionEnd::Click);
+        let mut ctx = test_ctx();
+        assert_eq!(
+            t.handle(&Action::Click(30, 5), &mut ctx),
+            Some(Action::ScrollBottom)
+        );
+    }
+
+    /// Drags outside the transcript area clamp to the viewport
+    /// edges (no auto-scroll — P2): a drag to the top of the screen
+    /// selects up through the first visible row.
+    #[test]
+    fn selection_drag_outside_the_area_clamps_to_the_edges() {
+        let mut t = TranscriptComponent::new();
+        for i in 0..10 {
+            t.push_user(&format!("line{i}"));
+        }
+        render(&t, 40, 6); // 39 rows, following → scroll 33
+                           // From entry 9's leading band blank (y=3 → layout 36) up to
+                           // the top edge (y=0 → layout 33, entry 8's content row).
+        t.selection_begin(5, 3);
+        assert!(t.selection_drag(4, 0));
+        let theme = Theme::new();
+        let (anchor, cursor) = t.selection.range().expect("selecting");
+        let text = t.extract_selection_text(&theme, &anchor, &cursor);
+        assert!(
+            text.starts_with("line8"),
+            "covers up through the first visible row: {text:?}"
+        );
+    }
+
+    // ── fix-23: reasoning collapse (summary + click toggle) ──────────
+    // fix-24 reworked the summary rule: flatten (lines trimmed,
+    // blanks dropped, single-space join, in-line spaces kept) then
+    // TAIL-cut to the available columns with a leading `…`.
+
+    /// Flattening: every line trimmed, blank lines dropped, joined
+    /// with ONE space; in-line spaces survive (English stays
+    /// readable); a single line passes through trimmed.
+    #[test]
+    fn reasoning_summary_flattens_lines_with_single_spaces() {
+        assert_eq!(
+            reasoning_summary("第一行\n第二行\n", 40, "…"),
+            "第一行 第二行"
+        );
+        assert_eq!(
+            reasoning_summary("line one\nline two", 40, "…"),
+            "line one line two"
+        );
+        // Blank lines (space/tab-only) collapse into the single
+        // joining space — never doubles.
+        assert_eq!(reasoning_summary("a\n \n\t\nb\n\n", 40, "…"), "a b");
+        // Edges trimmed per line, interior spacing preserved.
+        assert_eq!(
+            reasoning_summary("  padded  line  \n  next  ", 40, "…"),
+            "padded  line next"
+        );
+        // A single line passes through trimmed.
+        assert_eq!(reasoning_summary("  solo  ", 40, "…"), "solo");
+        // Nothing usable: empty / all-whitespace blocks.
+        assert_eq!(reasoning_summary("", 40, "…"), "");
+        assert_eq!(reasoning_summary(" \n\t\n ", 40, "…"), "");
+    }
+
+    /// The cut is by DISPLAY WIDTH from the TAIL (the status.rs
+    /// lesson): the flattened line's END survives, a leading `…`
+    /// marks dropped text, a wide char never straddles the budget,
+    /// exact fits carry no ellipsis.
+    #[test]
+    fn reasoning_summary_keeps_the_tail_with_leading_ellipsis() {
+        // 10 CJK chars = 20 cols; avail 9 → `…` + the last 4 chars.
+        let s = reasoning_summary(&"字".repeat(10), 9, "…");
+        assert_eq!(s, "…字字字字");
+        assert_eq!(str_width(&s), 9);
+        // Mixed latin+CJK: avail 6, "abc字字" (7 cols) → budget 5 →
+        // greedy from the end: 字(2) 字(4) c(5) → "…c字字" (6 cols).
+        assert_eq!(reasoning_summary("abc字字", 6, "…"), "…c字字");
+        // A wide char never straddles the budget: avail 5, "ab字字"
+        // (6 cols) → budget 4 → 字(2) 字(4), 'b' would exceed →
+        // "…字字" (5 cols).
+        assert_eq!(reasoning_summary("ab字字", 5, "…"), "…字字");
+        // Exact fit → no ellipsis (nothing dropped).
+        assert_eq!(reasoning_summary("字字字", 6, "…"), "字字字");
+        assert_eq!(reasoning_summary("abcdef", 6, "…"), "abcdef");
+        // One column over → the ellipsis replaces the front.
+        assert_eq!(reasoning_summary("abcdefg", 6, "…"), "…cdefg");
+        // A cut landing after a space trims it (whitespace only).
+        assert_eq!(reasoning_summary("aaaa bbb", 5, "…"), "…bbb");
+        // Degenerate avail 1: the ellipsis alone.
+        assert_eq!(reasoning_summary("字字字", 1, "…"), "…");
+    }
+
+    /// Committed Reasoning entries render collapsed (one summary row
+    /// of the FLATTENED block) by default; the expanded set switches
+    /// to the full block. The Meta estimate line keeps its own-entry
+    /// position in both states.
+    #[test]
+    fn committed_reasoning_renders_collapsed_by_default() {
+        let mut t = TranscriptComponent::new();
+        t.entries
+            .push(TranscriptEntry::Reasoning("第一段\n第二段结论".into()));
+        let ctx = test_ctx();
+        // fix-24: flattened — both lines joined with one space.
+        assert_eq!(layout_text(&t, 40, &ctx.theme), vec!["• 第一段 第二段结论"]);
+        t.expanded_reasoning.insert(0);
+        assert_eq!(
+            layout_text(&t, 40, &ctx.theme),
+            vec!["• 第一段", "  第二段结论"]
+        );
+        // fix-23 does not move the Meta estimate line (its own entry,
+        // after the reasoning block either way).
+        t.entries.push(TranscriptEntry::Meta("~3tok".into()));
+        assert_eq!(
+            layout_text(&t, 40, &ctx.theme),
+            vec!["• 第一段", "  第二段结论", "  ~3tok"]
+        );
+        t.expanded_reasoning.clear();
+        assert_eq!(
+            layout_text(&t, 40, &ctx.theme),
+            vec!["• 第一段 第二段结论", "  ~3tok"]
+        );
+    }
+
+    /// The streaming reasoning block collapses to a live-updating
+    /// flattened summary; once it overflows the width the TAIL
+    /// survives with a leading ellipsis (always the latest
+    /// thinking); expansion renders the full block.
+    #[test]
+    fn streaming_reasoning_summary_updates_per_delta() {
+        let mut t = TranscriptComponent::new();
+        t.begin_streaming();
+        t.push_reasoning("first thought");
+        let ctx = test_ctx();
+        assert_eq!(layout_text(&t, 40, &ctx.theme), vec!["• first thought"]);
+        // A second line joins with a single space — English reads.
+        t.push_reasoning("\nsecond thought");
+        assert_eq!(
+            layout_text(&t, 40, &ctx.theme),
+            vec!["• first thought second thought"]
+        );
+        // Overflow (avail 38): the tail cut keeps 37 cols of the end
+        // behind a leading ellipsis. The z-line is exactly avail wide
+        // so the EXPANDED block below renders it unwrapped.
+        t.push_reasoning(&format!("\n{}", "z".repeat(38)));
+        assert_eq!(
+            layout_text(&t, 40, &ctx.theme),
+            vec![format!("• …{}", "z".repeat(37))]
+        );
+        // Expanded → the full gutter block, untouched lines.
+        t.streaming_reasoning_expanded = true;
+        assert_eq!(
+            layout_text(&t, 40, &ctx.theme),
+            vec![
+                "• first thought",
+                "  second thought",
+                &format!("  {}", "z".repeat(38))
+            ]
+        );
+    }
+
+    /// Click toggle: collapsed row → expanded block → collapsed row.
+    /// Both hits consume the action in-component (None).
+    #[test]
+    fn click_toggles_reasoning_entry_expansion() {
+        let mut t = TranscriptComponent::new();
+        t.entries
+            .push(TranscriptEntry::Reasoning("hidden line\nsummary".into()));
+        let mut ctx = test_ctx();
+        render(&t, 40, 6); // records the collapsed row's hit rect
+        let rect = t.reasoning_hit_rects.borrow()[0].1;
+        assert_eq!(
+            rect,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 1
+            }
+        );
+        // Collapsed → click → expanded.
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(t.expanded_reasoning.contains(&0));
+        render(&t, 40, 6); // the expanded block spans two rows
+        let rect = t.reasoning_hit_rects.borrow()[0].1;
+        assert_eq!(rect.height, 2, "the expanded block is the target");
+        // Expanded → click (same screen spot) → collapsed again.
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(!t.expanded_reasoning.contains(&0));
+    }
+
+    /// The streaming block's collapsed row click-expands — its state
+    /// is independent of the committed entries'.
+    #[test]
+    fn click_toggles_streaming_reasoning_expansion() {
+        let mut t = TranscriptComponent::new();
+        t.begin_streaming();
+        t.push_reasoning("thinking\nlive tail");
+        let mut ctx = test_ctx();
+        render(&t, 40, 6);
+        assert_eq!(
+            t.streaming_reasoning_hit_rect.get(),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 1
+            })
+        );
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(t.streaming_reasoning_expanded);
+        render(&t, 40, 6);
+        assert_eq!(t.streaming_reasoning_hit_rect.get().unwrap().height, 2);
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(!t.streaming_reasoning_expanded);
+    }
+
+    /// Hint priority over reasoning rows: pinned with both the hint
+    /// and a collapsed reasoning row on screen — a click in the hint's
+    /// rect returns ScrollBottom WITHOUT touching the reasoning
+    /// state; a click on the reasoning row toggles WITHOUT releasing
+    /// the pin.
+    #[test]
+    fn hint_click_wins_over_reasoning_rows_and_vice_versa() {
+        let mut t = TranscriptComponent::new();
+        t.entries
+            .push(TranscriptEntry::Reasoning("reasoning tail".into()));
+        for i in 0..10 {
+            t.entries.push(TranscriptEntry::User(format!("line{i}")));
+        }
+        let mut ctx = test_ctx();
+        render(&t, 40, 6); // establish the viewport (21 rows)
+        t.handle(&Action::ScrollTop, &mut ctx); // pinned at 0, all below
+        render(&t, 40, 6); // hint (bottom-right) + reasoning row (top)
+        let hint = t.hint_hit_rect.get().expect("hint rendered");
+        assert_eq!(
+            t.handle(&Action::Click(hint.x + 1, hint.y), &mut ctx),
+            Some(Action::ScrollBottom)
+        );
+        assert!(
+            !t.expanded_reasoning.contains(&0),
+            "hint hit did not toggle"
+        );
+        t.handle(&Action::ScrollBottom, &mut ctx); // App feeds it back
+        assert!(!t.is_pinned());
+        // Back to the top; click the reasoning row itself.
+        t.handle(&Action::ScrollTop, &mut ctx);
+        render(&t, 40, 6);
+        let rect = t.reasoning_hit_rects.borrow()[0].1;
+        assert_eq!(t.handle(&Action::Click(rect.x + 2, rect.y), &mut ctx), None);
+        assert!(t.expanded_reasoning.contains(&0), "the row toggles");
+        assert!(t.is_pinned(), "the toggle never releases the pin");
+        assert!(t.hint_hit_rect.get().is_some(), "the hint survives");
+    }
+
+    /// Flush/finish continuation: an EXPANDED live block commits
+    /// expanded (no visual jump at the boundary); a collapsed one
+    /// commits collapsed; the next streaming block always starts
+    /// collapsed.
+    #[test]
+    fn flush_carries_streaming_expansion_into_the_entry() {
+        // Expanded flush (tool_start boundary).
+        let mut t = TranscriptComponent::new();
+        t.begin_streaming();
+        t.push_reasoning("deep\nthoughts");
+        t.streaming_reasoning_expanded = true;
+        t.tool_start("echo", "{}");
+        assert!(matches!(t.entries()[0], TranscriptEntry::Reasoning(_)));
+        assert!(t.expanded_reasoning.contains(&0), "committed expanded");
+        assert!(
+            !t.streaming_reasoning_expanded,
+            "flag reset for the next block"
+        );
+        // Collapsed flush.
+        let mut t2 = TranscriptComponent::new();
+        t2.begin_streaming();
+        t2.push_reasoning("deep\nthoughts");
+        t2.tool_start("echo", "{}");
+        assert!(!t2.expanded_reasoning.contains(&0), "stays collapsed");
+        // finish_request carries the state too.
+        let mut t3 = TranscriptComponent::new();
+        t3.begin_streaming();
+        t3.push_reasoning("deep\nthoughts");
+        t3.streaming_reasoning_expanded = true;
+        t3.finish_request(None, None, None);
+        assert!(
+            t3.expanded_reasoning.contains(&0),
+            "finish commits expanded"
+        );
+    }
+
+    /// rebuild / merge_turn / /new reset the expansion state (entry
+    /// indices die with the entries; Reasoning blocks re-derive
+    /// collapsed).
+    #[test]
+    fn rebuild_and_merge_reset_expansion() {
+        let mut t = TranscriptComponent::new();
+        t.begin_streaming();
+        t.push_reasoning("kept block");
+        t.streaming_reasoning_expanded = true;
+        t.tool_start("echo", "{}"); // commits expanded at index 0
+        assert!(t.expanded_reasoning.contains(&0));
+        t.merge_turn(&[msg(MessageRole::User, "go")]);
+        assert!(!t.expanded_reasoning.contains(&0), "merge resets");
+        assert!(!t.streaming_reasoning_expanded);
+
+        t.expanded_reasoning.insert(0);
+        t.rebuild(&[msg(MessageRole::User, "hi")]);
+        assert!(t.expanded_reasoning.is_empty(), "rebuild resets");
+        t.expanded_reasoning.insert(0);
+        t.clear();
+        assert!(t.expanded_reasoning.is_empty(), "/new resets");
+    }
+
+    // ── fix-25: tool row expansion (call/output detail) ──────────────
+
+    /// Click toggle on a tool row: collapsed head row ⇄ head + dim
+    /// call/output detail block; both hits consume in-component.
+    #[test]
+    fn click_toggles_tool_entry_expansion() {
+        let mut t = TranscriptComponent::new();
+        t.tool_start("echo", r#"{"text":"hi"}"#);
+        let mut ctx = test_ctx();
+        render(&t, 40, 6); // records the collapsed head row's hit rect
+        let rect = t.tool_hit_rects.borrow()[0].1;
+        assert_eq!(
+            rect,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 1
+            }
+        );
+        // Collapsed: the head row only, no detail.
+        let rows = layout_text(&t, 40, &ctx.theme);
+        assert_eq!(rows.len(), 1, "head row only: {rows:?}");
+        // Click → expanded: head + 调用 name / full args / 输出 /
+        // 运行中… (Running placeholder).
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(t.expanded_tools.contains(&0));
+        let rows = layout_text(&t, 40, &ctx.theme);
+        assert!(rows.iter().any(|r| r == "    调用 echo"), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r == r#"    {"text":"hi"}"#),
+            "full args wrapped: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r == "    输出"), "{rows:?}");
+        assert!(rows.iter().any(|r| r == "    运行中…"), "{rows:?}");
+        // head + label + args + label + placeholder = 5 rows.
+        render(&t, 40, 6);
+        assert_eq!(t.tool_hit_rects.borrow()[0].1.height, 5);
+        // Click again (same spot, inside the block) → collapsed.
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(!t.expanded_tools.contains(&0));
+        assert_eq!(layout_text(&t, 40, &ctx.theme).len(), 1);
+    }
+
+    /// Output placeholders through the live lifecycle, then the real
+    /// text after the fold: Running → 运行中…; a live-path Done (bytes
+    /// only) → （待回填）; the rebuild fold fills the text, and the
+    /// re-expanded entry shows it.
+    #[test]
+    fn tool_expansion_output_placeholders_then_fold_fill() {
+        let mut t = TranscriptComponent::new();
+        t.tool_start("echo", r#"{"text":"hi"}"#);
+        t.expanded_tools.insert(0);
+        let ctx = test_ctx();
+        assert!(layout_text(&t, 40, &ctx.theme)
+            .iter()
+            .any(|r| r == "    运行中…"));
+        t.tool_end("echo", 2, false); // live completion: bytes only
+        assert!(
+            layout_text(&t, 40, &ctx.theme)
+                .iter()
+                .any(|r| r == "    （待回填）"),
+            "live ToolEnd carries no text"
+        );
+        // The turn's Tool message folds the full text in (the rebuild
+        // path also resets the expansion — re-expand and the output
+        // is there).
+        t.rebuild(&[
+            assistant_with_call("tc-1", "echo"),
+            tool_result("tc-1", "echo", "real output"),
+        ]);
+        assert!(t.expanded_tools.is_empty(), "rebuild reset the toggle");
+        t.expanded_tools.insert(0);
+        assert!(
+            layout_text(&t, 40, &ctx.theme)
+                .iter()
+                .any(|r| r == "    real output"),
+            "folded output renders once expanded"
+        );
+    }
+
+    /// Both retention paths keep the FULL call and output: the rebuild
+    /// derives args from the message and folds the output; the merge
+    /// fills a live entry (whose ToolEnd had bytes only).
+    #[test]
+    fn folds_retain_full_args_and_output_text() {
+        // Rebuild path.
+        let mut t = TranscriptComponent::new();
+        t.rebuild(&[
+            assistant_with_call("tc-1", "echo"),
+            tool_result("tc-1", "echo", "line1\nline2 output"),
+        ]);
+        match &t.entries()[0] {
+            TranscriptEntry::ToolCall { args, detail, .. } => {
+                assert_eq!(args, "{}", "preview unchanged on the head row");
+                assert_eq!(detail.args, "{}");
+                assert_eq!(detail.output.as_deref(), Some("line1\nline2 output"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Merge path (live entry).
+        let mut t2 = TranscriptComponent::new();
+        t2.tool_start("echo", r#"{"text":"hi"}"#);
+        t2.tool_end("echo", 2, false);
+        t2.merge_turn(&[
+            assistant_with_call("t", "echo"),
+            tool_result("t", "echo", "merged output"),
+        ]);
+        match &t2.entries()[0] {
+            TranscriptEntry::ToolCall { detail, .. } => {
+                assert_eq!(detail.args, r#"{"text":"hi"}"#);
+                assert_eq!(detail.output.as_deref(), Some("merged output"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Each detail section caps at 30 wrapped rows; the `…（共 N 行）`
+    /// marker names the section's true row count and the cut content
+    /// stays hidden.
+    /// P1 (restyle-1): diff-shaped output rows (leading +/-) render as
+    /// full-width diffAdded/diffRemoved background bands with the
+    /// marker column colored; plain rows stay muted.
+    #[test]
+    fn tool_detail_diff_rows_render_colored_bands() {
+        let mut t = TranscriptComponent::new();
+        t.entries.push(TranscriptEntry::ToolCall {
+            name: "write_file".into(),
+            args: "{}".into(),
+            status: ToolEntryStatus::Done {
+                bytes: 0,
+                truncated: false,
+                elapsed_ms: None,
+            },
+            call_id: None,
+            detail: ToolEntryDetail {
+                args: "{}".into(),
+                output: Some("+added line\n-removed line\ncontext".into()),
+            },
+        });
+        t.expanded_tools.insert(0);
+        let ctx = test_ctx();
+        let lines = t.layout_lines(30, &ctx.theme, 0);
+        // Locate the diff rows (after `    输出`).
+        let out_label = lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("输出")))
+            .expect("output label");
+        let added = &lines[out_label + 1];
+        let removed = &lines[out_label + 2];
+        let context = &lines[out_label + 3];
+        // Full-width band: bg on every cell of the row (pad span
+        // included), marker colored success/error.
+        let added_bg = added
+            .spans
+            .iter()
+            .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(0x21, 0x3A, 0x2B)));
+        let removed_bg = removed
+            .spans
+            .iter()
+            .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(0x4A, 0x22, 0x1D)));
+        assert!(added_bg, "added band full-width: {added:?}");
+        assert!(removed_bg, "removed band full-width: {removed:?}");
+        assert_eq!(added.spans[1].content, "+");
+        assert_eq!(
+            added.spans[1].style.fg,
+            Some(ratatui::style::Color::Rgb(0x28, 0xC5, 0x67))
+        );
+        assert_eq!(removed.spans[1].content, "-");
+        assert_eq!(
+            removed.spans[1].style.fg,
+            Some(ratatui::style::Color::Rgb(0xFF, 0x5E, 0x6C))
+        );
+        // Context row: no band, muted.
+        assert!(context.spans.iter().all(|s| s.style.bg.is_none()));
+        // Band rows pad out to the full width (30 display cols).
+        assert_eq!(added.width(), 30);
+        assert_eq!(removed.width(), 30);
+    }
+
+    #[test]
+    fn tool_detail_sections_cap_at_30_rows() {
+        let mut t = TranscriptComponent::new();
+        t.entries.push(TranscriptEntry::ToolCall {
+            name: "echo".into(),
+            args: "{}".into(),
+            status: ToolEntryStatus::Done {
+                bytes: 0,
+                truncated: false,
+                elapsed_ms: None,
+            },
+            call_id: None,
+            detail: ToolEntryDetail {
+                args: (0..40)
+                    .map(|i| format!("arg-line-{i:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                output: Some(
+                    (0..35)
+                        .map(|i| format!("out-{i:02}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+            },
+        });
+        t.expanded_tools.insert(0);
+        let ctx = test_ctx();
+        let rows = layout_text(&t, 40, &ctx.theme);
+        let arg_rows = rows
+            .iter()
+            .filter(|r| r.starts_with("    arg-line"))
+            .count();
+        assert_eq!(arg_rows, 30, "args capped at 30 rows: {rows:?}");
+        assert!(rows.contains(&"    …（共 40 行）".to_owned()), "{rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.contains("arg-line-30")),
+            "cut rows stay hidden"
+        );
+        let out_rows = rows.iter().filter(|r| r.starts_with("    out-")).count();
+        assert_eq!(out_rows, 30, "output capped at 30 rows");
+        assert!(rows.contains(&"    …（共 35 行）".to_owned()), "{rows:?}");
+    }
+
+    /// Retention storage caps: 4KB args / 8KB output, byte-budgeted
+    /// with the marker inside the cap, cut on char boundaries.
+    #[test]
+    fn stored_detail_text_is_byte_capped_with_marker() {
+        assert_eq!(cap_stored_text("abc", ARGS_STORE_CAP), "abc");
+        // CJK: 3000 wide chars = 9000 bytes > 4KB → cut whole chars,
+        // marker appended, total within the cap.
+        let args = cap_stored_text(&"字".repeat(3000), ARGS_STORE_CAP);
+        assert!(args.len() <= ARGS_STORE_CAP, "{}", args.len());
+        assert!(args.ends_with("（已截断）"));
+        // Output cap (8KB): ascii over-long text.
+        let out = cap_stored_text(&"z".repeat(OUTPUT_STORE_CAP + 100), OUTPUT_STORE_CAP);
+        assert!(out.len() <= OUTPUT_STORE_CAP);
+        assert!(out.ends_with("（已截断）"));
+        assert!(out.starts_with('z'));
+    }
+
+    /// rebuild / merge_turn / /new reset the tool expansion (mirrors
+    /// the reasoning rule).
+    #[test]
+    fn rebuild_and_merge_reset_tool_expansion() {
+        let mut t = TranscriptComponent::new();
+        t.tool_start("echo", "{}");
+        t.expanded_tools.insert(0);
+        t.merge_turn(&[]);
+        assert!(!t.expanded_tools.contains(&0), "merge resets");
+        t.expanded_tools.insert(0);
+        t.rebuild(&[]);
+        assert!(t.expanded_tools.is_empty(), "rebuild resets");
+        t.expanded_tools.insert(0);
+        t.clear();
+        assert!(t.expanded_tools.is_empty(), "/new resets");
+    }
+
+    /// Three click targets on one pinned screen — hint, reasoning
+    /// summary, tool head — each hit routes to its own behavior and
+    /// nothing leaks across.
+    #[test]
+    fn hint_reasoning_and_tool_hits_coexist() {
+        let mut t = TranscriptComponent::new();
+        t.entries
+            .push(TranscriptEntry::Reasoning("reasoning tail".into()));
+        t.entries.push(TranscriptEntry::ToolCall {
+            name: "echo".into(),
+            args: "{}".into(),
+            status: ToolEntryStatus::Running,
+            call_id: None,
+            detail: ToolEntryDetail {
+                args: "{}".into(),
+                output: None,
+            },
+        });
+        for i in 0..10 {
+            t.entries.push(TranscriptEntry::User(format!("line{i}")));
+        }
+        let mut ctx = test_ctx();
+        render(&t, 40, 6); // establish the viewport
+        t.handle(&Action::ScrollTop, &mut ctx); // pinned at 0
+        render(&t, 40, 6); // hint bottom-right, reasoning row 0, tool row 1
+
+        // Tool head click: expands ONLY the tool, pin survives.
+        assert_eq!(t.handle(&Action::Click(3, 1), &mut ctx), None);
+        assert!(t.expanded_tools.contains(&1));
+        assert!(!t.expanded_reasoning.contains(&0));
+        assert!(t.is_pinned());
+        render(&t, 40, 6);
+
+        // Reasoning row click: expands ONLY the reasoning.
+        assert_eq!(t.handle(&Action::Click(3, 0), &mut ctx), None);
+        assert!(t.expanded_reasoning.contains(&0));
+        assert!(t.expanded_tools.contains(&1), "tool state untouched");
+
+        // Hint click: jumps to the bottom, toggles NOTHING.
+        let hint = t.hint_hit_rect.get().expect("hint rendered");
+        assert_eq!(
+            t.handle(&Action::Click(hint.x + 1, hint.y), &mut ctx),
+            Some(Action::ScrollBottom)
+        );
+        assert!(t.expanded_reasoning.contains(&0) && t.expanded_tools.contains(&1));
+        t.handle(&Action::ScrollBottom, &mut ctx);
+        assert!(!t.is_pinned());
     }
 
     // ── Wrap computation ────────────────────────────────────────────────
@@ -2883,19 +5186,22 @@ mod tests {
     #[test]
     fn layout_counts_match_rendered_structure() {
         let mut t = TranscriptComponent::new();
-        t.push_user("one two three four five"); // width 20 → bar gutter + wrapped body
+        t.push_user("one two three four five"); // width 20 → band rows
         t.viewport.set((22, 10));
         let ctx = test_ctx();
         let lines = t.layout_lines(20, &ctx.theme, 0);
-        // "┃ " (2) + body avail 18: "one two three four" (18), "five"
-        assert_eq!(lines.len(), 2);
+        // restyle-1: full-width band = blank + 2 content rows (avail
+        // 16: "one two three" / "four five") + blank; the `› ` anchor
+        // leads the first content row.
+        assert_eq!(lines.len(), 4);
         let total: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
             .collect();
-        // The ┃ bar covers the block's FULL height (every display line).
-        assert_eq!(total[0], "┃ one two three four");
-        assert_eq!(total[1], "┃ five");
+        assert_eq!(total[0], " ".repeat(20));
+        assert_eq!(total[1], "  › one two three".to_owned() + &" ".repeat(3));
+        assert_eq!(total[2], "    four five".to_owned() + &" ".repeat(7));
+        assert_eq!(total[3], " ".repeat(20));
     }
 
     #[test]
@@ -2914,29 +5220,36 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
             .collect();
         assert_eq!(joined.len(), 2, "one line per tool entry");
-        // Icon table: echo → cog, grep → search (substring match).
-        assert!(joined[0].starts_with(" echo({})"), "{}", joined[0]);
-        assert!(joined[0].contains(" 2B"), "{}", joined[0]);
-        assert!(joined[1].starts_with(" grep({})"), "{}", joined[1]);
-        assert!(joined[1].contains(" Error: x"), "{}", joined[1]);
+        // restyle-1: connectors + markers + English verbs; the first
+        // row connects to the second (`├`), the second closes
+        // (`└`). Output text known → `1 output line` suffix.
+        assert!(
+            joined[0].starts_with("├ ✓ Used echo {} · 1 output line"),
+            "{}",
+            joined[0]
+        );
+        assert!(joined[1].starts_with("└ × Searched {}"), "{}", joined[1]);
+        assert!(joined[1].contains("Error: x"), "{}", joined[1]);
     }
 
-    /// The opencode icon table (Nerd PUA: terminal shell / eye read /
-    /// pencil write-edit / search glob-grep / cog other), matched by
-    /// substring.
     #[test]
-    fn tool_icon_semantic_table() {
-        assert_eq!(tool_icon("bash"), "");
-        assert_eq!(tool_icon("shell"), "");
-        assert_eq!(tool_icon("filesystem_bash"), "");
-        assert_eq!(tool_icon("read_file"), "");
-        assert_eq!(tool_icon("read_skill"), "");
-        assert_eq!(tool_icon("write_file"), "");
-        assert_eq!(tool_icon("edit_file"), "");
-        assert_eq!(tool_icon("glob"), "");
-        assert_eq!(tool_icon("grep"), "");
-        assert_eq!(tool_icon("run_code"), "");
-        assert_eq!(tool_icon("current_time"), "");
+    fn tool_verb_table() {
+        assert_eq!(tool_verb("shell", true), "Running");
+        assert_eq!(tool_verb("shell", false), "Ran");
+        assert_eq!(tool_verb("filesystem_bash", true), "Running");
+        assert_eq!(tool_verb("read_file", true), "Reading");
+        assert_eq!(tool_verb("read_file", false), "Read");
+        assert_eq!(tool_verb("read_skill", false), "Read");
+        assert_eq!(tool_verb("write_file", true), "Writing");
+        assert_eq!(tool_verb("write_file", false), "Wrote");
+        assert_eq!(tool_verb("edit_file", false), "Wrote");
+        assert_eq!(tool_verb("call_agent", true), "Delegating");
+        assert_eq!(tool_verb("call_agent", false), "Delegated");
+        assert_eq!(tool_verb("glob", true), "Searching");
+        assert_eq!(tool_verb("grep", false), "Searched");
+        assert_eq!(tool_verb("search", true), "Searching");
+        assert_eq!(tool_verb("run_code", true), "Using run_code");
+        assert_eq!(tool_verb("current_time", false), "Used current_time");
     }
 
     /// Borderless spacing rules: one blank line before each block entry
@@ -2960,22 +5273,28 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
             .collect();
+        // restyle-1: the user band (blank + `›` row + blank, all
+        // bg-padded to the full width), compact tool rows with
+        // connectors/verbs, block gaps before assistant/marker, the
+        // `●` assistant anchor, the `└` turn marker.
+        let band = " ".repeat(60);
+        let user_row = "  › go".to_owned() + &" ".repeat(60 - 6);
         assert_eq!(
             joined,
             vec![
-                "┃ go",
-                " read_file({})  2B",
-                " grep({})  2B",
-                "",
-                "  done",
-                "",
-                " main · 9秒",
+                band.clone(),
+                user_row,
+                band,
+                "├ ✓ Read {} · 1 output line".to_owned(),
+                "└ ✓ Searched {} · 1 output line".to_owned(),
+                "".to_owned(),
+                "● done".to_owned(),
+                "".to_owned(),
+                "└ main · 9s".to_owned(),
             ]
         );
     }
 
-    /// The ` model · Ns` end-of-turn marker: only with turn_meta
-    /// set, cube themed, cleared by `/new`.
     #[test]
     fn turn_marker_rendering_rules() {
         let mut t = TranscriptComponent::new();
@@ -2988,21 +5307,88 @@ mod tests {
         let plain = t.layout_lines(40, &ctx.theme, 0);
         assert!(plain
             .iter()
-            .all(|l| !l.spans.iter().any(|s| s.content.contains(""))));
+            .all(|l| !l.spans.iter().any(|s| s.content.contains("└"))));
 
         t.set_turn_meta("fast".to_owned(), 3, None);
         let lines = t.layout_lines(40, &ctx.theme, 0);
         let last = lines.last().expect("marker line");
+        // restyle-1: `└ fast · 3s` — connector muted, body
+        // muted.
         assert_eq!(last.spans.len(), 2);
-        assert_eq!(last.spans[0].content, "");
+        assert_eq!(last.spans[0].content, "└ ");
         assert_eq!(last.spans[0].style, ctx.theme.turn_marker);
-        assert_eq!(last.spans[1].content, " fast · 3秒");
-        assert_eq!(last.spans[1].style, ctx.theme.muted);
+        assert_eq!(last.spans[1].content, "fast · 3s");
+        assert_eq!(last.spans[1].style, ctx.theme.turn_marker);
 
         // `/new` resets the marker along with everything else.
         t.clear();
         let cleared = t.layout_lines(40, &ctx.theme, 0);
-        assert_eq!(cleared.len(), 1, "back to the empty-state hint");
+        assert_eq!(cleared.len(), 2, "wordmark + hint rows");
+    }
+
+    /// ascii-turn-1: the pure-ASCII icon tier renders the turn
+    /// marker with dedicated chrome — `+` prefix and `-` separators
+    /// (NOT the shared `elbow`/`dot` slots), while the `^v` arrows
+    /// and `~` zap ride their slots untouched. Exact shape with the
+    /// full usage tail: rate = round(44/13) = 3.
+    #[test]
+    fn turn_marker_ascii_tier_plus_and_dash() {
+        let mut t = TranscriptComponent::new();
+        t.rebuild(&[
+            msg(MessageRole::User, "go"),
+            msg(MessageRole::Assistant, "ok"),
+        ]);
+        t.set_turn_meta("intern-latest".to_owned(), 13, Some((1200, 44)));
+        let mut ctx = test_ctx();
+        ctx.theme = Theme::dark().with_icons(crate::icons::Icons::Ascii);
+        let lines = t.layout_lines(60, &ctx.theme, 0);
+        let last = lines.last().expect("marker line");
+        let joined: String = last.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(joined, "+ intern-latest - 13s - ^1200 v44 - ~ 3 tok/s");
+    }
+
+    /// ascii-turn-1 guard: unicode/nerd tiers keep the shared
+    /// `elbow`/`dot` slots byte-for-byte, including the full usage
+    /// tail the no-tokens test above skips.
+    #[test]
+    fn turn_marker_unicode_tier_unchanged() {
+        let mut t = TranscriptComponent::new();
+        t.rebuild(&[
+            msg(MessageRole::User, "go"),
+            msg(MessageRole::Assistant, "ok"),
+        ]);
+        t.set_turn_meta("intern-latest".to_owned(), 13, Some((1200, 44)));
+        let ctx = test_ctx();
+        let lines = t.layout_lines(60, &ctx.theme, 0);
+        let last = lines.last().expect("marker line");
+        assert_eq!(last.spans[0].content, "└ ");
+        let joined: String = last.spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(joined, "└ intern-latest · 13s · ↑1200 ↓44 · ⚡ 3 tok/s");
+    }
+
+    /// ascii-turn-1 guard: the shared slots keep their ascii values
+    /// on TOOL rows — `` ` `` elbow connector, `.` dot in the
+    /// output-lines suffix — the marker's dedicated `+`/`-` chrome
+    /// must not leak into other rows.
+    #[test]
+    fn tool_rows_ascii_tier_keep_shared_slots() {
+        let mut t = TranscriptComponent::new();
+        t.rebuild(&[
+            assistant_with_call("t1", "read_file"),
+            tool_result("t1", "read_file", "ok"),
+        ]);
+        let mut ctx = test_ctx();
+        ctx.theme = Theme::dark().with_icons(crate::icons::Icons::Ascii);
+        let lines = t.layout_lines(60, &ctx.theme, 0);
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        let tool_row = joined
+            .iter()
+            .find(|l| l.contains("Read"))
+            .expect("tool row present");
+        assert_eq!(tool_row, "` + Read {} . 1 output line");
     }
 
     #[test]
@@ -3227,7 +5613,7 @@ mod tests {
     /// instant (`layout_lines_at` — the injectable-clock seam).
     fn rows_at(t: &TranscriptComponent, now: Instant) -> Vec<String> {
         let ctx = test_ctx();
-        t.layout_lines_at(60, &ctx.theme, 0, now)
+        t.layout_lines_at(60, &ctx.theme, now)
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
             .collect()
@@ -3246,8 +5632,8 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             rows_at(&t, started + Duration::from_secs(2)),
-            vec!["┆ pondering deeply"],
-            "no live row while only reasoning streams"
+            vec!["• pondering deeply"],
+            "no live row while only reasoning streams (collapsed summary)"
         );
     }
 
@@ -3284,7 +5670,7 @@ mod tests {
             at_2s[0]
         );
         let ctx = test_ctx();
-        let line = t.layout_lines_at(60, &ctx.theme, 0, t0 + Duration::from_secs(2))[0].clone();
+        let line = t.layout_lines_at(60, &ctx.theme, t0 + Duration::from_secs(2))[0].clone();
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].style, ctx.theme.muted);
     }
@@ -3538,7 +5924,7 @@ mod tests {
         let ctx = test_ctx();
         assert_eq!(
             layout_text(&t, 40, &ctx.theme),
-            vec!["┆ 思考过程", "", "  最终答案▍"],
+            vec!["• 思考过程", "", "● 最终答案▍"],
             "no leading/trailing blank gutter rows"
         );
         // Buffers untouched (render-time view only).
@@ -3555,7 +5941,7 @@ mod tests {
         let ctx = test_ctx();
         assert_eq!(
             layout_text(&t, 40, &ctx.theme),
-            vec!["  第一段", "  ", "  第二段▍"]
+            vec!["● 第一段", "  ", "  第二段▍"]
         );
     }
 
@@ -3711,7 +6097,7 @@ mod tests {
         let ctx = test_ctx();
         let rows = styled_rows(&t, 40, &ctx.theme);
         let texts: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(texts, vec!["  类别  要点", "  代码  说明内容"]);
+        assert_eq!(texts, vec!["● 类别  要点", "  代码  说明内容"]);
         // Header BOLD, body default.
         assert!(rows[0]
             .1
@@ -3731,11 +6117,11 @@ mod tests {
         t.push_delta("| a | b |");
         let ctx = test_ctx();
         let rows = styled_rows(&t, 20, &ctx.theme);
-        assert_eq!(rows[0].0, "  | a | b |▍");
+        assert_eq!(rows[0].0, "● | a | b |▍");
         assert_eq!(rows[0].1, ctx.theme.assistant);
         t.push_delta("\n|---|---|\n| 1 | 2 |");
         let rows = styled_rows(&t, 20, &ctx.theme);
-        assert_eq!(rows[0].0, "  a  b");
+        assert_eq!(rows[0].0, "● a  b");
         assert_eq!(
             rows[0].1,
             ctx.theme
@@ -3760,14 +6146,14 @@ mod tests {
         // orphan guard rebalances to 内容 / 很长.
         assert_eq!(
             rows,
-            vec!["  • 第一项", "    内容", "    很长", "  • 短项",]
+            vec!["● • 第一项", "    内容", "    很长", "  • 短项",]
         );
         // Ordered: "1. " hangs 3 → continuation indent = 2 + 3.
         let mut t2 = TranscriptComponent::new();
         t2.entries
             .push(TranscriptEntry::Assistant("1. 第一项内容很长".into()));
         let rows2 = layout_text(&t2, 11, &ctx.theme);
-        assert_eq!(rows2, vec!["  1. 第一项", "     内容", "     很长"]);
+        assert_eq!(rows2, vec!["● 1. 第一项", "     内容", "     很长"]);
     }
 
     /// Plain paragraphs do NOT hang (continuation rows stay at the
@@ -3781,7 +6167,7 @@ mod tests {
         let ctx = test_ctx();
         let rows = layout_text(&t, 8, &ctx.theme);
         // avail = 6: 第一段 / 正文很长... continuation at col 2.
-        assert_eq!(rows[0], "  第一段");
+        assert_eq!(rows[0], "● 第一段");
         assert!(rows[1].starts_with("  正文"), "{rows:?}");
         assert!(!rows[1].starts_with("    "), "no hang on plain paragraphs");
     }
@@ -3798,7 +6184,10 @@ mod tests {
                 let style = l
                     .spans
                     .iter()
-                    .find(|s| !s.content.trim().is_empty())
+                    // restyle-1: skip the leading indent AND the ●
+                    // anchor span (text color) — the first CONTENT
+                    // span represents the row.
+                    .find(|s| !s.content.trim().is_empty() && s.content.trim() != "●")
                     .map(|s| s.style)
                     .unwrap_or_default();
                 (text, style)
@@ -3818,17 +6207,20 @@ mod tests {
         assert_eq!(
             texts,
             vec![
-                "  Title",
+                "● Title",
                 "  ",
                 "  plain bold code",
                 "  ",
                 "  • item one",
                 "  ",
-                "  > quoted",
+                "  │ quoted",
             ]
         );
         // Heading row: md_heading (Cyan + BOLD).
-        assert_eq!(rows[0].1, ctx.theme.md_heading);
+        assert_eq!(
+            rows[0].1,
+            ctx.theme.md_heading.add_modifier(Modifier::UNDERLINED)
+        );
         // Plain body row carries the inline styles — spot check via
         // spans: "bold" is BOLD, "code" is the code color.
         let line3 = t.layout_lines(60, &ctx.theme, 0)[2].clone();
@@ -3860,8 +6252,15 @@ mod tests {
         let texts: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
         // avail = 7 - 2 indent = 5 cols: ascii clips at 5, CJK at 2
         // chars; content NEVER wraps to extra rows.
-        assert_eq!(texts, vec!["  abcde", "  世界"]);
-        assert_eq!(rows[0].1, ctx.theme.md_code, "code block styled");
+        assert_eq!(texts, vec!["● abcde", "  世界"]);
+        // restyle-1: the ● anchor (text color) leads row 0 — assert
+        // the code style on the clipped content span instead.
+        let code_line = t.layout_lines(7, &ctx.theme, 0)[0].clone();
+        assert_eq!(
+            code_line.spans[1].style, ctx.theme.md_code,
+            "code block styled"
+        );
+        let _ = rows;
     }
 
     #[test]
@@ -3891,7 +6290,7 @@ mod tests {
         // avail = 12: "aaa bbb ccc" (11) then "ddd eee".
         let rows = styled_rows(&t, 14, &ctx.theme);
         let texts: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(texts, vec!["  aaa bbb ccc", "  ddd eee"]);
+        assert_eq!(texts, vec!["● aaa bbb ccc", "  ddd eee"]);
         // The bold span survived the wrap.
         let row0 = t.layout_lines(14, &ctx.theme, 0)[0].clone();
         assert!(row0.spans.iter().any(|s| s.content == "aaa bbb"
@@ -3910,15 +6309,21 @@ mod tests {
         t.push_delta("# not a heading yet **bold**");
         let ctx = test_ctx();
         let rows = styled_rows(&t, 60, &ctx.theme);
-        assert_eq!(rows[0].0, "  not a heading yet bold▍");
-        assert_eq!(rows[0].1, ctx.theme.md_heading);
+        assert_eq!(rows[0].0, "● not a heading yet bold▍");
+        assert_eq!(
+            rows[0].1,
+            ctx.theme.md_heading.add_modifier(Modifier::UNDERLINED)
+        );
 
         // Committed (flushed) assistant text renders identically —
         // only the tail cursor disappears at the flush.
         t.tool_start("echo", "{}");
         let rows = styled_rows(&t, 60, &ctx.theme);
-        assert_eq!(rows[0].0, "  not a heading yet bold");
-        assert_eq!(rows[0].1, ctx.theme.md_heading);
+        assert_eq!(rows[0].0, "● not a heading yet bold");
+        assert_eq!(
+            rows[0].1,
+            ctx.theme.md_heading.add_modifier(Modifier::UNDERLINED)
+        );
     }
 
     // ── Streaming markdown live rendering (fix-18) ───────────────────
@@ -3962,12 +6367,18 @@ mod tests {
         let ctx = test_ctx();
         let rows = styled_rows(&t, 40, &ctx.theme);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "  标▍");
-        assert_eq!(rows[0].1, ctx.theme.md_heading);
+        assert_eq!(rows[0].0, "● 标▍");
+        assert_eq!(
+            rows[0].1,
+            ctx.theme.md_heading.add_modifier(Modifier::UNDERLINED)
+        );
         t.push_delta("题");
         let rows = styled_rows(&t, 40, &ctx.theme);
-        assert_eq!(rows[0].0, "  标题▍");
-        assert_eq!(rows[0].1, ctx.theme.md_heading);
+        assert_eq!(rows[0].0, "● 标题▍");
+        assert_eq!(
+            rows[0].1,
+            ctx.theme.md_heading.add_modifier(Modifier::UNDERLINED)
+        );
 
         // No space after `#` → not a heading, literal body text.
         let mut t2 = TranscriptComponent::new();
@@ -3975,7 +6386,7 @@ mod tests {
         t2.push_delta("#nos");
         t2.push_delta("pace");
         let rows = styled_rows(&t2, 40, &ctx.theme);
-        assert_eq!(rows[0].0, "  #nospace▍");
+        assert_eq!(rows[0].0, "● #nospace▍");
         assert_eq!(rows[0].1, ctx.theme.assistant);
     }
 
@@ -3989,11 +6400,11 @@ mod tests {
         t.push_delta("**bo");
         let ctx = test_ctx();
         let rows = styled_rows(&t, 40, &ctx.theme);
-        assert_eq!(rows[0].0, "  **bo▍");
+        assert_eq!(rows[0].0, "● **bo▍");
         assert_eq!(rows[0].1, ctx.theme.assistant);
         t.push_delta("ld**");
         let rows = styled_rows(&t, 40, &ctx.theme);
-        assert_eq!(rows[0].0, "  bold▍");
+        assert_eq!(rows[0].0, "● bold▍");
         assert_eq!(
             rows[0].1,
             ctx.theme
@@ -4013,7 +6424,7 @@ mod tests {
         t.push_delta("para\n```\nfn m");
         let ctx = test_ctx();
         let rows = styled_rows(&t, 20, &ctx.theme);
-        assert_eq!(rows[0].0, "  para");
+        assert_eq!(rows[0].0, "● para");
         assert_eq!(rows[1].0, "  fn m");
         assert_eq!(rows[1].1, ctx.theme.md_code);
         assert!(!rows[1].0.contains('▍'), "no cursor inside code");
@@ -4024,7 +6435,7 @@ mod tests {
         t2.begin_streaming();
         t2.push_delta("para\n```");
         let rows = styled_rows(&t2, 20, &ctx.theme);
-        assert_eq!(rows.last().unwrap().0, "  para");
+        assert_eq!(rows.last().unwrap().0, "● para");
 
         // Closing the fence finalizes the block (still cursorless).
         t.push_delta("() {}\n```");
@@ -4048,7 +6459,7 @@ mod tests {
         let rows = layout_text(&t, 12, &ctx.theme);
         assert_eq!(
             rows,
-            vec!["  one two", "  three four", "  five six▍"],
+            vec!["● one two", "  three four", "  five six▍"],
             "one cursor, on the last row only"
         );
 
@@ -4058,7 +6469,7 @@ mod tests {
         t2.begin_streaming();
         t2.push_delta("one two three");
         let rows = layout_text(&t2, 15, &ctx.theme);
-        assert_eq!(rows, vec!["  one two three"]);
+        assert_eq!(rows, vec!["● one two three"]);
     }
 
     /// THE seamless-flush contract (fix-18's core payoff): for the
@@ -4155,7 +6566,8 @@ mod tests {
         let lines = t.layout_lines(60, &ctx.theme, 0);
         let last = lines.last().expect("marker line");
         let text: String = last.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.contains("main · 9秒 · ↑130 ↓15"), "marker: {text}");
+        assert!(text.contains("main · 9s · ↑130 ↓15"), "marker: {text}");
+        assert!(text.contains("⚡ 2 tok/s"), "rate = 15/9 rounded: {text}");
         // Without totals: the plain form (existing behavior).
         t.set_turn_meta("fast".to_owned(), 3, None);
         let lines = t.layout_lines(60, &ctx.theme, 0);
@@ -4166,7 +6578,7 @@ mod tests {
             .iter()
             .map(|s| s.content.clone())
             .collect();
-        assert!(text.contains("fast · 3秒"), "plain form: {text}");
+        assert!(text.contains("fast · 3s"), "plain form: {text}");
         assert!(!text.contains('\u{2191}'), "no totals segment: {text}");
     }
 
@@ -4533,10 +6945,81 @@ mod tests {
         let rows = layout_text(&t, 40, &ctx.theme);
         let marker = rows
             .iter()
-            .position(|r| r.contains("main · 5秒"))
+            .position(|r| r.contains("main · 5s"))
             .expect("marker row");
         let q2 = rows.iter().position(|r| r.contains("q2")).expect("q2 row");
         let a1 = rows.iter().position(|r| r.contains("a1")).expect("a1 row");
         assert!(a1 < marker && marker < q2, "a1 < marker < q2: {rows:?}");
+    }
+
+    // ── splash-1: the empty-session splash ────────────────────────────
+
+    /// Both tiers' art is BYTE-FROZEN: independent transcriptions of
+    /// the spec's lines must match verbatim (guards a hand-typo in
+    /// the glyph tables), stay pure BMP box/block glyphs + space,
+    /// rstripped, each tier's widest row exactly its pinned block
+    /// width. The ladder geometry (80/45/10 + the ascii-tier veto)
+    /// is pinned alongside.
+    #[test]
+    fn splash_art_is_byte_frozen() {
+        let full: [&str; 6] = [
+            " ██████╗ ██████╗ ███████╗███╗   ██╗███████╗██╗      █████╗ ████████╗███████╗",
+            "██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔════╝██║     ██╔══██╗╚══██╔══╝██╔════╝",
+            "██║   ██║██████╔╝█████╗  ██╔██╗ ██║███████╗██║     ███████║   ██║   █████╗",
+            "██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║╚════██║██║     ██╔══██║   ██║   ██╔══╝",
+            "╚██████╔╝██║     ███████╗██║ ╚████║███████║███████╗██║  ██║   ██║   ███████╗",
+            " ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝",
+        ];
+        assert_eq!(&SPLASH_ART_FULL, &full, "byte-frozen full glyph table");
+        let medium: [&str; 6] = [
+            "███████╗██╗      █████╗ ████████╗███████╗",
+            "██╔════╝██║     ██╔══██╗╚══██╔══╝██╔════╝",
+            "███████╗██║     ███████║   ██║   █████╗",
+            "╚════██║██║     ██╔══██║   ██║   ██╔══╝",
+            "███████║███████╗██║  ██║   ██║   ███████╗",
+            "╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝",
+        ];
+        assert_eq!(
+            &SPLASH_ART_MEDIUM, &medium,
+            "byte-frozen medium glyph table"
+        );
+        for (name, (art, width)) in [
+            ("full", (&SPLASH_ART_FULL, SPLASH_FULL_WIDTH)),
+            ("medium", (&SPLASH_ART_MEDIUM, SPLASH_MEDIUM_WIDTH)),
+        ] {
+            assert_eq!(art.len(), 6, "{name} has six rows");
+            assert_eq!(
+                art.iter().map(|l| l.chars().count()).max().unwrap() as u16,
+                width,
+                "{name} widest row = block width"
+            );
+            for (i, line) in art.iter().enumerate() {
+                assert!(
+                    line.chars().all(|c| (c as u32) <= 0xFFFF),
+                    "BMP-only (no PUA) {name} row {i}"
+                );
+                assert!(
+                    line.chars()
+                        .all(|c| c == ' ' || ('\u{2500}'..='\u{259F}').contains(&c)),
+                    "box/block glyphs only, {name} row {i}"
+                );
+                assert_eq!(*line, line.trim_end(), "rows are rstripped ({name} {i})");
+            }
+        }
+        // The size ladder: full ≥ 80, medium ≥ 45, height ≥ 10, and
+        // the ascii icon tier never shows art.
+        assert_eq!(SplashTier::pick(80, 10, false), Some(SplashTier::Full));
+        assert_eq!(SplashTier::pick(120, 30, false), Some(SplashTier::Full));
+        assert_eq!(SplashTier::pick(79, 10, false), Some(SplashTier::Medium));
+        assert_eq!(SplashTier::pick(45, 10, false), Some(SplashTier::Medium));
+        assert_eq!(SplashTier::pick(44, 10, false), None);
+        assert_eq!(SplashTier::pick(80, 9, false), None, "short → legacy");
+        assert_eq!(
+            SplashTier::pick(120, 30, true),
+            None,
+            "ascii icon tier → legacy"
+        );
+        // The shared hint copy rides both empty-state paths.
+        assert_eq!(EMPTY_SESSION_HINT, "空会话 — 输入 prompt 开始,Enter 发送");
     }
 }

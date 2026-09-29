@@ -27,7 +27,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 # File logging to ~/.local/share/openslate/logs/tui.log (env-filter driven).
 tracing-subscriber = { workspace = true }
-clap = { workspace = true }
+clap = { workspace = true, features = ["env"] }
 # ApprovalRequest argument summaries + message JSON handling.
 serde_json = { workspace = true }
 # Local-time formatting for log timestamps.

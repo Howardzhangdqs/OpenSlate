@@ -19,20 +19,21 @@
 //! first calibration doubles as the topology source (P3 lane-b task
 //! brief; the frozen `App::new` call site cannot be extended).
 //!
-//! # Glyphs (design brief)
+//! # Glyphs (restyle-1)
 //!
 //! | row                  | glyph | style              |
 //! |----------------------|-------|--------------------|
-//! | root                 | ``   | Cyan + BOLD        |
-//! | running depth-1      | ``   | Cyan               |
-//! | completed            | ``   | DarkGray + DIM     |
-//! | failed               | ``   | Red                |
-//! | interrupted / `…`    | `…`   | DarkGray + DIM     |
+//! | root                 | `◆`   | signal + BOLD      |
+//! | running depth-1      | `◐`   | accent             |
+//! | completed            | `✓`   | muted              |
+//! | failed               | `×`   | error              |
+//! | interrupted          | `○`   | muted              |
 //!
-//! `Interrupted` rows only exist post-calibration: the execution-tree
-//! snapshot is final when `TurnDone` fires, so any node still `Running`
-//! in it was abandoned mid-flight (the turn was cancelled) — its true
-//! outcome is unknowable and it renders as `…`.
+//! Pure Unicode, no Nerd Font PUA. `Interrupted` rows only exist
+//! post-calibration: the execution-tree snapshot is final when
+//! `TurnDone` fires, so any node still `Running` in it was abandoned
+//! mid-flight (the turn was cancelled) — its true outcome is
+//! unknowable and it renders as `○`.
 
 use std::collections::HashMap;
 
@@ -43,19 +44,17 @@ use ratatui::Frame;
 
 use super::{AppCtx, Component, Focus};
 use crate::action::Action;
-use crate::theme::Theme;
 use openslate_core::execution::{ExecutionNode, ExecutionStatus, ExecutionTree};
 use openslate_core::types::ExecutionNodeId;
-use ratatui::style::Style;
 
 /// Display status of one tree row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
-    /// A depth-1 child whose `call_agent` call is in flight (``).
+    /// A depth-1 child whose `call_agent` call is in flight (`◐`).
     Running,
-    /// Finished successfully (``).
+    /// Finished successfully (`✓`).
     Completed,
-    /// Finished with an error (``).
+    /// Finished with an error (`×`).
     Failed,
     /// Still `Running` in a FINAL tree snapshot — the turn was cancelled
     /// above it; the real outcome is unknowable (`…`).
@@ -103,7 +102,7 @@ impl AgentsComponent {
         self.root.as_deref()
     }
 
-    /// A `call_agent` tool started: push a live depth-1 child (``).
+    /// A `call_agent` tool started: push a live depth-1 child (`◐`).
     pub fn on_delegate_start(&mut self, agent: &str) {
         self.live.push(AgentRow {
             id: agent.to_owned(),
@@ -112,7 +111,7 @@ impl AgentsComponent {
         });
     }
 
-    /// A tool ended: complete the oldest still-running live child (``→``).
+    /// A tool ended: complete the oldest still-running live child (`◐`→`✓`).
     ///
     /// The App forwards EVERY tool's end here (frozen call site) and
     /// `ToolEnd` carries no agent id — so non-`call_agent` ends are
@@ -169,40 +168,6 @@ impl AgentsComponent {
             &self.live
         }
     }
-
-    /// Compact one-line footer spans (the narrow-terminal info bar that
-    /// replaces the hidden sidebar): the root anchor
-    /// (`\u{F111} root`, [`Theme::agent_active`]) followed by the
-    /// current view's rows as `glyph id` pairs — status glyph in its
-    /// status style, id on the default foreground — with a single
-    /// space between rows. Glyphs are Nerd Font PUA chars built via
-    /// `char::from_u32` (PUA literals do not survive every edit
-    /// channel). Returns an empty vec when no root is seeded.
-    pub fn footer_spans(&self, theme: &Theme) -> Vec<Span<'static>> {
-        let Some(root) = &self.root else {
-            return Vec::new();
-        };
-        let root_glyph = char::from_u32(0xF111).expect("valid PUA glyph");
-        let mut spans = vec![Span::styled(
-            format!("{root_glyph} {root}"),
-            theme.agent_active,
-        )];
-        for row in self.rows().iter().filter(|r| r.depth > 0) {
-            let (glyph, style) = match row.status {
-                AgentStatus::Running => (0xF04B, theme.agent_running),
-                AgentStatus::Completed => (0xF10C, theme.agent_done),
-                AgentStatus::Failed => (0xF00D, theme.agent_failed),
-                // Same mapping as the sidebar tree: an unknowable
-                // outcome renders as `…` (U+2026) in the done style.
-                AgentStatus::Interrupted => (0x2026, theme.agent_done),
-            };
-            let glyph = char::from_u32(glyph).unwrap_or('…');
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(glyph.to_string(), style));
-            spans.push(Span::styled(format!(" {}", row.id), Style::new()));
-        }
-        spans
-    }
 }
 
 /// Depth-first walk from a node, emitting display rows in tree order.
@@ -245,11 +210,12 @@ impl Component for AgentsComponent {
         } else {
             ctx.theme.header
         };
+        let g = ctx.theme.icons.set();
         let mut lines: Vec<Line> = vec![Line::from(Span::styled("agents", header_style))];
         match &self.root {
             Some(root) => lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(format!(" {root}"), ctx.theme.agent_active),
+                Span::styled(format!("{} {root}", g.diamond), ctx.theme.agent_active),
             ])),
             None => lines.push(Line::from(vec![
                 Span::raw(" "),
@@ -258,30 +224,33 @@ impl Component for AgentsComponent {
         }
         let rows: Vec<&AgentRow> = self.rows().iter().filter(|r| r.depth > 0).collect();
         for (i, row) in rows.iter().enumerate() {
-            // Flat-tree connector: `└` when the NEXT row is not a
+            // Flat-tree connector: the elbow when the NEXT row is not a
             // descendant (strictly shallower or absent) — i.e. this row
-            // closed its parent's child list; `├` otherwise.
+            // closed its parent's child list; the tee otherwise.
             let is_last_sibling = rows.get(i + 1).is_none_or(|next| next.depth < row.depth);
-            let connector = if is_last_sibling { "└ " } else { "├ " };
+            let connector = if is_last_sibling { g.elbow } else { g.tee };
             let indent = "  ".repeat(row.depth as usize);
             let (glyph, style) = match row.status {
-                AgentStatus::Running => ("", ctx.theme.agent_running),
-                AgentStatus::Completed => ("", ctx.theme.agent_done),
-                AgentStatus::Failed => ("", ctx.theme.agent_failed),
-                AgentStatus::Interrupted => ("…", ctx.theme.agent_done),
+                AgentStatus::Running => (g.agents_running, ctx.theme.agent_running),
+                AgentStatus::Completed => (g.check, ctx.theme.agent_done),
+                AgentStatus::Failed => (g.cross, ctx.theme.agent_failed),
+                AgentStatus::Interrupted => (g.pending, ctx.theme.agent_done),
             };
             lines.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(format!("{indent}{connector}{glyph} {}", row.id), style),
+                Span::styled(format!("{indent}{connector} {glyph} {}", row.id), style),
             ]));
             // D2: a running child may itself have delegated —
             // grandchildren are invisible at the root, so hint at the
-            // unknowable tail with one `…` row.
+            // unknowable tail with one ellipsis row.
             if row.status == AgentStatus::Running {
                 let deeper = "  ".repeat(row.depth as usize + 1);
                 lines.push(Line::from(vec![
                     Span::raw(" "),
-                    Span::styled(format!("{deeper}└ …"), ctx.theme.fine),
+                    Span::styled(
+                        format!("{deeper}{} {}", g.elbow, g.ellipsis),
+                        ctx.theme.fine,
+                    ),
                 ]));
             }
         }
@@ -448,77 +417,5 @@ mod tests {
         let agents = AgentsComponent::new();
         assert_eq!(agents.root(), None);
         assert!(agents.rows().is_empty());
-    }
-
-    // ── footer spans (narrow-terminal info bar) ───────────────────────
-
-    fn plain(spans: &[Span]) -> String {
-        spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    #[test]
-    fn footer_spans_root_only_without_delegations() {
-        let mut agents = AgentsComponent::new();
-        let theme = Theme::new();
-        // No root seeded → nothing to anchor the footer on.
-        assert!(agents.footer_spans(&theme).is_empty());
-        agents.set_root("root");
-        let spans = agents.footer_spans(&theme);
-        assert_eq!(plain(&spans), "\u{F111} root");
-        assert_eq!(spans[0].style.fg, Some(ratatui::style::Color::Cyan));
-        assert!(spans[0]
-            .style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD));
-    }
-
-    #[test]
-    fn footer_spans_live_rows_carry_status_glyphs_and_default_ids() {
-        let mut agents = AgentsComponent::new();
-        let theme = Theme::new();
-        agents.set_root("root");
-        agents.on_delegate_start("researcher");
-        agents.on_delegate_start("writer");
-        agents.on_delegate_end("call_agent"); // researcher completes (FIFO)
-        let spans = agents.footer_spans(&theme);
-        // `● root` then rows in order; single space between rows;
-        // glyphs by status (researcher started first → FIFO-completed).
-        assert_eq!(
-            plain(&spans),
-            "\u{F111} root \u{F10C} researcher \u{F04B} writer"
-        );
-        // Glyph spans carry their status styles; id spans stay on the
-        // default foreground. Layout: [root] ' ' [glyph] ' id' ' '
-        // [glyph] ' id' ... → glyphs at 2,5,.. ids at 3,6,..
-        let glyph_styles: Vec<_> = spans.iter().skip(2).step_by(3).map(|s| s.style).collect();
-        assert_eq!(glyph_styles[0], theme.agent_done);
-        assert_eq!(glyph_styles[1], theme.agent_running);
-        let id_styles: Vec<_> = spans.iter().skip(3).step_by(3).map(|s| s.style).collect();
-        assert!(id_styles.iter().all(|s| s.fg.is_none()));
-    }
-
-    #[test]
-    fn footer_spans_calibrated_failed_row_uses_failed_style() {
-        let mut agents = AgentsComponent::new();
-        let theme = Theme::new();
-        agents.set_root("root");
-        let run_id = RunId("r".into());
-        let mut first = tree();
-        let root_id = first.root_id().clone();
-        first.create_child(run_id, AgentId("verifier".into()), root_id, None);
-        agents.calibrate(&first); // left Running → Interrupted post-turn
-        let mut second = tree();
-        let root_id = second.root_id().clone();
-        let verifier =
-            second.create_child(RunId("r2".into()), AgentId("writer".into()), root_id, None);
-        second.update_status(&verifier, ExecutionStatus::Failed);
-        agents.calibrate(&second);
-        let spans = agents.footer_spans(&theme);
-        assert_eq!(plain(&spans), "\u{F111} root \u{F00D} writer");
-        assert_eq!(spans[2].style, theme.agent_failed);
     }
 }

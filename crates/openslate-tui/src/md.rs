@@ -21,21 +21,23 @@
 //!
 //! | syntax                          | rendering                                    |
 //! |---------------------------------|----------------------------------------------|
-//! | `#`/`##`/`###` headings         | `#` prefix stripped, BOLD + accent color      |
+//! | `#` heading                     | prefix stripped, heading color + BOLD + UNDERLINE |
+//! | `##` heading                    | prefix stripped, heading color + BOLD        |
+//! | `###`+ heading                  | literal `### ` prefix + heading color        |
 //! | `**bold**`, `*italic*`, `***b+i***` | style modifiers on the body text         |
 //! | `` `code` ``                    | distinct code color (content literal)        |
 //! | ```` ``` ```` fenced blocks     | whole block indented, fixed color, verbatim  |
 //! | `- `/`* `/`1. ` lists           | `• ` / `N. ` prefix + inline body            |
-//! | `> ` blockquote                 | dim `> ` prefix, dim body                    |
+//! | `> ` blockquote                 | muted `│ ` prefix, italic muted body         |
 //! | `---` / `***` / `___` hr        | [`MdLine::Hr`] — dim rule expanded at width  |
-//! | `[text](url)`                   | link text (URL dropped)                      |
+//! | `[text](url)`                   | link text (URL dropped) in the link color    |
 //! | `\| a \|` + `\|---\|` tables    | [`MdLine::Table`] — pipes dropped, columns   |
 //! |                                 | padded (display-width aware), header BOLD,   |
 //! |                                 | separator row dropped, widest column shrunk  |
 //! |                                 | to fit                                      |
 //!
-//! Deliberate simplifications: `####`+ headings render as plain text;
-//! list nesting is flattened (one bullet level); blockquotes are
+//! Deliberate simplifications: `#######` (7+) headings render as plain
+//! text; list nesting is flattened (one bullet level); blockquotes are
 //! per-line (no lazy continuation); setext headings/HTML are not
 //! recognized; `\` escapes are not processed; table cells render
 //! literally (no inline markup, no per-column alignment flags).
@@ -50,12 +52,21 @@ use ratatui::text::Span;
 pub struct MdStyles {
     /// Body text (paragraphs, list bodies).
     pub text: Style,
-    /// `#`~`###` headings — BOLD + accent color.
+    /// `#`/`##` headings — BOLD + heading color (H1 adds UNDERLINE at
+    /// the parse site; H3+ keep the literal `### ` prefix in the
+    /// plain heading color).
     pub heading: Style,
     /// Inline code and fenced code blocks — distinct color.
     pub code: Style,
     /// Dim structural elements (blockquote prefix+body, bullets, hr).
     pub dim: Style,
+    /// Link text — the markdown link color (restyle-1).
+    pub link: Style,
+    /// Blockquote prefix glyph (`│ `; the icon tier's vertical stroke —
+    /// theme-1).
+    pub quote_prefix: &'static str,
+    /// Unordered-list bullet glyph (`• `; the icon tier's bullet).
+    pub bullet: &'static str,
 }
 
 impl MdStyles {
@@ -149,34 +160,51 @@ pub fn parse(text: &str, styles: &MdStyles) -> Vec<MdLine> {
             continue;
         }
 
-        // Heading: 1-3 `#` followed by a space (or end of line) —
-        // accent+BOLD base, inline markup composes onto it.
-        if let Some(rest) = heading_body(trimmed) {
-            out.push(MdLine::Flow(parse_inline(
-                rest.trim(),
-                styles.heading,
-                styles,
-            )));
+        // Heading (restyle-1): H1 = heading + UNDERLINE, H2 = heading,
+        // H3+ = literal `### ` prefix + plain heading color — inline
+        // markup composes onto the base.
+        if let Some((level, rest)) = heading_parts(trimmed) {
+            let base = match level {
+                1 => styles.heading.add_modifier(Modifier::UNDERLINED),
+                2 => styles.heading,
+                _ => styles.heading.remove_modifier(Modifier::BOLD),
+            };
+            if level <= 2 {
+                out.push(MdLine::Flow(parse_inline(rest.trim(), base, styles)));
+            } else {
+                let mut spans = vec![Span::styled(format!("{} ", "#".repeat(level)), base)];
+                spans.extend(parse_inline(rest.trim(), base, styles));
+                out.push(MdLine::Flow(spans));
+            }
             i += 1;
             continue;
         }
 
-        // Blockquote: dim `> ` prefix + dim inline body.
+        // Blockquote: muted `{vertical} ` prefix + italic muted body
+        // (restyle-1; the glyph from the icon tier — theme-1).
         if let Some(body) = trimmed.strip_prefix('>') {
             let body = body.strip_prefix(' ').unwrap_or(body);
-            let mut spans = vec![Span::styled("> ".to_owned(), styles.dim)];
-            spans.extend(parse_inline(body, styles.dim, styles));
+            let mut spans = vec![Span::styled(
+                format!("{} ", styles.quote_prefix),
+                styles.dim,
+            )];
+            spans.extend(parse_inline(
+                body,
+                styles.dim.add_modifier(Modifier::ITALIC),
+                styles,
+            ));
             out.push(MdLine::Flow(spans));
             i += 1;
             continue;
         }
 
-        // Unordered list: `- ` / `* ` → `• ` prefix.
+        // Unordered list: `- ` / `* ` → `{bullet} ` prefix (the icon
+        // tier's bullet — theme-1).
         if let Some(body) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            let mut spans = vec![Span::styled("• ".to_owned(), styles.dim)];
+            let mut spans = vec![Span::styled(format!("{} ", styles.bullet), styles.dim)];
             spans.extend(parse_inline(body, styles.text, styles));
             out.push(MdLine::Flow(spans));
             i += 1;
@@ -237,15 +265,16 @@ fn is_hr(s: &str) -> bool {
     false
 }
 
-/// Heading body for `#`~`###` headings (`None` for anything else —
-/// including `####`+ and `#nospace`).
-fn heading_body(s: &str) -> Option<&str> {
+/// Heading parts for `#`~`######` headings (`None` for anything else —
+/// including `#######` (7+) and `#nospace`): `(level, body)`. A
+/// heading needs a space after the markers (or nothing at all).
+fn heading_parts(s: &str) -> Option<(usize, &str)> {
     let level = s.chars().take_while(|c| *c == '#').count();
-    if (1..=3).contains(&level) {
+    if (1..=6).contains(&level) {
         let rest = &s[level..];
         // A heading needs a space after the markers (or nothing at all).
         if rest.is_empty() || rest.starts_with(' ') {
-            Some(rest)
+            Some((level, rest))
         } else {
             None
         }
@@ -325,7 +354,12 @@ fn parse_inline(s: &str, base: Style, styles: &MdStyles) -> Vec<Span<'static>> {
             }
             '[' => match parse_link(&chars, i) {
                 Some((text, end)) => {
-                    out.extend(parse_inline(&text, base, styles));
+                    // restyle-1: link text carries the markdown link
+                    // color; base modifiers (bold/italic context)
+                    // compose on top.
+                    let mut style = base;
+                    style.fg = styles.link.fg;
+                    out.extend(parse_inline(&text, style, styles));
                     i = end;
                 }
                 None => {
@@ -480,17 +514,17 @@ pub fn is_no_line_end(ch: char) -> bool {
 }
 
 /// Display width of a leading list/quote prefix span (`• `, `N. `,
-/// `> `) when the line starts with one — the hanging-indent anchor
+/// `│ `) when the line starts with one — the hanging-indent anchor
 /// for wrapped continuation rows. `0` when the line has no such
 /// prefix (continuation rows then align at the block indent).
-pub fn hang_width(spans: &[Span<'static>]) -> usize {
+pub fn hang_width(spans: &[Span<'static>], quote_prefix: &str, bullet: &str) -> usize {
     let Some(first) = spans.first() else { return 0 };
     let t = first.content.as_ref();
     let numbered = t.len() > 2
         && t.ends_with(". ")
         && t[..t.len() - 2].chars().all(|c| c.is_ascii_digit())
         && !t[..t.len() - 2].is_empty();
-    if t == "• " || t == "> " || numbered {
+    if t == format!("{bullet} ") || t == format!("{quote_prefix} ") || numbered {
         first.width()
     } else {
         0
@@ -751,6 +785,9 @@ mod tests {
             heading: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             code: Style::new().fg(Color::Yellow),
             dim: Style::new().fg(Color::DarkGray),
+            link: Style::new().fg(Color::Blue),
+            quote_prefix: "│",
+            bullet: "•",
         }
     }
 
@@ -767,18 +804,47 @@ mod tests {
     // ── Block level ─────────────────────────────────────────────────
 
     #[test]
-    fn headings_level_1_to_3_strip_prefix_and_use_heading_style() {
-        for (src, want) in [
-            ("# Title", "Title"),
-            ("## Sub", "Sub"),
-            ("### Deep", "Deep"),
-        ] {
+    fn h1_and_h2_strip_prefix_h1_underlines() {
+        // restyle-1: H1 = heading + UNDERLINE, H2 = heading (plain).
+        let lines = parse("# Title", &styles());
+        assert_eq!(flow_texts(&lines), vec!["Title"]);
+        match &lines[0] {
+            MdLine::Flow(spans) => {
+                assert_eq!(
+                    spans[0].style,
+                    styles().heading.add_modifier(Modifier::UNDERLINED)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let lines = parse("## Sub", &styles());
+        assert_eq!(flow_texts(&lines), vec!["Sub"]);
+        match &lines[0] {
+            MdLine::Flow(spans) => assert_eq!(spans[0].style, styles().heading),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn h3_plus_keeps_the_literal_prefix_in_heading_color() {
+        // restyle-1: H3+ keep the literal `### ` prefix + heading
+        // color, no BOLD "extra large" treatment.
+        for src in ["### Deep", "#### Deeper", "###### Six"] {
             let lines = parse(src, &styles());
-            assert_eq!(flow_texts(&lines), vec![want]);
+            let expected = src.split_once(' ').map(|(hashes, _)| hashes).unwrap();
+            assert_eq!(
+                flow_texts(&lines),
+                vec![format!("{expected} {}", src.split_once(' ').unwrap().1)],
+                "{src:?}"
+            );
             match &lines[0] {
                 MdLine::Flow(spans) => {
-                    assert_eq!(spans.len(), 1);
-                    assert_eq!(spans[0].style, styles().heading);
+                    assert!(
+                        spans
+                            .iter()
+                            .all(|s| s.style == styles().heading.remove_modifier(Modifier::BOLD)),
+                        "{src:?}"
+                    );
                 }
                 other => panic!("{other:?}"),
             }
@@ -786,10 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn heading_level_4_and_nospace_hash_stay_verbatim() {
-        // `####` is beyond the subset → plain paragraph.
-        let lines = parse("#### Not a heading", &styles());
-        assert_eq!(flow_texts(&lines), vec!["#### Not a heading"]);
+    fn heading_level_7_and_nospace_hash_stay_verbatim() {
+        // `#######` is beyond markdown → plain paragraph.
+        let lines = parse("####### Not a heading", &styles());
+        assert_eq!(flow_texts(&lines), vec!["####### Not a heading"]);
         match &lines[0] {
             MdLine::Flow(spans) => assert_eq!(spans[0].style, styles().text),
             other => panic!("{other:?}"),
@@ -834,15 +900,20 @@ mod tests {
     }
 
     #[test]
-    fn blockquote_dim_prefix_and_body() {
+    fn blockquote_bar_prefix_and_italic_body() {
         let lines = parse("> quoted **strong**", &styles());
         match &lines[0] {
             MdLine::Flow(spans) => {
-                assert_eq!(spans[0].content, "> ");
+                assert_eq!(spans[0].content, "│ ");
                 assert_eq!(spans[0].style, styles().dim);
-                // Body carries the dim base with BOLD composed on top.
+                // Body carries the dim base with ITALIC composed on top
+                // (BOLD from the marker joins the ITALIC base).
                 assert!(spans.iter().any(|s| s.content == "strong"
-                    && s.style == styles().dim.add_modifier(Modifier::BOLD)));
+                    && s.style
+                        == styles()
+                            .dim
+                            .add_modifier(Modifier::ITALIC)
+                            .add_modifier(Modifier::BOLD)));
             }
             other => panic!("{other:?}"),
         }
@@ -947,15 +1018,36 @@ mod tests {
     }
 
     #[test]
-    fn links_render_text_and_drop_url() {
+    fn links_render_text_in_link_color_and_drop_url() {
         let spans = parse_inline("see [docs](https://x.y/z) here", Style::new(), &styles());
         let text: String = spans.iter().map(|s| s.content.clone()).collect();
         assert_eq!(text, "see docs here");
         assert!(!text.contains("https"));
+        // restyle-1: link text carries the link color.
+        let docs = spans
+            .iter()
+            .find(|s| s.content == "docs")
+            .expect("link span");
+        assert_eq!(docs.style, styles().link);
         // Malformed links stay literal.
         let spans = parse_inline("[unclosed(]", Style::new(), &styles());
         let text: String = spans.iter().map(|s| s.content.clone()).collect();
         assert_eq!(text, "[unclosed(]");
+    }
+
+    /// Link color composes with contextual modifiers: a link inside a
+    /// bold context stays BOLD in the link color.
+    #[test]
+    fn link_color_composes_with_bold_context() {
+        let base = Style::new().add_modifier(Modifier::BOLD);
+        let spans = parse_inline("**[b](u)**", Style::new(), &styles());
+        let b = spans.iter().find(|s| s.content == "b").expect("link span");
+        let expected = {
+            let mut s = base;
+            s.fg = styles().link.fg;
+            s
+        };
+        assert_eq!(b.style, expected);
     }
 
     #[test]
@@ -1225,35 +1317,51 @@ mod tests {
     fn hang_width_detects_list_and_quote_prefixes() {
         let bullet = parse("- item", &styles());
         assert_eq!(
-            hang_width(match &bullet[0] {
-                MdLine::Flow(spans) => spans,
-                other => panic!("{other:?}"),
-            }),
+            hang_width(
+                match &bullet[0] {
+                    MdLine::Flow(spans) => spans,
+                    other => panic!("{other:?}"),
+                },
+                "│",
+                "•"
+            ),
             2
         );
         let ordered = parse("12. item", &styles());
         assert_eq!(
-            hang_width(match &ordered[0] {
-                MdLine::Flow(spans) => spans,
-                other => panic!("{other:?}"),
-            }),
+            hang_width(
+                match &ordered[0] {
+                    MdLine::Flow(spans) => spans,
+                    other => panic!("{other:?}"),
+                },
+                "│",
+                "•"
+            ),
             4
         );
         let quote = parse("> quoted", &styles());
         assert_eq!(
-            hang_width(match &quote[0] {
-                MdLine::Flow(spans) => spans,
-                other => panic!("{other:?}"),
-            }),
+            hang_width(
+                match &quote[0] {
+                    MdLine::Flow(spans) => spans,
+                    other => panic!("{other:?}"),
+                },
+                "│",
+                "•"
+            ),
             2
         );
         // Plain paragraphs: no hanging indent.
         let plain_line = parse("plain text", &styles());
         assert_eq!(
-            hang_width(match &plain_line[0] {
-                MdLine::Flow(spans) => spans,
-                other => panic!("{other:?}"),
-            }),
+            hang_width(
+                match &plain_line[0] {
+                    MdLine::Flow(spans) => spans,
+                    other => panic!("{other:?}"),
+                },
+                "│",
+                "•"
+            ),
             0
         );
     }

@@ -117,17 +117,50 @@ pub enum Action {
     ScrollPageDown,
     ScrollTop,
     ScrollBottom,
-    /// Mouse wheel notch up. ALWAYS targets the transcript regardless of
-    /// focus — the wheel is positional, unlike keyboard arrows which keep
-    /// their focus-routed history/scroll duality.
-    WheelScrollUp,
-    /// Mouse wheel notch down. See [`Action::WheelScrollUp`].
-    WheelScrollDown,
+    /// Mouse wheel notch up at terminal `(column, row)`. ALWAYS targets
+    /// the transcript regardless of focus — the wheel is positional,
+    /// unlike keyboard arrows which keep their focus-routed
+    /// history/scroll duality. slash-3: the App swallows the notch
+    /// when it lands inside the completion overlay rect (the list is
+    /// not scrollable-by-wheel and must not scroll the covered
+    /// transcript beneath).
+    WheelScrollUp(u16, u16),
+    /// Mouse wheel notch down at `(column, row)`. See
+    /// [`Action::WheelScrollUp`].
+    WheelScrollDown(u16, u16),
     /// Left-button mouse click at terminal `(column, row)`. Positional
     /// like the wheel: the App routes it straight to the transcript —
-    /// a hit on the pinned `↓ 新内容 +N` hint jumps back to the bottom
-    /// (re-follow) — never through focus routing.
+    /// a hit on the pinned `+N ↓ 回到底部` hint jumps back to the bottom
+    /// (re-follow), a hit on a reasoning block or tool row toggles its
+    /// expansion — never through focus routing. Since select-1 this is
+    /// the DERIVED click: the App fires it from a
+    /// press ([`Action::MouseDown`]) + release ([`Action::MouseUp`])
+    /// pair that never dragged, so every click behavior survives
+    /// drag-to-select unchanged.
     Click(u16, u16),
+    /// Left-button mouse press at terminal `(column, row)` — the
+    /// select-1 drag-to-select anchor. The App records the anchor in
+    /// the transcript and SUPPRESSES the legacy [`Action::Click`]
+    /// until the release proves the press never dragged.
+    MouseDown(u16, u16),
+    /// Left-button drag (motion while pressed) at terminal
+    /// `(column, row)`. Updates the selection cursor; the first
+    /// ≥1-cell displacement promotes the press into a live
+    /// selection (click suppression locks in for the gesture).
+    MouseDrag(u16, u16),
+    /// Left-button release at terminal `(column, row)`. No drag →
+    /// the legacy [`Action::Click`] fires; a completed selection →
+    /// the App extracts the covered text and copies it through the
+    /// existing chain (auto-copy on release).
+    MouseUp(u16, u16),
+    /// Plain mouse motion (no button) at terminal `(column, row)` —
+    /// interactive-1 hover tracking. `EnableMouseCapture` carries
+    /// `?1003h` (any-event tracking), so crossterm delivers
+    /// `MouseEventKind::Moved` for every cell crossing; the App
+    /// hit-tests the last-rendered button rectangles and repaints the
+    /// hovered segment (a miss clears). Coalesced batch-wise — only
+    /// the final resting position of a run matters.
+    MouseMove(u16, u16),
 
     // ── Engine turn lifecycle ────────────────────────────────────────────
     /// Start a turn with the given prompt (also used by the input component
@@ -182,10 +215,14 @@ impl PartialEq for Action {
             | (ScrollPageDown, ScrollPageDown)
             | (ScrollTop, ScrollTop)
             | (ScrollBottom, ScrollBottom)
-            | (WheelScrollUp, WheelScrollUp)
-            | (WheelScrollDown, WheelScrollDown)
             | (CancelTurn, CancelTurn) => true,
+            (WheelScrollUp(ac, ar), WheelScrollUp(bc, br))
+            | (WheelScrollDown(ac, ar), WheelScrollDown(bc, br)) => ac == bc && ar == br,
             (Click(ac, ar), Click(bc, br)) => ac == bc && ar == br,
+            (MouseDown(ac, ar), MouseDown(bc, br)) => ac == bc && ar == br,
+            (MouseDrag(ac, ar), MouseDrag(bc, br)) => ac == bc && ar == br,
+            (MouseUp(ac, ar), MouseUp(bc, br)) => ac == bc && ar == br,
+            (MouseMove(ac, ar), MouseMove(bc, br)) => ac == bc && ar == br,
             (InputChar(a), InputChar(b)) => a == b,
             (PasteText(a), PasteText(b)) => a == b,
             (StartTurn(a), StartTurn(b)) => a == b,
@@ -202,19 +239,37 @@ impl PartialEq for Action {
 /// [`Event::as_key_press_event`] so key-repeat/release kinds (kitty
 /// protocol) are ignored, and bracketed paste arrives as `Event::Paste`.
 /// Wheel events map to [`Action::WheelScrollUp`]/[`Action::WheelScrollDown`];
-/// a left-button press maps to [`Action::Click`] (carrying the terminal
-/// column/row). Other mouse kinds (other buttons, drags, motion), focus
-/// changes and unrecognized keys return `None`.
+/// the left button's press/drag/release map to
+/// [`Action::MouseDown`]/[`Action::MouseDrag`]/[`Action::MouseUp`]
+/// (carrying the terminal column/row — the select-1 drag-to-select
+/// gesture; the App decides at release whether the press was a click
+/// or a selection) and plain motion maps to
+/// [`Action::MouseMove`] (interactive-1 hover). Other mouse kinds
+/// (other buttons), focus changes and unrecognized keys return
+/// `None`.
 pub fn map_event(event: &Event) -> Option<Action> {
     match event {
         Event::Paste(text) => Some(Action::PasteText(text.clone())),
         Event::Resize(_, _) => Some(Action::Redraw),
         Event::Key(_) => map_key(&event.as_key_press_event()?),
         Event::Mouse(mouse) => match mouse.kind {
-            crossterm::event::MouseEventKind::ScrollUp => Some(Action::WheelScrollUp),
-            crossterm::event::MouseEventKind::ScrollDown => Some(Action::WheelScrollDown),
+            crossterm::event::MouseEventKind::ScrollUp => {
+                Some(Action::WheelScrollUp(mouse.column, mouse.row))
+            }
+            crossterm::event::MouseEventKind::ScrollDown => {
+                Some(Action::WheelScrollDown(mouse.column, mouse.row))
+            }
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                Some(Action::Click(mouse.column, mouse.row))
+                Some(Action::MouseDown(mouse.column, mouse.row))
+            }
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                Some(Action::MouseDrag(mouse.column, mouse.row))
+            }
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                Some(Action::MouseUp(mouse.column, mouse.row))
+            }
+            crossterm::event::MouseEventKind::Moved => {
+                Some(Action::MouseMove(mouse.column, mouse.row))
             }
             _ => None,
         },
@@ -394,28 +449,32 @@ mod tests {
         };
         assert_eq!(
             map_event(&mk(MouseEventKind::ScrollUp)),
-            Some(Action::WheelScrollUp)
+            Some(Action::WheelScrollUp(1, 1))
         );
         assert_eq!(
             map_event(&mk(MouseEventKind::ScrollDown)),
-            Some(Action::WheelScrollDown)
+            Some(Action::WheelScrollDown(1, 1))
         );
-        // Non-left clicks/drags/motion stay unmapped; so do focus
-        // changes. (Left clicks map to Click — see the test below.)
+        // Other buttons stay unmapped; so do focus changes. (The LEFT
+        // button's press/drag/release map — see the test below — and
+        // plain motion maps to the interactive-1 hover action.)
         assert_eq!(
             map_event(&mk(MouseEventKind::Down(MouseButton::Right))),
             None
         );
         assert_eq!(
-            map_event(&mk(MouseEventKind::Drag(MouseButton::Left))),
+            map_event(&mk(MouseEventKind::Drag(MouseButton::Right))),
             None
         );
-        assert_eq!(map_event(&mk(MouseEventKind::Moved)), None);
+        assert_eq!(
+            map_event(&mk(MouseEventKind::Moved)),
+            Some(Action::MouseMove(1, 1))
+        );
         assert_eq!(map_event(&Event::FocusGained), None);
     }
 
     #[test]
-    fn left_click_maps_to_click_with_coordinates() {
+    fn left_mouse_maps_down_drag_up_with_coordinates() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mk = |kind: MouseEventKind, column: u16, row: u16| {
             Event::Mouse(MouseEvent {
@@ -425,18 +484,33 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
         };
-        // Left press carries the terminal column/row through verbatim.
+        // The select-1 gesture carries the terminal column/row
+        // through verbatim on all three phases.
         assert_eq!(
             map_event(&mk(MouseEventKind::Down(MouseButton::Left), 7, 3)),
-            Some(Action::Click(7, 3))
+            Some(Action::MouseDown(7, 3))
         );
         assert_eq!(
             map_event(&mk(MouseEventKind::Down(MouseButton::Left), 0, 0)),
-            Some(Action::Click(0, 0))
+            Some(Action::MouseDown(0, 0))
         );
-        // Button releases and every other button stay unmapped.
+        assert_eq!(
+            map_event(&mk(MouseEventKind::Drag(MouseButton::Left), 9, 4)),
+            Some(Action::MouseDrag(9, 4))
+        );
         assert_eq!(
             map_event(&mk(MouseEventKind::Up(MouseButton::Left), 7, 3)),
+            Some(Action::MouseUp(7, 3))
+        );
+        // Plain motion carries its coordinates too (interactive-1
+        // hover hit-testing).
+        assert_eq!(
+            map_event(&mk(MouseEventKind::Moved, 11, 5)),
+            Some(Action::MouseMove(11, 5))
+        );
+        // Every other button stays unmapped on every phase.
+        assert_eq!(
+            map_event(&mk(MouseEventKind::Up(MouseButton::Right), 7, 3)),
             None
         );
         assert_eq!(

@@ -13,8 +13,11 @@
 pub mod action;
 pub mod app;
 pub mod clipboard;
+pub mod complete;
 pub mod components;
 pub mod event;
+pub mod icons;
 pub mod md;
+pub mod panel;
 pub mod slash;
 pub mod theme;

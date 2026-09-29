@@ -1,24 +1,40 @@
-//! Status bar — run-state machine + spinner + model/tokens/cost/elapsed
-//! + key hints (P2b-complete).
+//! Status line — run-state machine + spinner + segment row
+//! (restyle-1: minimax-code chrome).
 //!
 //! The state machine lives here as a pure function ([`transition`]) over
 //! [`crate::event::TuiEvent`]s; the App applies it to its `run_state` (the
 //! single source of truth, snapshotted into
 //! [`RunInfo`](crate::components::RunInfo)) and renders through this
-//! component. Visuals per the design brief — state icons are Nerd Font
-//! PUA glyphs (nf-* set, width always exactly 1 column, no emoji
-//! presentation variants that would punch holes in the REVERSED bar):
+//! component.
 //!
-//! | state     | left segment      | animation                        |
-//! |-----------|-------------------|----------------------------------|
-//! | idle      | ` idle`           | static                           |
-//! | thinking  | `◐ thinking`      | braille frames, 1 frame / tick   |
-//! | tool      | ` name...`          | braille frames + tool name       |
-//! | delegated | ` agent`          | active child agent name          |
-//! | approval  | ` approve?`       | 2-frame yellow blink             |
-//! | error     | ` {摘要≤36字}`   | static red                       |
-
-use std::time::Duration;
+//! Visuals (restyle-1 spec): the REVERSED bar is retired — the line
+//! renders PLAIN text spans on the terminal background. Groups join
+//! with a dim ` │ `, sub-parts with a dim ` · `:
+//!
+//! ```text
+//! {state} │ {cwd} │ ✦ {model} │ ◐ {n} agents │ ▕████░░▏ N% left
+//! ```
+//!
+//! | state     | segment                          |
+//! |-----------|----------------------------------|
+//! | idle      | (hidden — no state segment)      |
+//! | thinking  | `{spinner} thinking` (orbit)     |
+//! | tool      | `{spinner} {name}…` (orbit)      |
+//! | delegated | `◐ {agent}` (accent)             |
+//! | approval  | `◉ approve?` (warning, blinking) |
+//! | compacting| `◌ compacting…` (orbit)          |
+//! | error     | `× {摘要≤36字}` (error)           |
+//!
+//! The spinner frames come from the theme's icon tier
+//! (`IconSet::spinner`: the braille 10-frame table on unicode/nerd,
+//! `|/-\` on ascii) in the orbit color (#1CCDD2). Every built-in tier
+//! renders the spinner for Thinking (icons-5 retired the built-in
+//! static glyph); the [`IconSet::thinking`] Option slot remains for
+//! `[tui.icons] overrides` to configure a static glyph (rendered
+//! verbatim, no frames). The context meter
+//! renders only when the App has a remaining-context percentage
+//! (thresholds: ≤10% error, ≤25% warning, else signal fill on a
+//! line-colored ground).
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -28,10 +44,7 @@ use ratatui::Frame;
 use super::{AppCtx, Component};
 use crate::action::Action;
 use crate::event::TuiEvent;
-
-/// Braille spinner frame sequence (10 frames ≈ 1 s at the 100 ms running
-/// tick). Frozen visual vocabulary.
-pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+use crate::theme::Theme;
 
 /// The run-state machine positions. Owned by the App, displayed here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +153,7 @@ pub(crate) fn delegate_target(args: &str) -> String {
     "call_agent".to_owned()
 }
 
-/// The one-row status bar. Render-only: state comes in via
+/// The one-row status line. Render-only: state comes in via
 /// [`AppCtx::run`].
 #[derive(Debug, Default)]
 pub struct StatusComponent;
@@ -151,61 +164,191 @@ impl StatusComponent {
     }
 }
 
-/// Format a duration as compact `1m04s` / `12s` / `800ms`.
-fn format_elapsed(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs >= 60 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else if secs >= 1 {
-        format!("{secs}s")
-    } else {
-        format!("{}ms", d.as_millis())
-    }
-}
-
-/// Compact token/cost cell: `1.2k/0` + `$0.0012` (or `-` when zero).
-fn format_usage(tokens_in: u64, tokens_out: u64, cost: f64) -> String {
-    fn tok(n: u64) -> String {
-        if n >= 1000 {
-            format!("{:.1}k", n as f64 / 1000.0)
-        } else {
-            n.to_string()
-        }
-    }
-    let cost = if cost > 0.0 {
-        format!("${cost:.4}")
-    } else {
-        "-".to_owned()
-    };
-    format!("{}/{} {}", tok(tokens_in), tok(tokens_out), cost)
-}
-
-/// Left status segment: state glyph + label (per the brief's table).
-/// Icons are Nerd Font PUA glyphs — width 1, no emoji variants.
-fn state_segment(state: &RunState, frame: usize, approval_blink_on: bool) -> String {
-    let spinner = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+/// Left state group per the restyle-1 icon table (`◌` starting, `◐`
+/// agents running, `◉` waiting, `×` error). `None` while Idle — a
+/// ready session shows no state segment.
+fn state_group(
+    state: &RunState,
+    frame: usize,
+    approval_blink_on: bool,
+    theme: &Theme,
+) -> Option<Vec<Span<'static>>> {
+    let g = theme.icons.set();
+    let spinner = g
+        .spinner
+        .chars()
+        .nth(frame % g.spinner.chars().count())
+        .unwrap_or(' ');
     match state {
-        RunState::Idle => " idle".to_owned(),
-        RunState::Thinking => format!("{spinner} thinking"),
-        RunState::ToolRunning { name } => format!("{spinner}  {name}..."),
-        RunState::Delegated { agent } => format!(" {agent}"),
-        RunState::ApprovalPending => {
-            // 2-frame blink: alternate the glyph.
-            let glyph = if approval_blink_on { "" } else { " " };
-            format!("{glyph} approve?")
+        RunState::Idle => None,
+        RunState::Thinking => {
+            // icons-5: every built-in tier ships `thinking = None`, so
+            // the spinner frames render (the ordinary path — a
+            // terminal cannot rotate a glyph and fonts carry no frame
+            // pair). The Option SLOT stays for `[tui.icons] overrides`
+            // to configure a static glyph, which renders here.
+            let glyph = g
+                .thinking
+                .map(str::to_owned)
+                .unwrap_or_else(|| spinner.to_string());
+            Some(vec![
+                Span::styled(glyph, theme.orbit),
+                Span::styled(" thinking".to_owned(), theme.muted),
+            ])
         }
-        RunState::Compacting => " compacting...".to_owned(),
+        RunState::ToolRunning { name } => Some(vec![
+            Span::styled(spinner.to_string(), theme.orbit),
+            Span::styled(format!(" {name}{}", g.ellipsis), theme.muted),
+        ]),
+        RunState::Delegated { agent } => Some(vec![
+            Span::styled(format!("{} ", g.agents_running), theme.delegate),
+            Span::styled(agent.clone(), theme.muted),
+        ]),
+        RunState::ApprovalPending => {
+            // 2-frame blink: the waiting glyph alternates.
+            let glyph = if approval_blink_on {
+                g.waiting
+            } else {
+                g.pending
+            };
+            Some(vec![
+                Span::styled(format!("{glyph} "), theme.approval),
+                Span::styled("approve?".to_owned(), theme.approval),
+            ])
+        }
+        RunState::Compacting => Some(vec![
+            Span::styled(format!("{} ", g.starting), theme.orbit),
+            Span::styled(format!("compacting{}", g.ellipsis), theme.muted),
+        ]),
         RunState::Error(msg) => {
-            // Surface the failure reason (e.g. missing api key, provider
-            // error) in the status bar itself; full detail goes to the
-            // log file. Char-boundary truncation keeps CJK safe.
+            // Surface the failure reason (e.g. missing api key,
+            // provider error); full detail goes to the log file.
+            // Char-boundary truncation keeps CJK safe.
             let mut summary: String = msg.chars().take(36).collect();
             if msg.chars().count() > 36 {
-                summary.push_str("...");
+                summary.push_str(g.ellipsis);
             }
-            format!(" {summary}")
+            Some(vec![
+                Span::styled(format!("{} ", g.cross), theme.error),
+                Span::styled(summary, theme.error),
+            ])
         }
     }
+}
+
+/// The `✦ model` group (accent).
+fn model_group(alias: &str, theme: &Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!("{} ", theme.icons.set().brand), theme.tool_running),
+        Span::styled(alias.to_owned(), theme.tool_running),
+    ]
+}
+
+/// The `◐ N agents` group — delegation live only.
+fn agents_group(depth: u32, theme: &Theme) -> Option<Vec<Span<'static>>> {
+    (depth > 0).then(|| {
+        vec![
+            Span::styled(
+                format!("{} ", theme.icons.set().agents_running),
+                theme.delegate,
+            ),
+            Span::styled(
+                format!("{depth} agent{}", if depth == 1 { "" } else { "s" }),
+                theme.delegate,
+            ),
+        ]
+    })
+}
+
+/// The context-remaining meter `▕████░░▏ N% left` (data-gated). Fill
+/// blocks color by threshold (≤10% error / ≤25% warning / else
+/// signal); the ground uses the line color.
+fn meter_group(remaining: u8, theme: &Theme) -> Vec<Span<'static>> {
+    const CELLS: usize = 8;
+    let g = theme.icons.set();
+    let tone = if remaining <= 10 {
+        theme.error
+    } else if remaining <= 25 {
+        theme.warning
+    } else {
+        theme.tool_running
+    };
+    let filled = ((remaining as usize * CELLS + 50) / 100).min(CELLS);
+    vec![
+        Span::styled(g.meter_left.to_owned(), tone),
+        Span::styled(g.meter_fill.repeat(filled), tone),
+        Span::styled(g.meter_ground.repeat(CELLS - filled), theme.line),
+        Span::styled(format!("{} {remaining}% left", g.meter_right), tone),
+    ]
+}
+
+/// The current working directory's base name (`openslate`), muted —
+/// the status line's anchor group. `None` when the cwd is unreadable.
+pub(crate) fn cwd_dir_name() -> Option<String> {
+    let dir = std::env::current_dir().ok()?;
+    let base = dir.file_name()?.to_string_lossy().to_string();
+    (!base.is_empty()).then_some(base)
+}
+
+/// The git branch of the working directory (P1, restyle-1): `⎇ branch`
+/// renders only inside a git repo. Reads `.git/HEAD` directly (no
+/// process spawn); a `ref: refs/heads/X` yields `X`, anything else
+/// (detached) yields the first line trimmed to 12 chars.
+pub(crate) fn git_branch() -> Option<String> {
+    git_branch_in(&std::env::current_dir().ok()?)
+}
+
+/// [`git_branch`] against an explicit directory (test seam).
+fn git_branch_in(dir: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(dir.join(".git").join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(short) = head.strip_prefix("ref: refs/heads/") {
+        Some(short.to_owned())
+    } else {
+        let detached: String = head.chars().take(12).collect();
+        (!detached.is_empty()).then_some(detached)
+    }
+}
+
+/// Assemble the full status line spans (groups joined by dim ` │ `).
+/// Crate-visible for unit tests.
+pub(crate) fn status_spans(ctx: &AppCtx) -> Vec<Span<'static>> {
+    let theme = &ctx.theme;
+    let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+    if let Some(state) = state_group(
+        &ctx.run.state,
+        ctx.run.spinner_frame,
+        ctx.run.spinner_frame.is_multiple_of(2),
+        theme,
+    ) {
+        groups.push(state);
+    }
+    if let Some(cwd) = cwd_dir_name() {
+        groups.push(vec![Span::styled(cwd, theme.muted)]);
+    }
+    // P1: git branch `⎇ name` — repo-gated (accent glyph, muted name).
+    if let Some(branch) = git_branch() {
+        groups.push(vec![
+            Span::styled(format!("{} ", theme.icons.set().branch), theme.tool_running),
+            Span::styled(branch, theme.muted),
+        ]);
+    }
+    groups.push(model_group(&ctx.config.model_alias, theme));
+    if let Some(agents) = agents_group(ctx.run.depth_cur, theme) {
+        groups.push(agents);
+    }
+    if let Some(remaining) = ctx.run.context_remaining {
+        groups.push(meter_group(remaining, theme));
+    }
+    let g = theme.icons.set();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, group) in groups.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(format!(" {} ", g.vertical), theme.line));
+        }
+        spans.extend(group);
+    }
+    spans
 }
 
 impl Component for StatusComponent {
@@ -215,61 +358,8 @@ impl Component for StatusComponent {
     }
 
     fn render(&self, f: &mut Frame, area: Rect, ctx: &AppCtx) {
-        let left = state_segment(
-            &ctx.run.state,
-            ctx.run.spinner_frame,
-            ctx.run.spinner_frame.is_multiple_of(2),
-        );
-        // The state segment is tinted (error red / approval yellow) on top
-        // of the bar's REVERSED treatment; everything else stays neutral
-        // reversed so no background color is ever hard-coded.
-        let left_style = match &ctx.run.state {
-            RunState::Error(_) => ctx.theme.error.patch(ctx.theme.status_bar),
-            RunState::ApprovalPending => ctx.theme.approval.patch(ctx.theme.status_bar),
-            _ => ctx.theme.status_bar,
-        };
-
-        let usage = format_usage(ctx.run.tokens_in, ctx.run.tokens_out, ctx.run.cost_usd);
-        // Elapsed chip: Nerd clock (U+23F1 ⏱ has an emoji variant that
-        // renders 2-wide on some terminals — PUA glyphs never do).
-        let elapsed = ctx
-            .run
-            .elapsed
-            .map(|d| format!("  {}", format_elapsed(d)))
-            .unwrap_or_default();
-
-        // One reversed line: `state │ model@provider │ usage elapsed │
-        // notice (transient, yellow) or key hints`.
-        let right_segment = if let Some(notice) = &ctx.notice {
-            Span::styled(
-                format!("│ {notice} "),
-                ctx.theme.tool_running.patch(ctx.theme.status_bar),
-            )
-        } else {
-            // ASCII-only hint text: CJK glyphs in this REVERSED row leave
-            // tail cells the frame diff can never repaint (stale black
-            // half-cells on some terminal/tmux redraw paths).
-            Span::styled(
-                "│ ↑↓ history │ ? help │ Ctrl+C cancel",
-                ctx.theme.status_bar,
-            )
-        };
-        let line = Line::from(vec![
-            Span::styled(format!(" {left} "), left_style),
-            Span::styled(format!(" {} ", ctx.run.model_label), ctx.theme.status_bar),
-            Span::styled(format!(" {usage}{elapsed} "), ctx.theme.status_bar),
-            right_segment,
-        ]);
-        let paragraph = Paragraph::new(line).style(ctx.theme.status_bar);
-        f.render_widget(paragraph, area);
-        // Post-pass: re-apply the bar treatment to EVERY cell of the row.
-        // Wide glyphs (CJK hints/notices/error text) make ratatui reset
-        // the style of the cell following them (skip cells), and the
-        // frame diff then repaints those as default-background spaces —
-        // the "black gaps in the status bar" bug. Patching after the
-        // render keeps the fg tints (red/yellow) and restores REVERSED
-        // on the skip cells, so the bar is one continuous color strip.
-        f.buffer_mut().set_style(area, ctx.theme.status_bar);
+        let line = Line::from(status_spans(ctx));
+        f.render_widget(Paragraph::new(line), area);
     }
 }
 
@@ -278,78 +368,242 @@ mod tests {
     use super::*;
     use openslate_core::run_manager::RunManager;
     use openslate_core::types::RunStatus;
+    use ratatui::style::{Modifier, Style};
 
-    #[test]
-    fn status_row_keeps_reversed_across_cjk_skip_cells() {
-        use ratatui::{backend::TestBackend, Terminal};
+    use crate::components::{ConfigSummary, Focus, RunInfo};
+    use crate::theme::Theme;
 
-        use crate::components::{AppCtx, ConfigSummary, Focus, RunInfo};
-        use crate::theme::Theme;
-
-        let ctx = AppCtx {
+    fn ctx(state: RunState, depth: u32, remaining: Option<u8>) -> AppCtx {
+        AppCtx {
             theme: Theme::new(),
             focus: Focus::Input,
             run: RunInfo {
-                state: RunState::Idle,
+                state,
                 spinner_frame: 0,
-                model_label: "main@intern_genai".into(),
-                tokens_in: 1200,
-                tokens_out: 78,
-                cost_usd: 0.0001,
+                model_label: "main@mock".into(),
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: 0.0,
                 elapsed: None,
                 tool_calls_cur: 0,
-                depth_cur: 0,
+                depth_cur: depth,
+                context_remaining: remaining,
             },
             config: ConfigSummary {
                 model_alias: "main".into(),
-                model_id: "intern-latest".into(),
-                provider_name: "intern_genai".into(),
+                model_id: "mock-model".into(),
+                provider_name: "mock".into(),
                 max_depth: 4,
                 max_tool_calls: 20,
                 run_id: None,
+                model_aliases: Vec::new(),
             },
             size: (60, 1),
             notice: None,
-        };
-        let component = StatusComponent::new();
-        let backend = TestBackend::new(60, 1);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| component.render(f, f.area(), &ctx))
-            .expect("draw");
-        // Every PAINTED cell of the row must keep the REVERSED
-        // treatment. The trailing halves of wide glyphs (the CJK hints
-        // 历史/帮助/取消) are excluded from the frame diff BY DESIGN —
-        // the diff never copies them into the backend buffer, so they
-        // stay default cells there, and the terminal draws those
-        // columns as part of the wide glyph, with ITS attributes. The
-        // black-gaps bug was paintable cells (spaces next to CJK,
-        // notice text) losing the modifier when content shifted each
-        // frame; identify the excluded cells geometrically (directly
-        // after a painted wide glyph) since the skip flag lives in the
-        // front buffer, not this one.
-        let buf = terminal.backend().buffer();
-        let mut x = 0u16;
-        while x < 60 {
-            let cell = buf.cell((x, 0)).expect("cell");
-            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
-                x += 1;
-                continue;
-            }
-            let prev_is_painted_wide = x > 0
-                && buf
-                    .cell((x - 1, 0))
-                    .map(|p| {
-                        ratatui::text::Span::raw(p.symbol()).width() > 1
-                            && p.modifier.contains(ratatui::style::Modifier::REVERSED)
-                    })
-                    .unwrap_or(false);
-            assert!(
-                prev_is_painted_wide,
-                "cell {x} lost the bar treatment (not a wide-glyph tail)"
-            );
-            x += 1;
         }
+    }
+
+    fn text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.clone()).collect()
+    }
+
+    /// The plain status line: segments joined by dim ` │ `, the model
+    /// group `✦ main` in accent — and NO REVERSED anywhere.
+    #[test]
+    fn status_line_renders_plain_segments() {
+        let theme = Theme::new();
+        let c = ctx(RunState::Idle, 0, None);
+        let spans = status_spans(&c);
+        let joined = text(&spans);
+        // Expected assembly mirrors the group order: [cwd] [⎇ branch]
+        // ✦ main — the environment-derived segments use the same
+        // helpers the renderer does.
+        let mut expected = String::new();
+        if let Some(cwd) = cwd_dir_name() {
+            expected.push_str(&cwd);
+            expected.push_str(" │ ");
+        }
+        if let Some(branch) = git_branch() {
+            expected.push_str(&format!("⎇ {branch} │ "));
+        }
+        expected.push_str("✦ main");
+        assert_eq!(joined, expected);
+        // Separator in the line color; the model glyph/alias accent.
+        assert!(spans
+            .iter()
+            .any(|s| s.content == " │ " && s.style == theme.line));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "✦ " && s.style == theme.tool_running));
+        assert!(spans
+            .iter()
+            .all(|s| !s.style.add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    /// Running state leads with the orbit spinner; the label is muted.
+    #[test]
+    fn thinking_leads_with_orbit_spinner() {
+        let theme = Theme::new();
+        let spans = status_spans(&ctx(RunState::Thinking, 0, None));
+        assert_eq!(spans[0].content, "⠋");
+        assert_eq!(spans[0].style, theme.orbit);
+        assert_eq!(spans[1].content, " thinking");
+        assert_eq!(spans[1].style, theme.muted);
+    }
+
+    /// Nerd tier (icons-5): Thinking renders the spinner frames like
+    /// every built-in tier (the static glyph was retired); ToolRunning
+    /// keeps the inherited braille spinner; a `[tui.icons] overrides`
+    /// static glyph (via a Custom tier) still renders verbatim.
+    #[test]
+    fn nerd_thinking_uses_spinner_unless_overridden() {
+        let theme = crate::theme::Theme::from_palette(
+            crate::theme::ThemeMode::Dark.palette(),
+            crate::icons::Icons::Nerd,
+        );
+        let orbit = theme.orbit;
+        let mut c = ctx(RunState::Thinking, 0, None);
+        c.theme = theme;
+        let spans = status_spans(&c);
+        assert_eq!(
+            spans[0].content, "⠋",
+            "default = spinner frame, no static glyph"
+        );
+        assert_eq!(spans[0].style, orbit);
+        assert_eq!(spans[1].content, " thinking");
+        // ToolRunning stays on the braille frame table (nerd inherits
+        // it from unicode).
+        c.run.state = RunState::ToolRunning {
+            name: "read_file".into(),
+        };
+        let spans = status_spans(&c);
+        assert_eq!(spans[0].content, "⠋", "tool running keeps the spinner");
+        assert_eq!(spans[1].content, " read_file…");
+        // The override path: a Custom tier with `thinking` patched
+        // renders the static glyph instead of the frames.
+        let mut base = crate::icons::Icons::Nerd.set();
+        assert!(base.patch_field("thinking", "\u{F0EB}"));
+        let custom = crate::theme::Theme::from_palette(
+            crate::theme::ThemeMode::Dark.palette(),
+            crate::icons::Icons::Custom(Box::leak(Box::new(base))),
+        );
+        c.run.state = RunState::Thinking;
+        c.theme = custom;
+        let bulb = char::from_u32(0xF0EB).expect("valid PUA").to_string();
+        let spans = status_spans(&c);
+        assert_eq!(spans[0].content, bulb, "overridden static glyph renders");
+        assert_eq!(spans[1].content, " thinking");
+    }
+
+    /// Idle hides the state segment; the other states map to the
+    /// restyle icon table.
+    #[test]
+    fn state_icons_follow_the_restyle_table() {
+        // Delegated → `◐ agent`.
+        let spans = status_spans(&ctx(
+            RunState::Delegated {
+                agent: "researcher".into(),
+            },
+            1,
+            None,
+        ));
+        assert_eq!(&text(&spans[..2]), "◐ researcher");
+        // ApprovalPending → `◉ approve?` blinking (frame 0 = on).
+        let spans = status_spans(&ctx(RunState::ApprovalPending, 0, None));
+        assert_eq!(&text(&spans[..2]), "◉ approve?");
+        // Compacting → `◌ compacting…`.
+        let spans = status_spans(&ctx(RunState::Compacting, 0, None));
+        assert_eq!(&text(&spans[..2]), "◌ compacting…");
+        // Error → `× {summary}` in error color.
+        let spans = status_spans(&ctx(RunState::Error("boom".into()), 0, None));
+        assert_eq!(&text(&spans[..2]), "× boom");
+        assert_eq!(spans[1].style, theme_error());
+    }
+
+    fn theme_error() -> Style {
+        Theme::new().error
+    }
+
+    /// The error summary clamps to ≤36 chars with an ellipsis
+    /// (char-boundary safe for CJK).
+    #[test]
+    fn error_summary_clamps_to_36_chars() {
+        let long = "错".repeat(50);
+        let spans = status_spans(&ctx(RunState::Error(long), 0, None));
+        let summary = spans
+            .iter()
+            .find(|s| s.content.starts_with('错'))
+            .expect("summary span");
+        assert!(summary.content.chars().count() <= 37, "{}", summary.content);
+        assert!(summary.content.ends_with('…'));
+    }
+
+    /// `◐ N agents` renders only while delegation is live (accent).
+    #[test]
+    fn agents_segment_is_delegation_gated() {
+        let theme = Theme::new();
+        let spans = status_spans(&ctx(RunState::Idle, 0, None));
+        assert!(!text(&spans).contains("agent"), "hidden at depth 0");
+        let spans = status_spans(&ctx(RunState::Idle, 2, None));
+        assert!(text(&spans).contains("◐ 2 agents"));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "◐ " && s.style == theme.delegate));
+    }
+
+    /// The context meter: `▕██░░▏ N% left` with threshold coloring
+    /// (signal fill above 25%, warning ≤25%, error ≤10%; ground = line).
+    #[test]
+    fn context_meter_thresholds_and_glyphs() {
+        let theme = Theme::new();
+        let spans = status_spans(&ctx(RunState::Idle, 0, Some(80)));
+        let meter: String = spans
+            .iter()
+            .skip_while(|s| s.content != "▕")
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(meter.starts_with("▕█"), "{meter}");
+        assert!(meter.contains("░"), "{meter}");
+        assert!(meter.ends_with("▏ 80% left"), "{meter}");
+        let fill = spans.iter().find(|s| s.content.starts_with('█')).unwrap();
+        assert_eq!(fill.style, theme.tool_running);
+
+        let warning_spans = status_spans(&ctx(RunState::Idle, 0, Some(20)));
+        assert!(text(&warning_spans).contains("▏ 20% left"));
+        let fill = warning_spans
+            .iter()
+            .find(|s| s.content.starts_with('█'))
+            .unwrap();
+        assert_eq!(fill.style, theme.warning);
+
+        let error_spans = status_spans(&ctx(RunState::Idle, 0, Some(8)));
+        assert!(text(&error_spans).contains("▏ 8% left"));
+        let fill = error_spans
+            .iter()
+            .find(|s| s.content.starts_with('█'))
+            .unwrap();
+        assert_eq!(fill.style, theme.error);
+
+        // No data → no meter.
+        assert!(!text(&status_spans(&ctx(RunState::Idle, 0, None))).contains("% left"));
+    }
+
+    /// The git branch helper (P1): a repo dir parses `ref: refs/heads/X`
+    /// into `X`; a detached HEAD degrades to the short hash; outside a
+    /// repo nothing renders.
+    #[test]
+    fn git_branch_reads_head_or_hides() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No .git → None.
+        assert_eq!(git_branch_in(tmp.path()), None);
+        // Branch ref → the branch name.
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feat/restyle\n").unwrap();
+        assert_eq!(git_branch_in(tmp.path()), Some("feat/restyle".to_owned()));
+        // Detached HEAD → short hash.
+        std::fs::write(git_dir.join("HEAD"), "0123456789abcdef0123\n").unwrap();
+        assert_eq!(git_branch_in(tmp.path()), Some("0123456789ab".to_owned()));
     }
 
     fn dummy_summary(status: RunStatus) -> crate::event::TurnSummary {
@@ -507,9 +761,13 @@ mod tests {
 
     #[test]
     fn spinner_frames_sequence_is_frozen() {
-        assert_eq!(SPINNER_FRAMES.len(), 10);
-        assert_eq!(SPINNER_FRAMES[0], '⠋');
-        assert_eq!(SPINNER_FRAMES[9], '⠏');
+        // theme-1: the frames live in the icon tier now — pull them
+        // from the theme like `App::on_tick` does (the default unicode
+        // tier keeps the frozen braille 10-frame table).
+        let frames: Vec<char> = Theme::new().icons.set().spinner.chars().collect();
+        assert_eq!(frames.len(), 10);
+        assert_eq!(frames[0], '⠋');
+        assert_eq!(frames[9], '⠏');
     }
 
     #[test]
@@ -519,17 +777,9 @@ mod tests {
         let state = RunState::Compacting;
         assert!(state.is_animated());
         assert!(!state.is_running());
-        // The segment text is the review-mandated label.
-        assert_eq!(state_segment(&state, 0, true), " compacting...");
-    }
-
-    #[test]
-    fn usage_and_elapsed_formatting() {
-        assert_eq!(format_usage(1200, 0, 0.0012), "1.2k/0 $0.0012");
-        assert_eq!(format_usage(12, 3, 0.0), "12/3 -");
-        assert_eq!(format_elapsed(Duration::from_millis(800)), "800ms");
-        assert_eq!(format_elapsed(Duration::from_secs(12)), "12s");
-        assert_eq!(format_elapsed(Duration::from_secs(64)), "1m04s");
+        // The segment text carries the review-mandated label.
+        let spans = state_group(&state, 0, true, &Theme::new()).expect("compacting segment");
+        assert_eq!(text(&spans), "◌ compacting…");
     }
 
     // A minimal real RunManager (config parse + empty tree) as the opaque

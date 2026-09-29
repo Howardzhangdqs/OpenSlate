@@ -1,35 +1,32 @@
-//! Approval banner — pending tool-approval UI (P3 lane-c: full banner).
+//! Approval banner — pending tool-approval UI (restyle-1: minimax
+//! decision-frame language).
 //!
 //! The App owns the modal precedence (ApprovalActive preempts everything;
 //! y/n/a are intercepted at the dispatcher). This component holds the
 //! queue of blocked requests (serial display: front of queue first) and
-//! renders the yellow banner over the bottom of the transcript area
+//! renders the warning banner over the bottom of the transcript area
 //! (placement decided in P2b `App::render`). The engine side of the
 //! handshake lives in [`crate::event::ApprovalBridge`].
 //!
-//! Visual contract (design brief + lane-c spec, borderless Wave 2):
+//! Visual contract (restyle-1 spec):
 //!
 //! ```text
-//! ┃   approve? [researcher] shell({"cmd":"rm -rf /tmp/x"…})
-//! ┃  risk high        +2 pending
-//! ┃  [y] 允许  [n] 拒绝  [a] 本轮全允   Ctrl+C 拒绝并取消
+//! │  ◆ approve? [researcher] shell({"cmd":"rm -rf /tmp/x"…})
+//! │  risk high        +2 pending
+//! │  [y] 允许  [n] 拒绝  [a] 全部允许   Ctrl+C 拒绝并取消
 //! ```
 //!
-//! * borderless: `Clear` exposes the default background; column 0 is a
-//!   full-height `┃` accent line in Yellow+BOLD (approval style); the
-//!   content lines sit one blank column in (the input area's
-//!   bar+gap language); the hand icon is a Nerd Font PUA glyph
-//!   (nf-fa-hand_paper) — width exactly 1 column, no emoji
-//!   presentation variant (U+270B ✋ rendered 2-wide on emoji-capable
-//!   terminals and misaligned the request line);
-//! * the request line is Yellow+BOLD (approval style); the source
-//!   agent is Magenta (delegation semantics — child-agent approvals
-//!   bubble up to the root layer, so the banner must show WHERE the
-//!   request came from);
-//! * the args preview is truncated to ≤60 display columns (and further
-//!   to whatever the banner width allows), CJK-boundary safe;
-//! * queued requests surface as `+N pending` (English status words per
-//!   the design brief's copy rules; the key hints stay Chinese).
+//! * column 0 is a full-height `│` tone track in plain warning; the
+//!   content lines sit one blank column in;
+//! * the blocked marker is the theme's `blocked()` glyph (`◆`
+//!   unicode / nf-oct-hand on nerd / `#` ascii) in warning; the
+//!   request line is plain warning, the source agent accent
+//!   (child-agent approvals bubble up to the root layer, so the
+//!   banner must show WHERE the request came from);
+//! * key hints are BOLD warning; the args preview is truncated to
+//!   ≤60 display columns (and further to whatever the banner width
+//!   allows), CJK-boundary safe;
+//! * queued requests surface as `+N pending`.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -37,12 +34,28 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{AppCtx, Component};
-use crate::action::Action;
+use crate::action::{Action, ApprovalChoice};
 use crate::event::ApprovalSummary;
 use crate::theme::Theme;
 
 /// Args-preview cap in the request line (spec: ≤60 display columns).
 const ARGS_MAX_COLS: usize = 60;
+
+/// interactive-1: the three hint-line BUTTONS in display order —
+/// `(choice, key, verb)`. The hit rectangles ([`button_rects`]) and
+/// the hint line itself ([`ApprovalComponent::banner_lines`]) are both
+/// derived from THIS table, so the geometry can never drift from the
+/// painted copy.
+const BUTTONS: [(ApprovalChoice, &str, &str); 3] = [
+    (ApprovalChoice::Approve, "y", "允许"),
+    (ApprovalChoice::Deny, "n", "拒绝"),
+    (ApprovalChoice::ApproveAll, "a", "全部允许"),
+];
+
+/// The gap between hint-line button segments (frozen restyle-1 copy:
+/// three spaces — two belonged to the old verb-span padding, one to
+/// the inter-button separation).
+const BUTTON_GAP: &str = "   ";
 
 /// One queued approval request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +70,10 @@ pub struct PendingApproval {
 #[derive(Debug, Default)]
 pub struct ApprovalComponent {
     queue: Vec<PendingApproval>,
+    /// interactive-1: the button currently hovered (fed by the App's
+    /// `MouseMove` hit-test right before each render; `None` paints
+    /// the plain restyle-1 styles).
+    hover: Option<ApprovalChoice>,
 }
 
 impl ApprovalComponent {
@@ -103,30 +120,51 @@ impl ApprovalComponent {
         self.queue.clear();
     }
 
+    /// interactive-1: set the hovered button for the next render
+    /// (the App's `MouseMove` hit-test feeds this; `None` = no hover).
+    pub fn set_hover(&mut self, hover: Option<ApprovalChoice>) {
+        self.hover = hover;
+    }
+
     /// The banner body (three lines, drawn one blank column right of
-    /// the accent bar).
+    /// the tone track).
     ///
-    /// `inner_width` is the banner area minus the `┃` column and the
+    /// `inner_width` is the banner area minus the `│` column and the
     /// gap column; the args preview shrinks below [`ARGS_MAX_COLS`]
     /// when the banner is narrower than the request line. Crate-local
     /// so unit tests can assert content and styles without a terminal.
-    pub(crate) fn banner_lines(&self, inner_width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    /// interactive-1: `hover` restyles that button's WHOLE segment
+    /// (bracket+key and verb span) in `theme.hover`.
+    pub(crate) fn banner_lines(
+        &self,
+        inner_width: usize,
+        theme: &Theme,
+        hover: Option<ApprovalChoice>,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::with_capacity(3);
         let Some(pending) = self.current() else {
             return lines;
         };
         let s = &pending.summary;
 
-        // Line 1 — ` approve? [agent] tool(args≤60)` (Nerd hand icon).
-        let head = format!(" approve? [{}] {}(", s.agent_id, s.tool_name);
+        // Line 1 — `{blocked} approve? [agent] tool(args≤60)` (blocked
+        // marker, plain warning; the source agent accent; tool name
+        // BOLD text) — the glyph comes from the theme's icon tier.
+        let head = format!(
+            "{} approve? [{}] {}(",
+            theme.icons.blocked(),
+            s.agent_id,
+            s.tool_name
+        );
         let budget = ARGS_MAX_COLS.min(inner_width.saturating_sub(display_cols(&head) + 1));
-        let args = truncate_cols(&s.arguments, budget);
+        let args = truncate_cols(&s.arguments, budget, theme.icons.set().ellipsis);
         lines.push(Line::from(vec![
-            Span::styled(" approve? ", theme.approval),
+            Span::styled(format!("{} ", theme.icons.blocked()), theme.warning),
+            Span::styled("approve? ".to_owned(), theme.warning),
             Span::styled(format!("[{}]", s.agent_id), theme.delegate),
             Span::raw(" "),
-            Span::styled(format!("{}(", s.tool_name), theme.approval),
-            Span::raw(format!("{args})")),
+            Span::styled(format!("{}(", s.tool_name), theme.header),
+            Span::styled(format!("{args})"), theme.assistant),
         ]));
 
         // Line 2 — risk + queue depth (`+N pending` only when queued).
@@ -134,24 +172,70 @@ impl ApprovalComponent {
         let queued = self.queue.len().saturating_sub(1);
         if queued > 0 {
             meta.push(Span::raw("   "));
-            meta.push(Span::styled(format!("+{queued} pending"), theme.approval));
+            meta.push(Span::styled(format!("+{queued} pending"), theme.warning));
         }
         lines.push(Line::from(meta));
 
-        // Line 3 — key hints (Chinese per the design brief's copy rules).
-        lines.push(Line::from(vec![
-            Span::styled("[y] ", theme.approval),
-            Span::raw("允许   "),
-            Span::styled("[n] ", theme.approval),
-            Span::raw("拒绝   "),
-            Span::styled("[a] ", theme.approval),
-            Span::raw("本轮全允"),
-            Span::styled("   Ctrl+C ", theme.muted),
-            Span::raw("拒绝并取消"),
-        ]));
+        // Line 3 — key hints (Chinese per the design brief's copy rules;
+        // BOLD warning brackets). interactive-1: each `[k] verb` pair
+        // is a BUTTON — the hovered one renders entirely in
+        // `theme.hover`; the inter-button gap stays unstyled either
+        // way (no underline bleeding into dead columns).
+        let mut hints = Vec::with_capacity(BUTTONS.len() * 3 + 2);
+        for (i, (choice, key, verb)) in BUTTONS.iter().enumerate() {
+            let hovered = hover.is_some_and(|h| h == *choice);
+            let bracket = if hovered { theme.hover } else { theme.approval };
+            let label = if hovered {
+                theme.hover
+            } else {
+                theme.assistant
+            };
+            hints.push(Span::styled(format!("[{key}] "), bracket));
+            hints.push(Span::styled((*verb).to_owned(), label));
+            if i + 1 < BUTTONS.len() {
+                hints.push(Span::raw(BUTTON_GAP));
+            }
+        }
+        hints.push(Span::styled("   Ctrl+C ".to_owned(), theme.muted));
+        hints.push(Span::styled("拒绝并取消".to_owned(), theme.assistant));
+        lines.push(Line::from(hints));
 
         lines
     }
+}
+
+/// interactive-1: the terminal rectangles of the three `[k] verb`
+/// buttons inside the banner BODY area (the same rect
+/// [`ApprovalComponent::render`]'s Paragraph paints into — column 2
+/// of the banner, rows flowing from the top, so the hint line is
+/// `body.y + 2`). Geometry is accumulated from the [`BUTTONS`] table
+/// with the same display-width math the spans use. Narrow-banner
+/// policy: a button whose FULL segment does not fit `body.width` is
+/// not registered at all — a click on a clipped label is ambiguous,
+/// so "not fully shown ⇒ not hittable" is the simple self-consistent
+/// rule (the remaining buttons still work).
+pub(crate) fn button_rects(body: Rect) -> Vec<(ApprovalChoice, Rect)> {
+    let mut out = Vec::with_capacity(BUTTONS.len());
+    let mut x = 0usize;
+    let width = body.width as usize;
+    for (choice, key, verb) in BUTTONS {
+        let bracket_w = display_cols(&format!("[{key}] "));
+        let verb_w = display_cols(verb);
+        let seg_w = bracket_w + verb_w;
+        if x + seg_w <= width {
+            out.push((
+                choice,
+                Rect {
+                    x: body.x + x as u16,
+                    y: body.y + 2,
+                    width: seg_w as u16,
+                    height: 1,
+                },
+            ));
+        }
+        x += seg_w + display_cols(BUTTON_GAP);
+    }
+    out
 }
 
 /// Display width of `s` in terminal columns (CJK-aware through ratatui's
@@ -160,9 +244,11 @@ fn display_cols(s: &str) -> usize {
     Span::from(s).width()
 }
 
-/// Truncate `s` to at most `max_cols` display columns, appending `…`
-/// when cut. Walks whole chars, so multi-byte boundaries are safe.
-fn truncate_cols(s: &str, max_cols: usize) -> String {
+/// Truncate `s` to at most `max_cols` display columns, appending the
+/// tier's `ellipsis` glyph when cut (theme-1: the ascii tier's `...`
+/// arrives through the icon set, mirroring the transcript twin).
+/// Walks whole chars, so multi-byte boundaries are safe.
+fn truncate_cols(s: &str, max_cols: usize, ellipsis: &str) -> String {
     if max_cols == 0 {
         return String::new();
     }
@@ -179,7 +265,7 @@ fn truncate_cols(s: &str, max_cols: usize) -> String {
         out.push(ch);
         used += display_cols(&ch.to_string());
     }
-    out.push('…');
+    out.push_str(ellipsis);
     out
 }
 
@@ -194,14 +280,15 @@ impl Component for ApprovalComponent {
         if !self.has_pending() || area.width < 2 || area.height == 0 {
             return;
         }
-        // Borderless banner (Wave 2 lane-c): Clear wipes whatever the
-        // transcript painted underneath; a full-height `┃` accent
-        // column in approval Yellow claims column 0; the three content
-        // lines sit one blank column in.
+        // restyle-1: Clear wipes whatever the transcript painted
+        // underneath; a full-height `│` tone track in plain
+        // warning claims column 0; the three content lines sit one
+        // blank column in.
         f.render_widget(Clear, area);
-        let bar = vec![Line::from("┃"); area.height as usize];
+        let track = ctx.theme.icons.set().vertical;
+        let bar = vec![Line::from(track.to_owned()); area.height as usize];
         f.render_widget(
-            Paragraph::new(bar).style(ctx.theme.approval),
+            Paragraph::new(bar).style(ctx.theme.warning),
             Rect {
                 x: area.x,
                 y: area.y,
@@ -216,7 +303,7 @@ impl Component for ApprovalComponent {
             height: area.height,
         };
         f.render_widget(
-            Paragraph::new(self.banner_lines(body.width as usize, &ctx.theme)),
+            Paragraph::new(self.banner_lines(body.width as usize, &ctx.theme, self.hover)),
             body,
         );
     }
@@ -265,18 +352,18 @@ mod tests {
     #[test]
     fn empty_queue_renders_nothing() {
         let approval = ApprovalComponent::new();
-        assert!(approval.banner_lines(78, &theme()).is_empty());
+        assert!(approval.banner_lines(78, &theme(), None).is_empty());
     }
 
     #[test]
     fn request_line_shows_agent_tool_and_args() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(7, summary("shell", r#"{"cmd":"ls -la"}"#));
-        let lines = approval.banner_lines(78, &theme());
+        let lines = approval.banner_lines(78, &theme(), None);
         assert_eq!(lines.len(), 3);
         let request = text(&lines[0]);
         assert!(
-            request.contains(" approve? [root] shell("),
+            request.contains("◆ approve? [root] shell("),
             "request line: {request}"
         );
         assert!(request.contains(r#""cmd":"ls -la""#));
@@ -287,7 +374,7 @@ mod tests {
     fn args_truncated_to_60_display_cols() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(1, summary("shell", &"x".repeat(200)));
-        let lines = approval.banner_lines(200, &theme()); // wide: cap is ARGS_MAX_COLS
+        let lines = approval.banner_lines(200, &theme(), None); // wide: cap is ARGS_MAX_COLS
         let request = text(&lines[0]);
         let xs = request.matches('x').count();
         assert!(xs <= ARGS_MAX_COLS, "args ≤60 cols, got {xs}");
@@ -298,7 +385,7 @@ mod tests {
     fn args_truncate_cjk_boundary_safe() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(1, summary("shell", &"世".repeat(100)));
-        let lines = approval.banner_lines(200, &theme());
+        let lines = approval.banner_lines(200, &theme(), None);
         let request = text(&lines[0]);
         assert!(request.ends_with("…)"));
         let worlds = request.matches('世').count();
@@ -310,9 +397,9 @@ mod tests {
     fn args_shrink_further_on_narrow_banner() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(1, summary("shell", &"x".repeat(200)));
-        // Head " approve? [root] shell(" = 24 cols (icon is 1 col now)
+        // Head "◆ approve? [root] shell(" = 24 cols
         // → only ~5 left.
-        let lines = approval.banner_lines(30, &theme());
+        let lines = approval.banner_lines(30, &theme(), None);
         let request = text(&lines[0]);
         assert!(
             display_cols(&request) <= 30,
@@ -325,12 +412,12 @@ mod tests {
     fn pending_suffix_counts_only_extra_requests() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(1, summary("shell", "{}"));
-        let single = text(&approval.banner_lines(78, &theme())[1]);
+        let single = text(&approval.banner_lines(78, &theme(), None)[1]);
         assert_eq!(single, "risk high");
 
         approval.enqueue(2, summary("write_file", "{}"));
         approval.enqueue(3, summary("run_code", "{}"));
-        let queued = text(&approval.banner_lines(78, &theme())[1]);
+        let queued = text(&approval.banner_lines(78, &theme(), None)[1]);
         assert!(queued.contains("+2 pending"), "meta line: {queued}");
     }
 
@@ -338,39 +425,159 @@ mod tests {
     fn hint_line_is_the_spec_copy() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(1, summary("shell", "{}"));
-        let hints = text(&approval.banner_lines(78, &theme())[2]);
+        let hints = text(&approval.banner_lines(78, &theme(), None)[2]);
         assert!(hints.contains("[y]"));
         assert!(hints.contains("允许"));
         assert!(hints.contains("[n]"));
         assert!(hints.contains("拒绝"));
         assert!(hints.contains("[a]"));
-        assert!(hints.contains("本轮全允"));
+        assert!(hints.contains("全部允许"));
+    }
+
+    /// interactive-1: the hint-line text is byte-identical to the
+    /// frozen restyle-1 copy (the span split for hover styling must
+    /// not move a single character).
+    #[test]
+    fn hint_line_text_is_byte_identical_to_restyle_copy() {
+        let mut approval = ApprovalComponent::new();
+        approval.enqueue(1, summary("shell", "{}"));
+        let hints = text(&approval.banner_lines(78, &theme(), None)[2]);
+        assert_eq!(
+            hints,
+            "[y] 允许   [n] 拒绝   [a] 全部允许   Ctrl+C 拒绝并取消"
+        );
+    }
+
+    /// interactive-1: the hit rectangles agree with the PAINTED hint
+    /// line — each rect covers exactly its `[k] ` bracket span plus
+    /// its verb span (the raw gap spans belong to no button), on the
+    /// line's row at the body origin.
+    #[test]
+    fn button_rects_match_the_painted_hint_line() {
+        let mut approval = ApprovalComponent::new();
+        approval.enqueue(1, summary("shell", "{}"));
+        let line = &approval.banner_lines(78, &theme(), None)[2];
+        let body = Rect {
+            x: 5,
+            y: 9,
+            width: 78,
+            height: 5,
+        };
+        let rects = button_rects(body);
+        assert_eq!(
+            rects.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![
+                ApprovalChoice::Approve,
+                ApprovalChoice::Deny,
+                ApprovalChoice::ApproveAll
+            ]
+        );
+        // Walk the spans the way the painter lays them out: each
+        // approval-styled bracket span starts a button segment that
+        // ends after its verb span; everything else just advances.
+        let mut col = 0usize;
+        let mut expected: Vec<Rect> = Vec::new();
+        let mut i = 0;
+        while i < line.spans.len() {
+            let span = &line.spans[i];
+            let w = display_cols(span.content.as_ref());
+            if span.style == theme().approval {
+                let verb_w = display_cols(line.spans[i + 1].content.as_ref());
+                expected.push(Rect {
+                    x: body.x + col as u16,
+                    y: body.y + 2,
+                    width: (w + verb_w) as u16,
+                    height: 1,
+                });
+                col += w + verb_w;
+                i += 2;
+            } else {
+                col += w;
+                i += 1;
+            }
+        }
+        assert_eq!(
+            rects.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+            expected,
+            "rects = bracket+verb spans, gap spans excluded"
+        );
+    }
+
+    /// interactive-1: a fully-clipped button (narrow banner) is not
+    /// hittable; earlier buttons that still fit keep their rects.
+    #[test]
+    fn narrow_banner_drops_clipped_buttons() {
+        // "[y] 允许" = 8 cols fits; "[n] 拒绝" would span 11..19 —
+        // a 12-col body cuts the n verb mid-glyph.
+        let rects = button_rects(Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 5,
+        });
+        assert_eq!(rects.len(), 1, "only the y button fully shows");
+        assert_eq!(rects[0].0, ApprovalChoice::Approve);
+        assert_eq!(rects[0].1.width, 8);
+        // Degenerate: nothing fits at all.
+        assert!(button_rects(Rect {
+            width: 4,
+            height: 5,
+            ..Rect::ZERO
+        })
+        .is_empty());
+    }
+
+    /// interactive-1: the hovered button's bracket and verb spans
+    /// render in `theme.hover`; the other buttons keep the restyle-1
+    /// styles and the gap spans stay raw.
+    #[test]
+    fn hovered_button_uses_the_hover_style() {
+        let mut approval = ApprovalComponent::new();
+        approval.enqueue(1, summary("shell", "{}"));
+        let theme = theme();
+        let lines = approval.banner_lines(78, &theme, Some(ApprovalChoice::Deny));
+        let hint = &lines[2].spans;
+        // y button untouched.
+        assert_eq!(hint[0].style, theme.approval);
+        assert_eq!(hint[1].style, theme.assistant);
+        // n button fully hovered.
+        assert_eq!(hint[3].style, theme.hover, "[n] bracket");
+        assert_eq!(hint[4].style, theme.hover, "拒绝 verb");
+        // a button untouched; the raw gap between them stays raw.
+        assert_eq!(hint[6].style, theme.approval);
+        assert_eq!(hint[7].style, theme.assistant);
+        assert!(Span::raw(BUTTON_GAP).style == hint[2].style);
     }
 
     #[test]
-    fn styles_match_the_brief() {
+    fn styles_match_restyle() {
         let mut approval = ApprovalComponent::new();
         approval.enqueue(1, summary("shell", "{}"));
-        let lines = approval.banner_lines(78, &theme());
+        let lines = approval.banner_lines(78, &theme(), None);
         let theme = theme();
-        // Request base is Yellow+BOLD; the source agent is Magenta.
-        assert_eq!(lines[0].spans[0].style, theme.approval);
-        assert_eq!(lines[0].spans[1].style, theme.delegate);
-        // Args stay default-foreground (body-text principle).
-        assert_eq!(lines[0].spans[4].style, ratatui::style::Style::new());
-        // Key brackets pop; labels stay default.
+        // Request base is plain warning; the source agent accent; the
+        // tool name BOLD text.
+        assert_eq!(lines[0].spans[0].style, theme.warning);
+        assert_eq!(lines[0].spans[1].style, theme.warning);
+        assert_eq!(lines[0].spans[2].style, theme.delegate);
+        assert_eq!(lines[0].spans[4].style, theme.header);
+        // Args carry the body text color.
+        assert_eq!(lines[0].spans[5].style, theme.assistant);
+        // Key brackets pop (BOLD warning); labels stay body text.
         assert_eq!(lines[2].spans[0].style, theme.approval);
-        assert_eq!(lines[2].spans[1].style, ratatui::style::Style::new());
+        assert_eq!(lines[2].spans[1].style, theme.assistant);
     }
 
     #[test]
     fn truncate_cols_edge_cases() {
-        assert_eq!(truncate_cols("abc", 0), "");
-        assert_eq!(truncate_cols("abc", 5), "abc");
-        assert_eq!(truncate_cols("abcde", 4), "abc…");
-        assert_eq!(truncate_cols("ab", 1), "…");
+        assert_eq!(truncate_cols("abc", 0, "…"), "");
+        assert_eq!(truncate_cols("abc", 5, "…"), "abc");
+        assert_eq!(truncate_cols("abcde", 4, "…"), "abc…");
+        assert_eq!(truncate_cols("ab", 1, "…"), "…");
         // A wide char that would overflow the reserved ellipsis column.
-        assert_eq!(truncate_cols("a世", 2), "a…");
-        assert_eq!(truncate_cols("世", 2), "世");
+        assert_eq!(truncate_cols("a世", 2, "…"), "a…");
+        assert_eq!(truncate_cols("世", 2, "…"), "世");
+        // The tier's ellipsis rides through (ascii `...`).
+        assert_eq!(truncate_cols("abcde", 4, "..."), "abc...");
     }
 }

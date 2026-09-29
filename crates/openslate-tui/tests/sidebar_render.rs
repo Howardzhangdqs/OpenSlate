@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
@@ -37,6 +37,11 @@ const W: u16 = 30;
 /// 1-column content indent.
 const CONTENT: usize = 29;
 
+/// Theme slot accessor for color assertions (theme-1).
+fn theme() -> Theme {
+    Theme::new()
+}
+
 fn test_ctx(run_id: Option<&str>) -> AppCtx {
     AppCtx {
         theme: Theme::new(),
@@ -51,6 +56,7 @@ fn test_ctx(run_id: Option<&str>) -> AppCtx {
             elapsed: Some(Duration::from_secs(83)),
             tool_calls_cur: 3,
             depth_cur: 1,
+            context_remaining: None,
         },
         config: ConfigSummary {
             model_alias: "main".into(),
@@ -59,6 +65,7 @@ fn test_ctx(run_id: Option<&str>) -> AppCtx {
             max_depth: 4,
             max_tool_calls: 20,
             run_id: run_id.map(str::to_owned),
+            model_aliases: Vec::new(),
         },
         size: (W, 12),
         notice: None,
@@ -139,9 +146,9 @@ fn agents_live_view_renders_running_child_and_unknowable_tail() {
     let backend = draw(6, &ctx, |f, area, ctx| agents.render(f, area, ctx));
     let expected = Buffer::with_lines(vec![
         title("agents", t.header_focused),
-        content(" root", t.agent_active),
-        content("  ├  researcher", t.agent_done),
-        content("  └  verifier", t.agent_running),
+        content("◆ root", t.agent_active),
+        content("  ├ ✓ researcher", t.agent_done),
+        content("  └ ◐ verifier", t.agent_running),
         content("    └ …", t.fine),
         blank(),
     ]);
@@ -182,10 +189,10 @@ fn agents_calibrated_view_renders_full_tree_with_terminal_glyphs() {
     let backend = draw(6, &ctx, |f, area, ctx| agents.render(f, area, ctx));
     let expected = Buffer::with_lines(vec![
         title("agents", t.header_focused),
-        content(" root", t.agent_active),
-        content("  ├  researcher", t.agent_done),
-        content("    └  writer", t.agent_failed),
-        content("  └ … verifier", t.agent_done),
+        content("◆ root", t.agent_active),
+        content("  ├ ✓ researcher", t.agent_done),
+        content("    └ × writer", t.agent_failed),
+        content("  └ ○ verifier", t.agent_done),
         blank(),
     ]);
     backend.assert_buffer(&expected);
@@ -224,13 +231,13 @@ fn agents_long_id_clips_at_30_columns_without_wrap() {
     agents.calibrate(&tree);
 
     let backend = draw(4, &ctx, |f, area, ctx| agents.render(f, area, ctx));
-    // 1 indent + "  └  " prefix (6 cols) + 23 visible id chars = 30:
+    // 1 indent + "  └ ✓ " prefix (6 cols) + 23 visible id chars = 30:
     // the tail clips at the panel edge instead of wrapping (the freed
     // border columns buy one more visible char than the framed panel).
     let expected = Buffer::with_lines(vec![
         title("agents", t.header_focused),
-        content(" root", t.agent_active),
-        content("  └  very-long-agent-identif", t.agent_done),
+        content("◆ root", t.agent_active),
+        content("  └ ✓ very-long-agent-identif", t.agent_done),
         blank(),
     ]);
     backend.assert_buffer(&expected);
@@ -240,21 +247,20 @@ fn agents_long_id_clips_at_30_columns_without_wrap() {
 fn agents_title_is_bold_and_cyan_only_when_sidebar_focused() {
     let agents = AgentsComponent::new();
     let mut ctx = test_ctx(None);
-    // Unfocused: BOLD on the DEFAULT foreground (light/dark neutral —
-    // cells in an untouched buffer carry `Color::Reset`, ratatui's
-    // "terminal default fg").
+    // Unfocused: BOLD on the explicit text color (#D6D6D6 — restyle-1
+    // paints the body foreground instead of relying on the default).
     ctx.focus = Focus::Input;
     let backend = draw(2, &ctx, |f, area, ctx| agents.render(f, area, ctx));
     let cell = backend.buffer().cell((0, 0)).expect("title cell");
     assert_eq!(cell.symbol(), "a");
-    assert!(matches!(cell.style().fg, None | Some(Color::Reset)));
+    assert_eq!(cell.style().fg, theme().header.fg);
     assert!(cell.style().add_modifier.contains(Modifier::BOLD));
-    // Sidebar-focused: the title switches to Cyan + BOLD.
+    // Sidebar-focused: the title switches to signal (#67E8F9) + BOLD.
     ctx.focus = Focus::Sidebar;
     let backend = draw(2, &ctx, |f, area, ctx| agents.render(f, area, ctx));
     let cell = backend.buffer().cell((0, 0)).expect("title cell");
     assert_eq!(cell.symbol(), "a");
-    assert_eq!(cell.style().fg, Some(Color::Cyan));
+    assert_eq!(cell.style().fg, theme().header_focused.fg);
     assert!(cell.style().add_modifier.contains(Modifier::BOLD));
 }
 
@@ -323,19 +329,18 @@ fn session_long_value_clips_at_30_columns() {
 fn session_title_is_bold_and_cyan_only_when_sidebar_focused() {
     let session = SessionComponent::new();
     let mut ctx = test_ctx(None);
-    // Unfocused: BOLD on the DEFAULT foreground (light/dark neutral —
-    // untouched buffer cells carry `Color::Reset`).
+    // Unfocused: BOLD on the explicit text color.
     ctx.focus = Focus::Transcript;
     let backend = draw(2, &ctx, |f, area, ctx| session.render(f, area, ctx));
     let cell = backend.buffer().cell((0, 0)).expect("title cell");
     assert_eq!(cell.symbol(), "s");
-    assert!(matches!(cell.style().fg, None | Some(Color::Reset)));
+    assert_eq!(cell.style().fg, theme().header.fg);
     assert!(cell.style().add_modifier.contains(Modifier::BOLD));
-    // Sidebar-focused: the title switches to Cyan + BOLD.
+    // Sidebar-focused: the title switches to signal (#67E8F9) + BOLD.
     ctx.focus = Focus::Sidebar;
     let backend = draw(2, &ctx, |f, area, ctx| session.render(f, area, ctx));
     let cell = backend.buffer().cell((0, 0)).expect("title cell");
     assert_eq!(cell.symbol(), "s");
-    assert_eq!(cell.style().fg, Some(Color::Cyan));
+    assert_eq!(cell.style().fg, theme().header_focused.fg);
     assert!(cell.style().add_modifier.contains(Modifier::BOLD));
 }

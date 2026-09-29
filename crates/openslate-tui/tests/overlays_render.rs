@@ -16,6 +16,11 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+/// Theme slot accessor for color assertions (theme-1).
+fn theme() -> Theme {
+    Theme::new()
+}
+
 /// Minimal AppCtx for component rendering (only the theme is consumed
 /// by these components, but the trait takes the full snapshot).
 fn test_ctx() -> AppCtx {
@@ -32,6 +37,7 @@ fn test_ctx() -> AppCtx {
             elapsed: None,
             tool_calls_cur: 0,
             depth_cur: 0,
+            context_remaining: None,
         },
         config: ConfigSummary {
             model_alias: "main".into(),
@@ -40,6 +46,7 @@ fn test_ctx() -> AppCtx {
             max_depth: 4,
             max_tool_calls: 20,
             run_id: None,
+            model_aliases: Vec::new(),
         },
         size: (80, 24),
         notice: None,
@@ -87,11 +94,11 @@ fn approval_banner_fits_80_columns() {
         approval.enqueue(1, summary(&"x".repeat(200)));
         approval.render(f, Rect::new(0, 0, 80, 5), &test_ctx());
     });
-    // Borderless (Wave 2): accent bar + request line on row 0, meta on
-    // row 1, hints on row 2.
+    // restyle-1: `│` tone track + request line on row 0, meta on
+    // row 1, hints on row 2 (blocked marker `\u{25C6}`).
     assert!(
-        rows[0].starts_with('┃'),
-        "accent bar claims column 0: {}",
+        rows[0].starts_with('│'),
+        "tone track claims column 0: {}",
         rows[0]
     );
     assert!(
@@ -109,7 +116,7 @@ fn approval_banner_fits_80_columns() {
     let xs = rows[0].matches('x').count();
     assert!(xs <= 60, "args preview ≤60 display cols, got {xs}");
     // Hints on the third content row (Chinese copy per the brief).
-    for needle in ["[y]", "允许", "[n]", "拒绝", "[a]", "本轮全允"] {
+    for needle in ["[y]", "允许", "[n]", "拒绝", "[a]", "全部允许"] {
         assert!(
             rows[2].contains(needle),
             "hints row needs {needle}: {}",
@@ -153,10 +160,10 @@ fn approval_banner_empty_queue_is_blank() {
     assert!(rows.iter().all(|r| r.trim().is_empty()));
 }
 
-/// The accent bar is a `┃` in approval Yellow+BOLD covering the FULL
-/// banner height, with one blank column before the content.
+/// The tone track is a `\u{2502}` in the plain warning slot covering
+/// the FULL banner height, with one blank column before the content.
 #[test]
-fn approval_banner_accent_bar_is_yellow_bold_full_height() {
+fn approval_banner_tone_track_is_warning_full_height() {
     let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 5)).expect("test terminal");
     terminal
         .draw(|f| {
@@ -168,15 +175,15 @@ fn approval_banner_accent_bar_is_yellow_bold_full_height() {
     let buf = terminal.backend().buffer();
     for y in 0..5u16 {
         let bar = buf.cell((0, y)).expect("bar cell");
-        assert_eq!(bar.symbol(), "┃", "bar glyph at row {y}");
+        assert_eq!(bar.symbol(), "│", "track glyph at row {y}");
         assert_eq!(
-            bar.fg,
-            ratatui::style::Color::Yellow,
-            "bar Yellow at row {y}"
+            bar.style().fg,
+            theme().warning.fg,
+            "track warning at row {y}"
         );
         assert!(
-            bar.modifier.contains(ratatui::style::Modifier::BOLD),
-            "bar BOLD at row {y}"
+            !bar.modifier.contains(ratatui::style::Modifier::BOLD),
+            "track plain (BOLD lives on the key hints) at row {y}"
         );
     }
     // One blank column between the bar and the content.
@@ -207,32 +214,36 @@ fn help_overlay_is_centered() {
         .position(|r| r.contains("Help"))
         .expect("title renders");
     let title_row = &rows[title_y];
-    // Borderless: the reversed title bar starts AT the overlay's left
-    // edge (x=20) with its framing space; "Help" lands on x=21.
+    // restyle-1: the rounded frame header `╭─ Help ─╮` starts at
+    // the overlay's left edge (x=20): ╭(20) ─(21) sp(22) H(23).
     let text_x = title_row
         .chars()
         .position(|c| c == 'H')
         .expect("title text on the title row");
-    assert_eq!(text_x, 21, "60% of 100 centered → bar at x=20, text at 21");
+    assert_eq!(text_x, 23, "frame header at x=20, text at 23");
     // Nothing painted left of the overlay.
     assert!(title_row[..20].trim().is_empty());
+    // panel-meta-1: the close-key meta rides the header's right slot.
+    assert!(
+        title_row.contains("Esc 关闭"),
+        "close-key meta on the header: {title_row:?}"
+    );
     // 70% of 30 = 21 rows tall, centered → title lands around row 4.
     assert!(
         (3..=6).contains(&title_y),
         "vertically centered, title at row {title_y}"
     );
-    // The footer rides the overlay's last row (21 rows below the top),
-    // right-aligned (buffer-level right-alignment/style spot-checks
-    // live in the help module's inline tests).
-    let footer_y = title_y + 21 - 1;
+    // The footer rides the last CONTENT row — one above the frame's
+    // bottom border (21-row overlay: title at +0, bottom at +20).
+    let footer_y = title_y + 21 - 2;
     assert!(
         rows[footer_y].contains("Esc / ? 关闭"),
         "footer on the last overlay row: {:?}",
         rows[footer_y]
     );
     assert!(
-        rows[footer_y].trim_end().ends_with('闭'),
-        "footer is the row's right-most text: {:?}",
+        rows[footer_y].trim_end().ends_with("闭 │"),
+        "footer right-aligned inside the frame: {:?}",
         rows[footer_y]
     );
 }
@@ -260,9 +271,11 @@ fn help_lists_the_full_keymap() {
         "PgUp",
         "审批激活时",
         "y / n / a",
-        "本轮全部允许",
+        "全部允许",
         "slash 命令",
         "/model",
+        // copy-1: the /copy argument forms line.
+        "/copy [all|tool]",
     ] {
         assert!(screen.contains(needle), "help must cover {needle}");
     }
@@ -276,9 +289,21 @@ fn help_footer_survives_content_clipping() {
         HelpComponent::new().render(f, f.area(), &test_ctx());
     });
     assert!(rows.iter().any(|r| r.contains("Help")), "title visible");
+    // panel-meta-1: the close-key meta survives clipping too (the
+    // header closes with ` Esc 关闭 ─╮` before the footer's own hint).
     assert!(
-        rows[9].contains("Esc / ? 关闭"),
-        "footer on the last border row: {:?}",
+        rows.iter()
+            .any(|r| r.contains("Esc 关闭") && r.contains("Help")),
+        "header meta on the title row: {rows:?}"
+    );
+    assert!(
+        rows[9].starts_with('╰'),
+        "bottom border on the last row: {}",
         rows[9]
+    );
+    assert!(
+        rows[8].contains("Esc / ? 关闭"),
+        "footer above the bottom border: {:?}",
+        rows[8]
     );
 }

@@ -27,6 +27,8 @@ use clap::Parser;
 use tracing_subscriber::fmt::MakeWriter;
 
 use openslate_tui::app::{App, SessionSummary};
+use openslate_tui::icons::Icons;
+use openslate_tui::theme::{Theme, ThemeMode};
 
 /// Log-file truncation threshold: startup truncates an existing log
 /// larger than this (simple size cap, spec D5).
@@ -45,6 +47,32 @@ struct Cli {
     /// (trace, debug, info, warn, error).
     #[arg(long, global = true, default_value = "info")]
     log_level: String,
+
+    /// Icon tier: `unicode` (default, geometric symbols), `nerd`
+    /// (Nerd Font PUA markers), `ascii` (pure printable-ASCII glyphs —
+    /// the dumb-terminal/CI floor). Precedence: flag >
+    /// `OPENSLATE_ICONS` env > default; invalid values exit with an
+    /// error.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "unicode",
+        env = "OPENSLATE_ICONS"
+    )]
+    icons: Icons,
+
+    /// Color theme: `dark` (default), `light`, or `ansi` (256-color
+    /// degraded palette for no-truecolor terminals). Precedence: flag >
+    /// `OPENSLATE_THEME` env > default.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "dark",
+        env = "OPENSLATE_THEME"
+    )]
+    theme: ThemeMode,
 }
 
 // ── File logging (custom MakeWriter) ───────────────────────────────────────
@@ -202,7 +230,39 @@ async fn main() -> Result<()> {
     };
 
     let terminal = init_terminal()?;
-    let app = App::new(ctx);
+    // theme-1: the icon tier rides inside the theme (single source).
+    // icons-4: user-level per-slot overrides from `[tui.icons]
+    // overrides` stack on top of the CLI tier — missing glyphs
+    // self-heal per font. Unknown slots / empty glyphs are skipped
+    // with a warning (patch_field is the validator).
+    let overrides = &ctx.config.tui.icons.overrides;
+    let icons = if overrides.is_empty() {
+        cli.icons
+    } else {
+        let mut base = cli.icons.set();
+        let mut applied = 0usize;
+        for (slot, glyph) in overrides {
+            if glyph.is_empty() || !base.patch_field(slot, glyph) {
+                tracing::warn!(
+                    target: "openslate_tui",
+                    slot = slot.as_str(),
+                    "ignoring invalid icon override (unknown slot or empty glyph)"
+                );
+            } else {
+                applied += 1;
+            }
+        }
+        tracing::info!(
+            target: "openslate_tui",
+            applied,
+            total = overrides.len(),
+            "icon overrides applied on top of the --icons tier"
+        );
+        Icons::Custom(Box::leak(Box::new(base)))
+    };
+    let theme = Theme::from_palette(cli.theme.palette(), icons);
+    tracing::info!(icons = ?icons, theme = ?cli.theme, "ui appearance");
+    let app = App::new(ctx).with_theme(theme);
     let result = app.run(terminal).await;
 
     // Restore first so errors/summary render on the normal screen.

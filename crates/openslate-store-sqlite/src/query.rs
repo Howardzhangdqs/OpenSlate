@@ -591,6 +591,7 @@ mod tests {
         .expect("insert run");
     }
 
+    #[allow(clippy::too_many_arguments)] // test scaffold: row fields map 1:1
     async fn insert_execution_node(
         pool: &SqlitePool,
         id: &str,

@@ -1,5 +1,8 @@
 //! Markdown rendering for model output.
 //!
+//! Compiled only when the `markdown` cargo feature is enabled; default builds
+//! use the plain fallback module declared in `main.rs` instead.
+//!
 //! - Prose (headings, bold/italic, lists, tables, inline code) is rendered by
 //!   [`termimad`](https://crates.io/crates/termimad) to ANSI stdout.
 //! - Fenced code blocks are extracted and syntax-highlighted by

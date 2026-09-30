@@ -2,7 +2,33 @@
 
 mod cmd;
 mod input;
+#[cfg(feature = "markdown")]
 mod markdown;
+#[cfg(not(feature = "markdown"))]
+mod markdown {
+    //! Plain fallback when the `markdown` cargo feature is off (default):
+    //! no styling, verbatim output — the historical non-TTY behavior, now
+    //! also the TTY behavior without the feature. Trim semantics stay with
+    //! the callers, exactly as with the rendered path.
+    pub fn print_markdown(content: &str) {
+        println!("{content}");
+    }
+
+    #[cfg(test)]
+    mod tests {
+        // Smoke only: pin the default-build signature; stdout capture is
+        // unnecessary.
+        #[test]
+        fn fallback_prints_plain_text() {
+            super::print_markdown("plain");
+        }
+
+        #[test]
+        fn fallback_prints_markdown_source_verbatim() {
+            super::print_markdown("# Title\n\n```rust\nfn main() {}\n```\n");
+        }
+    }
+}
 mod repl;
 mod spinner;
 

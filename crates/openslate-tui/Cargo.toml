@@ -10,11 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 openslate-core = { path = "../openslate-core" }
-# Shared application wiring (build_app_context / resolve_config_file) and
-# per-turn provider construction, shared with the CLI.
-openslate-app = { path = "../openslate-app" }
-# RunRecorder session wiring (lazy shared run_id + per-turn message_sink).
-openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+# web-1 shared wire contract: ClientMsg/ServerMsg + DTOs (the TUI is a
+# pure client; the server owns engine + session + config persistence).
+openslate-protocol = { path = "../openslate-protocol" }
 # TUI framework (pinned =0.30.2 workspace-wide, see root Cargo.toml).
 ratatui = { workspace = true }
 # Terminal backend; must stay version-aligned with ratatui's backend
@@ -23,6 +21,10 @@ crossterm = { workspace = true }
 # StreamExt for the crossterm EventStream.
 tokio-stream = { workspace = true }
 tokio = { workspace = true }
+# web-1: WebSocket client transport (--server attach).
+tokio-tungstenite = { workspace = true }
+# Splitting the WS stream + driving the sink in the writer task.
+futures-util = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 # File logging to ~/.local/share/openslate/logs/tui.log (env-filter driven).
@@ -37,5 +39,7 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Implementing ModelProvider for the scripted test provider.
+# Implementing ModelProvider for the scripted e2e provider.
 async-trait = { workspace = true }
+# In-process real server for the #[ignore] end-to-end attach test.
+openslate-server = { path = "../openslate-server" }

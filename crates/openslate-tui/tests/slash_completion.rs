@@ -10,23 +10,16 @@
 //! tests (`src/components/input.rs`) and App layout tests
 //! (`src/app.rs::borderless_layout_tests`).
 
-use openslate_app::wiring::build_app_context;
+use openslate_core::config::parse_openslate_toml;
+use openslate_protocol::ServerMsg;
 use openslate_tui::action::Action;
-use openslate_tui::app::{App, DispatchOutcome};
+use openslate_tui::app::{App, ClientBootstrap, DispatchOutcome};
+use openslate_tui::client::{self, MemLink};
 
-/// Real temp project for `build_app_context` (config + agents +
-/// store); the `[database]` path is ABSOLUTE inside the tempdir so
-/// nothing leaks into the user's global store. Mirrors
-/// `select_integration.rs::temp_project`.
-fn temp_project() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let openslate_dir = tmp.path().join(".openslate");
-    std::fs::create_dir(&openslate_dir).expect("create .openslate dir");
-    let db_path = openslate_dir.join("test.sqlite");
-    std::fs::write(
-        openslate_dir.join("openslate.toml"),
-        format!(
-            r#"
+/// The client-fixture config (web-1: pure parse — the config mirror is
+/// all these dispatch-level tests need; no tempdir, no engine wiring).
+fn fixture_toml() -> &'static str {
+    r#"
 [providers.mock]
 base_url = "http://localhost"
 api_key_env = "TUI_TEST_KEY"
@@ -39,9 +32,6 @@ model = "mock-model"
 provider = "mock"
 model = "mock-model"
 
-[database]
-path = {db_path:?}
-
 [limits]
 max_steps = 10
 max_depth = 4
@@ -49,26 +39,25 @@ max_tool_calls = 20
 max_context_bytes = 100_000
 max_output_bytes = 10_000
 "#
-        ),
-    )
-    .expect("write toml");
-    let agents_dir = openslate_dir.join("agents");
-    std::fs::create_dir(&agents_dir).expect("create agents dir");
-    std::fs::write(
-        agents_dir.join("root.md"),
-        "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n",
-    )
-    .expect("write root.md");
-    tmp
 }
 
-async fn completion_app() -> (App, tempfile::TempDir) {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    (App::new(ctx), tmp)
+async fn completion_app() -> (App, std::sync::Arc<MemLink>) {
+    let config = parse_openslate_toml(fixture_toml()).expect("fixture parses");
+    let (link, events) = MemLink::pair();
+    // Hello snapshot: Connected + mirror (production receives one
+    // before the first draw) — build BEFORE the config moves.
+    let snapshot = client::snapshot_from_config(&config, "main");
+    let mut app = App::new(ClientBootstrap {
+        link: link.clone(),
+        events,
+        config,
+        root_agent_id: "root".into(),
+    });
+    link.emit(ServerMsg::Snapshot {
+        session: Box::new(snapshot),
+    });
+    app.drain_engine_events().await;
+    (app, link)
 }
 
 /// Type a string through the dispatcher (what chars become).
@@ -84,7 +73,7 @@ async fn type_into(app: &mut App, s: &str) {
 /// notice proves the switch happened).
 #[tokio::test]
 async fn model_completion_flows_through_the_real_dispatcher() {
-    let (mut app, _tmp) = completion_app().await;
+    let (mut app, link) = completion_app().await;
 
     type_into(&mut app, "/mo").await;
     assert!(app.input_completion_open(), "`/mo` opens the list");
@@ -102,11 +91,27 @@ async fn model_completion_flows_through_the_real_dispatcher() {
     assert_eq!(app.input_text(), "/model fast", "Enter applied the arg");
     assert!(app.input_completion_open(), "waiting for the confirm");
 
-    // …the second Enter submits verbatim; handle_slash switches the
-    // model and posts the transient notice.
+    // …the second Enter submits verbatim; handle_slash sends the model
+    // switch to the server — the notice lands with the ModelChanged
+    // broadcast (web-1: the alias is server state).
     app.dispatch(Action::SubmitInput).await;
     assert_eq!(app.input_text(), "", "the submit took the buffer");
     assert!(!app.input_completion_open());
+    assert_eq!(
+        app.status_notice(),
+        None,
+        "no local notice — the server confirms"
+    );
+    assert_eq!(
+        link.take_sent(),
+        vec![openslate_protocol::ClientMsg::SetModel {
+            alias: "fast".into()
+        }]
+    );
+    link.emit(openslate_protocol::ServerMsg::ModelChanged {
+        alias: "fast".into(),
+    });
+    app.drain_engine_events().await;
     assert_eq!(
         app.status_notice(),
         Some("model → fast".to_owned()).as_deref()
@@ -117,7 +122,7 @@ async fn model_completion_flows_through_the_real_dispatcher() {
 /// the apply the input still receives characters.
 #[tokio::test]
 async fn tab_applies_without_losing_input_focus() {
-    let (mut app, _tmp) = completion_app().await;
+    let (mut app, _link) = completion_app().await;
     type_into(&mut app, "/").await;
     assert!(app.input_completion_open());
     app.dispatch(Action::FocusNext).await; // applies /help (head row)
@@ -131,7 +136,7 @@ async fn tab_applies_without_losing_input_focus() {
 /// Esc dismisses the list but never eats the draft; editing resumes.
 #[tokio::test]
 async fn esc_dismisses_the_list_and_keeps_the_draft() {
-    let (mut app, _tmp) = completion_app().await;
+    let (mut app, _link) = completion_app().await;
     type_into(&mut app, "/mo").await;
     assert!(app.input_completion_open());
     app.dispatch(Action::DismissOverlay).await;
@@ -152,7 +157,7 @@ async fn esc_dismisses_the_list_and_keeps_the_draft() {
 /// this env — that Error path is fine, the routing is the contract.
 #[tokio::test]
 async fn double_slash_escape_stays_untouched() {
-    let (mut app, _tmp) = completion_app().await;
+    let (mut app, _link) = completion_app().await;
     type_into(&mut app, "//help").await;
     assert!(!app.input_completion_open(), "`//` never opens the list");
     app.dispatch(Action::SubmitInput).await;
@@ -172,7 +177,7 @@ async fn double_slash_escape_stays_untouched() {
 /// confirmation modal.
 #[tokio::test]
 async fn exit_enter_quits_immediately() {
-    let (mut app, _tmp) = completion_app().await;
+    let (mut app, _link) = completion_app().await;
     type_into(&mut app, "/exit").await;
     assert!(app.input_completion_open());
     assert_eq!(
@@ -186,7 +191,7 @@ async fn exit_enter_quits_immediately() {
 /// real copy chain — with nothing to copy the honest notice fires.
 #[tokio::test]
 async fn copy_arg_completion_reaches_handle_slash() {
-    let (mut app, _tmp) = completion_app().await;
+    let (mut app, _link) = completion_app().await;
     type_into(&mut app, "/copy").await;
     app.dispatch(Action::SubmitInput).await; // (b): apply + reopen
     assert_eq!(app.input_text(), "/copy ");

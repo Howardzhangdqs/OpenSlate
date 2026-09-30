@@ -1,21 +1,26 @@
-//! openslate-tui — the terminal agent frontend.
+//! openslate-tui — the terminal agent frontend (web-1 client edition).
 //!
-//! Startup order (frozen):
-//! 1. clap (`--config` top-level like the CLI, `--log-level` default info);
+//! Startup order:
+//! 1. clap (`--server` optional — flag > `OPENSLATE_SERVER` env >
+//!    server.json auto-discovery, see `discovery`; `--config` now scopes
+//!    the LOCAL display prefs only, `--log-level` default info);
 //! 2. file tracing to `~/.local/share/openslate/logs/tui.log` — THE only
-//!    debug window into the child-agent delegation chain (sub-agent
-//!    events surface only as tracing output, see spec D5);
+//!    debug window into the client/server link;
 //! 3. panic hook that synchronously restores the terminal BEFORE chaining
-//!    into the original hook (release builds use `panic = "abort`, so
+//!    into the original hook (release builds use `panic = "abort"`, so
 //!    `Drop`-based restoration is unreliable);
-//! 4. `build_app_context` (config → validation → store → agents → tools);
+//! 4. server link (initial ladder 0.5s/1s/2s; exhaustion exits 1);
 //! 5. raw mode + alternate screen + bracketed paste;
-//! 6. the App main loop (multi-thread runtime — `current_thread` is
-//!    forbidden: the approval `decide()` blocks a worker thread).
+//! 6. the App main loop.
 //!
-//! Exit order: App shutdown (cancel → deny approvals → await engine with
-//! timeout → finalize run row) → terminal restore (symmetric with init) →
-//! log flush → one stdout summary line (run_id / turns / cost).
+//! Exit order: App teardown (link drop — the transport task exits with
+//! the channel) → terminal restore (symmetric with init) → log flush →
+//! one stdout summary line (session_id / turns / cost).
+//!
+//! GAP-2 (display prefs): `[tui]`/`[tui.icons]` stays a LOCAL,
+//! read-only concern — the client never builds an engine context, but
+//! it still reads the same config discovery chain for the icon
+//! overrides (flag > env > local `[tui]` section).
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -26,20 +31,39 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::fmt::MakeWriter;
 
-use openslate_tui::app::{App, SessionSummary};
+use openslate_tui::app::{App, ClientBootstrap, SessionSummary};
+use openslate_tui::client;
 use openslate_tui::icons::Icons;
 use openslate_tui::theme::{Theme, ThemeMode};
 
 /// Log-file truncation threshold: startup truncates an existing log
-/// larger than this (simple size cap, spec D5).
+/// larger than this (simple size cap).
 const LOG_TRUNCATE_BYTES: u64 = 1 << 20; // 1 MiB
 
 #[derive(Parser)]
 #[command(name = "openslate-tui")]
-#[command(version, about = "OpenSlate TUI — terminal agent frontend")]
+#[command(
+    version,
+    about = "OpenSlate TUI — terminal agent frontend (server client)"
+)]
 struct Cli {
-    /// Path to openslate.toml config file (default: local/global resolution
-    /// identical to the CLI).
+    /// Server URL to attach to (e.g. `ws://127.0.0.1:7800`; a bare
+    /// host[:port] gets `ws://` and `/api/ws` appended). Precedence:
+    /// flag > `OPENSLATE_SERVER` env > server.json auto-discovery
+    /// (written by `openslate serve` into the config dir); all absent
+    /// → error exit 1.
+    #[arg(long, global = true, env = "OPENSLATE_SERVER")]
+    server: Option<String>,
+
+    /// Optional auth token (see `openslate serve --auth-token`);
+    /// read from the environment only — never typed into a flag that
+    /// shell history keeps.
+    #[arg(long, global = true, env = "OPENSLATE_TOKEN")]
+    token: Option<String>,
+
+    /// Path of a LOCAL config file to read display preferences
+    /// (`[tui]`/`[tui.icons]` only — the server owns everything else;
+    /// default: local/global discovery, same file chain the CLI uses).
     #[arg(long, global = true)]
     config: Option<String>,
 
@@ -142,7 +166,7 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
 }
 
 /// Initialize file tracing. `RUST_LOG` overrides `--log-level` (same
-/// precedence as the CLI); `rmcp` is quieted (its INFO logs are multi-KB).
+/// precedence as the CLI).
 fn init_logging(log_level: &str, handle: LogHandle) -> Result<()> {
     let default_directive = format!("{log_level},rmcp=warn");
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -202,14 +226,51 @@ fn install_panic_hook() {
 fn print_summary(summary: &SessionSummary) {
     let run_id = summary.run_id.clone().unwrap_or_else(|| "-".to_owned());
     println!(
-        "openslate-tui session ended — run_id: {run_id} | turns: {} | cost: ${:.4}",
+        "openslate-tui session ended — session: {run_id} | turns: {} | cost: ${:.4}",
         summary.turns, summary.total_cost_usd
     );
 }
 
+// ── Local display preferences (GAP-2) ──────────────────────────────────────
+
+/// Read-only `[tui.icons] overrides` from the local config discovery
+/// chain (`--config` flag, else `./.openslate/openslate.toml`, else the
+/// global `~/.config/openslate/openslate.toml`). Missing/unparseable
+/// files are silently skipped — display prefs must never block startup.
+fn local_tui_overrides(config_flag: Option<&str>) -> std::collections::HashMap<String, String> {
+    let candidates: Vec<PathBuf> = match config_flag {
+        Some(flag) => vec![PathBuf::from(flag)],
+        None => {
+            let mut v = Vec::new();
+            if let Ok(cwd) = std::env::current_dir() {
+                v.push(cwd.join(".openslate").join("openslate.toml"));
+            }
+            if let Some(cfg) = dirs::config_dir() {
+                v.push(cfg.join("openslate").join("openslate.toml"));
+            }
+            v
+        }
+    };
+    for path in candidates {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        match openslate_core::config::parse_openslate_toml(&content) {
+            Ok(cfg) => return cfg.tui.icons.overrides,
+            Err(e) => {
+                tracing::warn!(
+                    "skipping unparseable display-pref config {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Default::default()
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
-#[tokio::main] // default multi-thread runtime (MANDATORY — see module docs)
+#[tokio::main] // multi-thread runtime (WS tasks + the terminal event stream)
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -219,29 +280,45 @@ async fn main() -> Result<()> {
 
     install_panic_hook();
 
-    // Wire the engine context (may print startup errors to the normal
-    // screen — the TUI has not taken over the terminal yet).
-    let ctx = match openslate_app::wiring::build_app_context(cli.config.as_deref()).await {
-        Ok(ctx) => ctx,
+    // Attach to the server BEFORE taking over the terminal: connection
+    // errors (ladder exhausted) print on the normal screen and exit 1.
+    // auto-attach-1: flag/env absent → discover server.json (flag >
+    // env > file; see `discovery` module docs).
+    let Some(spec) = openslate_tui::discovery::resolve_server(
+        cli.server.as_deref(),
+        cli.token.clone(),
+        cli.config.as_deref(),
+    ) else {
+        eprintln!("未发现运行中的 server：请先启动 openslate serve，或用 --server 指定地址");
+        std::process::exit(1);
+    };
+    let connection = match client::connect(&spec.url, spec.token.clone()).await {
+        Ok(conn) => conn,
         Err(e) => {
-            eprintln!("启动失败: {e:#}");
+            match &spec.discovered_from {
+                Some(path) => eprintln!(
+                    "发现 {} 但 server 未响应（可能已停止），可重启 openslate serve 或用 --server 指定",
+                    path.display()
+                ),
+                None => eprintln!("连接服务器失败: {e:#}"),
+            }
             return Err(e);
         }
     };
 
     let terminal = init_terminal()?;
     // theme-1: the icon tier rides inside the theme (single source).
-    // icons-4: user-level per-slot overrides from `[tui.icons]
-    // overrides` stack on top of the CLI tier — missing glyphs
-    // self-heal per font. Unknown slots / empty glyphs are skipped
-    // with a warning (patch_field is the validator).
-    let overrides = &ctx.config.tui.icons.overrides;
+    // icons-4: user-level per-slot overrides from the LOCAL
+    // `[tui.icons] overrides` stack on top of the CLI tier — missing
+    // glyphs self-heal per font. Unknown slots / empty glyphs are
+    // skipped with a warning (patch_field is the validator).
+    let overrides = local_tui_overrides(cli.config.as_deref());
     let icons = if overrides.is_empty() {
         cli.icons
     } else {
         let mut base = cli.icons.set();
         let mut applied = 0usize;
-        for (slot, glyph) in overrides {
+        for (slot, glyph) in &overrides {
             if glyph.is_empty() || !base.patch_field(slot, glyph) {
                 tracing::warn!(
                     target: "openslate_tui",
@@ -261,8 +338,19 @@ async fn main() -> Result<()> {
         Icons::Custom(Box::leak(Box::new(base)))
     };
     let theme = Theme::from_palette(cli.theme.palette(), icons);
-    tracing::info!(icons = ?icons, theme = ?cli.theme, "ui appearance");
-    let app = App::new(ctx).with_theme(theme);
+    tracing::info!(icons = ?icons, theme = ?cli.theme, server = %spec.url, "ui appearance");
+
+    // Seed mirrors are empty; the queued first snapshot (hello ack)
+    // hydrates config/agents/session on the first loop iteration.
+    let seed_config =
+        openslate_core::config::parse_openslate_toml("").expect("empty TOML parses to defaults");
+    let bootstrap = ClientBootstrap {
+        link: Arc::new(connection.link),
+        events: connection.events,
+        config: seed_config,
+        root_agent_id: String::new(),
+    };
+    let app = App::new(bootstrap).with_theme(theme);
     let result = app.run(terminal).await;
 
     // Restore first so errors/summary render on the normal screen.
@@ -271,7 +359,7 @@ async fn main() -> Result<()> {
     match result {
         Ok(summary) => {
             print_summary(&summary);
-            // Flush logs (spec: 恢复终端 → flush 日志 → 摘要 → exit).
+            // Flush logs (恢复终端 → flush 日志 → 摘要 → exit).
             if let Ok(mut file) = log_handle.lock() {
                 let _ = file.flush();
             }

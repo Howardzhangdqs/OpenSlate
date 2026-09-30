@@ -20,27 +20,20 @@
 
 use std::sync::{Arc, Mutex};
 
-use openslate_app::wiring::build_app_context;
+use openslate_core::config::parse_openslate_toml;
 use openslate_tui::action::Action;
-use openslate_tui::app::App;
+use openslate_tui::app::{App, ClientBootstrap};
+use openslate_tui::client::MemLink;
 use openslate_tui::components::{Component, ConfigSummary, Focus, RunInfo, RunState};
 use openslate_tui::event::TuiEvent;
 
 // ─── Harness ───────────────────────────────────────────────────────────────
 
-/// Real temp project for `build_app_context` (config + agents + store);
-/// the `[database]` path is ABSOLUTE inside the tempdir so nothing
-/// leaks into the user's global store. Mirrors
-/// `bridge_integration.rs::temp_project`.
-fn temp_project() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let openslate_dir = tmp.path().join(".openslate");
-    std::fs::create_dir(&openslate_dir).expect("create .openslate dir");
-    let db_path = openslate_dir.join("test.sqlite");
-    std::fs::write(
-        openslate_dir.join("openslate.toml"),
-        format!(
-            r#"
+/// The client-fixture config (web-1: pure parse; the copy-file leg
+/// still lands in a tempdir — hermetic, no test writes the real
+/// `~/.local/share/openslate/last-copy.md`).
+fn fixture_toml() -> &'static str {
+    r#"
 [providers.mock]
 base_url = "http://localhost"
 api_key_env = "TUI_TEST_KEY"
@@ -53,9 +46,6 @@ model = "mock-model"
 provider = "mock"
 model = "mock-model"
 
-[database]
-path = {db_path:?}
-
 [limits]
 max_steps = 10
 max_depth = 4
@@ -63,33 +53,22 @@ max_tool_calls = 20
 max_context_bytes = 100_000
 max_output_bytes = 10_000
 "#
-        ),
-    )
-    .expect("write toml");
-    let agents_dir = openslate_dir.join("agents");
-    std::fs::create_dir(&agents_dir).expect("create agents dir");
-    std::fs::write(
-        agents_dir.join("root.md"),
-        "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n",
-    )
-    .expect("write root.md");
-    tmp
 }
 
-/// An App whose copy chain is fully observable: the OSC 52 sink
-/// captures payloads, the copy file lands in a tempdir (hermetic —
-/// no test writes the real `~/.local/share/openslate/last-copy.md`).
 async fn select_test_app() -> (App, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let config = parse_openslate_toml(fixture_toml()).expect("fixture parses");
+    let (_link, events) = MemLink::pair();
+    let mut app = App::new(ClientBootstrap {
+        link: _link,
+        events,
+        config,
+        root_agent_id: "root".into(),
+    });
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink_seen = Arc::clone(&seen);
-    app.set_clipboard_sink(Box::new(move |payload| {
+    app.set_clipboard_sink(Box::new(move |payload: &str| {
         sink_seen
             .lock()
             .expect("sink lock")
@@ -100,7 +79,6 @@ async fn select_test_app() -> (App, Arc<Mutex<Vec<String>>>, tempfile::TempDir) 
     (app, seen, tmp)
 }
 
-/// The copy file's expected location for a [`select_test_app`].
 fn copy_file(tmp: &tempfile::TempDir) -> std::path::PathBuf {
     tmp.path().join("copy-out").join("last-copy.md")
 }

@@ -1,23 +1,20 @@
-//! Agents panel — delegation tree (P3 lane-b).
+//! Agents panel — delegation tree (P3 lane-b; web-1 client edition).
 //!
 //! Per spec D2 (frozen capability statement): while a turn runs, only the
 //! root agent and its depth-1 children are observable at the root —
 //! grandchildren run through core's `ChildProgress` and never surface as
-//! events. The panel therefore runs a two-phase state machine:
+//! events. The panel shows:
 //!
-//! | phase           | source                        | rows shown                    |
-//! |-----------------|-------------------------------|-------------------------------|
-//! | live (turn      | `call_agent` ToolStart/ToolEnd | root + depth-1 children; an   |
-//! | running)        | push/complete (App-wired)     | ACTIVE child additionally     |
-//! |                 |                               | renders a `…` row for its     |
-//! |                 |                               | unknowable grand-children    |
-//! | calibrated      | `TurnDone` → [`Self::calibr   | full DFS-ordered tree with    |
-//! | (after TurnDone)| ate`] with the execution tree | terminal statuses             |
+//! | rows shown             | source                                           |
+//! |------------------------|--------------------------------------------------|
+//! | root + live depth-1    | root seeded at construction ([`Self::set_root`]) |
+//! | children (`◐`→`✓`)     | `call_agent` ToolStart/ToolEnd (App-wired)       |
 //!
-//! The App seeds only the root id at construction ([`Self::set_root`]) —
-//! the static agent-tree topology is NOT handed to this component, so the
-//! first calibration doubles as the topology source (P3 lane-b task
-//! brief; the frozen `App::new` call site cannot be extended).
+//! web-1: execution trees no longer cross the wire (the server's
+//! `TurnDone` carries none), so the old post-turn `calibrate` view is
+//! gone — the live delegation history lingers (completed) until the
+//! next turn's first request or a snapshot reset, matching the
+//! delegate-entry semantics the wire transcript mirrors.
 //!
 //! # Glyphs (restyle-1)
 //!
@@ -26,16 +23,8 @@
 //! | root                 | `◆`   | signal + BOLD      |
 //! | running depth-1      | `◐`   | accent             |
 //! | completed            | `✓`   | muted              |
-//! | failed               | `×`   | error              |
-//! | interrupted          | `○`   | muted              |
 //!
-//! Pure Unicode, no Nerd Font PUA. `Interrupted` rows only exist
-//! post-calibration: the execution-tree snapshot is final when
-//! `TurnDone` fires, so any node still `Running` in it was abandoned
-//! mid-flight (the turn was cancelled) — its true outcome is
-//! unknowable and it renders as `○`.
-
-use std::collections::HashMap;
+//! Pure Unicode, no Nerd Font PUA.
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -44,8 +33,6 @@ use ratatui::Frame;
 
 use super::{AppCtx, Component, Focus};
 use crate::action::Action;
-use openslate_core::execution::{ExecutionNode, ExecutionStatus, ExecutionTree};
-use openslate_core::types::ExecutionNodeId;
 
 /// Display status of one tree row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +41,6 @@ pub enum AgentStatus {
     Running,
     /// Finished successfully (`✓`).
     Completed,
-    /// Finished with an error (`×`).
-    Failed,
-    /// Still `Running` in a FINAL tree snapshot — the turn was cancelled
-    /// above it; the real outcome is unknowable (`…`).
-    Interrupted,
 }
 
 /// One visible tree row (root or a delegated execution).
@@ -75,16 +57,15 @@ pub struct AgentRow {
 /// The agents sidebar panel.
 #[derive(Debug, Default)]
 pub struct AgentsComponent {
-    /// Root agent id (seeded from the static agent tree at App start).
+    /// Root agent id (seeded from the snapshot's agent tree at App
+    /// start; re-seeded on config swaps).
     root: Option<String>,
     /// Live depth-1 children of the CURRENT turn: pushed by `call_agent`
-    /// ToolStart, optimistically completed by ToolEnd, replaced whole at
-    /// the next calibration. Kept (not removed) when a delegation ends so
-    /// the panel shows the turn's delegation history until TurnDone.
+    /// ToolStart, optimistically completed by ToolEnd. Kept (not
+    /// removed) when a delegation ends so the panel shows the turn's
+    /// delegation history; cleared by the next turn's first request or
+    /// a snapshot reset.
     live: Vec<AgentRow>,
-    /// Calibrated full-tree snapshot from the last `TurnDone` (DFS order,
-    /// root first).
-    calibrated: Vec<AgentRow>,
 }
 
 impl AgentsComponent {
@@ -92,7 +73,7 @@ impl AgentsComponent {
         Self::default()
     }
 
-    /// Seed the root row from the static agent tree (App start).
+    /// Seed the root row (App start / snapshot config swap).
     pub fn set_root(&mut self, root_id: &str) {
         self.root = Some(root_id.to_owned());
     }
@@ -119,8 +100,7 @@ impl AgentsComponent {
     /// (`FuturesUnordered`) and drains ends in tool-call order, so the
     /// completion target is the FIRST still-`Running` row (FIFO) to
     /// match the event order; with parallel `call_agent` calls the
-    /// pairing can still be transiently wrong — the `TurnDone`
-    /// calibration is authoritative for real statuses.
+    /// pairing can still be transiently wrong.
     pub fn on_delegate_end(&mut self, tool_name: &str) {
         if tool_name != "call_agent" {
             return;
@@ -134,61 +114,15 @@ impl AgentsComponent {
         }
     }
 
-    /// Turn finished: replace the view with the full execution-tree
-    /// snapshot (depth ≥2 children become visible here). Siblings render
-    /// in agent-id order — `all_nodes()` is HashMap-random and nodes
-    /// carry no creation timestamp, so a stable sort is the only
-    /// deterministic option. Nodes still `Running` map to
-    /// [`AgentStatus::Interrupted`] (the snapshot is final post-turn).
-    pub fn calibrate(&mut self, tree: &ExecutionTree) {
-        let mut by_parent: HashMap<Option<ExecutionNodeId>, Vec<&ExecutionNode>> = HashMap::new();
-        for node in tree.all_nodes() {
-            by_parent
-                .entry(node.parent_execution_id.clone())
-                .or_default()
-                .push(node);
-        }
-        for bucket in by_parent.values_mut() {
-            bucket.sort_by(|a, b| a.agent_id.0.cmp(&b.agent_id.0));
-        }
-        let mut rows = Vec::new();
-        walk(tree.root(), &by_parent, &mut rows);
-        self.calibrated = rows;
+    /// A new turn started (`RequestStart`): the previous turn's live
+    /// delegation history gives way to the fresh turn's view.
+    pub fn turn_reset(&mut self) {
         self.live.clear();
     }
 
-    /// Rows of the current view (besides the separately-rendered root):
-    /// live children while a delegation happened this turn, otherwise the
-    /// last calibrated full tree (which includes its own depth-0 root
-    /// row — render skips it to avoid duplicating the anchor row).
+    /// Rows of the current view (besides the separately-rendered root).
     pub fn rows(&self) -> &[AgentRow] {
-        if self.live.is_empty() {
-            &self.calibrated
-        } else {
-            &self.live
-        }
-    }
-}
-
-/// Depth-first walk from a node, emitting display rows in tree order.
-fn walk(
-    node: &ExecutionNode,
-    by_parent: &HashMap<Option<ExecutionNodeId>, Vec<&ExecutionNode>>,
-    out: &mut Vec<AgentRow>,
-) {
-    out.push(AgentRow {
-        id: node.agent_id.0.clone(),
-        depth: node.depth,
-        status: match node.status {
-            ExecutionStatus::Running => AgentStatus::Interrupted,
-            ExecutionStatus::Completed => AgentStatus::Completed,
-            ExecutionStatus::Failed => AgentStatus::Failed,
-        },
-    });
-    if let Some(children) = by_parent.get(&Some(node.id.clone())) {
-        for child in children {
-            walk(child, by_parent, out);
-        }
+        &self.live
     }
 }
 
@@ -233,8 +167,6 @@ impl Component for AgentsComponent {
             let (glyph, style) = match row.status {
                 AgentStatus::Running => (g.agents_running, ctx.theme.agent_running),
                 AgentStatus::Completed => (g.check, ctx.theme.agent_done),
-                AgentStatus::Failed => (g.cross, ctx.theme.agent_failed),
-                AgentStatus::Interrupted => (g.pending, ctx.theme.agent_done),
             };
             lines.push(Line::from(vec![
                 Span::raw(" "),
@@ -266,11 +198,6 @@ impl Component for AgentsComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openslate_core::types::{AgentId, RunId};
-
-    fn tree() -> ExecutionTree {
-        ExecutionTree::new(RunId("r".into()), AgentId("root".into()))
-    }
 
     #[test]
     fn live_children_push_and_lifo_complete() {
@@ -323,93 +250,15 @@ mod tests {
     }
 
     #[test]
-    fn calibrate_orders_dfs_and_maps_terminal_statuses() {
+    fn turn_reset_clears_the_live_history() {
         let mut agents = AgentsComponent::new();
         agents.set_root("root");
-        let run_id = RunId("r".into());
-        let mut tree = tree();
-        let root_id = tree.root_id().clone();
-        let researcher = tree.create_child(
-            run_id.clone(),
-            AgentId("researcher".into()),
-            root_id.clone(),
-            None,
-        );
-        let verifier = tree.create_child(
-            run_id.clone(),
-            AgentId("verifier".into()),
-            tree.root_id().clone(),
-            None,
-        );
-        let writer = tree.create_child(run_id, AgentId("writer".into()), researcher.clone(), None);
-        tree.update_status(&root_id, ExecutionStatus::Completed);
-        tree.update_status(&researcher, ExecutionStatus::Completed);
-        tree.update_status(&verifier, ExecutionStatus::Failed);
-        tree.update_status(&writer, ExecutionStatus::Failed);
-
-        agents.on_delegate_start("researcher"); // live view active pre-calibration
-        agents.calibrate(&tree);
-
-        // DFS order: root, then researcher (with writer nested), then
-        // verifier — siblings sorted by agent id.
-        let got: Vec<(String, u32, AgentStatus)> = agents
-            .rows()
-            .iter()
-            .map(|r| (r.id.clone(), r.depth, r.status))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("root".into(), 0, AgentStatus::Completed),
-                ("researcher".into(), 1, AgentStatus::Completed),
-                ("writer".into(), 2, AgentStatus::Failed),
-                ("verifier".into(), 1, AgentStatus::Failed),
-            ]
-        );
-    }
-
-    #[test]
-    fn calibrate_maps_running_to_interrupted_and_clears_live() {
-        let mut agents = AgentsComponent::new();
         agents.on_delegate_start("researcher");
-        assert!(!agents.rows().is_empty());
-        let mut tree = tree();
-        let run_id = RunId("r".into());
-        let root_id = tree.root_id().clone();
-        tree.create_child(run_id, AgentId("researcher".into()), root_id, None);
-        // Leave everything Running — the snapshot is final post-turn, so
-        // these were interrupted.
-        agents.calibrate(&tree);
-        assert_eq!(agents.rows()[0].status, AgentStatus::Interrupted);
-        assert_eq!(agents.rows()[1].status, AgentStatus::Interrupted);
-        // Live rows were replaced by the calibrated view (root + child).
-        assert_eq!(agents.rows().len(), 2);
-    }
-
-    #[test]
-    fn calibrate_sibling_order_is_deterministic() {
-        // Two executions of the same agent + one sibling: HashMap-random
-        // input must yield a stable, sorted output.
-        let mut agents = AgentsComponent::new();
-        let run_id = RunId("r".into());
-        let mut tree = tree();
-        let root_id = tree.root_id().clone();
-        tree.create_child(
-            run_id.clone(),
-            AgentId("zeta".into()),
-            root_id.clone(),
-            None,
-        );
-        tree.create_child(
-            run_id.clone(),
-            AgentId("alpha".into()),
-            root_id.clone(),
-            None,
-        );
-        tree.create_child(run_id, AgentId("alpha".into()), root_id, None);
-        agents.calibrate(&tree);
-        let ids: Vec<&str> = agents.rows().iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["root", "alpha", "alpha", "zeta"]);
+        agents.on_delegate_end("call_agent");
+        assert_eq!(agents.rows().len(), 1);
+        agents.turn_reset();
+        assert!(agents.rows().is_empty());
+        assert_eq!(agents.root(), Some("root"), "root survives the reset");
     }
 
     #[test]

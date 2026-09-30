@@ -511,6 +511,11 @@ pub struct TranscriptComponent {
     /// cleared per request). Rendered by the live stats row only —
     /// the final usage line gets its own copy at `RequestEnd`.
     live_ttft: Option<Duration>,
+    /// web-1: the server's input-token estimate for the streaming
+    /// request (`input_estimate` broadcast → App-fed via
+    /// [`TranscriptComponent::set_live_input_estimate`]); rendered as
+    /// the live row's leading `↑~N` segment, cleared per request.
+    live_input_est: Option<u32>,
     /// The HELD exact usage line (fix-19's position move): set by
     /// [`TranscriptComponent::finish_request`] instead of committing
     /// immediately, because tools of the same step execute AFTER
@@ -699,6 +704,7 @@ impl TranscriptComponent {
         self.reasoning_started = None;
         self.answer_started = None;
         self.live_ttft = None;
+        self.live_input_est = None;
     }
 
     /// One answer delta arrived. The first delta of a block also
@@ -719,6 +725,14 @@ impl TranscriptComponent {
     /// when the held exact line takes over.
     pub fn set_live_ttft(&mut self, ttft: Option<Duration>) {
         self.live_ttft = ttft;
+    }
+
+    /// web-1: the server's input-token estimate for the current
+    /// streaming request (`↑~N` live-row segment). `None` clears
+    /// (every `RequestStart`; the exact usage line replaces it at
+    /// `RequestEnd`).
+    pub fn set_live_input_estimate(&mut self, tokens: Option<u32>) {
+        self.live_input_est = tokens;
     }
 
     /// One reasoning delta arrived. The first delta of a block also
@@ -909,6 +923,7 @@ impl TranscriptComponent {
         let answer_raw = std::mem::take(&mut self.streaming);
         self.answer_started = None;
         self.live_ttft = None;
+        self.live_input_est = None;
 
         let has_reasoning = !reasoning_raw.trim().is_empty();
         let has_answer = !answer_raw.trim().is_empty();
@@ -1004,6 +1019,7 @@ impl TranscriptComponent {
         self.reasoning_started = None;
         self.answer_started = None;
         self.live_ttft = None;
+        self.live_input_est = None;
     }
 
     /// A step boundary was observed (`Usage` / `RequestEnd` / `StepEnd`
@@ -1215,6 +1231,29 @@ impl TranscriptComponent {
         self.scroll = 0;
         self.follow = true;
         self.running_since.clear();
+    }
+
+    /// web-1 snapshot rebuild: swap in the server's entry mirror
+    /// wholesale (hello ack / reconnect / post-`new_session`). This is
+    /// the ONLY wholesale path that preserves the live-only entry
+    /// kinds (Reasoning / Meta / Delegate / Tool detail) — the server
+    /// mirrors them; the message-based [`Self::rebuild`] cannot.
+    /// Live-view state resets like [`Self::rebuild`] (indices died
+    /// with the old entries) plus the turn marker (the snapshot's
+    /// Meta entries already carry the historical marker lines) and
+    /// the scroll pin (jump to the live tail of the restored view).
+    pub fn replace_entries(&mut self, entries: Vec<TranscriptEntry>) {
+        self.entries = entries;
+        self.clear_streaming();
+        self.expanded_reasoning.clear();
+        self.expanded_tools.clear();
+        self.clear_selection();
+        self.pending_step_meta = None;
+        self.turn_meta = None;
+        self.marker_at = None;
+        self.running_since.clear();
+        self.scroll = 0;
+        self.follow = true;
     }
 
     // ── Scroll / pinning ────────────────────────────────────────────────
@@ -1577,6 +1616,9 @@ impl TranscriptComponent {
     fn live_stats_line(&self, answer_view: &str, now: Instant) -> Option<String> {
         let started = self.answer_started?;
         let mut segments: Vec<String> = Vec::new();
+        if let Some(tokens) = self.live_input_est {
+            segments.push(format!("↑~{tokens}"));
+        }
         if let Some(ttft) = self.live_ttft {
             segments.push(format!("ttft {}", format_secs(ttft.as_secs_f64())));
         }

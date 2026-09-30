@@ -1,168 +1,32 @@
-//! Bridge integration — a full scripted turn through the REAL engine.
+//! Bridge integration — the client's `ServerMsg → TuiEvent → App`
+//! pipeline (web-1).
 //!
-//! No network: a hand-written `ScriptedProvider` (core
-//! integration_run.rs pattern) drives
-//! [`spawn_turn`] end-to-end while an [`App`] (built from a real
-//! `build_app_context` on a temp project) consumes the resulting events,
-//! proving:
+//! No network, no engine: a [`MemLink`] stands in for the server. Tests
+//! either dispatch `TuiEvent`s directly (display-mirror semantics,
+//! unchanged since the local-engine era) or `emit` real `ServerMsg`s
+//! through [`crate::openslate_tui::client::to_tui`] — the exact
+//! conversion the production WS task uses — proving:
 //!
-//! * the `TuiEvent` sequence for a tool-calling turn
-//!   (RequestStart → deltas → RequestEnd → ToolStart/ToolEnd → … →
-//!   TurnDone(Ok));
-//! * the transcript rebuild from `result.messages` (the fixed merge
-//!   point) and the run-state fall back to `Idle`.
+//! * submit/cancel/approval/CRUD turns into `ClientMsg`s on the link;
+//! * broadcast events drive the same transcript/merge/state paths as
+//!   before (the fixed merge point survives, manager-less now);
+//! * snapshots rebuild the transcript wholesale (hello/reconnect);
+//! * the copy chain stays hermetic (capturing sink + tempdir file leg).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use openslate_app::wiring::build_app_context;
-use openslate_core::agent_tree::AgentTree;
-use openslate_core::approval::{ApprovalCallback, ApprovalDecision, ApprovalRequest, RiskLevel};
 use openslate_core::config::parse_openslate_toml;
-use openslate_core::error::ProviderError;
-use openslate_core::provider::{GenerateRequest, ModelProvider};
-use openslate_core::run_manager::RunManager;
-use openslate_core::skills::SkillsCatalog;
-use openslate_core::tool::{Tool, ToolRegistry};
-use openslate_core::types::{
-    AgentConfig, AgentId, Message, MessageRole, ModelResponse, ModelStreamEvent, RunId, ToolCall,
-    ToolCallId, ToolOutput, ToolOutputStatus, Usage,
-};
+use openslate_core::types::{Message, MessageRole, RunId, ToolCall, ToolCallId, Usage};
 
-use openslate_tui::action::{Action, ApprovalChoice};
-use openslate_tui::app::{coalesce_deltas, App, DispatchOutcome};
+use openslate_protocol::{ClientMsg, ServerMsg};
+use openslate_tui::action::Action;
+use openslate_tui::app::{coalesce_deltas, App, ClientBootstrap, DispatchOutcome};
+use openslate_tui::client::{LinkPhase, MemLink};
 use openslate_tui::components::transcript::{ToolEntryStatus, TranscriptEntry};
 use openslate_tui::components::RunState;
-use openslate_tui::event::{self, ApprovalBridge, ApprovalSummary, TuiEvent};
-
-// ─── Scripted provider (streams deltas, then requests a tool) ─────────────
-
-struct ScriptedProvider {
-    responses: Vec<ModelResponse>,
-    call_count: AtomicUsize,
-}
-
-impl ScriptedProvider {
-    fn new(responses: Vec<ModelResponse>) -> Self {
-        Self {
-            responses,
-            call_count: AtomicUsize::new(0),
-        }
-    }
-
-    fn scripted_turn() -> Vec<ModelResponse> {
-        vec![
-            // Step 1: stream some text, then ask for the echo tool.
-            ModelResponse {
-                content: Some("Let me look at the code first.".into()),
-                tool_calls: vec![ToolCall {
-                    id: ToolCallId("tc-1".into()),
-                    name: "echo".into(),
-                    arguments: serde_json::json!({"text": "hello world"}),
-                }],
-                usage: Some(Usage {
-                    input_tokens: 50,
-                    output_tokens: 10,
-                    cached_input_tokens: None,
-                }),
-                finish_reason: Some("tool_calls".into()),
-            },
-            // Step 2: final answer.
-            ModelResponse {
-                content: Some("All done!".into()),
-                tool_calls: vec![],
-                usage: Some(Usage {
-                    input_tokens: 80,
-                    output_tokens: 5,
-                    cached_input_tokens: None,
-                }),
-                finish_reason: Some("stop".into()),
-            },
-        ]
-    }
-}
-
-#[async_trait]
-impl ModelProvider for ScriptedProvider {
-    async fn generate(&self, _request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
-        let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-        self.responses
-            .get(idx)
-            .cloned()
-            .ok_or(ProviderError::ServerError(500))
-    }
-
-    /// Stream the scripted response as explicit Delta events so the
-    /// bridge's on_first_token/on_delta paths actually fire.
-    async fn generate_stream(
-        &self,
-        request: GenerateRequest,
-    ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let result = self.generate(request).await;
-        tokio::spawn(async move {
-            match result {
-                Ok(response) => {
-                    if let Some(usage) = response.usage {
-                        let _ = tx.send(Ok(ModelStreamEvent::Usage(usage))).await;
-                    }
-                    if let Some(content) = &response.content {
-                        // Two deltas to exercise coalescing-adjacent paths.
-                        let mid = content.len() / 2;
-                        let (a, b) = content.split_at(mid.max(1));
-                        let _ = tx.send(Ok(ModelStreamEvent::Delta(a.to_owned()))).await;
-                        let _ = tx.send(Ok(ModelStreamEvent::Delta(b.to_owned()))).await;
-                    }
-                    let _ = tx.send(Ok(ModelStreamEvent::Done(response))).await;
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                }
-            }
-        });
-        rx
-    }
-
-    fn provider_name(&self) -> &str {
-        "scripted-mock"
-    }
-}
+use openslate_tui::event::{ApprovalSummary, TuiEvent, TurnSummary};
 
 // ─── Fixture helpers ───────────────────────────────────────────────────────
-
-struct EchoTool;
-
-#[async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        "echo"
-    }
-
-    fn description(&self) -> &str {
-        "Echo back the input"
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {"text": {"type": "string"}}
-        })
-    }
-
-    async fn execute(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<ToolOutput, openslate_core::error::ToolError> {
-        let text = args["text"].as_str().unwrap_or("");
-        Ok(ToolOutput {
-            content: text.to_owned(),
-            bytes: text.len(),
-            duration_ms: 1,
-            status: ToolOutputStatus::Success,
-        })
-    }
-}
 
 fn test_config() -> openslate_core::config::OpenSlateConfig {
     let toml = r#"
@@ -187,81 +51,42 @@ max_output_bytes = 10_000
     parse_openslate_toml(toml).expect("test config should parse")
 }
 
-fn test_manager() -> RunManager {
-    let agents = vec![AgentConfig {
-        id: AgentId("root".into()),
-        name: "Root Agent".into(),
-        model: "main".into(),
-        children: vec![],
-        tools: vec!["echo".into()],
-        default_prompt: "You are a test agent.".into(),
-    }];
-    let tree = AgentTree::from_configs(&agents).expect("agent tree should build");
-    let mut registry = ToolRegistry::new();
-    registry.register(EchoTool);
-    RunManager::new(test_config(), tree, registry, SkillsCatalog::default())
-}
-
 /// Theme slot accessor for color assertions (theme-1).
 fn theme() -> openslate_tui::theme::Theme {
     openslate_tui::theme::Theme::new()
 }
 
-/// Real temp project for `build_app_context` (config + agents + store).
-/// The `[database]` path is ABSOLUTE inside the tempdir — a relative path
-/// would be resolved against the user's global data dir, leaking test
-/// runs into the real store.
-fn temp_project() -> tempfile::TempDir {
-    temp_project_with_limits(100_000)
+/// A client App + its recording link (seeded with a hello snapshot —
+/// model alias `main`, empty transcript; mirrors production where the
+/// first snapshot precedes the first draw).
+async fn test_app_linked() -> (App, Arc<MemLink>) {
+    let config = test_config();
+    let (link, events) = MemLink::pair();
+    let mut app = App::new(ClientBootstrap {
+        link: link.clone(),
+        events,
+        config,
+        root_agent_id: "root".into(),
+    });
+    link.emit(ServerMsg::Snapshot {
+        session: Box::new(snapshot_dto("main")),
+    });
+    app.drain_engine_events().await;
+    (app, link)
 }
 
-/// [`temp_project`] with a configurable `max_context_bytes` (drive the
-/// auto-compact threshold in tests).
-fn temp_project_with_limits(max_context_bytes: u32) -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let openslate_dir = tmp.path().join(".openslate");
-    std::fs::create_dir(&openslate_dir).expect("create .openslate dir");
-    let db_path = openslate_dir.join("test.sqlite");
-    std::fs::write(
-        openslate_dir.join("openslate.toml"),
-        format!(
-            r#"
-[providers.mock]
-base_url = "http://localhost"
-api_key_env = "TUI_TEST_KEY"
+/// [`test_app_linked`] without the link handle.
+async fn test_app() -> App {
+    test_app_linked().await.0
+}
 
-[models.main]
-provider = "mock"
-model = "mock-model"
-
-[models.fast]
-provider = "mock"
-model = "mock-model"
-
-[database]
-path = {db_path:?}
-
-[limits]
-max_steps = 10
-max_depth = 4
-max_tool_calls = 20
-max_context_bytes = {max_context_bytes}
-max_output_bytes = 10_000
-"#
-        ),
-    )
-    .expect("write toml");
-    let agents_dir = openslate_dir.join("agents");
-    std::fs::create_dir(&agents_dir).expect("create agents dir");
-    // `read_file` is a registered builtin tool (validation knows it);
-    // the scripted turn's `echo` tool is only exercised through the
-    // manually-built manager in the other tests.
-    std::fs::write(
-        agents_dir.join("root.md"),
-        "---\nid: root\nname: Root Agent\nmodel: main\ntools:\n  - read_file\n---\nYou are the root agent.\n",
-    )
-    .expect("write root.md");
-    tmp
+/// A minimal wire snapshot for test seeding (custom session id/label;
+/// config view from the shared helper).
+fn snapshot_dto(model_alias: &str) -> openslate_protocol::SnapshotDto {
+    let mut snap = openslate_tui::client::snapshot_from_config(&test_config(), model_alias);
+    snap.session_id = "bridge-test-session".into();
+    snap.session_label = "bridge test".into();
+    snap
 }
 
 fn user_message(text: &str) -> Message {
@@ -276,98 +101,13 @@ fn user_message(text: &str) -> Message {
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
-/// Full turn through the real engine + bridge: assert the event sequence
-/// and that `TurnDone` carries a usable `TurnSummary` + the manager back.
-#[tokio::test]
-async fn full_turn_streams_expected_event_sequence() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-    let manager = test_manager();
-    let handle = event::spawn_turn(
-        manager,
-        RunId("integration-run".into()),
-        Box::new(ScriptedProvider::new(ScriptedProvider::scripted_turn())),
-        vec![user_message("echo hello world")],
-        openslate_core::runtime::CancellationToken::new(),
-        tx,
-    );
-    handle.await.expect("engine task joins cleanly");
-
-    let mut kinds: Vec<&'static str> = Vec::new();
-    let mut turn_summary = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            TuiEvent::RequestStart { .. } => kinds.push("request_start"),
-            TuiEvent::FirstToken => kinds.push("first_token"),
-            TuiEvent::Delta(_) => kinds.push("delta"),
-            TuiEvent::Reasoning(_) => kinds.push("reasoning"),
-            TuiEvent::Usage(_) => kinds.push("usage"),
-            TuiEvent::RequestEnd => kinds.push("request_end"),
-            TuiEvent::StepEnd => kinds.push("step_end"),
-            TuiEvent::ToolStart { .. } => kinds.push("tool_start"),
-            TuiEvent::ToolEnd { .. } => kinds.push("tool_end"),
-            TuiEvent::ApprovalRequested { .. } => kinds.push("approval"),
-            TuiEvent::TurnDone(payload) => {
-                kinds.push("turn_done");
-                // `RunManager` is not Debug, so no `.expect` — match.
-                let (summary, _manager) = match payload {
-                    Ok(pair) => pair,
-                    Err(_) => panic!("scripted turn should succeed"),
-                };
-                turn_summary = Some(summary);
-            }
-        }
-    }
-
-    // Step 1: request → stream → usage → request_end → tool → step_end
-    // Step 2 (final content step): request → stream → usage →
-    // request_end — the runtime emits NO step_end for the final step
-    // (core runtime.rs:903) — then TurnDone.
-    let expected = vec![
-        "request_start",
-        "usage",
-        "first_token",
-        "delta",
-        "delta",
-        "request_end",
-        "tool_start",
-        "tool_end",
-        "step_end",
-        "request_start",
-        "usage",
-        "first_token",
-        "delta",
-        "delta",
-        "request_end",
-        "turn_done",
-    ];
-    assert_eq!(kinds, expected, "full event sequence must match");
-
-    let summary = turn_summary.expect("TurnDone carried a summary");
-    assert_eq!(summary.run_id.0, "integration-run");
-    assert_eq!(summary.status, openslate_core::types::RunStatus::Completed);
-    assert_eq!(summary.total_steps, 2);
-    // user + assistant(tool_calls) + tool result + final assistant
-    assert_eq!(summary.messages.len(), 4);
-    assert_eq!(summary.total_input_tokens, 130);
-    assert_eq!(summary.total_output_tokens, 15);
-}
-
-/// The App side: engine events drive the transcript streaming area, the
-/// tool entry lifecycle, and the TurnDone merge + status fall-back.
+/// The App side: broadcast events drive the transcript streaming area,
+/// the tool entry lifecycle, and the TurnDone merge + status fall-back.
 #[tokio::test]
 async fn app_consumes_turn_events_and_merges_transcript() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
-    // A spare manager to hand back inside TurnDone(Ok) — the App stores
-    // it for the next turn (ownership round-trip).
-    let spare_manager = test_manager();
-
-    let summary = openslate_tui::event::TurnSummary {
+    let summary = TurnSummary {
         run_id: RunId("app-run".into()),
         status: openslate_core::types::RunStatus::Completed,
         messages: vec![
@@ -402,10 +142,6 @@ async fn app_consumes_turn_events_and_merges_transcript() {
         total_input_tokens: 100,
         total_output_tokens: 20,
         total_cost_usd: 0.002,
-        execution_tree: openslate_core::execution::ExecutionTree::new(
-            RunId("app-run".into()),
-            AgentId("root".into()),
-        ),
         model: "mock-model".into(),
     };
 
@@ -455,11 +191,8 @@ async fn app_consumes_turn_events_and_merges_transcript() {
     ));
 
     // ── TurnDone: merge + status fall-back ──
-    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok((
-        summary,
-        spare_manager,
-    )))))
-    .await;
+    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok(summary))))
+        .await;
     assert_eq!(*app.run_state(), RunState::Idle);
     assert!(!app.is_running());
     // The merge path keeps the event-ordered live view and only adds:
@@ -482,52 +215,8 @@ async fn app_consumes_turn_events_and_merges_transcript() {
         app.transcript_entries().last(),
         Some(TranscriptEntry::Assistant(text)) if text == "All done!"
     ));
-    // History = full message list (the engine-side authority).
+    // History = full message list (the server-side authority mirror).
     assert_eq!(app.history().len(), 4);
-}
-
-/// StartTurn through the injected scripted provider: a REAL end-to-end
-/// turn driven by dispatch only (store persistence included), polled to
-/// completion through the engine-event drain seam.
-#[tokio::test]
-async fn start_turn_via_dispatch_runs_real_engine() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let factory = move |_config: &openslate_core::config::OpenSlateConfig, _alias: &str| {
-        let responses = ScriptedProvider::scripted_turn();
-        Ok::<Box<dyn ModelProvider>, anyhow::Error>(Box::new(ScriptedProvider::new(responses)))
-    };
-    let mut app = App::with_provider_factory(ctx, std::sync::Arc::new(factory));
-
-    assert_eq!(
-        app.dispatch(Action::StartTurn("echo hello world".into()))
-            .await,
-        DispatchOutcome::Continue
-    );
-    assert!(app.is_running(), "engine task spawned");
-    assert!(app.session_run_id().is_some(), "session run opened");
-
-    // Pump engine events (the run loop's select! role) until TurnDone.
-    let mut guard = 0;
-    while app.is_running() && guard < 500 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        app.drain_engine_events().await;
-        guard += 1;
-    }
-    app.drain_engine_events().await;
-    assert!(!app.is_running(), "engine task must finish");
-
-    // Fixed merge point: the transcript was rebuilt from the engine's
-    // own result.messages (user + assistant(tool_calls) + final).
-    assert_eq!(*app.run_state(), RunState::Idle);
-    assert_eq!(app.history().len(), 4);
-    assert!(app.transcript_entries().iter().any(|e| matches!(
-        e,
-        TranscriptEntry::ToolCall { name, .. } if name == "echo"
-    )));
 }
 
 /// Per-request telemetry through the App's dispatch: RequestStart
@@ -542,13 +231,7 @@ async fn start_turn_via_dispatch_runs_real_engine() {
 /// (event-ordered entries) — only the recovery rebuilds drop them.
 #[tokio::test]
 async fn request_usage_meta_lines_flow_through_dispatch() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
-    let spare_manager = test_manager();
+    let mut app = test_app().await;
 
     app.dispatch(Action::Engine(TuiEvent::RequestStart {
         step: 1,
@@ -676,17 +359,10 @@ async fn request_usage_meta_lines_flow_through_dispatch() {
         total_input_tokens: 50,
         total_output_tokens: 10,
         total_cost_usd: 0.001,
-        execution_tree: openslate_core::execution::ExecutionTree::new(
-            RunId("app-run".into()),
-            AgentId("root".into()),
-        ),
         model: "mock-model".into(),
     };
-    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok((
-        summary,
-        spare_manager,
-    )))))
-    .await;
+    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok(summary))))
+        .await;
     assert!(
         app.transcript_entries()
             .iter()
@@ -703,12 +379,7 @@ async fn request_usage_meta_lines_flow_through_dispatch() {
 /// rate segment under the floor — a µs-old buffer shows ttft only).
 #[tokio::test]
 async fn first_token_feeds_the_live_stats_row_during_answer_streaming() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     app.dispatch(Action::Engine(TuiEvent::RequestStart {
         step: 1,
@@ -796,12 +467,7 @@ async fn first_token_feeds_the_live_stats_row_during_answer_streaming() {
 /// the tool row — `RequestEnd` holds it, `ToolStart` consumes it.
 #[tokio::test]
 async fn tool_step_usage_meta_lands_below_the_tool_row() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     app.dispatch(Action::Engine(TuiEvent::RequestStart {
         step: 1,
@@ -843,39 +509,22 @@ async fn tool_step_usage_meta_lands_below_the_tool_row() {
 
 // ─── ora-2 dispatch-level tests (frozen-revision window) ───────────────────
 
-/// A provider that always fails — drives the TurnDone(Err) path.
-struct FailingProvider;
-
-#[async_trait]
-impl ModelProvider for FailingProvider {
-    async fn generate(&self, _request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
-        Err(ProviderError::ServerError(500))
-    }
-
-    fn provider_name(&self) -> &str {
-        "failing"
-    }
-}
-
-/// Err path (review item 4a): the engine turn fails → the error surfaces
-/// as `RunState::Error`, the in-memory history is RELOADED from the store
-/// (exactly the persisted user message), and input submitted while the
+/// Err path (web-1 injection): the server's `TurnError` broadcast → the
+/// error surfaces as `RunState::Error`, and input submitted while the
 /// turn ran is RESTORED to the editor instead of auto-retried.
 #[tokio::test]
-async fn turn_error_restores_pending_input_and_reloads_store() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let factory = |_config: &openslate_core::config::OpenSlateConfig, _alias: &str| {
-        Ok::<Box<dyn ModelProvider>, anyhow::Error>(Box::new(FailingProvider))
-    };
-    let mut app = App::with_provider_factory(ctx, std::sync::Arc::new(factory));
+async fn turn_error_restores_pending_input_and_surfaces_error() {
+    let (mut app, link) = test_app_linked().await;
 
     app.dispatch(Action::StartTurn("hello".into())).await;
-    assert!(app.is_running(), "engine task spawned");
-    assert!(app.session_run_id().is_some(), "session run opened");
+    assert!(app.is_running(), "optimistic in-flight after the submit");
+    assert_eq!(
+        link.take_sent(),
+        vec![ClientMsg::Submit {
+            text: "hello".into()
+        }],
+        "the submit left for the server"
+    );
 
     // Submit while the turn is running → queued as pending input (never
     // reaches the editor yet).
@@ -887,40 +536,28 @@ async fn turn_error_restores_pending_input_and_reloads_store() {
         "queued text is not typed into the editor"
     );
 
-    // Pump engine events until TurnDone(Err) is dispatched.
-    let mut guard = 0;
-    while app.is_running() && guard < 500 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        app.drain_engine_events().await;
-        guard += 1;
-    }
+    // The server's failure lands as TurnDone(Err) through the link.
+    link.emit(ServerMsg::TurnError {
+        message: "boom".into(),
+    });
     app.drain_engine_events().await;
-    assert!(!app.is_running(), "engine task must finish");
+    assert!(!app.is_running());
 
-    // The engine error surfaces (session stays alive — not a Quit).
+    // The turn error surfaces (session stays alive — not a Quit).
     assert!(matches!(app.run_state(), RunState::Error(_)));
 
     // Pending input restored to the editor (no auto-retry storms).
     assert_eq!(app.input_text(), "queued follow-up");
-
-    // History reloaded from the store: exactly the persisted user
-    // message (the engine failed before any assistant output).
-    assert_eq!(app.history().len(), 1);
-    assert_eq!(app.history()[0].content, "hello");
 }
 
 /// Approval modal preemption (review item 4b): while ApprovalActive, y/n/a
 /// answer the queue and EVERYTHING else — including input-box characters
-/// and submit — is swallowed; normal typing resumes once the queue drains.
+/// and submit — is swallowed; typing resumes once the resolutions land
+/// (web-1: the banner drains on `approval_resolved` broadcasts, not on
+/// the local keypress — first answer wins server-side).
 #[tokio::test]
 async fn approval_modal_preempts_input_keys() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    // Production factory — never invoked (no turn runs in this test).
-    let mut app = App::new(ctx);
+    let (mut app, link) = test_app_linked().await;
 
     let summary = ApprovalSummary {
         tool_name: "shell".into(),
@@ -943,17 +580,33 @@ async fn approval_modal_preempts_input_keys() {
     app.dispatch(Action::SubmitInput).await;
     assert_eq!(app.input_text(), "");
 
-    // `y` answers the front request; the queue keeps preemption active.
+    // `y` answers the front request — the answer LEAVES, but the queue
+    // keeps preemption active until the broadcast resolves it.
     app.dispatch(Action::InputChar('y')).await;
     app.dispatch(Action::InputChar('q')).await; // still pending → swallowed
     assert_eq!(app.input_text(), "");
-    // `n` and `a` drain the remaining two.
+    assert_eq!(
+        link.take_sent(),
+        vec![ClientMsg::ApprovalAnswer {
+            id: 1,
+            choice: openslate_protocol::ApprovalAnswerChoice::Approve,
+        }],
+        "y answered the front request"
+    );
+    // `n` and `a` answer the remaining two.
     app.dispatch(Action::InputChar('n')).await;
     app.dispatch(Action::InputChar('a')).await;
 
-    // Queue empty → preemption over: characters type into the editor
-    // again (also proves the layer derives from the queue, not a stale
-    // modal flag).
+    // Server broadcasts resolve all three: preemption over → characters
+    // type into the editor again (also proves the layer derives from the
+    // queue, not a stale modal flag).
+    for (id, choice) in [(1u64, "approve"), (2, "deny"), (3, "approve_all")] {
+        link.emit(ServerMsg::ApprovalResolved {
+            id,
+            choice: choice.into(),
+        });
+        app.drain_engine_events().await;
+    }
     app.dispatch(Action::InputChar('x')).await;
     assert_eq!(app.input_text(), "x");
 }
@@ -990,64 +643,13 @@ fn coalesce_deltas_merges_only_adjacent_deltas() {
     assert!(matches!(batch[3], Action::Tick));
 }
 
-/// Deferred auto-compact (review item 7): when `needs_compact` fires,
-/// `StartTurn` returns WITHOUT spawning the engine (the ` compacting…`
-/// badge paints on the draw between dispatch rounds) and the blocking
-/// summary call + turn spawn run on the NEXT dispatched action — never a
-/// silent freeze on a slow provider.
-#[tokio::test]
-async fn auto_compact_defers_to_next_dispatch_with_badge_visible() {
-    // Tiny byte limit → the single user message already crosses the 0.8
-    // compaction threshold.
-    let tmp = temp_project_with_limits(64);
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let factory = move |_config: &openslate_core::config::OpenSlateConfig, _alias: &str| {
-        let responses = ScriptedProvider::scripted_turn();
-        Ok::<Box<dyn ModelProvider>, anyhow::Error>(Box::new(ScriptedProvider::new(responses)))
-    };
-    let mut app = App::with_provider_factory(ctx, std::sync::Arc::new(factory));
-
-    let long_prompt = "x".repeat(120); // > 0.8 × 64 bytes
-    app.dispatch(Action::StartTurn(long_prompt.clone())).await;
-
-    // Deferred: no engine task yet, badge state set — this is exactly the
-    // state the run loop's draw paints between dispatch rounds.
-    assert!(!app.is_running(), "engine not spawned while compacting");
-    assert_eq!(*app.run_state(), RunState::Compacting);
-
-    // The next dispatched action (a Tick in the real loop) runs the
-    // compaction and then continues the turn spawn.
-    app.dispatch(Action::Tick).await;
-    assert!(app.is_running(), "turn spawned after the compact");
-    assert_eq!(*app.run_state(), RunState::Thinking);
-
-    // Pump to TurnDone and verify the turn completed end-to-end.
-    let mut guard = 0;
-    while app.is_running() && guard < 500 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        app.drain_engine_events().await;
-        guard += 1;
-    }
-    app.drain_engine_events().await;
-    assert_eq!(*app.run_state(), RunState::Idle);
-    assert_eq!(app.history().len(), 4);
-}
-
-/// CancelTurn under ApprovalActive (ora-3 review item 2): the pending
-/// request is denied (queue drains, preemption lifts) AND the turn's
-/// cancel token flips — the R3 hazard was "Deny alone lets the engine
-/// keep running".
+/// CancelTurn under ApprovalActive (ora-3 review item 2): the Deny AND
+/// the turn Cancel both leave for the server — the R3 hazard was "Deny
+/// alone lets the engine keep running". The banner itself waits for the
+/// `approval_resolved` broadcast (web-1).
 #[tokio::test]
 async fn cancel_turn_while_approval_pending_denies_and_cancels() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let (mut app, link) = test_app_linked().await;
 
     let summary = ApprovalSummary {
         tool_name: "shell".into(),
@@ -1065,57 +667,34 @@ async fn cancel_turn_while_approval_pending_denies_and_cancels() {
 
     app.dispatch(Action::CancelTurn).await;
 
-    // The Deny consumed the pending request (preemption lifted) …
-    assert_ne!(*app.run_state(), RunState::ApprovalPending);
-    // … and the running turn is cancelled — a lone Deny would not be.
-    assert!(app.is_cancelled());
-}
-
-/// Bridge-level deny round-trip (ora-3 review item 2, engine side): a
-/// blocked `decide` is released by `respond(id, Deny)` and returns
-/// `Denied` — the same std-channel path the CancelTurn branch and the
-/// shutdown `deny_all` rely on.
-#[tokio::test]
-async fn approval_bridge_deny_round_trip() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-    let bridge = Arc::new(ApprovalBridge::new(tx));
-
-    let worker = std::thread::spawn({
-        let bridge = Arc::clone(&bridge);
-        move || {
-            let request = ApprovalRequest {
-                tool_name: "shell".into(),
-                arguments: serde_json::json!({"cmd": "ls"}),
-                agent_id: "root".into(),
-                risk_level: RiskLevel::High,
-            };
-            bridge.decide(&request)
-        }
+    // Both halves left: the Deny answers the blocked request …
+    assert_eq!(
+        link.take_sent(),
+        vec![
+            ClientMsg::ApprovalAnswer {
+                id: 1,
+                choice: openslate_protocol::ApprovalAnswerChoice::Deny,
+            },
+            ClientMsg::Cancel,
+        ],
+        "deny + cancel both left for the server"
+    );
+    // … and the turn cancel is marked locally. Preemption lifts with
+    // the broadcast:
+    assert!(app.is_cancelled(), "the running turn is cancelled");
+    link.emit(ServerMsg::ApprovalResolved {
+        id: 1,
+        choice: "deny".into(),
     });
-
-    // decide registers the request and blocks on the std responder.
-    let id = match rx.recv().await {
-        Some(TuiEvent::ApprovalRequested { id, .. }) => id,
-        _ => panic!("expected ApprovalRequested from the bridge"),
-    };
-    assert_eq!(bridge.pending_count(), 1);
-    assert!(bridge.respond(id, ApprovalChoice::Deny));
-
-    let decision = worker.join().expect("decide thread to finish");
-    assert!(matches!(decision, ApprovalDecision::Denied(_)));
-    assert_eq!(bridge.pending_count(), 0);
+    app.drain_engine_events().await;
+    assert_ne!(*app.run_state(), RunState::ApprovalPending);
 }
 
 /// Exit-confirmation semantics (user request): a second Ctrl+C inside
 /// the modal CONFIRMS the quit; Esc dismisses without quitting.
 #[tokio::test]
 async fn second_ctrl_c_confirms_exit_and_esc_cancels() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     // Idle Ctrl+C escalates to the exit-confirmation modal (no quit yet).
     assert_eq!(
@@ -1131,12 +710,7 @@ async fn second_ctrl_c_confirms_exit_and_esc_cancels() {
 
     // Esc path: reopen the modal, then Esc dismisses without quitting.
     // (Fresh App so the quit above doesn't poison the loop state.)
-    let tmp2 = temp_project();
-    let config2 = tmp2.path().join(".openslate/openslate.toml");
-    let ctx2 = build_app_context(config2.to_str())
-        .await
-        .expect("build app context 2");
-    let mut app2 = App::new(ctx2);
+    let (mut app2, _link2) = test_app_linked().await;
     assert_eq!(
         app2.dispatch(Action::CancelTurn).await,
         DispatchOutcome::Continue
@@ -1156,12 +730,7 @@ async fn second_ctrl_c_confirms_exit_and_esc_cancels() {
 /// re-follows the live tail.
 #[tokio::test]
 async fn wheel_scroll_targets_transcript_not_input_history() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     // Default focus is the input box; type a char so any accidental
     // history navigation would be observable through `input_text()`.
@@ -1191,12 +760,7 @@ async fn wheel_scroll_targets_transcript_not_input_history() {
 /// the tool result folds in).
 #[tokio::test]
 async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     app.dispatch(Action::StartTurn("go".into())).await;
 
@@ -1237,7 +801,6 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
     // reasoning blocks survive (core never persists reasoning; the
     // live entries are the only record), the straggler "think B"/
     // "final" buffers commit, and the tool result folds into the row.
-    let spare = test_manager();
     let summary = openslate_tui::event::TurnSummary {
         run_id: RunId("order-run".into()),
         status: openslate_core::types::RunStatus::Completed,
@@ -1273,13 +836,9 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
         total_input_tokens: 10,
         total_output_tokens: 5,
         total_cost_usd: 0.001,
-        execution_tree: openslate_core::execution::ExecutionTree::new(
-            RunId("order-run".into()),
-            AgentId("root".into()),
-        ),
         model: "mock-model".into(),
     };
-    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok((summary, spare)))))
+    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok(summary))))
         .await;
     assert!(matches!(
         app.transcript_entries(),
@@ -1301,12 +860,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
 /// alias. Default ON (wheel scrolls); OFF = native selection works.
 #[tokio::test]
 async fn toggle_mouse_capture_flips_state_and_notice() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     assert!(app.mouse_capture(), "capture on by default (wheel)");
 
@@ -1356,12 +910,7 @@ async fn toggle_mouse_capture_flips_state_and_notice() {
 /// stay empty; nothing waited for a flush boundary).
 #[tokio::test]
 async fn streaming_delta_renders_markdown_styles_before_flush() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
+    let mut app = test_app().await;
 
     app.dispatch(Action::Engine(TuiEvent::RequestStart {
         step: 1,
@@ -1451,13 +1000,7 @@ async fn streaming_delta_renders_markdown_styles_before_flush() {
 /// stays the engine-side message authority.
 #[tokio::test]
 async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let mut app = App::new(ctx);
-    let spare_manager = test_manager();
+    let mut app = test_app().await;
 
     app.dispatch(Action::StartTurn("go".into())).await;
 
@@ -1546,17 +1089,10 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
         total_input_tokens: 130,
         total_output_tokens: 15,
         total_cost_usd: 0.002,
-        execution_tree: openslate_core::execution::ExecutionTree::new(
-            RunId("merge-run".into()),
-            AgentId("root".into()),
-        ),
         model: "mock-model".into(),
     };
-    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok((
-        summary,
-        spare_manager,
-    )))))
-    .await;
+    app.dispatch(Action::Engine(TuiEvent::TurnDone(Ok(summary))))
+        .await;
     assert_eq!(*app.run_state(), RunState::Idle);
 
     let entries = app.transcript_entries();
@@ -1632,29 +1168,20 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
     assert_eq!(app.history().len(), 4);
 }
 
-/// The Err-path fallback: after the store reload the transcript is
-/// REBUILT from the persisted messages — the live-only reasoning/tool
-/// entries are dropped (acceptable loss on the recovery path) and
-/// display == persisted truth for the next turn.
+/// The Err-path client semantics (web-1): the server's `TurnError`
+/// flushes the held step meta, drops the streaming buffers, and leaves
+/// the committed live-only entries (reasoning/tool rows) IN PLACE — the
+/// server is the history authority, so there is no local store reload
+/// anymore; a reconnect snapshot is the reconciliation path.
 #[tokio::test]
-async fn turn_done_err_rebuilds_from_store_dropping_live_entries() {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let factory = |_config: &openslate_core::config::OpenSlateConfig, _alias: &str| {
-        Ok::<Box<dyn ModelProvider>, anyhow::Error>(Box::new(FailingProvider))
-    };
-    let mut app = App::with_provider_factory(ctx, std::sync::Arc::new(factory));
+async fn turn_done_err_keeps_committed_live_entries() {
+    let (mut app, link) = test_app_linked().await;
 
     app.dispatch(Action::StartTurn("hello".into())).await;
-    assert!(app.is_running(), "engine task spawned");
-    assert!(app.session_run_id().is_some(), "session run opened (store)");
+    assert!(app.is_running(), "optimistic in-flight after the submit");
 
     // Live-only entries exist when the turn dies: a reasoning block
-    // flushed above a tool line (synthetic events — the failing
-    // provider streams nothing itself).
+    // flushed above a tool line (synthetic events).
     app.dispatch(Action::Engine(TuiEvent::Reasoning("dying thought".into())))
         .await;
     app.dispatch(Action::Engine(TuiEvent::ToolStart {
@@ -1669,24 +1196,23 @@ async fn turn_done_err_rebuilds_from_store_dropping_live_entries() {
         "reasoning visible before the failure"
     );
 
-    // Pump engine events until TurnDone(Err) is dispatched.
-    let mut guard = 0;
-    while app.is_running() && guard < 500 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        app.drain_engine_events().await;
-        guard += 1;
-    }
+    // The server's failure lands through the link.
+    link.emit(ServerMsg::TurnError {
+        message: "boom".into(),
+    });
     app.drain_engine_events().await;
-    assert!(!app.is_running(), "engine task must finish");
+    assert!(!app.is_running());
     assert!(matches!(app.run_state(), RunState::Error(_)));
 
-    // The store reload REBUILT the transcript from the persisted
-    // messages: only the user message survives (reasoning loss is
-    // accepted on the recovery path).
-    assert!(matches!(
-        app.transcript_entries(),
-        [TranscriptEntry::User(text)] if text == "hello"
-    ));
+    // Committed entries SURVIVE the error (user + reasoning + tool row):
+    // no local rebuild — the pushed user entry and the streamed history
+    // stay exactly what the user watched.
+    let entries = app.transcript_entries();
+    assert!(matches!(&entries[0], TranscriptEntry::User(t) if t == "hello"));
+    assert!(matches!(&entries[1], TranscriptEntry::Reasoning(t) if t == "dying thought"));
+    assert!(matches!(&entries[2], TranscriptEntry::ToolCall { .. }));
+    // The local history mirror keeps the submitted user message (the
+    // server's authoritative list arrives with the next snapshot).
     assert_eq!(app.history().len(), 1);
     assert_eq!(app.history()[0].content, "hello");
 }
@@ -1715,22 +1241,14 @@ fn written_payloads(seen: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
     seen.lock().expect("sink lock").clone()
 }
 
-/// Fresh app on a temp project with the capturing sink installed and
-/// the copy-file leg redirected into the tempdir (hermetic — no test
-/// writes the real `~/.local/share/openslate/last-copy.md`). The
-/// provider factory always FAILS, so a plain-text StartTurn pushes
-/// the user transcript entry and restores the editor without spawning
-/// an engine task (no background events racing the assertions).
+/// Fresh client app with the capturing sink installed and the copy-file
+/// leg redirected into a tempdir (hermetic — no test writes the real
+/// `~/.local/share/openslate/last-copy.md`). A plain-text StartTurn
+/// pushes the user transcript entry and sends `Submit` — the server
+/// (MemLink) never answers, so no background events race the assertions.
 async fn copy_test_app() -> (App, Arc<std::sync::Mutex<Vec<String>>>, tempfile::TempDir) {
-    let tmp = temp_project();
-    let config_path = tmp.path().join(".openslate/openslate.toml");
-    let ctx = build_app_context(config_path.to_str())
-        .await
-        .expect("build app context");
-    let factory = move |_config: &openslate_core::config::OpenSlateConfig, _alias: &str| {
-        Err::<Box<dyn ModelProvider>, anyhow::Error>(anyhow::anyhow!("offline fixture"))
-    };
-    let mut app = App::with_provider_factory(ctx, std::sync::Arc::new(factory));
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let (mut app, _link) = test_app_linked().await;
     let (seen, sink) = capturing_sink();
     app.set_clipboard_sink(sink);
     app.set_copy_file_dir(tmp.path().join("copy-out"));
@@ -1787,13 +1305,9 @@ fn tool_fold_turn_done(content: &str) -> TuiEvent {
         total_input_tokens: 10,
         total_output_tokens: 5,
         total_cost_usd: 0.0,
-        execution_tree: openslate_core::execution::ExecutionTree::new(
-            RunId("copy-tool".into()),
-            AgentId("root".into()),
-        ),
         model: "mock-model".into(),
     };
-    TuiEvent::TurnDone(Ok((summary, test_manager())))
+    TuiEvent::TurnDone(Ok(summary))
 }
 
 /// Empty state: Ctrl+Y with no assistant output posts the
@@ -2044,4 +1558,189 @@ async fn copy_with_unknown_arg_shows_usage() {
     assert_eq!(app.status_notice(), Some("usage: /copy [all|tool]"));
     assert!(written_payloads(&seen).is_empty(), "no OSC 52 write");
     assert!(!copy_file(&tmp).exists(), "no copy file written");
+}
+
+// ─── web-1: client-lifecycle behaviors ─────────────────────────────────────
+
+/// `/new`: sends `NewSession` when idle; while a turn is running the
+/// guard posts the notice instead (the reset broadcast owns the swap).
+#[tokio::test]
+async fn new_session_sends_and_guards_while_running() {
+    let (mut app, link) = test_app_linked().await;
+    app.dispatch(Action::StartTurn("/new".into())).await;
+    assert_eq!(link.take_sent(), vec![ClientMsg::NewSession]);
+    // The notice lands with the broadcast, not the local keypress.
+    link.emit(ServerMsg::SessionReset);
+    app.drain_engine_events().await;
+    assert_eq!(app.status_notice(), Some("已开启新会话"));
+
+    // While a turn runs: guarded, nothing leaves.
+    app.dispatch(Action::StartTurn("go".into())).await;
+    link.take_sent();
+    app.dispatch(Action::StartTurn("/new".into())).await;
+    assert!(link.sent_snapshot().is_empty(), "guarded while running");
+    assert_eq!(
+        app.status_notice(),
+        Some("turn running — Ctrl+C to cancel, then /new")
+    );
+}
+
+/// `/model <alias>`: known alias → `SetModel` leaves, the notice lands
+/// with the `ModelChanged` broadcast; unknown alias → local mirror
+/// error, nothing leaves.
+#[tokio::test]
+async fn model_switch_flows_through_the_server() {
+    let (mut app, link) = test_app_linked().await;
+    app.dispatch(Action::StartTurn("/model fast".into())).await;
+    assert_eq!(
+        link.take_sent(),
+        vec![ClientMsg::SetModel {
+            alias: "fast".into()
+        }]
+    );
+    assert_eq!(app.status_notice(), None, "no notice until the broadcast");
+    link.emit(ServerMsg::ModelChanged {
+        alias: "fast".into(),
+    });
+    app.drain_engine_events().await;
+    assert_eq!(app.status_notice(), Some("model → fast"));
+
+    // Unknown alias: rejected against the mirror, nothing leaves.
+    app.dispatch(Action::StartTurn("/model nope".into())).await;
+    assert!(link.take_sent().is_empty());
+    assert!(matches!(app.run_state(), RunState::Error(_)));
+}
+
+/// Link-phase notices: the INITIAL connect is silent (the UI is not on
+/// screen yet — a notice there would linger as a stale banner on the
+/// first frame, the "首次打开显示重连中" bug); a mid-run drop announces
+/// with the attempt number; recovery announces only after a real drop.
+#[tokio::test]
+async fn link_state_notice_lifecycle() {
+    let (mut app, link) = test_app_linked().await;
+    assert_eq!(app.status_notice(), None);
+
+    // A late/defensive Connecting event stays silent.
+    link.emit_tui(TuiEvent::LinkState(LinkPhase::Connecting));
+    app.drain_engine_events().await;
+    assert_eq!(app.status_notice(), None);
+
+    // Mid-run drop → attempt-numbered freeze notice.
+    link.emit_tui(TuiEvent::LinkState(LinkPhase::Reconnecting { attempt: 2 }));
+    app.drain_engine_events().await;
+    assert_eq!(app.status_notice(), Some("已断线，第 2 次重连中…"));
+
+    // Recovery after a real drop → announced.
+    link.emit_tui(TuiEvent::LinkState(LinkPhase::Connected));
+    app.drain_engine_events().await;
+    assert_eq!(app.status_notice(), Some("已重新连接"));
+
+    // A repeated Connected (snapshot's defensive path) never re-announces.
+    link.emit_tui(TuiEvent::LinkState(LinkPhase::Connected));
+    app.drain_engine_events().await;
+    assert_eq!(app.status_notice(), Some("已重新连接"));
+}
+
+/// Snapshot rebuild: the server's entry mirror swaps the transcript
+/// WHOLESALE (live-only kinds included), session state re-syncs, and a
+/// second snapshot REPLACES rather than appends.
+#[tokio::test]
+async fn snapshot_rebuilds_the_transcript_wholesale() {
+    use openslate_protocol::EntryDto;
+    let (mut app, link) = test_app_linked().await;
+    // Local live state first (submitted turn in flight).
+    app.dispatch(Action::StartTurn("local".into())).await;
+    assert!(app.is_running());
+
+    let mut snap = snapshot_dto("main");
+    snap.session_id = "snap-2".into();
+    snap.running = false;
+    snap.transcript = vec![
+        EntryDto::User {
+            text: "history user".into(),
+        },
+        EntryDto::Assistant {
+            text: "history answer".into(),
+        },
+        EntryDto::Reasoning {
+            text: "history reasoning".into(),
+        },
+        EntryDto::Meta {
+            text: "↑1 ↓2".into(),
+        },
+    ];
+    link.emit(ServerMsg::Snapshot {
+        session: Box::new(snap),
+    });
+    app.drain_engine_events().await;
+
+    let entries = app.transcript_entries();
+    assert_eq!(
+        entries.len(),
+        4,
+        "the local user entry is GONE — wholesale swap"
+    );
+    assert!(matches!(&entries[0], TranscriptEntry::User(t) if t == "history user"));
+    assert!(matches!(&entries[1], TranscriptEntry::Assistant(t) if t == "history answer"));
+    assert!(matches!(&entries[2], TranscriptEntry::Reasoning(t) if t == "history reasoning"));
+    assert!(matches!(&entries[3], TranscriptEntry::Meta(t) if t == "↑1 ↓2"));
+    assert_eq!(app.session_run_id(), Some("snap-2"));
+    assert!(!app.is_running(), "running re-synced from the snapshot");
+
+    // A second snapshot REPLACES the first.
+    let mut snap2 = snapshot_dto("main");
+    snap2.transcript = vec![EntryDto::User {
+        text: "only".into(),
+    }];
+    link.emit(ServerMsg::Snapshot {
+        session: Box::new(snap2),
+    });
+    app.drain_engine_events().await;
+    assert_eq!(app.transcript_entries().len(), 1);
+}
+
+/// Pending input auto-submits when the turn completes (TurnOk) and the
+/// optimistic in-flight flag retires on both TurnOk/TurnError.
+#[tokio::test]
+async fn pending_input_auto_submits_after_turn_ok() {
+    let (mut app, link) = test_app_linked().await;
+    app.dispatch(Action::StartTurn("first".into())).await;
+    link.take_sent();
+    // Queued while the first turn runs.
+    app.dispatch(Action::StartTurn("second".into())).await;
+    assert!(link.take_sent().is_empty(), "queued, not sent");
+
+    link.emit(ServerMsg::TurnOk {
+        summary: Box::new(openslate_protocol::TurnSummaryDto {
+            run_id: RunId("t1".into()),
+            status: openslate_core::types::RunStatus::Completed,
+            messages: vec![user_message("first")],
+            total_steps: 1,
+            total_input_tokens: 10,
+            total_output_tokens: 5,
+            total_cost_usd: 0.001,
+            model: "mock-model".into(),
+        }),
+    });
+    app.drain_engine_events().await;
+    assert_eq!(
+        link.take_sent(),
+        vec![ClientMsg::Submit {
+            text: "second".into()
+        }],
+        "the queued input auto-submitted"
+    );
+    assert!(app.is_running(), "optimistic flag set for the next turn");
+}
+
+/// Ctrl+C while running sends `Cancel` (the server runs the engine-side
+/// cancel; TurnOk/TurnError closes the turn).
+#[tokio::test]
+async fn cancel_while_running_sends_cancel() {
+    let (mut app, link) = test_app_linked().await;
+    app.dispatch(Action::StartTurn("go".into())).await;
+    link.take_sent();
+    app.dispatch(Action::CancelTurn).await;
+    assert_eq!(link.take_sent(), vec![ClientMsg::Cancel]);
+    assert!(app.is_cancelled());
 }

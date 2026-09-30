@@ -1900,9 +1900,8 @@ supports_vision = true
 fast = "fast"
 "#;
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("openslate.toml");
-        std::fs::write(&path, toml).expect("write toml");
-        openslate_app::wiring::load_config(&path).expect("parse test config")
+        let _ = dir; // fixture is parse-only (web-1): no store, no wiring
+        openslate_core::config::parse_openslate_toml(toml).expect("parse test config")
     }
 
     fn component() -> ModelsComponent {
@@ -2297,10 +2296,7 @@ fast = "fast"
     fn empty_config_renders_empty_state_hints() {
         let mut m = ModelsComponent::new();
         m.reset_view();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("openslate.toml");
-        std::fs::write(&path, "").expect("write empty toml");
-        let cfg = openslate_app::wiring::load_config(&path).expect("parse empty config");
+        let cfg = openslate_core::config::parse_openslate_toml("").expect("parse empty config");
         m.sync(&cfg);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 18)).expect("terminal");

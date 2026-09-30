@@ -115,6 +115,17 @@ impl ApprovalComponent {
         }
     }
 
+    /// web-1: remove the request with the given id (the server's
+    /// `approval_resolved` broadcast — any client may have answered).
+    /// Returns the removed request so the App can record the decision
+    /// line; `None` when this client never saw that request (e.g. it
+    /// attached mid-approval after the banner was already queued
+    /// elsewhere, or the id raced a snapshot swap).
+    pub fn resolve(&mut self, id: u64) -> Option<PendingApproval> {
+        let pos = self.queue.iter().position(|p| p.id == id)?;
+        Some(self.queue.remove(pos))
+    }
+
     /// Drop everything (shutdown / deny-all).
     pub fn clear(&mut self) {
         self.queue.clear();

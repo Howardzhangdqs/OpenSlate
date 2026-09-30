@@ -24,8 +24,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Terminal;
 
-use openslate_core::execution::{ExecutionStatus, ExecutionTree};
-use openslate_core::types::{AgentId, RunId};
 use openslate_tui::components::{
     AgentsComponent, AppCtx, Component, ConfigSummary, Focus, RunInfo, RunState, SessionComponent,
 };
@@ -123,10 +121,6 @@ fn session_row(label: &str, value: &str, value_style: Style, t: &Theme) -> Line<
     ])
 }
 
-fn execution_tree() -> ExecutionTree {
-    ExecutionTree::new(RunId("r".into()), AgentId("root".into()))
-}
-
 // ─── agents panel ──────────────────────────────────────────────────────────
 
 #[test]
@@ -156,43 +150,34 @@ fn agents_live_view_renders_running_child_and_unknowable_tail() {
 }
 
 #[test]
-fn agents_calibrated_view_renders_full_tree_with_terminal_glyphs() {
+fn agents_live_history_lingers_and_turn_reset_clears() {
     let t = Theme::new();
     let ctx = test_ctx(None);
     let mut agents = AgentsComponent::new();
     agents.set_root("root");
+    // Two delegations complete; the rows LINGER (completed) — web-1 has
+    // no post-turn calibration, the live history IS the turn's record.
+    agents.on_delegate_start("researcher");
+    agents.on_delegate_start("verifier");
+    agents.on_delegate_end("call_agent");
+    agents.on_delegate_end("call_agent");
 
-    // root → researcher(Completed) → writer(Failed, depth 2)
-    // root → verifier(left Running → Interrupted)
-    let run_id = RunId("r".into());
-    let mut tree = execution_tree();
-    let root_id = tree.root_id().clone();
-    let researcher = tree.create_child(
-        run_id.clone(),
-        AgentId("researcher".into()),
-        root_id.clone(),
-        None,
-    );
-    let writer = tree.create_child(
-        run_id.clone(),
-        AgentId("writer".into()),
-        researcher.clone(),
-        None,
-    );
-    tree.create_child(run_id, AgentId("verifier".into()), root_id.clone(), None);
-    tree.update_status(&root_id, ExecutionStatus::Completed);
-    tree.update_status(&researcher, ExecutionStatus::Completed);
-    tree.update_status(&writer, ExecutionStatus::Failed);
-    // root/verifier stay Running → Interrupted in the final snapshot.
-    agents.calibrate(&tree);
-
-    let backend = draw(6, &ctx, |f, area, ctx| agents.render(f, area, ctx));
+    let backend = draw(5, &ctx, |f, area, ctx| agents.render(f, area, ctx));
     let expected = Buffer::with_lines(vec![
         title("agents", t.header_focused),
         content("◆ root", t.agent_active),
         content("  ├ ✓ researcher", t.agent_done),
-        content("    └ × writer", t.agent_failed),
-        content("  └ ○ verifier", t.agent_done),
+        content("  └ ✓ verifier", t.agent_done),
+        blank(),
+    ]);
+    backend.assert_buffer(&expected);
+
+    // The next turn's first request retires the previous history.
+    agents.turn_reset();
+    let backend = draw(3, &ctx, |f, area, ctx| agents.render(f, area, ctx));
+    let expected = Buffer::with_lines(vec![
+        title("agents", t.header_focused),
+        content("◆ root", t.agent_active),
         blank(),
     ]);
     backend.assert_buffer(&expected);
@@ -218,17 +203,8 @@ fn agents_long_id_clips_at_30_columns_without_wrap() {
     let ctx = test_ctx(None);
     let mut agents = AgentsComponent::new();
     agents.set_root("root");
-    let run_id = RunId("r".into());
-    let mut tree = execution_tree();
-    let root_id = tree.root_id().clone();
-    let child = tree.create_child(
-        run_id,
-        AgentId("very-long-agent-identifier-123456".into()),
-        root_id,
-        None,
-    );
-    tree.update_status(&child, ExecutionStatus::Completed);
-    agents.calibrate(&tree);
+    agents.on_delegate_start("very-long-agent-identifier-123456");
+    agents.on_delegate_end("call_agent");
 
     let backend = draw(4, &ctx, |f, area, ctx| agents.render(f, area, ctx));
     // 1 indent + "  └ ✓ " prefix (6 cols) + 23 visible id chars = 30:

@@ -95,11 +95,11 @@ impl RunState {
     }
 }
 
-/// Pure state-machine step: fold one engine event into the run state.
+/// Pure state-machine step: fold one server event into the run state.
 ///
-/// Note `ApprovalRespond` is not a `TuiEvent` — when the App sends the
-/// answer it sets the state back to `Thinking` itself (the engine's next
-/// event corrects it to the truth).
+/// The client-lifecycle variants (Snapshot/ConfigChanged/…) are
+/// transport/config concerns — no run-state change (the App's snapshot
+/// handler re-syncs `Thinking` from `running` itself).
 pub fn transition(state: &mut RunState, event: &TuiEvent) {
     match event {
         TuiEvent::RequestStart { .. } => *state = RunState::Thinking,
@@ -109,7 +109,10 @@ pub fn transition(state: &mut RunState, event: &TuiEvent) {
                 *state = RunState::Thinking;
             }
         }
-        TuiEvent::Usage(_) | TuiEvent::RequestEnd | TuiEvent::StepEnd => {
+        TuiEvent::InputEstimate(_)
+        | TuiEvent::Usage(_)
+        | TuiEvent::RequestEnd
+        | TuiEvent::StepEnd => {
             // No state change: request end → maybe more steps.
         }
         TuiEvent::ToolStart { name, args } => {
@@ -126,15 +129,31 @@ pub fn transition(state: &mut RunState, event: &TuiEvent) {
             *state = RunState::Thinking;
         }
         TuiEvent::ApprovalRequested { .. } => *state = RunState::ApprovalPending,
-        TuiEvent::TurnDone(Ok((summary, _manager))) => {
+        TuiEvent::ApprovalResolved { .. } => {
+            // The server resumes the turn (or ends it) — the next
+            // streaming event corrects; meanwhile stop showing the
+            // approval-pending marker.
+            if *state == RunState::ApprovalPending {
+                *state = RunState::Thinking;
+            }
+        }
+        TuiEvent::TurnDone(Ok(summary)) => {
             *state = if summary.status == openslate_core::types::RunStatus::Failed {
                 RunState::Error("run failed".to_owned())
             } else {
                 RunState::Idle
             };
         }
-        TuiEvent::TurnDone(Err((msg, _))) => {
+        TuiEvent::TurnDone(Err(msg)) => {
             *state = RunState::Error(msg.clone());
+        }
+        TuiEvent::Snapshot(_)
+        | TuiEvent::ConfigChanged(_)
+        | TuiEvent::ModelChanged(_)
+        | TuiEvent::SessionReset
+        | TuiEvent::Notice(_)
+        | TuiEvent::LinkState(_) => {
+            // Transport/config lifecycle: no run-state change.
         }
     }
 }
@@ -366,7 +385,6 @@ impl Component for StatusComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openslate_core::run_manager::RunManager;
     use openslate_core::types::RunStatus;
     use ratatui::style::{Modifier, Style};
 
@@ -615,10 +633,6 @@ mod tests {
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cost_usd: 0.0,
-            execution_tree: openslate_core::execution::ExecutionTree::new(
-                openslate_core::types::RunId("r".into()),
-                openslate_core::types::AgentId("root".into()),
-            ),
             model: "m".into(),
         }
     }
@@ -727,15 +741,12 @@ mod tests {
     fn turn_done_returns_to_idle_or_error() {
         let mut state = RunState::Thinking;
         let summary = dummy_summary(RunStatus::Completed);
-        transition(
-            &mut state,
-            &TuiEvent::TurnDone(Ok((summary, manager_stub()))),
-        );
+        transition(&mut state, &TuiEvent::TurnDone(Ok(summary)));
         assert_eq!(state, RunState::Idle);
         assert!(!state.is_running());
 
         let mut state = RunState::Thinking;
-        transition(&mut state, &TuiEvent::TurnDone(Err(("boom".into(), None))));
+        transition(&mut state, &TuiEvent::TurnDone(Err("boom".into())));
         assert_eq!(state, RunState::Error("boom".into()));
     }
 
@@ -743,11 +754,33 @@ mod tests {
     fn turn_done_failed_status_is_error() {
         let mut state = RunState::Thinking;
         let summary = dummy_summary(RunStatus::Failed);
+        transition(&mut state, &TuiEvent::TurnDone(Ok(summary)));
+        assert!(matches!(state, RunState::Error(_)));
+    }
+
+    #[test]
+    fn approval_resolved_resumes_from_pending() {
+        // web-1: the broadcast clears the approval-pending marker; any
+        // other state is left for the next streaming event to correct.
+        let mut state = RunState::ApprovalPending;
         transition(
             &mut state,
-            &TuiEvent::TurnDone(Ok((summary, manager_stub()))),
+            &TuiEvent::ApprovalResolved {
+                id: 1,
+                choice: "approve".into(),
+            },
         );
-        assert!(matches!(state, RunState::Error(_)));
+        assert_eq!(state, RunState::Thinking);
+
+        let mut state = RunState::Idle;
+        transition(
+            &mut state,
+            &TuiEvent::ApprovalResolved {
+                id: 1,
+                choice: "deny".into(),
+            },
+        );
+        assert_eq!(state, RunState::Idle, "non-pending stays untouched");
     }
 
     #[test]
@@ -772,43 +805,15 @@ mod tests {
 
     #[test]
     fn compacting_animates_but_is_not_running() {
-        // Compacting shows a live badge but no engine task exists yet —
-        // it must not gate /new or the tick cadence as "running".
+        // web-1: compaction runs server-side — the client never enters
+        // this state anymore, but the display state (badge + animation
+        // without "running" gating) stays frozen for wire-compatible
+        // future use.
         let state = RunState::Compacting;
         assert!(state.is_animated());
         assert!(!state.is_running());
         // The segment text carries the review-mandated label.
         let spans = state_group(&state, 0, true, &Theme::new()).expect("compacting segment");
         assert_eq!(text(&spans), "◌ compacting…");
-    }
-
-    // A minimal real RunManager (config parse + empty tree) as the opaque
-    // TurnDone payload — constructing it inline keeps the test hermetic.
-    fn manager_stub() -> RunManager {
-        let toml = r#"
-[providers.p]
-base_url = "http://localhost"
-api_key_env = "K"
-
-[models.main]
-provider = "p"
-model = "m"
-"#;
-        let config = openslate_core::config::parse_openslate_toml(toml).expect("parse");
-        let agents = vec![openslate_core::types::AgentConfig {
-            id: openslate_core::types::AgentId("root".into()),
-            name: "Root".into(),
-            model: "main".into(),
-            children: vec![],
-            tools: vec![],
-            default_prompt: "p".into(),
-        }];
-        let tree = openslate_core::agent_tree::AgentTree::from_configs(&agents).expect("tree");
-        RunManager::new(
-            config,
-            tree,
-            openslate_core::tool::ToolRegistry::new(),
-            openslate_core::skills::SkillsCatalog::default(),
-        )
     }
 }

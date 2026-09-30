@@ -4,7 +4,7 @@
 //! # Main loop shape
 //!
 //! ```text
-//! select! { tick │ crossterm EventStream │ engine channel }
+//! select! { tick │ crossterm EventStream │ server-link channel }
 //!   → all sources become Actions in one unbounded dispatcher channel
 //!   → bounded drain (≤64 actions or 4 ms, whichever first)
 //!   → adjacent Delta events coalesced
@@ -20,29 +20,26 @@
 //! layer is active, `y`/`n`/`a` preempt EVERYTHING (including input-box
 //! characters). `Tab` (focus cycling) only works in the non-modal layer.
 //!
-//! # Engine-turn ownership (frozen)
+//! # Client ownership (web-1)
 //!
-//! The App holds `Option<RunManager>`; submitting a turn `take()`s it,
-//! moves it into [`crate::event::spawn_turn`]'s task, and
-//! [`crate::event::TuiEvent::TurnDone`] carries it back (both arms). The
-//! turn future is NEVER inlined into the UI `select!` — an approval's
-//! blocking `decide()` would freeze the loop. The runtime MUST be
-//! multi-thread (see main.rs).
+//! The App is a pure client: turns, approvals, session state and config
+//! persistence all live in `openslate-server`. Submitting a turn sends
+//! [`openslate_protocol::ClientMsg::Submit`] through the
+//! [`crate::client::ServerLink`]; every server broadcast arrives as
+//! [`crate::event::TuiEvent`]s through the same channel the local
+//! engine bridge used to feed (the `select!`/coalesce pipeline is
+//! unchanged). The transcript mirror is rebuilt wholesale from each
+//! [`TuiEvent::Snapshot`]; a link drop freezes outbound actions behind
+//! a transport-state gate.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use openslate_app::wiring::AppContext;
-use openslate_core::approval::ApprovalManager;
 use openslate_core::config::OpenSlateConfig;
-use openslate_core::context_manager::{compact, needs_compact};
-use openslate_core::provider::{GenerateRequest, ModelProvider};
-use openslate_core::run_manager::RunManager;
-use openslate_core::runtime::{CancellationToken, CostSpec, MessageSink};
-use openslate_core::types::{Message, MessageRole, RunId, Usage};
-use openslate_store_sqlite::recorder::RunRecorder;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use openslate_core::types::{Message, MessageRole, Usage};
+use openslate_protocol::{ClientMsg, ConfigViewDto, SnapshotDto};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio_stream::StreamExt;
 
 use ratatui::buffer::Buffer;
@@ -51,6 +48,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::action::{map_event, Action, ApprovalChoice};
+use crate::client::{
+    approval_choice_label, approval_choice_to_msg, config_from_view, entries_from_dto, LinkPhase,
+    ServerLink,
+};
 use crate::clipboard;
 use crate::components::models::{ModelsChange, ModelsIntent};
 use crate::components::transcript::SelectionEnd;
@@ -59,7 +60,7 @@ use crate::components::{
     InputComponent, ModelsComponent, RunInfo, RunState, SessionComponent, StatusComponent,
     TranscriptComponent,
 };
-use crate::event::{spawn_turn, ApprovalBridge, TuiEvent, TurnSummary};
+use crate::event::{TuiEvent, TurnSummary};
 use crate::icons::localize;
 use crate::slash::{self, SlashCommand};
 use crate::theme::Theme;
@@ -72,30 +73,12 @@ const RUN_TICK: Duration = Duration::from_millis(100);
 const DRAIN_BATCH: usize = 64;
 /// Drain time budget (spec: 4 ms).
 const DRAIN_BUDGET: Duration = Duration::from_millis(4);
-/// Grace period for the engine task during shutdown (spec: 5 s).
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ticks a transient status-bar notice stays up (~5 s at the 250 ms idle
 /// tick) before auto-clearing.
 const NOTICE_TICKS: u8 = 20;
 /// Minimum usable terminal; below this a warning panel replaces layout.
 const MIN_COLS: u16 = 60;
 const MIN_ROWS: u16 = 12;
-
-/// System prompt for the compaction summarizer (same contract as the
-/// REPL's — ported verbatim so both frontends summarize identically).
-const SUMMARY_SYSTEM_PROMPT: &str = "You summarize agent conversation transcripts \
-for continued work. Produce a concise summary that preserves: \
-(1) key decisions made and their rationale, \
-(2) important file paths, commands, and code artifacts touched, \
-(3) unfinished tasks, open questions, and next steps. \
-Drop pleasantries and verbose tool output details. Be brief — only what is \
-needed to continue the work effectively.";
-
-/// How the test seam builds the per-turn provider. Production wires
-/// [`openslate_app::build_provider_for_model`]; the integration test
-/// injects a scripted provider.
-pub type ProviderFactory =
-    Arc<dyn Fn(&OpenSlateConfig, &str) -> Result<Box<dyn ModelProvider>> + Send + Sync>;
 
 /// The modal layer stack, computed (not stored): approval queue wins over
 /// the stored `modal` field. See the module docs for precedence.
@@ -163,82 +146,87 @@ pub struct SessionSummary {
     pub total_cost_usd: f64,
 }
 
-/// Session-accumulated statistics (REPL-parity semantics).
-#[derive(Debug, Clone)]
+/// Session-accumulated statistics. web-1: the server snapshot's
+/// `session_stats` is the truth source — this local mirror accumulates
+/// per-turn for immediate feedback and is overwritten wholesale by
+/// every snapshot (which also reconciles server-side compact costs
+/// the local sum cannot see).
+#[derive(Debug, Clone, Default)]
 struct SessionStats {
     total_steps: u32,
     total_input_tokens: u64,
     total_output_tokens: u64,
     turns: u32,
-    /// Total session cost: turns + compact summary calls.
     total_cost_usd: f64,
-    /// The compact-summary subset (bills the session, not the run row).
-    compact_cost_usd: f64,
 }
 
-impl SessionStats {
-    fn new() -> Self {
-        Self {
-            total_steps: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            turns: 0,
-            total_cost_usd: 0.0,
-            compact_cost_usd: 0.0,
-        }
-    }
-
-    /// Cost attributable to the persisted run row (session minus compact).
-    fn run_cost_usd(&self) -> f64 {
-        self.total_cost_usd - self.compact_cost_usd
-    }
-}
-
-/// The session's backing persisted run (REPL `SessionRun` port): one run
-/// row spans the whole session; every turn lands under the same `run_id`.
-#[derive(Clone)]
-struct SessionRun {
-    run_id: RunId,
-    recorder: Arc<RunRecorder>,
+/// What `main` hands the App at construction (web-1): the outbound
+/// link, the inbound event feed, and seed state for the window between
+/// construction and the first snapshot. Tests build one from a parsed
+/// config + a `MemLink::pair()` channel.
+pub struct ClientBootstrap {
+    /// Outbound message sink (WS writer queue / test recorder).
+    pub link: Arc<dyn ServerLink>,
+    /// Inbound server events (the WS task's conversion output / the
+    /// test MemLink's `emit` producer).
+    pub events: UnboundedReceiver<TuiEvent>,
+    /// Config mirror seed — production passes an empty default (the
+    /// queued first snapshot hydrates on the first loop iteration);
+    /// tests may seed a parsed TOML fixture directly.
+    pub config: OpenSlateConfig,
+    /// Root agent id seed (snapshot refines).
+    pub root_agent_id: String,
 }
 
 /// The application aggregate. Public surface frozen; internals evolve
 /// only within the P3 write-domain rules.
 pub struct App {
-    // ── wiring pieces (kept alive / used per turn) ─────────────────────
+    // ── client state (web-1: the server owns engine + persistence) ────
+    /// Outbound message sink (WS writer queue; tests record).
+    link: Arc<dyn ServerLink>,
+    /// Transport state of the link (freeze gate source).
+    link_phase: LinkPhase,
+    /// Config mirror for local display/UX decisions (model panel,
+    /// `/model` alias check, limits). The server is the authority;
+    /// `ConfigChanged` swaps this wholesale.
     config: OpenSlateConfig,
-    /// Active (local) config file the session started from
-    /// (model-mgmt-2): levels write here.
-    active_config_path: std::path::PathBuf,
-    /// The user-global config library merged underneath the active file
-    /// (`None` = no global layer — provider/model writes then fall back
-    /// to the active file).
-    global_config_path: Option<std::path::PathBuf>,
-    /// Agents snapshot for post-save merged-config validation
-    /// (model-mgmt-2 save flow).
-    agents_config: openslate_core::config::AgentsConfig,
-    agent_tree: openslate_core::agent_tree::AgentTree,
-    store: Option<openslate_store_sqlite::store::SqliteStore>,
-    provider_factory: ProviderFactory,
-    /// MCP connections must outlive the tool registry inside the manager.
-    _mcp_connections: openslate_core::mcp::McpConnectionGuard,
-
-    // ── engine bridge ──────────────────────────────────────────────────
-    manager: Option<RunManager>,
-    engine_task: Option<tokio::task::JoinHandle<()>>,
-    cancel_token: CancellationToken,
-    events_tx: UnboundedSender<TuiEvent>,
+    /// Root agent id (agents panel seed; refreshed on config swaps).
+    root_agent_id: String,
+    /// Flattened `(agent name, model alias)` pairs from the config
+    /// view's agent tree — `models_change_guard`'s reference check
+    /// (delete-a-model-still-used-by-an-agent).
+    agents_model_refs: Vec<(String, String)>,
+    /// Server-assigned session id (first snapshot; `/new` swaps it).
+    session_id: Option<String>,
+    /// Display label of the current session.
+    session_label: String,
+    /// Server-authoritative active model alias (`ModelChanged` swaps it).
+    model_alias: String,
+    /// Whether THIS client believes a turn is in flight: set optimisti-
+    /// cally on `Submit`, cleared on `TurnDone` (both arms); snapshots
+    /// re-sync from `running`. Drives `is_running`, the input-queue
+    /// gate and the tick cadence.
+    turn_active: bool,
+    /// Test observer parity for the old cancel-token flip: set when a
+    /// `Cancel` left for the server, reset when the next turn starts.
+    cancel_sent: bool,
+    /// The server-link event feed (WS task / test MemLink producer on
+    /// the other end). The App never produces events itself (web-1) —
+    /// this is a receive-only leg of the main `select!`.
     events_rx: UnboundedReceiver<TuiEvent>,
-    approval_bridge: Arc<ApprovalBridge>,
+    /// A pending client-initiated request whose success confirmation
+    /// should notice (CRUD save / model switch); cleared on the matching
+    /// broadcast.
+    pending_confirm: Option<String>,
 
-    // ── conversation ───────────────────────────────────────────────────
+    // ── conversation mirror ────────────────────────────────────────────
+    /// Server history mirror (last `TurnOk` message list — display
+    /// parity for tests; the server never reads it back).
     history: Vec<Message>,
-    session_run: Option<SessionRun>,
     /// Input submitted while a turn was running; auto-submitted after
     /// `TurnDone` (restored to the editor on error instead — no retry
     /// storms).
     pending_input: Option<String>,
-    model_override: Option<String>,
     stats: SessionStats,
     /// Set by `Action::Redraw` (Ctrl+L): the run loop clears the
     /// terminal before the next draw — a TRUE full repaint. Diff-based
@@ -296,12 +284,6 @@ pub struct App {
     status_notice: Option<String>,
     /// Ticks remaining before `status_notice` auto-clears.
     notice_ticks: u8,
-    /// Auto-compact deferred flag: set with `RunState::Compacting` so the
-    /// badge PAINTS on the draw between dispatch rounds; the blocking
-    /// summary call then runs at the top of the NEXT dispatched action
-    /// (worst case one idle tick, 250 ms) — the UI is never frozen
-    /// without the `· compacting…` feedback visible.
-    compact_pending: bool,
     /// The completion overlay's last-rendered rectangle (slash-3):
     /// the mouse-swallow hit rect. `None` while the list is closed
     /// (or a modal owns the screen) — recomputed every render.
@@ -338,69 +320,38 @@ pub struct App {
 }
 
 impl App {
-    /// Build the App with the production provider factory.
-    pub fn new(ctx: AppContext) -> Self {
-        Self::with_provider_factory(ctx, Arc::new(openslate_app::build_provider_for_model))
-    }
-
-    /// Override the theme (colors + icon tier) — the CLI's
-    /// `--theme`/`--icons` entry point (theme-1).
-    pub fn with_theme(mut self, theme: Theme) -> Self {
-        self.theme = theme;
-        self
-    }
-
-    /// Build the App with a custom per-turn provider factory (test seam).
-    #[allow(clippy::too_many_lines)]
-    pub fn with_provider_factory(ctx: AppContext, provider_factory: ProviderFactory) -> Self {
-        let AppContext {
+    /// Build the App from the client bootstrap (web-1): the link plus
+    /// the snapshot-derived initial state. The engine-era
+    /// `AppContext` assembly (manager/store/MCP/provider factory) is
+    /// gone — the server owns all of it.
+    pub fn new(bootstrap: ClientBootstrap) -> Self {
+        let ClientBootstrap {
+            link,
+            events,
             config,
-            agent_tree,
-            manager,
-            store,
-            mcp_connections,
-            agents,
-            config_path,
-            global_config_path,
-            ..
-        } = ctx;
-        let agents_config = agents;
-
-        let (events_tx, events_rx) = unbounded_channel();
-        let approval_bridge = Arc::new(ApprovalBridge::new(events_tx.clone()));
-
-        // Interactive approval policy derivation (same priority as the
-        // REPL): [approval].policy > interactive default
-        // auto_except([shell, run_code]).
-        let configured = config.approval.as_ref().map(|a| a.to_policy());
-        let effective = openslate_app::wiring::derive_effective_policy(configured, true, false);
-        let mut manager = manager;
-        // Arc<ApprovalBridge> coerces into the callback trait object here.
-        manager.approval = ApprovalManager::new(effective).with_callback(approval_bridge.clone());
+            root_agent_id,
+        } = bootstrap;
+        let events_rx = events;
 
         let mut agents = AgentsComponent::new();
-        agents.set_root(&agent_tree.get_root().id.0);
+        agents.set_root(&root_agent_id);
 
         Self {
+            link,
+            link_phase: LinkPhase::Connecting,
             config,
-            active_config_path: config_path,
-            global_config_path,
-            agents_config,
-            agent_tree,
-            store,
-            provider_factory,
-            _mcp_connections: mcp_connections,
-            manager: Some(manager),
-            engine_task: None,
-            cancel_token: CancellationToken::new(),
-            events_tx,
+            root_agent_id,
+            agents_model_refs: Vec::new(),
+            session_id: None,
+            session_label: String::new(),
+            model_alias: String::new(),
+            turn_active: false,
+            cancel_sent: false,
             events_rx,
-            approval_bridge,
+            pending_confirm: None,
             history: Vec::new(),
-            session_run: None,
             pending_input: None,
-            model_override: None,
-            stats: SessionStats::new(),
+            stats: SessionStats::default(),
             needs_full_redraw: false,
             mouse_capture: true,
             clipboard_out: clipboard::stdout_clipboard_sink(),
@@ -419,7 +370,6 @@ impl App {
             depth_cur: 0,
             status_notice: None,
             notice_ticks: 0,
-            compact_pending: false,
             completion_hit_rect: None,
             hover: None,
             mouse_down_target: None,
@@ -436,6 +386,13 @@ impl App {
         }
     }
 
+    /// Override the theme (colors + icon tier) — the CLI's
+    /// `--theme`/`--icons` entry point (theme-1).
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
     // ── Observers (frozen pub surface for tests/panels) ────────────────
 
     /// Current run-state machine position.
@@ -443,9 +400,9 @@ impl App {
         &self.run_state
     }
 
-    /// Whether a turn is executing (engine task alive).
+    /// Whether a turn is executing (submit sent, `TurnDone` pending).
     pub fn is_running(&self) -> bool {
-        self.engine_task.is_some()
+        self.turn_active
     }
 
     /// Committed transcript entries (rebuild output / live view).
@@ -465,9 +422,9 @@ impl App {
         &self.history
     }
 
-    /// Backing session run id, once a turn has been submitted.
+    /// Server-assigned session id, once the first snapshot arrived.
     pub fn session_run_id(&self) -> Option<&str> {
-        self.session_run.as_ref().map(|r| r.run_id.0.as_str())
+        self.session_id.as_deref()
     }
 
     /// Current input-editor text (dispatch-level test observer; also the
@@ -482,10 +439,11 @@ impl App {
         self.input.completion_open()
     }
 
-    /// Whether the current turn's cancel token has been flipped
+    /// Whether the current turn's cancel has been sent to the server
     /// (dispatch-level test observer for the CancelTurn / Ctrl+C paths).
+    /// web-1: the sent-`Cancel` observer — the local token is gone.
     pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.is_cancelled()
+        self.cancel_sent
     }
 
     /// Whether the transcript is pinned away from the live tail
@@ -528,10 +486,9 @@ impl App {
 
     // ── Main loop ──────────────────────────────────────────────────────
 
-    /// Run until quit. Performs the ordered shutdown (cancel → deny
-    /// pending approvals → await engine with timeout → finalize run row),
-    /// restores NOTHING here (terminal restore is main's job, symmetric
-    /// with init).
+    /// Run until quit. Restores NOTHING here (terminal restore is
+    /// main's job, symmetric with init); quitting drops the server
+    /// link, which the transport task observes as teardown.
     pub async fn run(mut self, mut terminal: ratatui::DefaultTerminal) -> Result<SessionSummary> {
         let (action_tx, mut action_rx) = unbounded_channel::<Action>();
         let mut events = crossterm::event::EventStream::new();
@@ -545,6 +502,14 @@ impl App {
         // `self.mouse_capture` after each dispatch round; a mismatch
         // executes the Enable/Disable escape BEFORE the next draw.
         let mut mouse_capture_applied = true;
+        // Force a full repaint before the first draw: a resize race
+        // during terminal handover (e.g. tmux window-size negotiation)
+        // can leave the first frame rendered against a stale buffer
+        // size, after which diff-rendering sees no changes and never
+        // repaints — observed as a blank screen until the first
+        // keypress. `clear()` resets both the screen and the previous
+        // buffer, so the first `draw()` is guaranteed to be full-size.
+        terminal.clear()?;
         while !quit {
             tokio::select! {
                 _ = tick.tick() => {
@@ -639,6 +604,14 @@ impl App {
         Ok(self.summary())
     }
 
+    /// Terminal teardown is main's job; the only App-side cleanup is
+    /// dropping the link (its send-channel close tells the transport
+    /// task to exit — the server denies still-blocked approvals on
+    /// disconnect).
+    async fn shutdown(&mut self) {
+        tracing::debug!("app shutdown: dropping server link");
+    }
+
     /// Feed one action through the dispatcher. Public so integration
     /// tests can drive the App without a terminal.
     pub async fn dispatch(&mut self, action: Action) -> DispatchOutcome {
@@ -666,15 +639,6 @@ impl App {
     /// Dispatch one action; returns the outcome plus an optional chained
     /// follow-up action (e.g. `SubmitInput` → `StartTurn(text)`).
     async fn dispatch_one(&mut self, action: Action) -> (DispatchOutcome, Option<Action>) {
-        // Deferred auto-compact (see `start_turn`): the `Compacting` badge
-        // has been painted by the draw between dispatch rounds — run the
-        // blocking summary call NOW (worst case one idle tick after the
-        // badge appeared), then continue the queued turn spawn. `Quit` is
-        // exempt: never wait out a slow summary call to exit.
-        if self.compact_pending && !matches!(action, Action::Quit) {
-            self.compact_pending = false;
-            self.run_deferred_compact().await;
-        }
         match action {
             // ── Lifecycle ──
             Action::Tick => {
@@ -723,9 +687,9 @@ impl App {
             // ── Ctrl+C semantics (state-dependent; see action.rs) ──
             Action::CancelTurn => match self.active_layer() {
                 Layer::ApprovalActive => {
-                    // Deny (unblocks the engine) AND cancel the turn.
+                    // Deny (unblocks the server) AND cancel the turn.
                     self.approval_respond(ApprovalChoice::Deny);
-                    self.cancel_token.cancel();
+                    self.send_cancel();
                     (DispatchOutcome::Continue, None)
                 }
                 Layer::ConfirmExit => {
@@ -736,7 +700,7 @@ impl App {
                     (DispatchOutcome::Quit, None)
                 }
                 _ if self.is_running() => {
-                    self.cancel_token.cancel();
+                    self.send_cancel();
                     (DispatchOutcome::Continue, None)
                 }
                 _ => {
@@ -1350,18 +1314,17 @@ impl App {
         }
     }
 
-    // ── model-mgmt-2: write routing + hot swap ──────────────────────────
+    // ── model-mgmt-2: CRUD send + confirm routing (web-1) ──────────────
 
-    /// Execute one models-overlay change: persist → reload the merged
-    /// config → validate → hot-swap `self.config`. Any failure posts a
-    /// warning notice and keeps BOTH the overlay open and the previous
-    /// config running (the provider is rebuilt per turn from
-    /// `self.config`, so a successful swap is immediately effective).
+    /// Execute one models-overlay change: emit the CRUD `ClientMsg`s
+    /// and wait for the server's verdict — `ConfigChanged` (success,
+    /// swap the mirror + notice) or a directed `Notice` (failure, keep
+    /// the previous config). The overlay stays open on both paths.
     ///
-    /// Defense in depth per the batch spec: the overlay's reference
-    /// guards run first (App-side, before the commit is even produced),
-    /// and this reload+validate pass is the backstop for anything that
-    /// slips through (e.g. a hand-broken file on disk).
+    /// Defense in depth: the overlay's reference guards run first
+    /// (App-side, instant, exact referencing names), the server
+    /// re-validates everything (its `validate_config` backstop) before
+    /// writing to disk.
     fn apply_models_change(&mut self, change: ModelsChange) {
         // First line of defense: refuse reference-breaking removals
         // with the exact referencing names (the overlay stays open).
@@ -1370,86 +1333,44 @@ impl App {
             self.models.sync(&self.config);
             return;
         }
-        let what = match self.persist_models_change(&change) {
-            Err(e) => {
-                self.set_notice(format!("保存失败 · {e}"));
-                self.models.sync(&self.config);
-                return;
-            }
-            Ok(what) => what,
-        };
-        match openslate_app::wiring::load_config_layered(
-            &self.active_config_path,
-            self.global_config_path.as_deref(),
-        ) {
-            Err(e) => self.set_notice(format!("已写入但装配失败 · {e}")),
-            Ok(merged) => match merged_validate_error(&merged, &self.agents_config) {
-                Some(err) => self.set_notice(format!("已写入但校验未通过 · {err}")),
-                None => {
-                    self.config = merged;
-                    let mut msg = format!("已保存并生效 · {what}");
-                    // provider/model edits route to the global library;
-                    // without one they fell back to the active file —
-                    // say so, per the write-routing contract.
-                    if self.global_config_path.is_none() && change_touches_library(&change) {
-                        msg +=
-                            &format!("（无全局库，已写入 {}）", self.active_config_path.display());
-                    }
-                    self.set_notice(msg);
-                }
-            },
+        if !self.link_ready() {
+            self.set_notice("已断线，重连中 · 保存请求未发送");
+            self.models.sync(&self.config);
+            return;
         }
-        // Either path: the overlay snapshot must match the config the
-        // App now holds (unchanged on failure, reloaded on success).
-        self.models.sync(&self.config);
+        let (what, msgs) = client_msgs_for_change(&change);
+        self.pending_confirm = Some(what);
+        for msg in msgs {
+            self.link.send(msg);
+        }
     }
 
-    /// Run the persist writers for one change. Returns the human
-    /// summary used in the success notice. Write routing: provider/
-    /// model upserts and removals → global library (fallback: the
-    /// active file); level set/remove → the active file (local-overlay
-    /// semantics); a pasted API key → the `.env` beside the global
-    /// config (fallback: beside the active file).
-    fn persist_models_change(
-        &self,
-        change: &ModelsChange,
-    ) -> std::result::Result<String, anyhow::Error> {
-        use openslate_core::config::persist;
-        let active = self.active_config_path.as_path();
-        let global = self.global_config_path.as_deref();
-        let library = global.unwrap_or(active);
-        let env_dir = |file: &std::path::Path| -> std::path::PathBuf {
-            file.parent().map(|p| p.to_path_buf()).unwrap_or_default()
-        };
-        Ok(match change {
-            ModelsChange::UpsertProvider { name, cfg, env_key } => {
-                if let Some((var, value)) = env_key {
-                    persist::upsert_env_key(&env_dir(global.unwrap_or(active)), var, value)?;
-                }
-                persist::upsert_provider(library, name, cfg)?;
-                format!("provider {name}")
+    /// `ConfigChanged` handling: swap the mirror, re-sync the overlay,
+    /// and post the pending CRUD's success notice (any client's save
+    /// refreshes us; only the initiator sees the confirmation text).
+    fn handle_config_changed(&mut self, config: ConfigViewDto) {
+        self.apply_config_view(&config);
+        if let Some(what) = self.pending_confirm.take() {
+            self.set_notice(format!("已保存并生效 · {what}"));
+        }
+    }
+
+    /// Swap the config mirror + everything derived from the view
+    /// (agents panel seed, guard reference pairs, overlay sync).
+    fn apply_config_view(&mut self, view: &ConfigViewDto) {
+        self.config = config_from_view(view);
+        self.root_agent_id = view.agents.id.clone();
+        fn walk(node: &openslate_protocol::AgentNodeDto, out: &mut Vec<(String, String)>) {
+            out.push((node.name.clone(), node.model.clone()));
+            for child in &node.children {
+                walk(child, out);
             }
-            ModelsChange::UpsertModel { entry, cfg } => {
-                persist::upsert_model(library, entry, cfg)?;
-                format!("模型条目 {entry}")
-            }
-            ModelsChange::SetLevel { level, entry } => {
-                persist::set_level(active, level, entry)?;
-                format!("levels.{level} → {entry}")
-            }
-            ModelsChange::RemoveProvider { name } => {
-                persist::remove_provider(library, name)?;
-                format!("删除 provider {name}")
-            }
-            ModelsChange::RemoveModel { entry } => {
-                persist::remove_model_entry(library, entry)?;
-                format!("删除模型条目 {entry}")
-            }
-            ModelsChange::RemoveLevel { level } => {
-                persist::remove_level(active, level)?;
-                format!("删除级别 {level}")
-            }
-        })
+        }
+        let mut refs = Vec::new();
+        walk(&view.agents, &mut refs);
+        self.agents_model_refs = refs;
+        self.agents.set_root(&self.root_agent_id);
+        self.models.sync(&self.config);
     }
 
     /// Reference guards for the models overlay (run BEFORE the commit):
@@ -1489,9 +1410,9 @@ impl App {
                     .filter(|(_, e)| e.as_str() == entry.as_str())
                     .map(|(l, _)| format!("levels.{l}"))
                     .collect();
-                for node in self.agent_tree.all_agents() {
-                    if node.model_alias == *entry {
-                        refs.push(format!("agent '{}'", node.name));
+                for (name, model) in &self.agents_model_refs {
+                    if model == entry {
+                        refs.push(format!("agent '{name}'"));
                     }
                 }
                 if refs.is_empty() {
@@ -1529,7 +1450,7 @@ impl App {
         }
     }
 
-    // ── Engine events ──────────────────────────────────────────────────
+    // ── Server events (display mirror + client lifecycle) ─────────────
 
     async fn handle_engine_event(&mut self, event: TuiEvent) -> (DispatchOutcome, Option<Action>) {
         // State machine first (single source of truth).
@@ -1581,12 +1502,17 @@ impl App {
                 self.request_started = Some(Instant::now());
                 self.first_token_at = None;
                 self.pending_usage = None;
+                // A new request means the previous turn's delegation
+                // view retires (web-1: no post-turn calibration — the
+                // live history lingers only until the next turn).
+                self.agents.turn_reset();
                 // A hold that reached the next request means the
                 // previous step had no tools — its stats land at that
                 // step's answer tail now; the live stats row resets
                 // for the new request.
                 self.transcript.flush_pending_step_meta();
                 self.transcript.set_live_ttft(None);
+                self.transcript.set_live_input_estimate(None);
             }
             TuiEvent::FirstToken => {
                 // First content/reasoning token of the current
@@ -1630,6 +1556,11 @@ impl App {
             TuiEvent::StepEnd => {
                 self.transcript.step_end();
             }
+            TuiEvent::InputEstimate(tokens) => {
+                // Server-side input estimate for the streaming request
+                // (`↑~N` live-row segment; cleared per request).
+                self.transcript.set_live_input_estimate(Some(tokens));
+            }
             TuiEvent::ApprovalRequested { id, request } => {
                 self.approval.enqueue(id, request);
                 // select-1: the approval banner preempts input (and
@@ -1638,6 +1569,79 @@ impl App {
                 self.transcript.clear_selection();
                 self.input.close_completion();
             }
+            TuiEvent::ApprovalResolved { id, choice } => {
+                // Broadcast verdict (ANY client may have answered —
+                // first answer wins server-side). All clients clear the
+                // banner for `id` and record the decision line.
+                if let Some(pending) = self.approval.resolve(id) {
+                    let label = approval_choice_label(&choice);
+                    self.transcript
+                        .push_approval(&pending.summary.tool_name, label);
+                }
+                // The turn resumes (or dies) server-side; the local
+                // banner-preempted layer closes with the queue.
+            }
+            TuiEvent::Snapshot(snapshot) => {
+                return self.handle_snapshot(*snapshot);
+            }
+            TuiEvent::ConfigChanged(config) => {
+                self.handle_config_changed(*config);
+            }
+            TuiEvent::ModelChanged(alias) => {
+                self.model_alias = alias.clone();
+                // Model switches confirm via ModelChanged (not
+                // ConfigChanged — no config CRUD involved); only the
+                // initiating client holds a pending "model →" marker.
+                if self
+                    .pending_confirm
+                    .as_deref()
+                    .is_some_and(|what| what.starts_with("model →"))
+                {
+                    self.pending_confirm = None;
+                    self.set_notice(format!("model → {alias}"));
+                }
+            }
+            TuiEvent::SessionReset => {
+                // The server broadcasts reset, then every connection
+                // receives a fresh snapshot — light prep only (the
+                // snapshot owns every wholesale swap).
+                self.pending_input = None;
+                self.pending_confirm = None;
+                self.cancel_sent = false;
+                self.set_notice("已开启新会话");
+            }
+            TuiEvent::Notice(text) => {
+                // A failed client-initiated request (CRUD/model) clears
+                // its pending confirmation — the notice IS the verdict.
+                if self.pending_confirm.is_some() {
+                    self.pending_confirm = None;
+                }
+                self.set_notice(text);
+            }
+            TuiEvent::LinkState(phase) => {
+                let was_reconnecting = matches!(self.link_phase, LinkPhase::Reconnecting { .. });
+                self.link_phase = phase;
+                match self.link_phase {
+                    // Initial connect: the UI is not on screen yet
+                    // (main's connect() returns only after the first
+                    // snapshot), so a notice here would linger as a
+                    // stale banner on the first frame. Silent.
+                    LinkPhase::Connecting => {}
+                    // True mid-run drop: freeze notice until the
+                    // Connected event (or a snapshot) lands.
+                    LinkPhase::Reconnecting { attempt } => {
+                        self.set_notice(format!("已断线，第 {attempt} 次重连中…"));
+                    }
+                    // Recovery AND first connect both arrive here.
+                    // Announce only a RE-connect: a first connect never
+                    // showed a drop notice, so recovery would be noise.
+                    LinkPhase::Connected => {
+                        if was_reconnecting {
+                            self.set_notice("已重新连接");
+                        }
+                    }
+                }
+            }
             TuiEvent::TurnDone(result) => {
                 return self.handle_turn_done(result).await;
             }
@@ -1645,15 +1649,56 @@ impl App {
         (DispatchOutcome::Continue, None)
     }
 
+    /// Full-session snapshot: the server's authoritative state. Every
+    /// mirror (session id/label/model, running flags, counters, config,
+    /// transcript, pending approval, session stats) is swapped
+    /// wholesale — no incremental reconciliation (reconnects can have
+    /// missed arbitrary events; the snapshot is the reset point).
+    fn handle_snapshot(&mut self, snapshot: SnapshotDto) -> (DispatchOutcome, Option<Action>) {
+        // A snapshot IS proof the link is up (hello accepted): set the
+        // phase defensively — normally the LinkState(Connected) event
+        // preceded it, and this is idempotent.
+        self.link_phase = LinkPhase::Connected;
+        self.session_id = Some(snapshot.session_id);
+        self.session_label = snapshot.session_label;
+        self.model_alias = snapshot.model_alias;
+        self.turn_active = snapshot.running;
+        self.depth_cur = snapshot.depth_cur;
+        self.apply_config_view(&snapshot.config);
+        self.transcript
+            .replace_entries(entries_from_dto(snapshot.transcript));
+        // Pending approval: swap the queue (a mid-approval attach sees
+        // the server's truth; the banner re-arms).
+        self.approval.clear();
+        if let Some(pending) = snapshot.pending_approval {
+            self.approval.enqueue(
+                pending.id,
+                crate::event::ApprovalSummary::from(pending.summary),
+            );
+        }
+        // Server-truth stats (reconciles compaction costs the local
+        // per-turn accumulation cannot see).
+        self.stats = SessionStats {
+            total_steps: 0,
+            total_input_tokens: snapshot.session_stats.total_input_tokens,
+            total_output_tokens: snapshot.session_stats.total_output_tokens,
+            turns: snapshot.session_stats.turns as u32,
+            total_cost_usd: snapshot.session_stats.total_cost_usd,
+        };
+        if snapshot.running && !self.run_state.is_running() {
+            self.run_state = RunState::Thinking;
+        }
+        (DispatchOutcome::Continue, None)
+    }
+
     async fn handle_turn_done(
         &mut self,
-        result: Result<(TurnSummary, RunManager), (String, Option<RunManager>)>,
+        result: Result<TurnSummary, String>,
     ) -> (DispatchOutcome, Option<Action>) {
-        // Reap the finished task (TurnDone was its last send; joining is
-        // immediate).
-        if let Some(task) = self.engine_task.take() {
-            let _ = task.await;
-        }
+        // The turn ended server-side: the optimistic in-flight flag
+        // and the cancel marker retire first.
+        self.turn_active = false;
+        self.cancel_sent = false;
         // Capture the turn duration before clearing the start instant —
         // feeds the transcript's end-of-turn marker (set_turn_meta).
         let turn_elapsed = self
@@ -1663,59 +1708,49 @@ impl App {
         self.turn_started = None;
 
         match result {
-            Ok((summary, manager)) => {
-                self.manager = Some(manager);
+            Ok(summary) => {
                 // THE merge point for successful turns: the committed
                 // entries are the event-ordered authority, so the
                 // thinking blocks and per-request meta lines SURVIVE —
                 // `merge_turn` only folds tool results in from the
                 // messages (+ appends assistant content the transcript
-                // never saw). The wholesale `rebuild` stays as the
-                // recovery fallback (the Err store-reload path below,
-                // a future /resume) where losing live-only entries is
-                // acceptable. `history` below stays the engine-side
-                // authority regardless — display and history are
-                // decoupled.
+                // never saw). `history` mirrors the server's message
+                // list (display parity; the server is the authority).
                 self.transcript.set_turn_meta(
                     summary.model.clone(),
                     turn_elapsed,
                     Some((summary.total_input_tokens, summary.total_output_tokens)),
                 );
                 self.transcript.merge_turn(&summary.messages);
-                self.agents.calibrate(&summary.execution_tree);
                 self.history = summary.messages;
                 self.stats.total_steps += summary.total_steps;
                 self.stats.total_input_tokens += summary.total_input_tokens;
                 self.stats.total_output_tokens += summary.total_output_tokens;
                 self.stats.total_cost_usd += summary.total_cost_usd;
                 self.stats.turns += 1;
-                // Counter calibration (turn over): the execution tree is
-                // all-terminal → live depth back to 0. tool_calls_cur
-                // intentionally KEEPS the finished turn's count for the
-                // session panel until the next turn resets it.
+                // Counter reset (turn over; live depth back to 0 —
+                // the server's delegation view closed with the turn).
+                // tool_calls_cur intentionally KEEPS the finished
+                // turn's count for the session panel until the next
+                // turn resets it.
                 self.depth_cur = 0;
                 // Pending input auto-submits as the next turn.
                 if let Some(text) = self.pending_input.take() {
                     return self.handle_start_turn(text).await;
                 }
             }
-            Err((msg, manager)) => {
-                if let Some(manager) = manager {
-                    self.manager = Some(manager);
-                }
+            Err(msg) => {
                 self.run_state = RunState::Error(msg.clone());
                 // fix-19 兜底: a held step meta (its request completed,
                 // then the turn died before tools/next-request proved
                 // the step's shape) materializes at the tail — the
                 // stats the user watched live are not lost. Then the
                 // buffers drop (the partial streamed text is the
-                // Err-path's accepted loss).
+                // Err-path's accepted loss). The server owns history —
+                // no local reload; a reconnect snapshot reconciles.
                 self.transcript.flush_pending_step_meta();
                 self.transcript.clear_streaming();
                 self.depth_cur = 0;
-                // Reload the persisted transcript so in-memory history
-                // matches what /resume would restore (REPL parity).
-                self.reload_history_after_error().await;
                 tracing::warn!("turn failed: {msg}");
                 // No auto-retry: restore pending input to the editor.
                 if let Some(text) = self.pending_input.take() {
@@ -1724,30 +1759,6 @@ impl App {
             }
         }
         (DispatchOutcome::Continue, None)
-    }
-
-    /// Err-path history reconciliation (repl.rs:1010-1022 port):
-    /// reload the persisted transcript when a session run + store
-    /// exist. On a successful reload the transcript is REBUILT from
-    /// the reloaded messages — the recovery fallback path (the
-    /// live-only reasoning/meta entries are lost here, acceptable in
-    /// the error scenario, and display == persisted truth for the
-    /// next turn). Without a store the already-flushed live entries
-    /// stay visible and the pushed user message remains the history.
-    async fn reload_history_after_error(&mut self) {
-        if let (Some(run), Some(store)) = (&self.session_run, self.store.clone()) {
-            match RunRecorder::load_messages(&store, &run.run_id.0).await {
-                Ok(msgs) if !msgs.is_empty() => {
-                    self.transcript.rebuild(&msgs);
-                    self.history = msgs;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("failed to reload persisted history: {e}");
-                }
-            }
-        }
-        // Without a store the already-pushed user message stays.
     }
 
     // ── Turn lifecycle ─────────────────────────────────────────────────
@@ -1765,20 +1776,24 @@ impl App {
         self.start_turn(text).await
     }
 
-    /// Spawn one engine turn (REPL `handle_normal_input` port). Steps:
-    /// push/persist the user message → install the sink → (deferred)
-    /// auto-compact → [`Self::finish_start_turn`] builds the provider and
-    /// spawns the engine task.
-    #[allow(clippy::too_many_lines)]
+    /// Submit one user turn (REPL `handle_normal_input` semantics,
+    /// client edition): push the local display mirrors → send
+    /// `Submit` → optimistic in-flight state. The server owns
+    /// history/compaction/provider; events stream back as broadcasts.
     async fn start_turn(&mut self, prompt: String) -> (DispatchOutcome, Option<Action>) {
         if prompt.trim().is_empty() {
             return (DispatchOutcome::Continue, None);
         }
-        if self.is_running() || self.compact_pending {
+        if self.is_running() {
             // Queued; auto-submitted on TurnDone (spec: pending_input).
-            // Also queued while a compaction is pending so the user
-            // message is not double-pushed.
             self.pending_input = Some(prompt);
+            return (DispatchOutcome::Continue, None);
+        }
+        if !self.link_ready() {
+            // Disconnected: restore to the editor (queueing would
+            // deadlock — nothing would drain the queue).
+            self.input.set_text(&prompt);
+            self.set_notice("已断线，重连中…");
             return (DispatchOutcome::Continue, None);
         }
         // A new turn clears any transient notice (e.g. a rejected /new).
@@ -1786,6 +1801,7 @@ impl App {
         self.notice_ticks = 0;
         self.tool_calls_cur = 0;
         self.depth_cur = 0;
+        self.cancel_sent = false;
 
         let user_message = Message {
             role: MessageRole::User,
@@ -1794,101 +1810,19 @@ impl App {
             name: None,
             tool_calls: None,
         };
-        self.history.push(user_message.clone());
+        self.history.push(user_message);
         self.transcript.push_user(&prompt);
 
-        // Session wiring: lazy shared run + persist user message + sink.
-        let session_run = self.current_run().await;
-        if let Some(run) = &session_run {
-            if let Err(e) = run.recorder.write_message(&user_message).await {
-                tracing::warn!("failed to persist user message: {e}");
-            }
-        }
-        if let Some(manager) = self.manager.as_mut() {
-            manager.message_sink = session_run
-                .as_ref()
-                .map(|r| r.recorder.clone() as Arc<dyn MessageSink>);
-        }
-
-        // Auto-compact before the turn (REPL parity). DEFERRED by one
-        // dispatch round: setting `RunState::Compacting` here lets the
-        // loop's draw paint the `· compacting…` badge BEFORE the blocking
-        // summary call (up to `timeout_ms` on a real provider) runs at
-        // the top of the next dispatched action — never a silent freeze.
-        let (max_msgs, max_bytes) = self.context_limits();
-        if self.auto_compact_enabled() && needs_compact(&self.history, max_msgs, max_bytes, 0) {
-            self.run_state = RunState::Compacting;
-            self.compact_pending = true;
-            return (DispatchOutcome::Continue, None);
-        }
-        self.finish_start_turn().await
-    }
-
-    /// Run the deferred compaction, then continue the queued turn spawn
-    /// (invoked from the top of `dispatch_one` once the badge painted).
-    async fn run_deferred_compact(&mut self) {
-        let result = self.run_compact().await;
-        tracing::info!(
-            "auto-compact: {} → {} messages",
-            result.messages_before,
-            result.messages_after
-        );
-        // Falls back through the spawn: Thinking (or Error on provider
-        // failure) overwrites the Compacting state here.
-        let _ = self.finish_start_turn().await;
-    }
-
-    /// Post-compaction turn steps: provider build + engine spawn. The
-    /// user message is already pushed and persisted; on provider failure
-    /// it is popped and restored to the editor.
-    async fn finish_start_turn(&mut self) -> (DispatchOutcome, Option<Action>) {
-        let prompt = self
-            .history
-            .last()
-            .filter(|m| m.role == MessageRole::User)
-            .map(|m| m.content.clone());
-
-        // Provider per turn (REPL rebuilds it too — /model switches).
-        let model_alias = self.effective_model_alias();
-        let provider = match (self.provider_factory)(&self.config, &model_alias) {
-            Ok(provider) => provider,
-            Err(e) => {
-                // Keep the session alive: undo the push, restore the text.
-                if matches!(self.history.last(), Some(m) if m.role == MessageRole::User) {
-                    self.history.pop();
-                }
-                self.run_state = RunState::Error(e.to_string());
-                if let Some(prompt) = prompt {
-                    self.input.set_text(&prompt);
-                }
-                return (DispatchOutcome::Continue, None);
-            }
-        };
-
-        let run_id = self
-            .session_run
-            .as_ref()
-            .map(|r| r.run_id.clone())
-            .unwrap_or_else(RunManager::new_run_id);
-
-        let cancel = CancellationToken::new();
-        self.cancel_token = cancel.clone();
+        self.link.send(ClientMsg::Submit { text: prompt });
+        // Optimistic in-flight state; the broadcasts (RequestStart
+        // first) take over from here. If the server is mid-turn from
+        // ANOTHER client, its directed notice corrects us (the pushed
+        // user entry stays — it mirrors what the user sees themselves
+        // type; the next snapshot reconciles).
+        self.turn_active = true;
         self.run_state = RunState::Thinking;
         self.turn_started = Some(Instant::now());
         self.transcript.begin_streaming();
-
-        let Some(manager) = self.manager.take() else {
-            self.run_state = RunState::Error("manager unavailable".into());
-            return (DispatchOutcome::Continue, None);
-        };
-        self.engine_task = Some(spawn_turn(
-            manager,
-            run_id,
-            provider,
-            self.history.clone(),
-            cancel,
-            self.events_tx.clone(),
-        ));
         (DispatchOutcome::Continue, None)
     }
 
@@ -1907,36 +1841,36 @@ impl App {
                 (DispatchOutcome::Continue, None)
             }
             SlashCommand::New => {
-                if self.is_running() || self.compact_pending {
-                    // Clearing mid-turn would race the TurnDone rebuild;
+                if self.is_running() {
+                    // Clearing mid-turn would race the turn's broadcasts;
                     // cancel first, then /new again. A transient notice
                     // (yellow), NOT RunState::Error — the red × misreads
                     // as a turn failure.
                     self.set_notice("turn running — Ctrl+C to cancel, then /new");
                     return (DispatchOutcome::Continue, None);
                 }
-                self.history.clear();
-                self.transcript.clear();
-                // interactive-1: the fresh transcript drops the jump
-                // hint — no hover survives it.
-                self.hover = None;
-                self.mouse_down_target = None;
-                // Close the backing run; the next turn opens a fresh one.
-                if let Some(run) = self.session_run.take() {
-                    let cost = self.stats.run_cost_usd();
-                    if let Err(e) = run.recorder.finish("completed", None, cost).await {
-                        tracing::warn!("failed to persist previous session run: {e}");
-                    }
+                if !self.link_ready() {
+                    self.set_notice("已断线，重连中…");
+                    return (DispatchOutcome::Continue, None);
                 }
-                self.stats = SessionStats::new();
+                // The server resets and broadcasts `session_reset` +
+                // fresh snapshots (wholesale swap); nothing clears
+                // locally here — localhost round-trip is imperceptible.
+                self.link.send(ClientMsg::NewSession);
                 (DispatchOutcome::Continue, None)
             }
             SlashCommand::Model { alias } => {
                 let known = self.config.models.contains_key(&alias)
                     || openslate_core::model_config::resolve_model(&self.config, &alias).is_ok();
                 if known {
-                    self.model_override = Some(alias.clone());
-                    self.set_notice(format!("model → {alias}"));
+                    if self.link_ready() {
+                        self.pending_confirm = Some(format!("model → {alias}"));
+                        self.link.send(ClientMsg::SetModel {
+                            alias: alias.clone(),
+                        });
+                    } else {
+                        self.set_notice("已断线，重连中…");
+                    }
                 } else {
                     self.run_state = RunState::Error(format!(
                         "unknown model alias '{alias}' (available: {})",
@@ -1986,167 +1920,49 @@ impl App {
         }
     }
 
-    /// Lazily open (or return) the persisted session run (repl.rs:750-767
-    /// port). `None` when there is no store or the insert failed — the
-    /// session then runs unpersisted.
-    async fn current_run(&mut self) -> Option<SessionRun> {
-        if let Some(run) = &self.session_run {
-            return Some(run.clone());
-        }
-        let store = self.store.clone()?;
-        let root_agent_id = self.agent_tree.get_root().id.0.clone();
-        let run_id = RunManager::new_run_id();
-        match RunRecorder::begin(
-            store,
-            run_id.clone(),
-            &root_agent_id,
-            Some("tui session"),
-            r#"{"kind":"tui"}"#,
-        )
-        .await
-        {
-            Ok(recorder) => {
-                let run = SessionRun {
-                    run_id,
-                    recorder: Arc::new(recorder),
-                };
-                self.session_run = Some(run.clone());
-                Some(run)
-            }
-            Err(e) => {
-                tracing::warn!("session persistence unavailable ({e}); running unpersisted");
-                None
-            }
-        }
-    }
-
-    // ── Compaction (repl.rs run_compact port) ──────────────────────────
-
-    /// Effective context limits for compaction decisions.
-    fn context_limits(&self) -> (usize, usize) {
-        (
-            self.config
-                .limits
-                .as_ref()
-                .map(|l| l.max_context_messages as usize)
-                .unwrap_or(16),
-            self.config
-                .limits
-                .as_ref()
-                .map(|l| l.max_context_bytes as usize)
-                .unwrap_or(64_000),
-        )
-    }
-
-    /// Whether auto-compact is enabled (default on).
-    fn auto_compact_enabled(&self) -> bool {
-        self.config
-            .limits
-            .as_ref()
-            .map(|l| l.auto_compact)
-            .unwrap_or(true)
-    }
-
-    /// Compact the in-memory history through the `fast` model when
-    /// available (mechanical fallback otherwise); compact-usage cost is
-    /// credited to the session but not the run row.
-    async fn run_compact(&mut self) -> openslate_core::context_manager::CompactResult {
-        let summary_plan: Option<(String, Box<dyn ModelProvider>, CostSpec)> = {
-            match openslate_core::model_config::resolve_model(&self.config, "fast") {
-                Ok(resolved) => match (self.provider_factory)(&self.config, "fast") {
-                    Ok(provider) => {
-                        let pricing = resolved.cost_spec();
-                        Some((resolved.model_id, provider, pricing))
-                    }
-                    Err(e) => {
-                        tracing::debug!("no provider for 'fast' — mechanical fallback: {e}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::debug!("no 'fast' alias — mechanical fallback: {e}");
-                    None
-                }
-            }
-        };
-        let summary_pricing = summary_plan
-            .as_ref()
-            .map(|(_, _, pricing)| *pricing)
-            .unwrap_or_default();
-
-        let usage_slot = Arc::new(std::sync::Mutex::new(None::<Usage>));
-        let slot = Arc::clone(&usage_slot);
-        let (max_messages, max_bytes) = self.context_limits();
-
-        let result = compact(
-            &mut self.history,
-            None,
-            max_messages,
-            max_bytes,
-            move |text| {
-                let text = text.to_owned();
-                async move {
-                    let (model_id, provider, _pricing) = summary_plan?;
-                    let (summary, usage) =
-                        generate_summary(provider.as_ref(), &model_id, &text).await;
-                    if let Some(u) = usage {
-                        *slot.lock().expect("compact usage slot poisoned") = Some(u);
-                    }
-                    summary
-                }
-            },
-        )
-        .await;
-
-        if let Some(usage) = usage_slot
-            .lock()
-            .expect("compact usage slot poisoned")
-            .take()
-        {
-            self.stats.total_input_tokens += usage.input_tokens as u64;
-            self.stats.total_output_tokens += usage.output_tokens as u64;
-            let cost = summary_pricing.cost_of(&usage);
-            self.stats.total_cost_usd += cost;
-            self.stats.compact_cost_usd += cost;
-        }
-        result
-    }
-
     // ── Approvals ──────────────────────────────────────────────────────
 
-    /// Deliver the user's answer to the front pending approval.
+    /// Deliver the user's answer to the front pending approval: send it
+    /// and let the server's `approval_resolved` BROADCAST drive every
+    /// client-side effect (banner removal, decision line, state resume)
+    /// — single path for the answerer and every observer, first answer
+    /// wins server-side, late answers get a directed notice.
     fn approval_respond(&mut self, choice: ApprovalChoice) {
         // interactive-1: the banner's buttons die with the answer.
         self.hover = None;
         self.mouse_down_target = None;
-        if let Some(pending) = self.approval.pop_answered() {
-            let label = match choice {
-                ApprovalChoice::Approve => "approved",
-                ApprovalChoice::Deny => "denied",
-                ApprovalChoice::ApproveAll => "approve-all",
-            };
-            self.transcript
-                .push_approval(&pending.summary.tool_name, label);
-            if !self.approval_bridge.respond(pending.id, choice) {
-                tracing::warn!(
-                    "approval {id} no longer pending (answer dropped)",
-                    id = pending.id
-                );
-            }
-            if self.run_state == RunState::ApprovalPending {
-                // The engine continues from here; its next event corrects.
-                self.run_state = RunState::Thinking;
-            }
-        }
+        let Some(pending) = self.approval.current() else {
+            return;
+        };
+        self.link.send(ClientMsg::ApprovalAnswer {
+            id: pending.id,
+            choice: approval_choice_to_msg(choice),
+        });
+        // The banner stays until the broadcast arrives (localhost
+        // round-trip is imperceptible; a lost race simply means another
+        // client answered first and the broadcast carries THEIR choice).
+    }
+
+    /// Send `Cancel` for the in-flight turn (Ctrl+C while running /
+    /// deny-and-cancel from the approval banner). The engine-side
+    /// cancel runs on the server; `TurnOk/TurnError` closes the turn.
+    fn send_cancel(&mut self) {
+        self.cancel_sent = true;
+        self.link.send(ClientMsg::Cancel);
+    }
+
+    /// Whether outbound turn-affecting actions may leave (freeze gate:
+    /// the link must be up).
+    fn link_ready(&self) -> bool {
+        self.link_phase == LinkPhase::Connected
     }
 
     // ── Context / rendering ────────────────────────────────────────────
 
-    /// Effective model alias (override > root agent).
+    /// Effective model alias — the server's session-level state
+    /// (snapshot-seeded, `ModelChanged`-swapped).
     fn effective_model_alias(&self) -> String {
-        self.model_override
-            .clone()
-            .unwrap_or_else(|| self.agent_tree.get_root().model_alias.clone())
+        self.model_alias.clone()
     }
 
     /// All configured model aliases, sorted (slash-1: the `/model`
@@ -2870,28 +2686,8 @@ impl App {
 
     // ── Shutdown & summary ─────────────────────────────────────────────
 
-    /// Ordered shutdown (spec R2): cancel token → deny pending approvals
-    /// → await the engine task with a timeout (sink flush) → finalize the
-    /// run row. Terminal restore and log flush are main's job.
-    async fn shutdown(&mut self) {
-        self.cancel_token.cancel();
-        self.approval_bridge.deny_all();
-        self.approval.clear();
-        if let Some(task) = self.engine_task.take() {
-            match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
-                Ok(_) => {}
-                Err(_) => {
-                    tracing::warn!("engine task did not finish within 5s; aborting");
-                }
-            }
-        }
-        if let Some(run) = &self.session_run {
-            let cost = self.stats.run_cost_usd();
-            if let Err(e) = run.recorder.finish("completed", None, cost).await {
-                tracing::warn!("failed to persist session completion: {e}");
-            }
-        }
-    }
+    // web-1: shutdown is link-drop only — see the stub near `run`.
+    // (Kept as a section marker; the stub logs and returns.)
 
     /// The stdout one-liner printed after terminal restore.
     fn summary(&self) -> SessionSummary {
@@ -2903,32 +2699,80 @@ impl App {
     }
 }
 
-/// First ERROR-severity validation finding for the reloaded merged
-/// config (model-mgmt-2 save flow backstop): the persist layer does not
-/// guard references, so the hot swap only happens on a valid merged
-/// config. Warnings pass through.
-fn merged_validate_error(
-    config: &OpenSlateConfig,
-    agents: &openslate_core::config::AgentsConfig,
-) -> Option<String> {
-    openslate_core::config::validation::validate_config(config, agents)
-        .into_iter()
-        .next()
-        .map(|e| format!("{}: {}", e.field, e.message))
-}
-
-/// Whether a models-overlay change touches the provider/model LIBRARY
-/// (as opposed to the level mapping) — the library writes route to the
-/// global config, so the "no global library" notice only applies to
-/// these.
-fn change_touches_library(change: &ModelsChange) -> bool {
-    matches!(
-        change,
-        ModelsChange::UpsertProvider { .. }
-            | ModelsChange::UpsertModel { .. }
-            | ModelsChange::RemoveProvider { .. }
-            | ModelsChange::RemoveModel { .. }
-    )
+/// Map one models-overlay commit to its `ClientMsg`s (web-1: the CRUD
+/// wire vocabulary). Returns the human description (used in the success
+/// notice) plus the messages — a provider upsert with a pasted API key
+/// maps to TWO sends (`upsert_provider` + `set_api_key`, per the wire
+/// contract; the server derives the env var name and writes `.env`
+/// 0600 itself).
+fn client_msgs_for_change(change: &ModelsChange) -> (String, Vec<ClientMsg>) {
+    use openslate_protocol::{ModelDto, ProviderDto};
+    match change {
+        ModelsChange::UpsertProvider { name, cfg, env_key } => {
+            let mut msgs = vec![ClientMsg::UpsertProvider {
+                name: name.clone(),
+                provider: ProviderDto {
+                    base_url: cfg.base_url.clone(),
+                    api_key_env: cfg.api_key_env.clone(),
+                    adapter: cfg.adapter.clone(),
+                    max_attempts: cfg.max_attempts,
+                    retry_base_ms: cfg.retry_base_ms,
+                },
+            }];
+            if let Some((var, value)) = env_key {
+                // `set_api_key` carries the provider name + the raw
+                // value; the server owns the `<NAME>_API_KEY`/`.env`
+                // derivation. The var name stays client-side only as
+                // form-display context.
+                let _ = var;
+                msgs.push(ClientMsg::SetApiKey {
+                    provider: name.clone(),
+                    value: value.clone(),
+                });
+            }
+            (format!("provider {name}"), msgs)
+        }
+        ModelsChange::UpsertModel { entry, cfg } => (
+            format!("模型条目 {entry}"),
+            vec![ClientMsg::UpsertModel {
+                entry: entry.clone(),
+                model: ModelDto {
+                    provider: cfg.provider.clone(),
+                    model: cfg.model.clone(),
+                    max_context_tokens: cfg.max_context_tokens,
+                    max_output_tokens: cfg.max_output_tokens,
+                    supports_tool_call: cfg.supports_tool_call,
+                    supports_vision: cfg.supports_vision,
+                    supports_reasoning: cfg.supports_reasoning,
+                    input_price_per_mtok: cfg.input_price_per_mtok,
+                    output_price_per_mtok: cfg.output_price_per_mtok,
+                },
+            }],
+        ),
+        ModelsChange::SetLevel { level, entry } => (
+            format!("levels.{level} → {entry}"),
+            vec![ClientMsg::SetLevel {
+                level: level.clone(),
+                entry: entry.clone(),
+            }],
+        ),
+        ModelsChange::RemoveProvider { name } => (
+            format!("删除 provider {name}"),
+            vec![ClientMsg::DeleteProvider { name: name.clone() }],
+        ),
+        ModelsChange::RemoveModel { entry } => (
+            format!("删除模型条目 {entry}"),
+            vec![ClientMsg::DeleteModel {
+                entry: entry.clone(),
+            }],
+        ),
+        ModelsChange::RemoveLevel { level } => (
+            format!("删除级别 {level}"),
+            vec![ClientMsg::DeleteLevel {
+                level: level.clone(),
+            }],
+        ),
+    }
 }
 
 /// Absolutize `path` (joining the cwd) so copy notices always name a
@@ -2979,46 +2823,6 @@ pub fn coalesce_deltas(batch: &mut Vec<Action>) {
         }
     }
     *batch = out;
-}
-
-/// One LLM summarization attempt for compaction (REPL port; degraded to
-/// `None` on any failure — the mechanical fallback inside `compact`
-/// takes over).
-async fn generate_summary(
-    provider: &dyn ModelProvider,
-    model_id: &str,
-    conversation_text: &str,
-) -> (Option<String>, Option<Usage>) {
-    let request = GenerateRequest {
-        model_id: model_id.to_owned(),
-        system_prompt: Some(SUMMARY_SYSTEM_PROMPT.to_owned()),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: format!(
-                "Summarize the following conversation for continuation:\n\n{}",
-                conversation_text
-            ),
-            tool_call_id: None,
-            name: None,
-            tool_calls: None,
-        }],
-        tools: Vec::new(),
-        max_tokens: None,
-        temperature: None,
-    };
-    match provider.generate(request).await {
-        Ok(response) => {
-            let usage = response.usage;
-            // An empty/blank reply is treated as failure → mechanical
-            // fallback (an empty summary message would be worse).
-            let summary = response.content.filter(|c| !c.trim().is_empty());
-            (summary, usage)
-        }
-        Err(e) => {
-            tracing::warn!("compact summary failed ({e}); mechanical fallback");
-            (None, None)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3196,57 +3000,16 @@ mod borderless_layout_tests {
     // content — these tests assert only the LAYER the App owns.
 
     use super::*;
+    use crate::client::MemLink;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;
 
-    /// Hermetic temp project (absolute `[database]` path inside the
-    /// tempdir — a relative path would leak into the user's global
-    /// store). Mirrors `tests/bridge_integration.rs::temp_project`.
-    /// `temp_project` with a custom `[models.*]` block and root-agent
-    /// model alias (the rest of the wiring — provider/db/limits — is
-    /// identical).
-    fn temp_project_with(models_toml: &str, root_model: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let openslate_dir = tmp.path().join(".openslate");
-        std::fs::create_dir(&openslate_dir).expect("create .openslate dir");
-        let db_path = openslate_dir.join("test.sqlite");
-        std::fs::write(
-            openslate_dir.join("openslate.toml"),
-            format!(
-                r#"
-[providers.mock]
-base_url = "http://localhost"
-api_key_env = "TUI_TEST_KEY"
-
-{models_toml}
-[database]
-path = {db_path:?}
-
-[limits]
-max_steps = 10
-max_depth = 4
-max_tool_calls = 20
-max_context_bytes = 100_000
-max_output_bytes = 10_000
-"#
-            ),
-        )
-        .expect("write toml");
-        let agents_dir = openslate_dir.join("agents");
-        std::fs::create_dir(&agents_dir).expect("create agents dir");
-        std::fs::write(
-            agents_dir.join("root.md"),
-            format!(
-                "---\nid: root\nname: Root Agent\nmodel: {root_model}\ntools:\n  - read_file\n---\nYou are the root agent.\n"
-            ),
-        )
-        .expect("write root.md");
-        tmp
-    }
-
-    fn temp_project() -> tempfile::TempDir {
-        temp_project_with(
+    /// The base client-fixture TOML (two mock models; web-1: pure parse
+    /// — no tempdir, no store, no engine wiring; the config mirror is
+    /// all these UI tests need).
+    fn fixture_toml() -> String {
+        fixture_toml_with(
             r#"[models.main]
 provider = "mock"
 model = "mock-model"
@@ -3255,12 +3018,122 @@ model = "mock-model"
 provider = "mock"
 model = "mock-model"
 "#,
-            "main",
         )
     }
 
-    /// `test_app` with TWELVE model aliases — `main`+`fast` (both
-    /// REQUIRED by config validation) plus a01..=a10 — the >8
+    /// The fixture with a custom `[models.*]` block (the provider and
+    /// limits parts stay fixed).
+    fn fixture_toml_with(models_toml: &str) -> String {
+        format!(
+            r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "TUI_TEST_KEY"
+
+{models_toml}
+[limits]
+max_steps = 10
+max_depth = 4
+max_tool_calls = 20
+max_context_bytes = 100_000
+max_output_bytes = 10_000
+"#
+        )
+    }
+
+    /// Build a client App from a raw config string + a recording link.
+    fn app_from_toml(toml: &str) -> (App, std::sync::Arc<MemLink>) {
+        let config = openslate_core::config::parse_openslate_toml(toml).expect("fixture parses");
+        let (link, events) = MemLink::pair();
+        let app = App::new(ClientBootstrap {
+            link: link.clone(),
+            events,
+            config,
+            root_agent_id: "root".into(),
+        });
+        (app, link)
+    }
+
+    /// The inverse of [`crate::client::config_from_view`]: build a wire
+    /// config view from a parsed fixture config (the snapshot's
+    /// `ConfigViewDto` payload for test seeding).
+    fn view_dto_from(config: &OpenSlateConfig) -> ConfigViewDto {
+        use openslate_protocol::{AgentNodeDto, ConfigViewDto, LimitsDto, ModelDto, ProviderDto};
+        let limits = config.limits.as_ref();
+        ConfigViewDto {
+            providers: config
+                .providers
+                .iter()
+                .map(|(k, v)| (k.clone(), ProviderDto::from(v)))
+                .collect(),
+            models: config
+                .models
+                .iter()
+                .map(|(k, v)| (k.clone(), ModelDto::from(v)))
+                .collect(),
+            levels: config.levels.clone().into_iter().collect(),
+            limits: LimitsDto {
+                max_steps: limits.map(|l| l.max_steps).unwrap_or(8),
+                max_depth: limits.map(|l| l.max_depth).unwrap_or(4),
+                max_tool_calls: limits.map(|l| l.max_tool_calls).unwrap_or(20),
+                max_child_agent_calls: limits.map(|l| l.max_child_agent_calls).unwrap_or(8),
+                timeout_ms: limits.map(|l| l.timeout_ms).unwrap_or(300000),
+                max_context_messages: limits.map(|l| l.max_context_messages).unwrap_or(200),
+                max_context_bytes: limits.map(|l| l.max_context_bytes).unwrap_or(512000),
+                max_output_bytes: limits.map(|l| l.max_output_bytes).unwrap_or(65536),
+                auto_compact: limits.map(|l| l.auto_compact).unwrap_or(true),
+                parallel_tool_calls: limits.map(|l| l.parallel_tool_calls).unwrap_or(true),
+            },
+            agents: AgentNodeDto {
+                id: "root".into(),
+                name: "Root".into(),
+                model: "main".into(),
+                children: vec![],
+            },
+            skills: vec![],
+            active_config: "/fixture/openslate.toml".into(),
+            global_config: None,
+            local_config: None,
+        }
+    }
+
+    /// Seed a hello-ack snapshot into the app (production receives one
+    /// through the link before the first draw; tests dispatch it).
+    async fn seed_snapshot(app: &mut App, model_alias: &str) {
+        let view = view_dto_from(&app.config);
+        app.dispatch(Action::Engine(TuiEvent::Snapshot(Box::new(SnapshotDto {
+            proto: 1,
+            session_id: "test-session".into(),
+            session_label: "tui test".into(),
+            transcript: vec![],
+            running: false,
+            depth_cur: 0,
+            agents_running: 0,
+            tool_calls_cur: 0,
+            model_alias: model_alias.into(),
+            pending_approval: None,
+            config: view,
+            session_stats: Default::default(),
+        }))))
+        .await;
+    }
+
+    /// The default client App WITH a seeded snapshot (model alias
+    /// `main` — the status bar's model segment renders from it).
+    async fn test_app() -> App {
+        test_app_linked().await.0
+    }
+
+    /// [`Self::test_app`] keeping the recording link (broadcast-driven
+    /// assertions: approval races, turn submits, CRUD sends).
+    async fn test_app_linked() -> (App, std::sync::Arc<MemLink>) {
+        let (mut app, link) = app_from_toml(&fixture_toml());
+        seed_snapshot(&mut app, "main").await;
+        (app, link)
+    }
+
+    /// [`Self::test_app`] with TWELVE model aliases — `main`+`fast`
+    /// (both REQUIRED by config validation) plus a01..=a10 — the >8
     /// overflow fixture for the `/model` argument completion
     /// (slash-2). Sorted, the list reads a01..a10, fast, main.
     async fn many_models_app() -> App {
@@ -3279,24 +3152,7 @@ model = "mock-model"
                 "[models.a{i:02}]\nprovider = \"mock\"\nmodel = \"mock-model\"\n\n"
             ));
         }
-        app_from(temp_project_with(&models, "main")).await
-    }
-
-    /// Wire an App from a temp project (shared by [`Self::test_app`]
-    /// and [`Self::many_models_app`]).
-    async fn app_from(tmp: tempfile::TempDir) -> App {
-        let config_path = tmp.path().join(".openslate/openslate.toml");
-        let ctx = openslate_app::wiring::build_app_context(config_path.to_str())
-            .await
-            .expect("build app context");
-        // Leak the TempDir for the App's lifetime (test process is short;
-        // the store file must outlive the App).
-        std::mem::forget(tmp);
-        App::new(ctx)
-    }
-
-    async fn test_app() -> App {
-        app_from(temp_project()).await
+        app_from_toml(&fixture_toml_with(&models)).0
     }
 
     /// Draw the app at `w x h` and return the buffer clone.
@@ -3762,7 +3618,7 @@ model = "mock-model"
     /// all no-ops.
     #[tokio::test]
     async fn in_overlay_mouse_gestures_are_swallowed() {
-        let (mut app, (hx, hy)) = pinned_app_with_hint().await;
+        let (mut app, _link, (hx, hy)) = pinned_app_with_hint().await;
         assert!(app.transcript_pinned());
         // The pinned hint renders at the main region's bottom — the
         // overlay covers it once the list opens.
@@ -4022,8 +3878,8 @@ model = "mock-model"
     /// 80x20 so the hint renders and its hit rectangle records, then
     /// return the terminal cell of the hint's `回` glyph (inside the
     /// hit rectangle by construction).
-    async fn pinned_app_with_hint() -> (App, (u16, u16)) {
-        let mut app = test_app().await;
+    async fn pinned_app_with_hint() -> (App, std::sync::Arc<MemLink>, (u16, u16)) {
+        let (mut app, link) = test_app_linked().await;
         for i in 0..40 {
             app.dispatch(Action::Engine(TuiEvent::Delta(format!("line{i}\n"))))
                 .await;
@@ -4040,7 +3896,7 @@ model = "mock-model"
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
             .find(|&(x, y)| buf.cell((x, y)).is_some_and(|c| c.symbol() == "回"))
             .expect("the hint renders bottom-right");
-        (app, hit)
+        (app, link, hit)
     }
 
     /// Dispatch level: a click on the hint jumps back to the bottom
@@ -4048,7 +3904,7 @@ model = "mock-model"
     /// positional, like the wheel.
     #[tokio::test]
     async fn click_on_new_content_hint_jumps_to_bottom() {
-        let (mut app, (hx, hy)) = pinned_app_with_hint().await;
+        let (mut app, _link, (hx, hy)) = pinned_app_with_hint().await;
         app.dispatch(Action::Click(hx, hy)).await;
         assert!(
             !app.transcript_pinned(),
@@ -4062,7 +3918,7 @@ model = "mock-model"
     /// instead of typing.
     #[tokio::test]
     async fn approval_modal_swallows_hint_click() {
-        let (mut app, (hx, hy)) = pinned_app_with_hint().await;
+        let (mut app, link, (hx, hy)) = pinned_app_with_hint().await;
         app.dispatch(Action::Engine(TuiEvent::ApprovalRequested {
             id: 1,
             request: crate::event::ApprovalSummary {
@@ -4079,14 +3935,33 @@ model = "mock-model"
         app.dispatch(Action::Click(hx, hy)).await;
         assert!(app.transcript_pinned(), "modal guard swallows the click");
 
-        // `y` answers the approval (not typed into the editor); the
-        // queue drains and ordinary input resumes.
+        // `y` answers the approval (not typed into the editor). web-1:
+        // the answer LEAVES for the server; the banner stays until the
+        // `approval_resolved` broadcast lands (any client's answer).
         app.dispatch(Action::InputChar('y')).await;
         assert_eq!(app.input_text(), "");
+        assert_eq!(
+            link.take_sent(),
+            vec![ClientMsg::ApprovalAnswer {
+                id: 1,
+                choice: openslate_protocol::ApprovalAnswerChoice::Approve,
+            }],
+            "the answer left for the server"
+        );
+        assert_eq!(
+            app.active_layer(),
+            Layer::ApprovalActive,
+            "the banner waits for the broadcast"
+        );
+        link.emit(openslate_protocol::ServerMsg::ApprovalResolved {
+            id: 1,
+            choice: "approve".into(),
+        });
+        app.drain_engine_events().await;
         assert_ne!(
             app.active_layer(),
             Layer::ApprovalActive,
-            "the drained queue ends preemption"
+            "the broadcast ends preemption"
         );
         app.dispatch(Action::InputChar('x')).await;
         assert_eq!(app.input_text(), "x");
@@ -4212,7 +4087,7 @@ model = "mock-model"
     /// the key, and the answer clears the hover.
     #[tokio::test]
     async fn approval_buttons_hover_click_and_clear() {
-        let mut app = test_app().await;
+        let (mut app, link) = test_app_linked().await;
         draw(&mut app, 100, 30).await; // records the help rect too
         app.dispatch(Action::Engine(TuiEvent::ApprovalRequested {
             id: 1,
@@ -4271,8 +4146,10 @@ model = "mock-model"
             "approval modal outranks every other button"
         );
 
-        // Click the [y] button: the approval answers (queue drains,
-        // run state leaves ApprovalPending) and the hover clears.
+        // Click the [y] button: the approval answer leaves through the
+        // same ApprovalRespond path as the key (web-1: the banner
+        // clears on the broadcast; the hover clears immediately) and
+        // the run state leaves ApprovalPending with the broadcast.
         let mid_y = y_rect.x + y_rect.width / 2;
         app.dispatch(Action::MouseMove(mid_y, y_rect.y)).await;
         assert_eq!(
@@ -4281,9 +4158,22 @@ model = "mock-model"
         );
         app.dispatch(Action::MouseDown(mid_y, y_rect.y)).await;
         app.dispatch(Action::MouseUp(mid_y, y_rect.y)).await;
-        assert!(!app.approval.has_pending(), "the click answered it");
-        assert_ne!(*app.run_state(), RunState::ApprovalPending);
+        assert_eq!(
+            link.take_sent(),
+            vec![ClientMsg::ApprovalAnswer {
+                id: 1,
+                choice: openslate_protocol::ApprovalAnswerChoice::Approve,
+            }],
+            "the click sent the answer"
+        );
         assert_eq!(app.hover(), None, "the answer clears the hover");
+        link.emit(openslate_protocol::ServerMsg::ApprovalResolved {
+            id: 1,
+            choice: "approve".into(),
+        });
+        app.drain_engine_events().await;
+        assert!(!app.approval.has_pending(), "the broadcast answered it");
+        assert_ne!(*app.run_state(), RunState::ApprovalPending);
     }
 
     /// T3: a visible completion row hovers WITHOUT moving the keyboard
@@ -4417,7 +4307,7 @@ model = "mock-model"
     /// exact same Click action the legacy release fires.
     #[tokio::test]
     async fn jump_hint_hover_style_and_click_behavior() {
-        let (mut app, (hx, hy)) = pinned_app_with_hint().await;
+        let (mut app, _link, (hx, hy)) = pinned_app_with_hint().await;
         app.dispatch(Action::MouseMove(hx, hy)).await;
         assert_eq!(app.hover(), Some(HoverTarget::JumpBottom));
         let buf = draw_front(&mut app, 80, 20).await;

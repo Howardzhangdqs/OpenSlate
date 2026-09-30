@@ -132,6 +132,19 @@ enum Commands {
         #[arg(long)]
         quiet: bool,
     },
+    /// Start the shared-session HTTP+WS server (web-1)
+    Serve {
+        /// Bind address (default 127.0.0.1)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Listen port (default 7800)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Shared secret: WS hello.token / REST ?token= (strongly advised
+        /// when binding non-localhost)
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
 }
 
 // ── Tracing format ────────────────────────────────────────────────────────
@@ -295,24 +308,30 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize tracing subscriber.
-    // When --quiet is set, suppress info-level step logs by default.
-    let default_level = if cli.is_quiet() {
-        "warn".to_owned()
-    } else {
-        cli.log_level.clone()
-    };
-    // Default directive: user's `--log-level` governs OpenSlate's own crates,
-    // but quiet the chatty `rmcp` INFO logs — its "Service initialized as
-    // client" prints the entire server InitializeResult including a multi-KB
-    // `instructions` string that swamps startup output. Per-target overrides
-    // still work via RUST_LOG (e.g. RUST_LOG="info,rmcp=debug").
-    let default_directive = format!("{default_level},rmcp=warn");
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_directive));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .event_format(SimpleFormatter)
-        .init();
+    // `serve` 除外——openslate-server::serve 自带 server.log 文件
+    // subscriber（全局只能装一个，这里先装会把它顶掉）。
+    let is_serve = matches!(cli.command, Commands::Serve { .. });
+    if !is_serve {
+        // When --quiet is set, suppress info-level step logs by default.
+        let default_level = if cli.is_quiet() {
+            "warn".to_owned()
+        } else {
+            cli.log_level.clone()
+        };
+        // Default directive: user's `--log-level` governs OpenSlate's own
+        // crates, but quiet the chatty `rmcp` INFO logs — its "Service
+        // initialized as client" prints the entire server InitializeResult
+        // including a multi-KB `instructions` string that swamps startup
+        // output. Per-target overrides still work via RUST_LOG (e.g.
+        // RUST_LOG="info,rmcp=debug").
+        let default_directive = format!("{default_level},rmcp=warn");
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&default_directive));
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .event_format(SimpleFormatter)
+            .init();
+    }
 
     match cli.command {
         Commands::Init { name } => {
@@ -332,6 +351,24 @@ async fn main() -> Result<()> {
                 tracing::debug!("merged global library: {}", global_path.display());
             }
             cmd::skills::run_skills_command(&config_path, config)?;
+        }
+        Commands::Serve {
+            bind,
+            port,
+            auth_token,
+        } => {
+            let bind = bind
+                .as_deref()
+                .map(str::parse::<std::net::IpAddr>)
+                .transpose()
+                .context("invalid --bind address")?
+                .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+            let args = cmd::serve::ServeArgs {
+                bind,
+                port: port.unwrap_or(7800),
+                auth_token,
+            };
+            cmd::serve::run_serve(cli.config.as_deref(), args).await?;
         }
         Commands::Run {
             agent,

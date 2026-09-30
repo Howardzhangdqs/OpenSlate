@@ -1,0 +1,14 @@
+[package]
+name = "openslate-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "openslate server/client shared protocol: ClientMsg/ServerMsg wire contract and DTOs"
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

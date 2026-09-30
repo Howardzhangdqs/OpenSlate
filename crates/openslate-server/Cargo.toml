@@ -1,0 +1,31 @@
+[package]
+name = "openslate-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "openslate server: shared-session HTTP+WS backend (REST read-only + WS full protocol)"
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+openslate-app = { path = "../openslate-app" }
+openslate-protocol = { path = "../openslate-protocol" }
+openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+futures-util = { workspace = true }
+dirs = { workspace = true }
+# server.json 的 started_at（ISO 8601 本地时区）。
+chrono = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tempfile = { workspace = true }
+async-trait = { workspace = true }

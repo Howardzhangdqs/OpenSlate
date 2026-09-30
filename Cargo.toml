@@ -9,6 +9,8 @@ members = [
     "crates/openslate-tui",
     "crates/openslate-mcp-builtin",
     "crates/openslate-ptc",
+    "crates/openslate-protocol",
+    "crates/openslate-server",
 ]
 
 [workspace.package]
@@ -72,6 +74,13 @@ async-trait = "0.1"
 
 # Async primitives (channels etc. for in-process MCP transports)
 futures = "0.3"
+
+# HTTP+WS server (web-1: openslate-server). axum 0.8 with ws for the
+# single full-protocol channel /api/ws; REST handlers share the router.
+axum = { version = "0.8", features = ["ws"] }
+
+# WS client for server integration tests (真 listener 连接).
+tokio-tungstenite = "0.28"
 
 # Embedded QuickJS sandbox for Programmatic Tool Calling (openslate-ptc).
 # Sync runtime usage only (default features); see PTC_PLAN.md §6.

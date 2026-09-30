@@ -22,6 +22,8 @@ openslate-store-sqlite = { path = "../openslate-store-sqlite" }
 # assembly + provider construction + approval policy derivation), extracted
 # from this crate's former `wiring` module in P2a.
 openslate-app = { path = "../openslate-app" }
+# web-1: `openslate serve` 子命令转发（server 装配在本 crate 外）。
+openslate-server = { path = "../openslate-server" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

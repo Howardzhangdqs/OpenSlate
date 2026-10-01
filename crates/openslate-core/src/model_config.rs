@@ -323,7 +323,8 @@ model = "ghost-model"
             main.cost_spec().cost_of(&crate::types::Usage {
                 input_tokens: 5,
                 output_tokens: 5,
-                cached_input_tokens: None
+                cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             0.0
         );
@@ -350,7 +351,8 @@ output_price_per_mtok = 3.0
             (spec.cost_of(&crate::types::Usage {
                 input_tokens: 2_000_000,
                 output_tokens: 1_000_000,
-                cached_input_tokens: None
+                cached_input_tokens: None,
+                reasoning_tokens: None,
             }) - 6.0f64)
                 .abs()
                 < 1e-12

@@ -37,7 +37,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({
         "status": "ok",
         "proto": openslate_protocol::PROTOCOL_VERSION,
-        "clients": state.hub.count(),
+        "clients": state.sink.count(),
     }))
     .into_response()
 }

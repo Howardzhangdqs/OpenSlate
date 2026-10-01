@@ -3490,6 +3490,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 
@@ -3499,6 +3500,7 @@ mod tests {
             content: String::new(),
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: ToolCallId(id.to_owned()),
                 name: name.to_owned(),
@@ -3514,6 +3516,7 @@ mod tests {
             tool_call_id: Some(ToolCallId(id.to_owned())),
             name: Some(name.to_owned()),
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 
@@ -3667,6 +3670,7 @@ mod tests {
                     tool_call_id: Some(ToolCallId("t".into())),
                     name: Some("x".into()),
                     tool_calls: None,
+                    reasoning_content: None,
                 },
             ]);
             let status = match &t.entries()[0] {
@@ -5475,6 +5479,7 @@ mod tests {
             input_tokens: 50,
             output_tokens: 10,
             cached_input_tokens: None,
+            reasoning_tokens: None,
         };
         // FirstToken observed → the ttft segment after the counts;
         // rate = output / total elapsed.
@@ -5538,6 +5543,7 @@ mod tests {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(600)),
@@ -5609,6 +5615,7 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 5,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_millis(500)),
             None,
@@ -5765,6 +5772,7 @@ mod tests {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(800)),
@@ -5799,6 +5807,7 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 5,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_millis(500)),
             None,
@@ -5832,6 +5841,7 @@ mod tests {
                 input_tokens: 5,
                 output_tokens: 5,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             None,
             None,
@@ -5844,6 +5854,7 @@ mod tests {
                 input_tokens: 7,
                 output_tokens: 7,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             None,
             None,
@@ -5882,6 +5893,7 @@ mod tests {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             None,
             None,
@@ -5896,6 +5908,7 @@ mod tests {
                 input_tokens: 80,
                 output_tokens: 5,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             None,
             None,
@@ -5934,6 +5947,7 @@ mod tests {
                 input_tokens: 9,
                 output_tokens: 9,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             None,
             None,
@@ -6032,6 +6046,7 @@ mod tests {
                 input_tokens: 1221,
                 output_tokens: 96,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.6)),
             None,
@@ -6064,6 +6079,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 5,
                 cached_input_tokens: Some(80),
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs(1)),
             Some(Duration::from_millis(500)),
@@ -6089,6 +6105,7 @@ mod tests {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             None,
@@ -6114,6 +6131,7 @@ mod tests {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(700)),
@@ -6663,6 +6681,7 @@ mod tests {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(800)),
@@ -6680,6 +6699,7 @@ mod tests {
                 input_tokens: 80,
                 output_tokens: 5,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(Duration::from_secs_f64(1.0)),
             None,
@@ -6692,6 +6712,7 @@ mod tests {
                 content: "checking".into(),
                 tool_call_id: None,
                 name: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
                     name: "echo".into(),

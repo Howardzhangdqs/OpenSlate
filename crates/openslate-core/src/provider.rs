@@ -126,6 +126,7 @@ mod tests {
             Ok(ModelResponse {
                 content: Some("dummy".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             })

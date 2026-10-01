@@ -1,0 +1,26 @@
+[package]
+name = "openslate-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenSlate mobile runtime composition (Android host; transport-independent, testable on desktop)"
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+openslate-app = { path = "../openslate-app" }
+openslate-protocol = { path = "../openslate-protocol" }
+openslate-session = { path = "../openslate-session" }
+openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+# 仅为注册原始 usage 诊断钩子（genai::chat::set_raw_usage_logger → logcat）。
+genai = { path = "../../vendor/genai" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+openslate-model-genai = { path = "../openslate-model-genai" }

@@ -96,6 +96,7 @@ fn user_message(text: &str) -> Message {
         tool_call_id: None,
         name: None,
         tool_calls: None,
+        reasoning_content: None,
     }
 }
 
@@ -122,6 +123,7 @@ async fn app_consumes_turn_events_and_merges_transcript() {
                     name: "echo".into(),
                     arguments: serde_json::json!({"text": "hi"}),
                 }]),
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -129,6 +131,7 @@ async fn app_consumes_turn_events_and_merges_transcript() {
                 tool_call_id: Some(ToolCallId("tc-1".into())),
                 name: Some("echo".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -136,6 +139,7 @@ async fn app_consumes_turn_events_and_merges_transcript() {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ],
         total_steps: 2,
@@ -252,6 +256,7 @@ async fn request_usage_meta_lines_flow_through_dispatch() {
         input_tokens: 50,
         output_tokens: 10,
         cached_input_tokens: Some(3),
+        reasoning_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -353,6 +358,7 @@ async fn request_usage_meta_lines_flow_through_dispatch() {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ],
         total_steps: 1,
@@ -481,6 +487,7 @@ async fn tool_step_usage_meta_lands_below_the_tool_row() {
         input_tokens: 50,
         output_tokens: 10,
         cached_input_tokens: None,
+        reasoning_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -816,6 +823,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
                     name: "echo".into(),
                     arguments: serde_json::json!({}),
                 }]),
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -823,6 +831,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
                 tool_call_id: Some(ToolCallId("tc-1".into())),
                 name: Some("echo".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -830,6 +839,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ],
         total_steps: 2,
@@ -1019,6 +1029,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
         input_tokens: 50,
         output_tokens: 10,
         cached_input_tokens: None,
+        reasoning_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -1050,6 +1061,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
         input_tokens: 80,
         output_tokens: 5,
         cached_input_tokens: None,
+        reasoning_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -1069,6 +1081,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
                     name: "echo".into(),
                     arguments: serde_json::json!({"text": "hi"}),
                 }]),
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -1076,6 +1089,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
                 tool_call_id: Some(ToolCallId("tc-1".into())),
                 name: Some("echo".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -1083,6 +1097,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ],
         total_steps: 2,
@@ -1300,6 +1315,7 @@ fn tool_fold_turn_done(content: &str) -> TuiEvent {
             tool_call_id: None,
             name: Some("read_file".into()),
             tool_calls: None,
+            reasoning_content: None,
         }],
         total_steps: 1,
         total_input_tokens: 10,

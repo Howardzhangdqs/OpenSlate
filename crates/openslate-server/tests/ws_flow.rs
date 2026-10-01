@@ -85,11 +85,13 @@ fn usage(in_tok: u32, out_tok: u32) -> Usage {
         input_tokens: in_tok,
         output_tokens: out_tok,
         cached_input_tokens: None,
+        reasoning_tokens: None,
     }
 }
 
 fn resp_tool(call_id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
     ModelResponse {
+    reasoning_content: None,
         content: None,
         tool_calls: vec![ToolCall {
             id: ToolCallId(call_id.into()),
@@ -105,6 +107,7 @@ fn resp_text(text: &str) -> ModelResponse {
     ModelResponse {
         content: Some(text.into()),
         tool_calls: vec![],
+        reasoning_content: None,
         usage: Some(usage(40, 8)),
         finish_reason: Some("stop".into()),
     }

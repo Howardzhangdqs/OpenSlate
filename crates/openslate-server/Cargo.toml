@@ -9,6 +9,8 @@ description = "openslate server: shared-session HTTP+WS backend (REST read-only 
 openslate-core = { path = "../openslate-core" }
 openslate-app = { path = "../openslate-app" }
 openslate-protocol = { path = "../openslate-protocol" }
+# 传输无关会话核心（state/engine/approval/config_ops/session）。
+openslate-session = { path = "../openslate-session" }
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
 axum = { workspace = true }
 tokio = { workspace = true }

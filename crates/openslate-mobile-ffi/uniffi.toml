@@ -1,0 +1,4 @@
+# UniFFI 全局配置（0.32 新式结构）。
+[bindings.kotlin]
+package_name = "uniffi.openslate.mobile"
+generate_immutable_records = true

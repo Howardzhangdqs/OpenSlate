@@ -15,8 +15,17 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 futures = "0.3"
 
+# Android：rustls-platform-verifier 需要 JNI 宿主初始化（纯 .so 场景不可
+# 满足，TLS 一碰即 panic）。移动端改用 webpki 静态根证书的预配置 TLS。
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "tls12"] }
+webpki-roots = "0.26"
+
 [dev-dependencies]
 mockito = { workspace = true }
 # "net" (raw TCP test servers for the retry-boundary tests) merges with the
 # workspace feature set for this crate's tests only.
 tokio = { workspace = true, features = ["net"] }
+anyhow = { workspace = true }
+openslate-core = { path = "../openslate-core" }
+tracing-subscriber = { workspace = true }

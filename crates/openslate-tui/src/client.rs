@@ -710,6 +710,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             }],
         }
     }
@@ -770,7 +771,8 @@ mod tests {
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 2,
-                    cached_input_tokens: None
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }
             })
             .len(),

@@ -10,13 +10,15 @@
 //!
 //! 组合根见 [`serve`]；测试可直接用 [`build_router`] 起真 listener。
 
-pub mod approval;
-pub mod config_ops;
 pub mod discovery;
-pub mod engine;
+pub mod hub;
 pub mod rest;
-pub mod state;
 pub mod ws;
+
+// 会话核心（state/engine/approval/config_ops/session）已抽取到
+// openslate-session（传输无关，server WS 与 mobile FFI 共用）；原
+// `openslate_server::<module>` 路径经 re-export 保持可用。
+pub use openslate_session::{approval, config_ops, engine, session, state};
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -28,7 +30,9 @@ use axum::Router;
 use openslate_app::wiring::{apply_approval, build_app_context};
 use openslate_core::approval::ApprovalManager;
 use openslate_protocol::{ServerInfo, SkillInfoDto, PROTOCOL_VERSION};
-use state::{AppState, ConfigPaths, ConnectionHub, CoreInner, ProviderFactory, SessionCore};
+use hub::ConnectionHub;
+use openslate_session::approval::SessionApprovalBridge;
+use state::{AppState, ConfigPaths, CoreInner, ProviderFactory, SessionCore};
 
 /// stdout 运行时事件的专用 target：stdout fmt layer 只放行它（见
 /// [`init_logging`]），第三方 crate 的 info 日志不会刷到前台。
@@ -87,7 +91,7 @@ pub async fn build_state(opts: &ServeOptions) -> Result<Arc<AppState>> {
     } = ctx;
 
     let hub = Arc::new(ConnectionHub::new());
-    let approval_bridge = Arc::new(approval::ServerApprovalBridge::new(hub.clone()));
+    let approval_bridge = Arc::new(SessionApprovalBridge::new(hub.clone()));
 
     // server = 交互式语义：审批策略按 interactive 推导，回调挂桥。
     apply_approval(&mut manager, &config, true, false);
@@ -154,13 +158,14 @@ pub async fn build_state(opts: &ServeOptions) -> Result<Arc<AppState>> {
 
     Ok(Arc::new(AppState {
         core: Arc::new(SessionCore::new(inner)),
-        hub,
+        sink: hub,
         approval: approval_bridge,
         auth_token: opts.auth_token.clone(),
         provider_factory: opts
             .provider_factory
             .clone()
             .unwrap_or_else(default_provider_factory),
+        origin: "server",
         _mcp: mcp_connections,
     }))
 }
@@ -370,7 +375,7 @@ async fn graceful_shutdown_work(state: Arc<AppState>) {
     stdout_event!("engine settled, run persisted");
 
     // 4. 关闭全部连接（写任务发 Close 帧退出 → axum 收尾）。
-    state.hub.close_all();
+    state.sink.close_all();
 }
 
 /// 日志双路：`~/.local/share/openslate/logs/server.log`（追加，全量——
@@ -417,7 +422,13 @@ fn init_logging() -> Option<PathBuf> {
         .with_writer(std::io::stdout)
         .with_filter(
             tracing_subscriber::filter::Targets::new()
-                .with_target(STDOUT_TARGET, tracing_subscriber::filter::LevelFilter::INFO),
+                .with_target(STDOUT_TARGET, tracing_subscriber::filter::LevelFilter::INFO)
+                // 会话核心的单行事件（turn ok / approval / config）迁到
+                // openslate-session 后经此 target 输出，stdout 行为不变。
+                .with_target(
+                    openslate_session::EVENT_TARGET,
+                    tracing_subscriber::filter::LevelFilter::INFO,
+                ),
         );
     let installed = tracing_subscriber::registry()
         .with(filter)

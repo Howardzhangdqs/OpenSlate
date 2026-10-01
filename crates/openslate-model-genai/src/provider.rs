@@ -64,6 +64,11 @@ pub struct GenaiConfig {
     /// Optional endpoint override (rarely needed for native providers; useful for
     /// proxies / gateways).
     pub base_url: Option<String>,
+    /// Optional HTTP(S) proxy for all provider traffic, e.g.
+    /// `Some("http://127.0.0.1:7890")`. `None` keeps the no-proxy default
+    /// (desktop). Mobile hosts use this to route egress through the host
+    /// machine (adb reverse → mihomo) when the device network is restricted.
+    pub proxy: Option<String>,
     /// genai adapter protocol (e.g. `"anthropic"`, `"gemini"`, `"openai"`,
     /// `"ollama"`). If `None`, genai infers the protocol from the model name —
     /// but unknown prefixes silently fall through to Ollama, so an explicit
@@ -127,12 +132,39 @@ impl GenaiProvider {
         // each attempt in a total `tokio::time::timeout`, and
         // `generate_stream` enforces an idle budget between stream events
         // (connection establishment is bounded by CONNECT_TIMEOUT above).
-        let reqwest_client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .no_proxy()
-            .build()
-            .map_err(|e| GenaiBuildError::ReqwestBuild(e.to_string()))?;
+        let reqwest_client = {
+            let mut builder = reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .connect_timeout(CONNECT_TIMEOUT);
+            // Android：rustls-platform-verifier 需 JNI 宿主初始化（本 .so
+            // 场景不可用，未初始化即 panic——「空回合」的根因）。改用
+            // webpki 静态根证书预配置 TLS；desktop 保持系统证书链不变。
+            #[cfg(target_os = "android")]
+            {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let provider = rustls::crypto::aws_lc_rs::default_provider();
+                let tls = rustls::ClientConfig::builder_with_provider(provider.into())
+                    .with_safe_default_protocol_versions()
+                    .map_err(|e| GenaiBuildError::ReqwestBuild(format!("tls config: {e}")))?
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                builder = builder.use_preconfigured_tls(tls);
+            }
+            // Proxy support: default no_proxy（desktop 语义不变）；mobile 等
+            // 受限网络经 OPENSLATE_HTTP_PROXY 显式启用。
+            if let Some(proxy_url) = &config.proxy {
+                let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+                    GenaiBuildError::ReqwestBuild(format!("invalid proxy url '{proxy_url}': {e}"))
+                })?;
+                builder = builder.proxy(proxy);
+            } else {
+                builder = builder.no_proxy();
+            }
+            builder
+                .build()
+                .map_err(|e| GenaiBuildError::ReqwestBuild(e.to_string()))?
+        };
 
         let mut builder = Client::builder().with_reqwest(reqwest_client);
 
@@ -349,6 +381,7 @@ impl ModelProvider for GenaiProvider {
                 // in the terminal Done), and Usage/Done end the stream, so
                 // Delta/Reasoning is exactly the boundary that matters.
                 let mut sent_output = false;
+                let mut saw_end = false;
                 let mut failure: Option<(bool, ProviderError)> = None;
 
                 loop {
@@ -385,6 +418,7 @@ impl ModelProvider for GenaiProvider {
                         Ok(ChatStreamEvent::ThoughtSignatureChunk(_)) => None,
                         Ok(ChatStreamEvent::ToolCallChunk(_)) => None,
                         Ok(ChatStreamEvent::End(end)) => {
+                            saw_end = true;
                             let (usage_event, response) = from_stream_end(end);
                             if let Some(u) = usage_event {
                                 if tx.send(Ok(ModelStreamEvent::Usage(u))).await.is_err() {
@@ -412,7 +446,20 @@ impl ModelProvider for GenaiProvider {
                 }
 
                 match failure {
-                    None => return, // clean End: Done was forwarded.
+                    None if saw_end => return, // clean End: Done was forwarded.
+                    // 流在 End 之前关闭（典型：网关返回非 SSE 的 JSON 错误体，
+                    // genai 的 SSE 解析零事件即静默结束）——显式报错，上游
+                    // 不再看到无从排查的「空回合」。
+                    None => {
+                        let _ = tx
+                            .send(Err(ProviderError::MalformedResponse(
+                                "stream closed before Done — gateway returned a non-SSE/empty \
+                                 body (check base_url path; anthropic 网关通常需要以 /v1 结尾)"
+                                    .to_owned(),
+                            )))
+                            .await;
+                        return;
+                    }
                     Some((retryable, mapped)) => {
                         // Retry ONLY transient failures that happened before
                         // any Delta/Reasoning reached the consumer.
@@ -456,6 +503,7 @@ mod tests {
             model: "claude-sonnet-4-5".into(),
             api_key: Some("k".into()),
             base_url: None,
+            proxy: None,
             adapter: Some("anthropic".into()),
             timeout_ms: 60_000,
             max_attempts: 3,
@@ -474,6 +522,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             base_url: None,
+            proxy: None,
             adapter: Some("not-a-real-adapter".into()),
             timeout_ms: 60_000,
             max_attempts: 3,
@@ -531,6 +580,7 @@ mod tests {
             model: "test-model".into(),
             api_key: Some("test-key".into()),
             base_url: Some(server.url()),
+            proxy: None,
             adapter: Some("openai".into()),
             timeout_ms: 30_000,
             max_attempts: 3,
@@ -579,6 +629,7 @@ mod tests {
                 model: "test-model".into(),
                 api_key: Some("test-key".into()),
                 base_url: Some(server.url()),
+                proxy: None,
                 adapter: Some("openai".into()),
                 timeout_ms: 30_000,
                 max_attempts: 1,
@@ -647,6 +698,7 @@ mod tests {
                 model: "test-model".into(),
                 api_key: Some("test-key".into()),
                 base_url: Some(base_url),
+                proxy: None,
                 adapter: Some("openai".into()),
                 timeout_ms: 30_000,
                 max_attempts,

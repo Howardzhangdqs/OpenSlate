@@ -141,6 +141,7 @@ fn text(t: &str) -> ModelResponse {
     ModelResponse {
         content: Some(t.into()),
         tool_calls: vec![],
+        reasoning_content: None,
         usage: None,
         finish_reason: Some("stop".into()),
     }
@@ -194,6 +195,7 @@ enabled = true
                 ModelResponse {
                     content: None,
                     tool_calls: vec![run_code_call()],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("tool_calls".into()),
                 },

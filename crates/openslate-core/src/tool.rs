@@ -82,6 +82,13 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_owned(), Arc::new(tool));
     }
 
+    /// Register an already-boxed tool (mobile host-tool injection seam:
+    /// host tools are built as `Box<dyn Tool>` by the embedding frontend
+    /// and injected into the registry assembled by `build_app_context`).
+    pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
+        self.tools.insert(tool.name().to_owned(), Arc::from(tool));
+    }
+
     /// Register a tool, returning an error if the name is already taken.
     ///
     /// Unlike [`register`](Self::register), this surfaces collisions — covering

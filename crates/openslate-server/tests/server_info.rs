@@ -28,10 +28,12 @@ impl ModelProvider for FixedProvider {
         Ok(ModelResponse {
             content: Some(format!("echo:{n}")),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: Some(Usage {
                 input_tokens: 5,
                 output_tokens: 2,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         })

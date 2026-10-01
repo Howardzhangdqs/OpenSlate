@@ -1,0 +1,26 @@
+[package]
+name = "openslate-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UniFFI FFI surface of the OpenSlate mobile runtime (Android/Kotlin host)"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "openslate_mobile"
+
+[dependencies]
+openslate-mobile = { path = "../openslate-mobile" }
+uniffi = { version = "0.32", features = ["build"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# bindgen 二进制（`cargo run -p openslate-mobile-ffi --features bindgen --bin uniffi-bindgen`）。
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]

@@ -11,7 +11,13 @@ members = [
     "crates/openslate-ptc",
     "crates/openslate-protocol",
     "crates/openslate-server",
+    "crates/openslate-session",
+    "crates/openslate-mobile",
+    "crates/openslate-mobile-ffi",
 ]
+# vendor 补丁目录不是成员：独立测试在 vendor/genai 内跑（那里的 Cargo.toml
+# 带自己的 [workspace] 表，见 vendor/genai 内说明）。
+exclude = ["vendor/genai"]
 
 [workspace.package]
 version = "0.1.0"
@@ -67,7 +73,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rmcp = { version = "3.2", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # SQLite (async)
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite-bundled"] }
+# default-features=false：仅 sqlite 后端（仓库本就只用 sqlite；默认特性
+# 会拉 postgres/mysql 门面——本机网络拉不齐其 .crate，且产物冗余）。
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 
 # Async trait
 async-trait = "0.1"
@@ -101,9 +109,32 @@ indicatif = "0.18"
 tempfile = "3.22"
 futures-util = "0.3"
 
+[patch.crates-io]
+# 本机网络对 crates CDN（rsproxy/static.crates.io）拉 askama 系列长期
+# TLS 失败；askama 0.16.1 源自 GitHub（可达）同版本 git 源补齐。
+# 版本与 crates.io 一致（tag v0.16.1），无行为差异；网络恢复后可移除。
+askama = { git = "https://github.com/askama-rs/askama.git", tag = "v0.16.1" }
+askama_derive = { git = "https://github.com/askama-rs/askama.git", tag = "v0.16.1" }
+askama_macros = { git = "https://github.com/askama-rs/askama.git", tag = "v0.16.1" }
+askama_parser = { git = "https://github.com/askama-rs/askama.git", tag = "v0.16.1" }
+# rquickjs-sys 0.12.2 未随包发布 aarch64-linux-android 绑定（Android 编译
+# 硬失败）；vendor 副本补充了该绑定（照抄 gnu 版，quickjs 为纯 C ABI，
+# 二进制布局一致）。上游合入后可移除。
+rquickjs-sys = { path = "vendor/rquickjs-sys" }
+# genai 0.6.5 vendor：anthropic adapter 原本丢弃历史 ReasoningContent——
+# patch 为回传 thinking block（多轮 extended-thinking 语义）。
+genai = { path = "vendor/genai" }
+
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Android cdylib（libopenslate_mobile.so）：FFI 边界必须可 unwind——
+# panic=abort 下 Rust panic 穿越 extern "C" 是 UB，且 ffi 层的
+# catch_unwind 防线依赖 unwind。其余优化与 release 一致。
+[profile.mobile]
+inherits = "release"
+panic = "unwind"

@@ -216,6 +216,7 @@ impl RunManager {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }];
         self.execute_with_history(provider, &messages, progress)
             .await
@@ -324,10 +325,12 @@ max_output_bytes = 10_000
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("Hello from agent!".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: Some(Usage {
                 input_tokens: 50,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);
@@ -392,6 +395,7 @@ max_output_bytes = 10_000
         let provider = MockProvider::new(vec![
             // Step 1: model requests echo tool
             ModelResponse {
+            reasoning_content: None,
                 content: Some("Let me echo that.".into()),
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -402,6 +406,7 @@ max_output_bytes = 10_000
                     input_tokens: 100,
                     output_tokens: 20,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -409,10 +414,12 @@ max_output_bytes = 10_000
             ModelResponse {
                 content: Some("Done!".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 120,
                     output_tokens: 5,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -444,6 +451,7 @@ max_output_bytes = 10_000
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("Done".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }]);
@@ -470,6 +478,7 @@ max_output_bytes = 10_000
     async fn test_managed_run_tracks_tokens() {
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -480,16 +489,19 @@ max_output_bytes = 10_000
                     input_tokens: 200,
                     output_tokens: 50,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
             ModelResponse {
                 content: Some("Final answer".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 300,
                     output_tokens: 100,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -532,6 +544,7 @@ output_price_per_mtok = 2.0
 
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -542,16 +555,19 @@ output_price_per_mtok = 2.0
                     input_tokens: 500_000,
                     output_tokens: 100_000,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 500_000,
                     output_tokens: 100_000,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -585,10 +601,12 @@ output_price_per_mtok = 2.0
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("answer".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: Some(Usage {
                 input_tokens: 42,
                 output_tokens: 7,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);
@@ -719,6 +737,7 @@ model = "m"
 
     fn tool_call_response(id: &str) -> ModelResponse {
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId(id.into()),
@@ -734,6 +753,7 @@ model = "m"
         ModelResponse {
             content: Some(text.into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }
@@ -763,6 +783,7 @@ model = "m"
                     tool_call_id: None,
                     name: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }],
                 CancellationToken::new(),
                 None,
@@ -805,6 +826,7 @@ model = "m"
                     tool_call_id: None,
                     name: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }],
                 None,
             )
@@ -820,6 +842,7 @@ model = "m"
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         })
         .chain(sink.0.lock().expect("sink poisoned").iter().cloned())
         .collect();
@@ -895,6 +918,7 @@ max_output_bytes = 10_000
                     tool_call_id: None,
                     name: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }],
                 CancellationToken::new(),
                 None,
@@ -983,6 +1007,7 @@ max_output_bytes = 10_000
                     tool_call_id: None,
                     name: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }],
                 token,
                 None,

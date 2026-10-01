@@ -300,6 +300,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 2,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             TuiEvent::RequestEnd,
             TuiEvent::StepEnd,

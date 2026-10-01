@@ -120,6 +120,7 @@ async fn integration_max_tool_calls_enforced_in_main_loop() {
         }
     }
     let tool_step = |id: &str| ModelResponse {
+    reasoning_content: None,
         content: None,
         tool_calls: vec![huge_call(id)],
         usage: None,
@@ -153,6 +154,7 @@ max_tool_calls = 2
         tool_step("tc-3"),
         ModelResponse {
             content: Some("done".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("stop".into()),
@@ -251,11 +253,13 @@ async fn builtin_mcp_registry(
 async fn integration_simple_single_turn() {
     let provider = ScriptedProvider::new(vec![ModelResponse {
         content: Some("Hello from the model!".into()),
+        reasoning_content: None,
         tool_calls: vec![],
         usage: Some(Usage {
             input_tokens: 10,
             output_tokens: 5,
             cached_input_tokens: None,
+            reasoning_tokens: None,
         }),
         finish_reason: Some("stop".into()),
     }]);
@@ -290,6 +294,7 @@ async fn integration_run_with_real_tool() {
     let provider = ScriptedProvider::new(vec![
         // Step 1: model calls write_file
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId("tc-1".into()),
@@ -303,17 +308,20 @@ async fn integration_run_with_real_tool() {
                 input_tokens: 50,
                 output_tokens: 20,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("tool_calls".into()),
         },
         // Step 2: model returns final text
         ModelResponse {
             content: Some("File written successfully!".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: Some(Usage {
                 input_tokens: 80,
                 output_tokens: 10,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
@@ -351,6 +359,7 @@ async fn integration_run_with_read_file_tool() {
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId("tc-read".into()),
@@ -362,6 +371,7 @@ async fn integration_run_with_read_file_tool() {
         },
         ModelResponse {
             content: Some("I read the data".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("stop".into()),
@@ -394,6 +404,7 @@ async fn integration_tool_rejects_path_outside_workspace() {
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId("tc-evil".into()),
@@ -405,6 +416,7 @@ async fn integration_tool_rejects_path_outside_workspace() {
         },
         ModelResponse {
             content: Some("ok".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("stop".into()),
@@ -455,6 +467,7 @@ async fn integration_tool_rejects_path_traversal() {
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId("tc-trav".into()),
@@ -469,6 +482,7 @@ async fn integration_tool_rejects_path_traversal() {
         },
         ModelResponse {
             content: Some("ok".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("stop".into()),
@@ -514,6 +528,7 @@ async fn integration_tool_output_capped_by_max_output_bytes() {
 
     let provider = ScriptedProvider::new(vec![
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId("tc-huge".into()),
@@ -525,6 +540,7 @@ async fn integration_tool_output_capped_by_max_output_bytes() {
         },
         ModelResponse {
             content: Some("got it".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("stop".into()),
@@ -569,6 +585,7 @@ async fn integration_tool_output_capped_by_max_output_bytes() {
 async fn integration_execution_tree_built() {
     let provider = ScriptedProvider::new(vec![ModelResponse {
         content: Some("done".into()),
+        reasoning_content: None,
         tool_calls: vec![],
         usage: None,
         finish_reason: Some("stop".into()),
@@ -599,6 +616,7 @@ async fn integration_execution_tree_built() {
 async fn integration_model_resolved() {
     let provider = ScriptedProvider::new(vec![ModelResponse {
         content: Some("ok".into()),
+        reasoning_content: None,
         tool_calls: vec![],
         usage: None,
         finish_reason: Some("stop".into()),
@@ -651,6 +669,7 @@ async fn integration_delegates_root_to_child() {
     let provider = ScriptedProvider::new(vec![
         // root step 1: delegate
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![ToolCall {
                 id: ToolCallId("ca-1".into()),
@@ -661,28 +680,33 @@ async fn integration_delegates_root_to_child() {
                 input_tokens: 10,
                 output_tokens: 5,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("tool_calls".into()),
         },
         // child step 1: answer
         ModelResponse {
             content: Some("4".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: Some(Usage {
                 input_tokens: 20,
                 output_tokens: 3,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
         // root step 2: final summary using the child's reply
         ModelResponse {
             content: Some("The answer is 4".into()),
+            reasoning_content: None,
             tool_calls: vec![],
             usage: Some(Usage {
                 input_tokens: 30,
                 output_tokens: 8,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
@@ -790,6 +814,7 @@ async fn integration_ptc_run_code_end_to_end() {
         responses: vec![
             // Step 1: model calls run_code, orchestrating read_file in code.
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("rc-1".into()),
@@ -802,6 +827,7 @@ async fn integration_ptc_run_code_end_to_end() {
             // Step 2: model wraps up.
             ModelResponse {
                 content: Some("read the file via code".into()),
+                reasoning_content: None,
                 tool_calls: vec![],
                 usage: None,
                 finish_reason: Some("stop".into()),

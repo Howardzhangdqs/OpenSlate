@@ -393,6 +393,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
                     tool_call_id: None,
                     name: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 };
                 if let Err(e) = recorder.write_message(&user_message).await {
                     tracing::warn!("Failed to persist resume prompt: {}", e);
@@ -425,6 +426,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             };
             let run_id = RunManager::new_run_id();
             let recorder = match ctx.store {
@@ -871,6 +873,7 @@ max_output_bytes = 65536
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -878,6 +881,7 @@ max_output_bytes = 65536
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ];
         assert_eq!(
@@ -896,6 +900,7 @@ max_output_bytes = 65536
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }];
         assert_eq!(extract_final_assistant_message(&messages), None);
     }
@@ -990,11 +995,13 @@ model = "m2"
             Message {
                 role: MessageRole::User,
                 content: "list files".into(),
+                reasoning_content: None,
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
             },
             Message {
+            reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -1011,6 +1018,7 @@ model = "m2"
                 tool_call_id: Some(ToolCallId("call-7".into())),
                 name: Some("shell".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -1018,6 +1026,7 @@ model = "m2"
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ]);
 
@@ -1071,6 +1080,7 @@ model = "m2"
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -1078,6 +1088,7 @@ model = "m2"
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ]);
 
@@ -1115,6 +1126,7 @@ model = "m2"
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }]);
         result.total_input_tokens = 12_345;
         result.total_output_tokens = 6_789;
@@ -1221,11 +1233,13 @@ model = "m3"
             Message {
                 role: MessageRole::User,
                 content: "go".into(),
+                reasoning_content: None,
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
             },
             Message {
+            reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -1242,6 +1256,7 @@ model = "m3"
                 tool_call_id: Some(ToolCallId("tc-1".into())),
                 name: Some("shell".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
         ] {
             rec.write_message(&m).await.expect("seed message");
@@ -1283,6 +1298,7 @@ model = "m3"
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         })
         .await
         .expect("write after resume");

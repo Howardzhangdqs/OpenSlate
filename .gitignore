@@ -36,3 +36,19 @@ ca-certificates.crt
 
 # Deepwork session state
 .slim/deepwork/
+
+# Android 构建产物
+target-android/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+
+# vendor 内独立构建产物（vendor/genai 可单独 cargo test）
+vendor/**/target/
+
+# Rust 交叉编译产物（构建时生成，勿入库）
+android/app/src/main/jniLibs/
+*.apk

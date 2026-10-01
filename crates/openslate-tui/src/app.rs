@@ -1809,6 +1809,7 @@ impl App {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         };
         self.history.push(user_message);
         self.transcript.push_user(&prompt);

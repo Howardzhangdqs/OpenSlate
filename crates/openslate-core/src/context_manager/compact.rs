@@ -91,6 +91,7 @@ where
         tool_call_id: None,
         name: Some(COMPACT_NAME.to_owned()),
         tool_calls: None,
+        reasoning_content: None,
     };
 
     let recent = messages.split_off(split_point);
@@ -172,6 +173,7 @@ mod tests {
                         tool_call_id: None,
                         name: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     Message {
                         role: MessageRole::Assistant,
@@ -179,6 +181,7 @@ mod tests {
                         tool_call_id: None,
                         name: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                 ]
             })
@@ -261,6 +264,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }];
         assert!(needs_compact(&msgs, 100, 1000, 0));
     }
@@ -303,6 +307,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             })
             .collect();
 
@@ -359,6 +364,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -366,6 +372,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::User,
@@ -373,6 +380,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -380,6 +388,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ];
         let result = compact(&mut msgs, None, 100, 100, |_text| async {

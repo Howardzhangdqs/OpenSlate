@@ -70,6 +70,7 @@ async fn generate_summary(
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }],
         tools: Vec::new(),
         max_tokens: None,
@@ -923,6 +924,7 @@ impl ReplSession {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         };
         self.history.push(user_message.clone());
 
@@ -1796,6 +1798,7 @@ max_tool_calls = 20
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
         assert_eq!(session.history().len(), 1);
 
@@ -1815,6 +1818,7 @@ max_tool_calls = 20
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
 
         let result = rt.block_on(session.dispatch("/clear")).unwrap();
@@ -2228,6 +2232,7 @@ max_tool_calls = 20
 
     fn assistant_tool_call_msg() -> Message {
         Message {
+        reasoning_content: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -2247,6 +2252,7 @@ max_tool_calls = 20
             tool_call_id: Some(ToolCallId("tc-1".into())),
             name: Some("shell".into()),
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 
@@ -2270,6 +2276,7 @@ max_tool_calls = 20
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             assistant_tool_call_msg(),
             tool_result_msg(),
@@ -2312,6 +2319,7 @@ max_tool_calls = 20
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             })
             .await
             .expect("write after adoption");
@@ -2336,6 +2344,7 @@ max_tool_calls = 20
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         })
         .await
         .expect("write");
@@ -2369,6 +2378,7 @@ max_tool_calls = 20
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         })
         .await
         .expect("write");
@@ -2410,6 +2420,7 @@ max_tool_calls = 20
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         })
         .await
         .expect("write");
@@ -2559,6 +2570,7 @@ max_tool_calls = 20
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
             session.history.push(Message {
                 role: MessageRole::Assistant,
@@ -2566,6 +2578,7 @@ max_tool_calls = 20
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         }
     }
@@ -2690,10 +2703,12 @@ max_tool_calls = 20
             response: Ok(ModelResponse {
                 content: Some("kept decisions, paths, todos".to_owned()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 5,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2720,10 +2735,12 @@ max_tool_calls = 20
             response: Ok(ModelResponse {
                 content: Some("kept decisions".to_owned()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 2_000,
                     output_tokens: 500,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2784,10 +2801,12 @@ max_tool_calls = 20
             response: Ok(ModelResponse {
                 content: Some("   ".to_owned()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 3,
                     output_tokens: 0,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),

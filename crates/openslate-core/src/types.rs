@@ -76,6 +76,10 @@ pub struct Message {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// 模型思维链（extended thinking）。多轮对话按 Anthropic 语义应随
+    /// assistant 消息回传（历史 thinking 块）；持久化自动携带。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Static configuration for a single agent.
@@ -119,6 +123,9 @@ impl StepKind {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelResponse {
     pub content: Option<String>,
+    /// 本步思维链全文（流式 ReasoningChunk 聚合）。
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
@@ -146,6 +153,15 @@ pub struct Usage {
     /// computations deliberately ignore it.
     #[serde(default)]
     pub cached_input_tokens: Option<u32>,
+    /// Reasoning (thinking) tokens included in `output_tokens`, when the
+    /// provider reports the split — e.g. OpenAI
+    /// `completion_tokens_details.reasoning_tokens`, or an
+    /// Anthropic-compatible gateway injecting the same. `None` when only the
+    /// combined `output_tokens` is reported. Additive field: older serialized
+    /// payloads (without it) deserialize to `None`, cost computations
+    /// deliberately ignore it (already counted in `output_tokens`).
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Events emitted during a streaming chat completion.
@@ -257,6 +273,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         };
         assert_eq!(msg.role, MessageRole::User);
         assert_eq!(msg.content, "hello");
@@ -270,6 +287,7 @@ mod tests {
             tool_call_id: Some(ToolCallId::from("tc-1")),
             name: Some("bash".into()),
             tool_calls: None,
+            reasoning_content: None,
         };
         assert!(msg.tool_call_id.is_some());
         assert_eq!(msg.name.as_deref(), Some("bash"));
@@ -338,6 +356,20 @@ mod tests {
                 .unwrap();
         assert_eq!(usage.cached_input_tokens, Some(2));
         // Round-trip keeps it.
+        let back: Usage = serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn usage_reasoning_tokens_roundtrip() {
+        // Old-shape payload (no reasoning field) → None.
+        let usage: Usage = serde_json::from_str(r#"{"input_tokens":3,"output_tokens":4}"#).unwrap();
+        assert_eq!(usage.reasoning_tokens, None);
+        // With the field → Some, and it survives a round trip.
+        let usage: Usage =
+            serde_json::from_str(r#"{"input_tokens":3,"output_tokens":9,"reasoning_tokens":6}"#)
+                .unwrap();
+        assert_eq!(usage.reasoning_tokens, Some(6));
         let back: Usage = serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
         assert_eq!(back, usage);
     }

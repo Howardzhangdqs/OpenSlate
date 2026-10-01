@@ -120,6 +120,7 @@ fn user_msg(content: &str) -> Message {
         tool_call_id: None,
         name: None,
         tool_calls: None,
+        reasoning_content: None,
     }
 }
 
@@ -130,6 +131,7 @@ fn assistant_msg(content: &str) -> Message {
         tool_call_id: None,
         name: None,
         tool_calls: None,
+        reasoning_content: None,
     }
 }
 
@@ -144,6 +146,7 @@ fn assistant_call(id: &str, name: &str) -> Message {
             name: name.to_owned(),
             arguments: json!({}),
         }]),
+        reasoning_content: None,
     }
 }
 
@@ -154,6 +157,7 @@ fn tool_result(id: &str, name: &str, content: &str) -> Message {
         tool_call_id: Some(ToolCallId(id.to_owned())),
         name: Some(name.to_owned()),
         tool_calls: None,
+        reasoning_content: None,
     }
 }
 
@@ -1058,6 +1062,7 @@ fn renders_request_meta_lines_dim_and_indented() {
             input_tokens: 50,
             output_tokens: 10,
             cached_input_tokens: None,
+            reasoning_tokens: None,
         }),
         Some(std::time::Duration::from_secs(2)),
         Some(std::time::Duration::from_millis(800)),
@@ -1097,6 +1102,7 @@ fn renders_single_merged_meta_line_for_empty_answer() {
             input_tokens: 1221,
             output_tokens: 96,
             cached_input_tokens: None,
+            reasoning_tokens: None,
         }),
         Some(std::time::Duration::from_secs_f64(2.6)),
         Some(std::time::Duration::from_millis(900)),

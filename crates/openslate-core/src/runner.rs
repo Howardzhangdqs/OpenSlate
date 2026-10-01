@@ -1400,6 +1400,7 @@ model = "mock-fast"
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 
@@ -1591,6 +1592,7 @@ model = "mock-fast"
         ModelResponse {
             content: Some(content.into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }
@@ -1605,6 +1607,7 @@ model = "mock-fast"
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-1", "child", "greet")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1682,6 +1685,7 @@ output_price_per_mtok = 1.0
         let has_calls = !tool_calls.is_empty();
         ModelResponse {
             content: content.map(|c| c.to_owned()),
+            reasoning_content: None,
             tool_calls,
             usage: Some(usage),
             finish_reason: Some(if has_calls { "tool_calls" } else { "stop" }.into()),
@@ -1703,6 +1707,7 @@ output_price_per_mtok = 1.0
                     input_tokens: 1_000,
                     output_tokens: 100,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 },
             ),
             response_with_usage(
@@ -1712,6 +1717,7 @@ output_price_per_mtok = 1.0
                     input_tokens: 500,
                     output_tokens: 50,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 },
             ),
             response_with_usage(
@@ -1721,6 +1727,7 @@ output_price_per_mtok = 1.0
                     input_tokens: 2_000,
                     output_tokens: 200,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 },
             ),
         ]);
@@ -1766,6 +1773,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-1", "child", "greet")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1816,6 +1824,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-1", "child", "first")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1823,6 +1832,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-2", "child", "second")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1874,6 +1884,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-1", "ghost", "x")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1953,6 +1964,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-1", "child", "do it")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1960,6 +1972,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-2", "grandchild", "sub-task")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -2042,6 +2055,7 @@ output_price_per_mtok = 1.0
             ModelResponse {
                 content: None,
                 tool_calls: vec![call_agent_tool_call("ca-1", "child", "greet")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -2135,6 +2149,7 @@ output_price_per_mtok = 1.0
                     Ok(ModelResponse {
                         content: None,
                         tool_calls: vec![call_agent_tool_call("ca-1", "child", self.marker)],
+                        reasoning_content: None,
                         usage: None,
                         finish_reason: Some("tool_calls".into()),
                     })
@@ -2229,6 +2244,7 @@ output_price_per_mtok = 1.0
                 ModelResponse {
                     content: None,
                     tool_calls: vec![call_agent_tool_call("ca-2", "grandchild", "sub-task")],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("tool_calls".into()),
                 }
@@ -2237,6 +2253,7 @@ output_price_per_mtok = 1.0
                 ModelResponse {
                     content: None,
                     tool_calls: vec![call_agent_tool_call("ca-1", "child", "do it")],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("tool_calls".into()),
                 }
@@ -3065,24 +3082,28 @@ enabled = true
             ModelResponse {
                 content: None,
                 tool_calls: vec![echo_tool_call("tc-1")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
             ModelResponse {
                 content: None,
                 tool_calls: vec![echo_tool_call("tc-2")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
             ModelResponse {
                 content: None,
                 tool_calls: vec![echo_tool_call("tc-3")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
             ModelResponse {
                 content: None,
                 tool_calls: vec![echo_tool_call("tc-4")],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("tool_calls".into()),
             },
@@ -3312,6 +3333,7 @@ enabled = true
         ModelResponse {
             content: None,
             tool_calls: calls,
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("tool_calls".into()),
         }

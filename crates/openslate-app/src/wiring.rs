@@ -442,6 +442,16 @@ fn load_dotenv(dir: Option<&Path>) {
 
 /// Build the full application context from CLI parameters.
 pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> {
+    build_app_context_with(config_flag, Vec::new()).await
+}
+
+/// [`build_app_context`] + 额外工具注入接缝（mobile host tools）：
+/// `extra_tools` 在 builtin/external MCP 注册之后、RunManager 构造之前
+/// 注入注册表（desktop 传空 Vec，行为与原 `build_app_context` 完全一致）。
+pub async fn build_app_context_with(
+    config_flag: Option<&str>,
+    extra_tools: Vec<Box<dyn openslate_core::tool::Tool>>,
+) -> Result<AppContext> {
     // 1. Resolve + load config files via the shared entry (model-mgmt-1):
     //    an explicit `--config` keeps the exact single-file semantics (no
     //    global library, no merging); the default discovery layers the
@@ -645,6 +655,15 @@ pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> 
                 invalid.join(", ")
             );
         }
+    }
+
+    // 7.7 Host tool injection seam (mobile): extras register AFTER builtin
+    //     and external MCP tools, plain overwrite semantics — the embedding
+    //     frontend owns these namespaces (e.g. `mobile.*` / `android.*`).
+    for tool in extra_tools {
+        let name = tool.name().to_owned();
+        registry.register_boxed(tool);
+        tracing::debug!(target: "openslate_mcp", "host tool registered: {name}");
     }
 
     // 8. Resolve the root agent to determine which model to use (informational;

@@ -261,6 +261,7 @@ mod tests {
         Message {
             role: MessageRole::User,
             content: content.to_owned(),
+            reasoning_content: None,
             tool_call_id: None,
             name: None,
             tool_calls: None,
@@ -269,6 +270,7 @@ mod tests {
 
     fn assistant_with_tool_calls() -> Message {
         Message {
+        reasoning_content: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -288,6 +290,7 @@ mod tests {
             tool_call_id: Some(ToolCallId("tc-1".into())),
             name: Some("shell".into()),
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 
@@ -375,6 +378,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ] {
             rec.write_message(&m).await.expect("write");

@@ -60,6 +60,7 @@ pub fn build_child_context(
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
     }
 
@@ -87,6 +88,7 @@ pub fn build_child_context(
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
     }
 
@@ -97,6 +99,7 @@ pub fn build_child_context(
         tool_call_id: None,
         name: None,
         tool_calls: None,
+        reasoning_content: None,
     });
 
     messages
@@ -151,6 +154,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 

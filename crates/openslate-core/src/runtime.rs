@@ -99,6 +99,7 @@ fn cancelled_tool_message(tc: &ToolCall) -> Message {
         tool_call_id: Some(tc.id.clone()),
         name: Some(tc.name.clone()),
         tool_calls: None,
+        reasoning_content: None,
     }
 }
 
@@ -420,8 +421,16 @@ pub async fn execute_run(
         // `timeout_ms` minus the provider-await time already spent on
         // earlier steps. Exhausted (including `timeout_ms = 0`, the
         // immediate-timeout convention pinned by tests) → Timeout.
-        let remaining_llm =
-            Duration::from_millis(config.timeout_ms).saturating_sub(llm_time_accumulated);
+        // `u64::MAX` = 无总时长预算（移动端 thinking 模型语义：总时长
+        // 不设限，挂死防护交给 provider 层的 per-request 空闲超时）。
+        let unlimited_budget = config.timeout_ms == u64::MAX;
+        let remaining_llm = if unlimited_budget {
+            // 50 年——实际无限（tokio deadline 安全范围）；挂死防护由
+            // provider 层 per-request 空闲超时（流静默 60s）承担。
+            Duration::from_secs(50 * 365 * 24 * 3600)
+        } else {
+            Duration::from_millis(config.timeout_ms).saturating_sub(llm_time_accumulated)
+        };
         if remaining_llm.is_zero() {
             return Err(OpenSlateError::Runtime(RuntimeError::Timeout {
                 timeout_ms: config.timeout_ms,
@@ -551,6 +560,7 @@ pub async fn execute_run(
                     assembled.unwrap_or(ModelResponse {
                         content: None,
                         tool_calls: vec![],
+                        reasoning_content: None,
                         usage: None,
                         finish_reason: None,
                     })
@@ -636,6 +646,8 @@ pub async fn execute_run(
             } else {
                 None
             },
+            // 思维链随 assistant 消息入库/回传（Anthropic 多轮语义）。
+            reasoning_content: response.reasoning_content.clone().filter(|r| !r.is_empty()),
         };
         // Per-step incremental persistence: the assistant message is on
         // durable storage before any tool runs (crash mid-step leaves a
@@ -757,6 +769,7 @@ pub async fn execute_run(
                         tool_call_id: Some(tc.id.clone()),
                         name: Some(tc.name.clone()),
                         tool_calls: None,
+                        reasoning_content: None,
                     };
                     // Persist the tool result before continuing (same per-step
                     // contract as the assistant message above).
@@ -920,6 +933,7 @@ pub async fn execute_run(
                                 tool_call_id: Some(tc.id.clone()),
                                 name: Some(tc.name.clone()),
                                 tool_calls: None,
+                                reasoning_content: None,
                             };
                             // Persist the tool result before continuing
                             // (same per-step contract as the sequential
@@ -1135,6 +1149,7 @@ fn truncate_context_if_needed(messages: &mut Vec<Message>, max_bytes: u32) {
         tool_call_id: None,
         name: None,
         tool_calls: None,
+        reasoning_content: None,
     };
     trimmed.push(notice);
 
@@ -1220,6 +1235,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             }],
             max_steps: 10,
             max_context_bytes: 100_000,
@@ -1240,6 +1256,7 @@ mod tests {
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("Hello!".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }]);
@@ -1271,6 +1288,7 @@ mod tests {
         let provider = MockProvider::new(vec![
             // Step 1: model requests a tool call
             ModelResponse {
+            reasoning_content: None,
                 content: Some("Let me check that.".into()),
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -1284,6 +1302,7 @@ mod tests {
             ModelResponse {
                 content: Some("Here are the files.".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -1320,6 +1339,7 @@ mod tests {
         // Provider always returns tool_calls — never terminates naturally
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -1388,6 +1408,7 @@ mod tests {
         let provider = MockProvider::new(vec![
             // Step 1: tool call
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -1398,6 +1419,7 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 20,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1405,10 +1427,12 @@ mod tests {
             ModelResponse {
                 content: Some("42".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 150,
                     output_tokens: 5,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -1437,6 +1461,7 @@ mod tests {
             ModelResponse {
                 content: None,
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: None,
             };
@@ -1473,12 +1498,14 @@ mod tests {
             ModelResponse {
                 content: None,
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: None,
             },
             ModelResponse {
                 content: Some("Finally!".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -1513,6 +1540,7 @@ mod tests {
 
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: Some("calling unknown tool".into()),
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -1525,6 +1553,7 @@ mod tests {
             ModelResponse {
                 content: Some("Done after error".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -1638,6 +1667,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -1645,6 +1675,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::User,
@@ -1652,6 +1683,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -1659,6 +1691,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::User,
@@ -1666,6 +1699,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ];
 
@@ -1689,6 +1723,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
             Message {
                 role: MessageRole::Assistant,
@@ -1696,6 +1731,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             },
         ];
 
@@ -1820,6 +1856,7 @@ mod tests {
                 Ok(ModelResponse {
                     content: Some("too slow".into()),
                     tool_calls: vec![],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("stop".into()),
                 })
@@ -1856,6 +1893,7 @@ mod tests {
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("fast enough".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }]);
@@ -1878,6 +1916,7 @@ mod tests {
     async fn test_timeout_allows_multi_step_within_budget() {
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -1890,6 +1929,7 @@ mod tests {
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -1911,6 +1951,7 @@ mod tests {
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("never".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }]);
@@ -1966,6 +2007,7 @@ mod tests {
         // killed the run with `timeout after 200ms`.
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -1978,6 +2020,7 @@ mod tests {
             ModelResponse {
                 content: Some("tutorial draft done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2057,6 +2100,7 @@ mod tests {
         let provider = ScriptedStreamProvider {
             responses: vec![
                 ModelResponse {
+                reasoning_content: None,
                     content: None,
                     tool_calls: vec![ToolCall {
                         id: ToolCallId("tc-1".into()),
@@ -2069,6 +2113,7 @@ mod tests {
                 ModelResponse {
                     content: Some("done".into()),
                     tool_calls: vec![],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("stop".into()),
                 },
@@ -2117,6 +2162,7 @@ mod tests {
                 Ok(ModelResponse {
                     content: Some("never".into()),
                     tool_calls: vec![],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("stop".into()),
                 })
@@ -2168,6 +2214,7 @@ mod tests {
                 if is_first {
                     tokio::time::sleep(Duration::from_millis(120)).await;
                     Ok(ModelResponse {
+                    reasoning_content: None,
                         content: None,
                         tool_calls: vec![ToolCall {
                             id: ToolCallId("tc-1".into()),
@@ -2182,6 +2229,7 @@ mod tests {
                     Ok(ModelResponse {
                         content: Some("never".into()),
                         tool_calls: vec![],
+                        reasoning_content: None,
                         usage: None,
                         finish_reason: Some("stop".into()),
                     })
@@ -2239,6 +2287,7 @@ mod tests {
 
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -2251,6 +2300,7 @@ mod tests {
             ModelResponse {
                 content: Some("all done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2303,6 +2353,7 @@ mod tests {
 
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -2315,6 +2366,7 @@ mod tests {
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2346,6 +2398,7 @@ mod tests {
         };
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -2358,6 +2411,7 @@ mod tests {
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2390,6 +2444,7 @@ mod tests {
 
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -2402,6 +2457,7 @@ mod tests {
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2434,6 +2490,7 @@ mod tests {
         let provider = MockProvider::new(vec![
             // Step 1: assistant asks for a tool
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -2447,6 +2504,7 @@ mod tests {
             ModelResponse {
                 content: Some("all done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2526,6 +2584,7 @@ mod tests {
         let provider = SnapshotProvider {
             responses: vec![
                 ModelResponse {
+                reasoning_content: None,
                     content: None,
                     tool_calls: vec![ToolCall {
                         id: ToolCallId("tc-1".into()),
@@ -2538,6 +2597,7 @@ mod tests {
                 ModelResponse {
                     content: Some("fin".into()),
                     tool_calls: vec![],
+                    reasoning_content: None,
                     usage: None,
                     finish_reason: Some("stop".into()),
                 },
@@ -2618,6 +2678,7 @@ mod tests {
                         .await;
                     let _ = tx
                         .send(Ok(ModelStreamEvent::Done(ModelResponse {
+                        reasoning_content: None,
                             content: None,
                             tool_calls: vec![ToolCall {
                                 id: ToolCallId("tc-1".into()),
@@ -2722,6 +2783,7 @@ mod tests {
         };
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -2734,6 +2796,7 @@ mod tests {
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             },
@@ -2815,6 +2878,7 @@ mod tests {
             Ok(ModelResponse {
                 content: Some("should never be reached".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: None,
                 finish_reason: Some("stop".into()),
             })
@@ -2865,6 +2929,7 @@ mod tests {
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("all good".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }]);
@@ -2964,6 +3029,7 @@ mod tests {
     /// Two direct tool calls in one step.
     fn two_call_response(first: &str, second: &str) -> ModelResponse {
         ModelResponse {
+        reasoning_content: None,
             content: None,
             tool_calls: vec![
                 ToolCall {
@@ -2986,6 +3052,7 @@ mod tests {
         ModelResponse {
             content: Some(text.into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: None,
             finish_reason: Some("stop".into()),
         }
@@ -3208,6 +3275,7 @@ mod tests {
         let executor = BatchProbeExecutor::new();
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![
                     ToolCall {
@@ -3362,7 +3430,8 @@ mod tests {
             (spec.cost_of(&Usage {
                 input_tokens: 500_000,
                 output_tokens: 100_000,
-                cached_input_tokens: None
+                cached_input_tokens: None,
+                reasoning_tokens: None,
             }) - 1.6f64)
                 .abs()
                 < 1e-12
@@ -3373,7 +3442,8 @@ mod tests {
             (input_only.cost_of(&Usage {
                 input_tokens: 1_000_000,
                 output_tokens: 999,
-                cached_input_tokens: None
+                cached_input_tokens: None,
+                reasoning_tokens: None,
             }) - 1.0f64)
                 .abs()
                 < 1e-12
@@ -3388,7 +3458,8 @@ mod tests {
             spec.cost_of(&Usage {
                 input_tokens: 123_456,
                 output_tokens: 65_432,
-                cached_input_tokens: None
+                cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             0.0,
             "unconfigured pricing must record cost 0"
@@ -3405,6 +3476,7 @@ mod tests {
         //   step2: 3000*2e-6 + 4000*5e-6 = 0.026  → total 0.038
         let provider = MockProvider::new(vec![
             ModelResponse {
+            reasoning_content: None,
                 content: None,
                 tool_calls: vec![ToolCall {
                     id: ToolCallId("tc-1".into()),
@@ -3415,16 +3487,19 @@ mod tests {
                     input_tokens: 1_000,
                     output_tokens: 2_000,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
             ModelResponse {
                 content: Some("done".into()),
                 tool_calls: vec![],
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 3_000,
                     output_tokens: 4_000,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -3452,10 +3527,12 @@ mod tests {
         let provider = MockProvider::new(vec![ModelResponse {
             content: Some("answer".into()),
             tool_calls: vec![],
+            reasoning_content: None,
             usage: Some(Usage {
                 input_tokens: 9_999,
                 output_tokens: 1_111,
                 cached_input_tokens: None,
+                reasoning_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);

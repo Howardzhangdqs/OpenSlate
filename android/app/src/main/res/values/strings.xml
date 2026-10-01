@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OpenSlate</string>
+    <string name="agent_service_notification_title">OpenSlate Agent</string>
+    <string name="agent_service_notification_text">Agent 运行时已就绪</string>
+    <string name="agent_service_channel">agent_runtime</string>
+</resources>

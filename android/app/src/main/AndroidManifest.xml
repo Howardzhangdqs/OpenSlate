@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- termux.run：读取 Termux 落在共享存储的输出文件 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- termux.run：Termux 的 RUN_COMMAND 自定义权限（Termux 未装时无副作用） -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+
+    <application
+        android:name=".OpenSlateApp"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.OpenSlate"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.OpenSlate">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.AgentService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="AI agent runtime host" />
+        </service>
+
+        <!-- Phase 1 调试注入通道（设置页上线后移除）：adb 注入 key / 发消息。
+             exported=true 仅为 adb 调试广播可达（action 带包名前缀，风险可控）。 -->
+        <receiver
+            android:name=".bridge.DebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.openslate.mobile.SET_KEY" />
+                <action android:name="dev.openslate.mobile.SET_PROXY" />
+                <action android:name="dev.openslate.mobile.SEND" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

@@ -54,14 +54,34 @@ fn to_chat_message(msg: &Message) -> ChatMessage {
             // be flattened to plain text. Any accompanying text must survive
             // too — genai maps Text parts to `content` and ToolCall parts to
             // `tool_calls`, so a parts-based message keeps both on the wire.
+            // 思维链回传（Anthropic 多轮语义：历史 thinking 块随 assistant
+            // 消息原样回传；genai anthropic adapter 输出为 thinking block）。
+            let reasoning = msg
+                .reasoning_content
+                .as_ref()
+                .filter(|r| !r.is_empty())
+                .map(|r| ContentPart::ReasoningContent(r.clone()));
             if let Some(tcs) = msg.tool_calls.as_ref().filter(|v| !v.is_empty()) {
                 let genai_tcs: Vec<GenaiToolCall> = tcs.iter().map(to_genai_tool_call).collect();
-                let mut parts: Vec<ContentPart> =
-                    Vec::with_capacity(usize::from(!msg.content.is_empty()) + genai_tcs.len());
+                let mut parts: Vec<ContentPart> = Vec::with_capacity(
+                    usize::from(!msg.content.is_empty()) + usize::from(reasoning.is_some())
+                        + genai_tcs.len(),
+                );
+                if let Some(rc) = reasoning {
+                    parts.push(rc);
+                }
                 if !msg.content.is_empty() {
                     parts.push(ContentPart::Text(msg.content.clone()));
                 }
                 parts.extend(genai_tcs.into_iter().map(ContentPart::ToolCall));
+                ChatMessage::assistant(MessageContent::from_parts(parts))
+            } else if let Some(rc) = reasoning {
+                let mut parts: Vec<ContentPart> =
+                    Vec::with_capacity(1 + usize::from(!msg.content.is_empty()));
+                parts.push(rc);
+                if !msg.content.is_empty() {
+                    parts.push(ContentPart::Text(msg.content.clone()));
+                }
                 ChatMessage::assistant(MessageContent::from_parts(parts))
             } else {
                 ChatMessage::assistant(msg.content.clone())
@@ -141,6 +161,19 @@ fn cached_input_tokens(u: &genai::chat::Usage) -> Option<u32> {
         .map(|t| t.max(0) as u32)
 }
 
+/// Extract the reasoning-token breakdown from a genai usage struct (normalized
+/// `completion_tokens_details.reasoning_tokens`, filled by the OpenAI/Gemini
+/// adapters and — via our vendor patch — by Anthropic-compatible gateways that
+/// inject a split). `None` when the provider reports only a combined output
+/// count; genai's `zero_as_none` convention already folds a reported 0.
+fn reasoning_tokens(u: &genai::chat::Usage) -> Option<u32> {
+    u.completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens)
+        .filter(|t| *t > 0)
+        .map(|t| t.max(0) as u32)
+}
+
 /// Convert a non-streaming genai [`ChatResponse`] into an OpenSlate
 /// [`ModelResponse`].
 ///
@@ -154,8 +187,10 @@ pub(crate) fn from_chat_response(res: ChatResponse) -> ModelResponse {
         input_tokens: res.usage.prompt_tokens.unwrap_or(0).max(0) as u32,
         output_tokens: res.usage.completion_tokens.unwrap_or(0).max(0) as u32,
         cached_input_tokens: cached_input_tokens(&res.usage),
+        reasoning_tokens: reasoning_tokens(&res.usage),
     };
     let finish_reason = res.stop_reason.as_ref().map(|sr| sr.raw().to_string());
+    let reasoning = res.reasoning_content.clone().filter(|r| !r.is_empty());
 
     // into_tool_calls() consumes `res`; call it last, after the borrows above.
     let tool_calls: Vec<ToolCall> = res
@@ -170,6 +205,7 @@ pub(crate) fn from_chat_response(res: ChatResponse) -> ModelResponse {
 
     ModelResponse {
         content,
+        reasoning_content: reasoning,
         tool_calls,
         usage: Some(usage),
         finish_reason,
@@ -186,11 +222,45 @@ pub(crate) fn from_chat_response(res: ChatResponse) -> ModelResponse {
 /// Requires `capture_content` / `capture_tool_calls` / `capture_usage` to have
 /// been set on the `ChatOptions` — otherwise the `captured_*` fields are `None`
 /// and the returned `ModelResponse` is empty.
+#[cfg(not(target_os = "android"))]
+fn openslate_mobile_compat_log(
+    _finish: &Option<String>,
+    _content: &Option<String>,
+    _tools: &[ToolCall],
+) {
+}
+
+#[cfg(target_os = "android")]
+fn openslate_mobile_compat_log(
+    finish: &Option<String>,
+    content: &Option<String>,
+    tools: &[ToolCall],
+) {
+    // 最小依赖：直写 liblog，避免 crate 间耦合。
+    use std::ffi::CString;
+    unsafe extern "C" {
+        #[link_name = "__android_log_print"]
+        fn alog(prio: i32, tag: *const std::os::raw::c_char, fmt: *const std::os::raw::c_char, ...)
+            -> i32;
+    }
+    let msg = format!(
+        "stream_end: finish={:?} content_len={} tools={}",
+        finish,
+        content.as_ref().map(|c| c.len()).unwrap_or(0),
+        tools.len()
+    );
+    let tag = CString::new("OpenSlateRust").unwrap();
+    let fmt = CString::new("%s").unwrap();
+    let m = CString::new(msg).unwrap();
+    unsafe { alog(4, tag.as_ptr(), fmt.as_ptr(), m.as_ptr()) };
+}
+
 pub(crate) fn from_stream_end(end: StreamEnd) -> (Option<Usage>, ModelResponse) {
     let usage = end.captured_usage.map(|u| Usage {
         input_tokens: u.prompt_tokens.unwrap_or(0).max(0) as u32,
         output_tokens: u.completion_tokens.unwrap_or(0).max(0) as u32,
         cached_input_tokens: cached_input_tokens(&u),
+        reasoning_tokens: reasoning_tokens(&u),
     });
 
     // All text parts, newline-joined (first_text() would drop the rest).
@@ -216,8 +286,16 @@ pub(crate) fn from_stream_end(end: StreamEnd) -> (Option<Usage>, ModelResponse) 
         .as_ref()
         .map(|sr| sr.raw().to_string());
 
+    // 诊断可见性（logcat）：每步结束打一行——空回合排查的关键锚点。
+    openslate_mobile_compat_log(&finish_reason, &content, &tool_calls);
+
     let response = ModelResponse {
         content,
+        // 思维链全文随响应走（engine 侧写入 assistant 消息并回传）。
+        reasoning_content: end
+            .captured_reasoning_content
+            .clone()
+            .filter(|r| !r.is_empty()),
         tool_calls,
         usage,
         finish_reason,
@@ -241,6 +319,7 @@ mod tests {
     #[test]
     fn assistant_with_tool_calls_keeps_tool_calls() {
         let msg = Message {
+        reasoning_content: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -278,6 +357,7 @@ mod tests {
             tool_call_id: Some(ToolCallId("call_1".into())),
             name: Some("search".into()),
             tool_calls: None,
+            reasoning_content: None,
         };
 
         let genai_msg = to_chat_message(&msg);
@@ -297,6 +377,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         };
         let genai_msg = to_chat_message(&msg);
         let serialized = serde_json::to_string(&genai_msg).expect("serialize");
@@ -336,6 +417,7 @@ mod tests {
     #[test]
     fn assistant_text_and_tool_calls_both_preserved() {
         let msg = Message {
+        reasoning_content: None,
             role: MessageRole::Assistant,
             content: "Let me look that up.".into(),
             tool_call_id: None,
@@ -422,6 +504,7 @@ mod tests {
             tool_call_id: None,
             name: Some("search".into()),
             tool_calls: None,
+            reasoning_content: None,
         };
 
         let genai_msg = to_chat_message(&msg);
@@ -479,6 +562,96 @@ mod tests {
             Some(4)
         );
         assert_eq!(mr.usage.expect("usage").cached_input_tokens, Some(4));
+    }
+
+    /// Reasoning tokens survive both conversion paths when the provider (or an
+    /// Anthropic-compatible gateway, via the vendor patch) reports
+    /// `completion_tokens_details.reasoning_tokens`.
+    #[test]
+    fn reasoning_tokens_parsed_on_both_paths() {
+        let genai_usage = || genai::chat::Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(9),
+            completion_tokens_details: Some(genai::chat::CompletionTokensDetails {
+                reasoning_tokens: Some(6),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Non-streaming path.
+        let model_iden = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "m");
+        let res = ChatResponse {
+            content: MessageContent::from_text("hi"),
+            reasoning_content: None,
+            model_iden: model_iden.clone(),
+            provider_model_iden: model_iden,
+            stop_reason: None,
+            usage: genai_usage(),
+            captured_raw_body: None,
+            response_id: None,
+        };
+        let mr = from_chat_response(res);
+        assert_eq!(mr.usage.expect("usage present").reasoning_tokens, Some(6));
+
+        // Streaming path: the usage event AND the embedded response usage.
+        let end = StreamEnd {
+            captured_usage: Some(genai_usage()),
+            captured_stop_reason: None,
+            captured_content: Some(MessageContent::from_text("hi")),
+            captured_reasoning_content: None,
+            captured_response_id: None,
+        };
+        let (usage_event, mr) = from_stream_end(end);
+        assert_eq!(usage_event.expect("usage event").reasoning_tokens, Some(6));
+        assert_eq!(mr.usage.expect("usage").reasoning_tokens, Some(6));
+    }
+
+    /// Without a reported split the field stays `None` (absent details object,
+    /// details without `reasoning_tokens`, and a reported 0).
+    #[test]
+    fn reasoning_tokens_absent_when_unreported() {
+        let cases = [
+            genai::chat::Usage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(1),
+                ..Default::default()
+            },
+            genai::chat::Usage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(1),
+                completion_tokens_details: Some(Default::default()),
+                ..Default::default()
+            },
+            genai::chat::Usage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(1),
+                completion_tokens_details: Some(genai::chat::CompletionTokensDetails {
+                    reasoning_tokens: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        for usage in cases {
+            let model_iden = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "m");
+            let res = ChatResponse {
+                content: MessageContent::from_text("hi"),
+                reasoning_content: None,
+                model_iden: model_iden.clone(),
+                provider_model_iden: model_iden,
+                stop_reason: None,
+                usage,
+                captured_raw_body: None,
+                response_id: None,
+            };
+            let mr = from_chat_response(res);
+            assert_eq!(
+                mr.usage.expect("usage").reasoning_tokens,
+                None,
+                "unreported split must stay None"
+            );
+        }
     }
 
     /// When the server does not report cache details the field stays `None`

@@ -325,9 +325,10 @@ fn server_stream_events() {
                 input_tokens: 100,
                 output_tokens: 20,
                 cached_input_tokens: Some(5),
+                reasoning_tokens: None,
             },
         },
-        r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":20,"cached_input_tokens":5}}"#,
+        r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":20,"cached_input_tokens":5,"reasoning_tokens":null}}"#,
     );
     assert_wire_server(ServerMsg::RequestEnd, r#"{"type":"request_end"}"#);
     assert_wire_server(ServerMsg::StepEnd, r#"{"type":"step_end"}"#);
@@ -404,6 +405,7 @@ fn server_turn_events() {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         }],
     };
     assert_wire_server(

@@ -76,6 +76,7 @@ impl ContextManager {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
     }
 
@@ -87,6 +88,7 @@ impl ContextManager {
             tool_call_id: None,
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
     }
 
@@ -98,6 +100,7 @@ impl ContextManager {
             tool_call_id: Some(tool_call_id),
             name: None,
             tool_calls: None,
+            reasoning_content: None,
         });
     }
 
@@ -114,6 +117,7 @@ impl ContextManager {
             tool_call_id: Some(tool_call_id),
             name,
             tool_calls: None,
+            reasoning_content: None,
         });
     }
 
@@ -136,6 +140,7 @@ impl ContextManager {
                 tool_call_id: None,
                 name: None,
                 tool_calls: None,
+                reasoning_content: None,
             };
             total_bytes += msg.content.len();
             result.push(msg);
@@ -308,6 +313,7 @@ fn truncate_message(msg: &Message, max_bytes: usize) -> Option<Message> {
         tool_call_id: msg.tool_call_id.clone(),
         name: msg.name.clone(),
         tool_calls: msg.tool_calls.clone(),
+        reasoning_content: None,
     })
 }
 
@@ -683,10 +689,12 @@ mod tests {
             response: Ok(ModelResponse {
                 content: Some(content.to_owned()),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
                 usage: Some(Usage {
                     input_tokens: 11,
                     output_tokens: 7,
                     cached_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -722,6 +730,7 @@ mod tests {
                             tool_call_id: None,
                             name: None,
                             tool_calls: None,
+                            reasoning_content: None,
                         }],
                         tools: Vec::new(),
                         max_tokens: None,
@@ -763,6 +772,7 @@ mod tests {
                             tool_call_id: None,
                             name: None,
                             tool_calls: None,
+                            reasoning_content: None,
                         }],
                         tools: Vec::new(),
                         max_tokens: None,

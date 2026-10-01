@@ -60,10 +60,12 @@ fn text(t: &str, usage: (u32, u32)) -> ModelResponse {
     ModelResponse {
         content: Some(t.into()),
         tool_calls: vec![],
+        reasoning_content: None,
         usage: Some(Usage {
             input_tokens: usage.0,
             output_tokens: usage.1,
             cached_input_tokens: None,
+            reasoning_tokens: None,
         }),
         finish_reason: Some("stop".into()),
     }
@@ -73,10 +75,12 @@ fn delegate(tag: &str, child: &str, task: &str, usage: (u32, u32)) -> ModelRespo
     ModelResponse {
         content: None,
         tool_calls: vec![call_agent(tag, child, task)],
+        reasoning_content: None,
         usage: Some(Usage {
             input_tokens: usage.0,
             output_tokens: usage.1,
             cached_input_tokens: None,
+            reasoning_tokens: None,
         }),
         finish_reason: Some("tool_calls".into()),
     }

@@ -20,15 +20,30 @@ pub fn build_provider_for_model(
     config: &openslate_core::config::OpenSlateConfig,
     model_alias: &str,
 ) -> Result<Box<dyn ModelProvider>> {
+    // Desktop 语义：key 从环境变量读取（.env / shell export）。
+    build_genai_provider(config, model_alias, None)
+}
+
+/// [`build_provider_for_model`] 的 key 注入版（mobile secret provider 接缝，
+/// PLAN §18）：`api_key = None` 保持 desktop 环境变量语义；`Some(key)` 直接
+/// 使用注入值（Android Keystore → FFI set_api_key → 内存 map）。
+pub fn build_genai_provider(
+    config: &openslate_core::config::OpenSlateConfig,
+    model_alias: &str,
+    api_key: Option<String>,
+) -> Result<Box<dyn ModelProvider>> {
     let resolved = openslate_core::model_config::resolve_model(config, model_alias)
         .with_context(|| format!("Failed to resolve model alias '{}'", model_alias))?;
 
-    let api_key = std::env::var(&resolved.provider.api_key_env).with_context(|| {
-        format!(
-            "API key not found: set environment variable '{}'",
-            resolved.provider.api_key_env
-        )
-    })?;
+    let api_key = match api_key {
+        Some(k) => k,
+        None => std::env::var(&resolved.provider.api_key_env).with_context(|| {
+            format!(
+                "API key not found: set environment variable '{}'",
+                resolved.provider.api_key_env
+            )
+        })?,
+    };
 
     // Default to the OpenAI adapter when unset: most OpenAI-compatible
     // providers (zhipu, minimax, internlm, …) don't set `adapter` explicitly,
@@ -44,8 +59,10 @@ pub fn build_provider_for_model(
     // treat it as a TOTAL per-attempt budget; streaming requests treat it
     // as an IDLE budget (max silence between stream events — tokens flowing
     // keep a long stream alive). A missing [limits] section (or a degenerate
-    // 0) falls back to 60s.
+    // 0) falls back to 60s. `u64::MAX` = 无总时长预算（mobile thinking
+    // 语义）——provider 层仍需有限预算：流式=空闲 60s / 非流式=单次 60s。
     let timeout_ms = match config.limits.as_ref().map(|l| l.timeout_ms) {
+        Some(ms) if ms == u64::MAX => 60_000,
         Some(ms) if ms > 0 => ms,
         _ => 60_000,
     };
@@ -55,6 +72,9 @@ pub fn build_provider_for_model(
         model: resolved.model_id.clone(),
         api_key: Some(api_key),
         base_url: Some(resolved.provider.base_url.clone()),
+        // 受限网络的出站代理（mobile 宿主经 adb reverse 共享电脑代理；
+        // desktop 无此 env，行为不变）。
+        proxy: std::env::var("OPENSLATE_HTTP_PROXY").ok().filter(|u| !u.is_empty()),
         adapter,
         timeout_ms,
         max_attempts: resolved.provider.max_attempts,

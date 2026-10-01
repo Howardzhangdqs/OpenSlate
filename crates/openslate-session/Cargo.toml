@@ -1,0 +1,20 @@
+[package]
+name = "openslate-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport-independent shared session core for OpenSlate frontends (server WS, mobile FFI)"
+
+[dependencies]
+openslate-core = { path = "../openslate-core" }
+# config_ops 的写回链复用 app 的分层加载（load_config_layered）。
+openslate-app = { path = "../openslate-app" }
+openslate-protocol = { path = "../openslate-protocol" }
+# run 持久化（RunRecorder / SqliteStore）。
+openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

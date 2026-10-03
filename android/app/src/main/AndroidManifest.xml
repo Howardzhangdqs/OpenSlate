@@ -58,18 +58,8 @@
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
-        <!-- Phase 1 调试注入通道（设置页上线后移除）：adb 注入 key / 发消息。
-             exported=true 仅为 adb 调试广播可达（action 带包名前缀，风险可控）。 -->
-        <receiver
-            android:name=".bridge.DebugReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="dev.openslate.mobile.SET_KEY" />
-                <action android:name="dev.openslate.mobile.SET_PROXY" />
-                <action android:name="dev.openslate.mobile.SEND" />
-                <action android:name="dev.openslate.mobile.TERMUX" />
-            </intent-filter>
-        </receiver>
+        <!-- 调试注入通道（DebugReceiver）已移至 debug 源集（src/debug/），
+             仅 debug 构建注册；release 不携带。 -->
     </application>
 
 </manifest>

@@ -44,8 +44,11 @@ class AgentService : LifecycleService() {
     }
 
     override fun onDestroy() {
-        lifecycleScope.launch {
-            RuntimeBridge.shutdown()
+        // 进程即将销毁：此前经 lifecycleScope.launch 执行 shutdown，DESTROYED
+        // 竞态会截断协程、Rust 侧 run 终态收尾与 SQLite 收束做不完。这里宁可
+        // 短暂阻塞主线程（上限 2.5s）也要同步等它完成。
+        kotlinx.coroutines.runBlocking {
+            kotlinx.coroutines.withTimeoutOrNull(2_500) { RuntimeBridge.shutdown() }
         }
         super.onDestroy()
     }

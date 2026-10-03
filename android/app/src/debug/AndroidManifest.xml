@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- debug 变体专属 manifest（合并进 debug 构建；release 不合并本文件，
+     DebugReceiver 不进生产包）。exported=true 仅为 adb 广播便利——调试
+     通道四个 action 允许任意发送方触发，故必须限定在 debug 变体内。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <receiver
+            android:name="dev.openslate.mobile.bridge.DebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.openslate.mobile.SET_KEY" />
+                <action android:name="dev.openslate.mobile.SET_PROXY" />
+                <action android:name="dev.openslate.mobile.SEND" />
+                <action android:name="dev.openslate.mobile.TERMUX" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

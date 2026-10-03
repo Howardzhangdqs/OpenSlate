@@ -7,7 +7,7 @@ import android.util.Log
 import kotlinx.coroutines.launch
 
 /**
- * 调试用 adb 注入通道（Phase 1 临时，设置页上线后移除）：
+ * 调试用 adb 注入通道（仅 debug 变体携带，release 不包含本类与注册）：
  *
  *   # 注入 API key（进程内存，重启失效）
  *   adb shell am broadcast \

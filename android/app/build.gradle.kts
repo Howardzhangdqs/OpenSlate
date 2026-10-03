@@ -43,6 +43,9 @@ android {
     }
     buildFeatures {
         compose = true
+        // BuildConfig.DEBUG 门控内容型日志（release 不剥离 logcat）需要
+        // BuildConfig 生成；AGP 8+ 默认关闭，需显式开启。
+        buildConfig = true
     }
     packaging {
         jniLibs {
@@ -65,7 +68,6 @@ dependencies {
     implementation(libs.androidx.material.icons)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.androidx.datastore.preferences)
     // Markdown 渲染（模型回复）。
     implementation(libs.markdown.renderer)
     implementation(libs.markdown.renderer.core)

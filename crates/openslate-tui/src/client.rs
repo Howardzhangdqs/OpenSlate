@@ -942,6 +942,7 @@ mod tests {
                     base_url: "https://x".into(),
                     api_key_env: "P_KEY".into(),
                     adapter: Some("openai".into()),
+                    title: None,
                     max_attempts: 2,
                     retry_base_ms: 100,
                 },

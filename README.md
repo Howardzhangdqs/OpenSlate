@@ -31,7 +31,7 @@
 
 - Compose App（聊天 / 设置 / 历史 / 前台服务），UniFFI 0.32 proc-macro 绑定，
   事件单队列泵线程回调宿主
-- `termux.run` 工具：RUN_COMMAND intent 在 Termux 后台会话执行命令，输出回传进对话
+- 双后端 bash 工具（设置页可切）：`shell.run` 进程内直接执行 Android 系统 sh（toybox，零依赖零授权）；`termux.run` 经 RUN_COMMAND intent + 结果 PendingIntent 本机直传（无 PC、无 adb、无中继），授权可在系统设置手动授予或经 Shizuku 一键完成
 - API Key 存 Android Keystore（AES-GCM），绝不落明文配置，重启自动重注入
 - SQLite 会话持久化：重启自动恢复最近会话，历史页切换续聊
 - UI：Markdown 渲染、相邻工具调用聚合为圆角矩形容器（chip 独立展开）、

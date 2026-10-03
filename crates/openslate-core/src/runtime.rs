@@ -421,9 +421,10 @@ pub async fn execute_run(
         // `timeout_ms` minus the provider-await time already spent on
         // earlier steps. Exhausted (including `timeout_ms = 0`, the
         // immediate-timeout convention pinned by tests) → Timeout.
-        // `u64::MAX` = 无总时长预算（移动端 thinking 模型语义：总时长
+        // `i64::MAX`（及以上）= 无总时长预算（移动端 thinking 模型语义：TOML
+        // 整数为 i64 域，配置文件里能表达的最大值即 i64::MAX；总时长
         // 不设限，挂死防护交给 provider 层的 per-request 空闲超时）。
-        let unlimited_budget = config.timeout_ms == u64::MAX;
+        let unlimited_budget = config.timeout_ms >= i64::MAX as u64;
         let remaining_llm = if unlimited_budget {
             // 50 年——实际无限（tokio deadline 安全范围）；挂死防护由
             // provider 层 per-request 空闲超时（流静默 60s）承担。

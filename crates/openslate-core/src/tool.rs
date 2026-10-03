@@ -4,7 +4,7 @@
 //! The `ToolRegistry` maps tool names to tool implementations.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
@@ -61,15 +61,17 @@ pub trait ToolExecutor: Send + Sync {
 }
 
 /// Registry mapping tool names to tool implementations.
+/// 工具注册表。内部为 `RwLock`：装配完成后仍可运行期增删（mobile
+/// bash 工具按设置热换名/换后端），`Arc<ToolRegistry>` 即可变更。
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: RwLock::new(HashMap::new()),
         }
     }
 
@@ -78,15 +80,30 @@ impl ToolRegistry {
     /// Silently overwrites any existing tool with the same name. Prefer
     /// [`try_register`](Self::try_register) when collisions must be detected —
     /// e.g. when mixing builtin tools with MCP-provided tools.
-    pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name().to_owned(), Arc::new(tool));
+    pub fn register(&self, tool: impl Tool + 'static) {
+        self.tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tool.name().to_owned(), Arc::new(tool));
     }
 
     /// Register an already-boxed tool (mobile host-tool injection seam:
     /// host tools are built as `Box<dyn Tool>` by the embedding frontend
     /// and injected into the registry assembled by `build_app_context`).
-    pub fn register_boxed(&mut self, tool: Box<dyn Tool>) {
-        self.tools.insert(tool.name().to_owned(), Arc::from(tool));
+    pub fn register_boxed(&self, tool: Box<dyn Tool>) {
+        self.tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tool.name().to_owned(), Arc::from(tool));
+    }
+
+    /// Unregister a tool by name (mobile: bash 工具热换名）。返回是否存在。
+    pub fn unregister(&self, name: &str) -> bool {
+        self.tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .is_some()
     }
 
     /// Register a tool, returning an error if the name is already taken.
@@ -96,23 +113,33 @@ impl ToolRegistry {
     /// at startup rather than silently shadowing a tool and confusing the LLM.
     /// Callers that intentionally namespace tools should apply a prefix before
     /// calling this.
-    pub fn try_register(&mut self, tool: impl Tool + 'static) -> Result<(), ToolNameConflict> {
+    pub fn try_register(&self, tool: impl Tool + 'static) -> Result<(), ToolNameConflict> {
         let name = tool.name().to_owned();
-        if self.tools.contains_key(&name) {
+        let mut tools = self.tools.write().unwrap_or_else(|e| e.into_inner());
+        if tools.contains_key(&name) {
             return Err(ToolNameConflict(name));
         }
-        self.tools.insert(name, Arc::new(tool));
+        tools.insert(name, Arc::new(tool));
         Ok(())
     }
 
     /// Get a tool by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// Get tool definitions for all registered tools (to send to the model).
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|t| t.to_definition()).collect()
+        self.tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|t| t.to_definition())
+            .collect()
     }
 
     /// Get definitions for tools whose name matches any of the given patterns.
@@ -124,6 +151,8 @@ impl ToolRegistry {
     /// the pattern order.
     pub fn definitions_for(&self, patterns: &[String]) -> Vec<ToolDefinition> {
         self.tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(name, _)| patterns.iter().any(|p| tool_name_matches(name, p)))
             .map(|(_, t)| t.to_definition())
@@ -132,7 +161,12 @@ impl ToolRegistry {
 
     /// List all registered tool names.
     pub fn tool_names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Execute a tool by name.
@@ -143,14 +177,20 @@ impl ToolRegistry {
     ) -> Result<ToolOutput, ToolError> {
         let tool = self
             .tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(name)
+            .cloned()
             .ok_or_else(|| ToolError::NotFound(name.to_owned()))?;
         tool.execute(args).await
     }
 
     /// Check if a tool is registered.
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
     }
 }
 

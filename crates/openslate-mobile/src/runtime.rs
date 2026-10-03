@@ -9,6 +9,7 @@
 //! 创建即推送首份 snapshot；`send(Hello)` 校验协议版本后补发新
 //! snapshot。其余消息全部走 [`openslate_session::session::dispatch`]。
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +28,7 @@ use openslate_session::session as session_dispatch;
 
 use crate::bootstrap::MobilePaths;
 use crate::events::{EventCallback, EventSink, MOBILE_CONN_ID};
+use crate::exec::{register_bash_tools, ExecSelection, ExecSelectionCell};
 use crate::hostcall::{HostCallRouter, HostTool, HOST_CALL_TIMEOUT};
 use crate::provider::{mobile_provider_factory, MobileSecrets};
 
@@ -58,6 +60,12 @@ pub struct MobileRuntime {
     sink: Arc<EventSink>,
     secrets: Arc<MobileSecrets>,
     host_router: Arc<HostCallRouter>,
+    /// bash 工具注册表（设置页多选热换名）。
+    registry: Arc<openslate_core::tool::ToolRegistry>,
+    /// bash 工具工作区路径（重注册时用）。
+    workspace_dir: PathBuf,
+    /// bash 后端多选状态（设置页热切换；bash / termux_bash 命名规则）。
+    exec_selection: ExecSelectionCell,
     shutdown_flag: std::sync::atomic::AtomicBool,
 }
 
@@ -85,7 +93,9 @@ impl MobileRuntime {
         crate::alog!("create_with: event sink started");
         let host_router = HostCallRouter::new(sink.clone(), opts.host_call_timeout);
 
-        // host 工具集：默认演示 ping + termux.run（阶段五预演）+ 注入项。
+        // host/本地工具集：mobile.ping（演示）+ bash 工具（按设置多选动
+        // 态注册：单选 → bash；双选 → bash=native + termux_bash）+ 注入项。
+        let exec_selection = ExecSelectionCell::new(ExecSelection::default());
         let mut extra_tools = opts.extra_tools;
         extra_tools.push(Box::new(HostTool::new(
             "mobile.ping",
@@ -97,22 +107,8 @@ impl MobileRuntime {
             }),
             host_router.clone(),
         )));
-        extra_tools.push(Box::new(HostTool::new(
-            "termux.run",
-            "Run a shell command inside the local Termux environment (Android) and return its \
-             combined stdout/stderr. The Termux bootstrap (coreutils) is available; network \
-             access from Termux may be restricted by the device network. Avoid interactive \
-             commands. Output beyond ~8KB is truncated.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "shell command to execute" }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            host_router.clone(),
-        )));
+        // bash 工具不进 extra_tools（命名随设置变化）：先注册默认
+        // native-only，装配完成后由 set_exec_backends 按偏好重注册。
 
         let secrets = Arc::new(MobileSecrets::default());
         let factory = opts
@@ -134,12 +130,24 @@ impl MobileRuntime {
             extra_tools,
         ))?;
         crate::alog!("create_with: state assembled, emitting first snapshot");
+        // 拿到运行期注册表并按当前（默认）多选注册 bash 工具。
+        let runtime_registry = state.core.lock().manager.as_ref()
+            .expect("manager present").tool_registry.clone();
+        register_bash_tools(
+            &runtime_registry,
+            exec_selection.get(),
+            paths.workspace_dir.clone(),
+            host_router.clone(),
+        );
         let runtime = Arc::new(Self {
             rt: std::sync::Mutex::new(Some(rt)),
             state,
             sink,
             secrets,
-            host_router,
+            host_router: host_router.clone(),
+            registry: runtime_registry.clone(),
+            workspace_dir: paths.workspace_dir.clone(),
+            exec_selection: exec_selection.clone(),
             shutdown_flag: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -188,6 +196,20 @@ impl MobileRuntime {
     /// 注入 provider API key（内存；宿主负责 Keystore 持久化，PLAN §18）。
     pub fn set_api_key(&self, provider: &str, value: &str) {
         self.secrets.set(provider, value);
+    }
+
+    /// 设置 bash 工具后端多选（逗号分隔："native"、"termux"、
+    /// "native,termux"；热生效，无需重启）。命名规则：
+    /// 单选 → `bash`；双选 → `bash`=native + `termux_bash`=termux。
+    pub fn set_exec_backends(&self, backends: &str) {
+        let sel = ExecSelection::parse_csv(backends).normalized();
+        self.exec_selection.set(sel);
+        register_bash_tools(&self.registry, sel, self.workspace_dir.clone(), self.host_router.clone());
+        crate::alog!(
+            "exec backends set to {backends:?} (native={}, termux={})",
+            sel.native,
+            sel.termux
+        );
     }
 
     /// 宿主应答 host call。`ok=true` → `payload` 为结果 JSON；

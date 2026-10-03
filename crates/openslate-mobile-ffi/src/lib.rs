@@ -143,6 +143,13 @@ impl OpenSlateRuntime {
         }
     }
 
+    /// 设置 bash 工具后端多选（逗号分隔："native" / "termux" /
+    /// "native,termux"）。热生效：单选 → 工具名 `bash`；双选 →
+    /// `bash`（native）+ `termux_bash`（termux）。
+    pub fn set_exec_backends(&self, backends: String) {
+        self.inner.set_exec_backends(&backends);
+    }
+
     /// 应答 host call。`ok=true` → payload 为结果 JSON；`ok=false` →
     /// payload 为错误说明。返回 false = 无此在途调用（超时/已答/关停）。
     pub fn resolve_host_call(&self, id: u64, ok: bool, payload: String) -> bool {

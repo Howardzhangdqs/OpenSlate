@@ -504,7 +504,7 @@ pub async fn build_app_context_with(
         .map_err(|e| anyhow::anyhow!("Failed to build agent tree: {}", e))?;
 
     // 7. Build tool registry.
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
 
     // 7.2 Builtin tool servers: in-process MCP (fs / shell / edit / skills),
     //     started without any config; `[builtin_tools]` toggles gate the

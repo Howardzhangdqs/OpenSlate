@@ -709,6 +709,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_api_key(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_http_proxy(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_shutdown(
@@ -755,6 +757,8 @@ internal object UniffiLib {
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_send(`ptr`: Long,`msg`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_api_key(`ptr`: Long,`provider`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_exec_backends(`ptr`: Long,`backends`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_http_proxy(`ptr`: Long,`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -897,6 +901,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_api_key() and 0xFFFF) != 20435) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends() and 0xFFFF) != 11970) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_http_proxy() and 0xFFFF) != 421) {
@@ -1335,6 +1342,13 @@ public interface OpenSlateRuntimeInterface {
     fun `setApiKey`(`provider`: kotlin.String, `value`: kotlin.String)
     
     /**
+     * 设置 bash 工具后端多选（逗号分隔："native" / "termux" /
+     * "native,termux"）。热生效：单选 → 工具名 `bash`；双选 →
+     * `bash`（native）+ `termux_bash`（termux）。
+     */
+    fun `setExecBackends`(`backends`: kotlin.String)
+    
+    /**
      * 设置 HTTP(S) 出站代理（受限网络：宿主可经 adb reverse 共享电脑
      * 代理）。进程级、立即生效于后续 provider 构建；空串清除。
      */
@@ -1550,6 +1564,24 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
         
         FfiConverterString.lower(`provider`),
         FfiConverterString.lower(`value`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 设置 bash 工具后端多选（逗号分隔："native" / "termux" /
+     * "native,termux"）。热生效：单选 → 工具名 `bash`；双选 →
+     * `bash`（native）+ `termux_bash`（termux）。
+     */override fun `setExecBackends`(`backends`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_set_exec_backends(
+        it,
+        
+        FfiConverterString.lower(`backends`),_status)
 }
     }
     

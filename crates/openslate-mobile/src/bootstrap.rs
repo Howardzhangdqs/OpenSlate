@@ -32,10 +32,40 @@ name: OpenSlate
 model: main
 tools:
     - mobile.ping
-    - termux.run
+    - bash
+    - termux_bash
 ---
 You are a helpful AI assistant.
 "#;
+
+/// 旧版默认（历届自动生成的 Phase 1/2 白名单，历史命名 shell.run /
+/// termux.run）。已装机设备的 root.md 与之一致时视为未定制，自动迁移
+/// 到当前默认（bash / termux_bash 多选命名）；用户改过则保持不动。
+const LEGACY_ROOT_AGENT_MDS: &[&str] = &[
+    // v2：双后端固定名（shell.run / termux.run）。
+    r#"---
+id: root
+name: OpenSlate
+model: main
+tools:
+    - mobile.ping
+    - shell.run
+    - termux.run
+---
+You are a helpful AI assistant.
+"#,
+    // v1：仅 Termux、依赖 PC 中继。
+    r#"---
+id: root
+name: OpenSlate
+model: main
+tools:
+    - mobile.ping
+    - termux.run
+---
+You are a helpful AI assistant.
+"#,
+];
 
 impl MobilePaths {
     pub fn config_file(&self) -> PathBuf {
@@ -76,6 +106,15 @@ impl MobilePaths {
             fs::write(&root_md, DEFAULT_ROOT_AGENT_MD)
                 .with_context(|| format!("写入默认 agent 失败：{}", root_md.display()))?;
             tracing::info!("mobile bootstrap: wrote default root agent");
+        } else {
+            let current = fs::read_to_string(&root_md).unwrap_or_default();
+            if LEGACY_ROOT_AGENT_MDS.iter().any(|legacy| current == *legacy) {
+                // 旧默认升级：原样覆盖即可获得 bash / termux_bash；用户
+                // 定制过的文件不会被触碰。
+                fs::write(&root_md, DEFAULT_ROOT_AGENT_MD)
+                    .with_context(|| format!("迁移默认 agent 失败：{}", root_md.display()))?;
+                tracing::info!("mobile bootstrap: migrated legacy root agent (bash/termux_bash)");
+            }
         }
 
         Ok(config_path)
@@ -113,8 +152,9 @@ auto_compact = true
 max_context_bytes = 60000
 max_context_messages = 220
 max_turn_output_bytes = 131072
-# 无总时长预算（u64::MAX）；挂死防护 = 每请求 60s 无新数据即断。
-timeout_ms = 18446744073709551615
+# 无总时长预算（i64::MAX；TOML 整数为 i64 域，u64::MAX 字面量会被
+# toml_edit 拒绝 → persist 层写回失败）；挂死防护 = 每请求 60s 无新数据即断。
+timeout_ms = 9223372036854775807
 
 # Mobile 关闭桌面内置文件/Shell 工具（Phase 3+ 由 Android 能力接替）。
 [builtin_tools]

@@ -19,7 +19,7 @@
 //!   `tool_calls` (crash between the assistant turn and its tool results) is
 //!   dropped — providers reject dangling `tool_calls`.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use openslate_core::error::StoreError;
 use openslate_core::runtime::MessageSink;
@@ -40,6 +40,13 @@ pub struct RunRecorder {
     /// the sink (invoked from inside the runtime loop) and CLI-side writes
     /// (e.g. the turn's user message) share one monotonic counter.
     last_seq: AtomicI64,
+    /// resume 过的 recorder 是否已把 run 置回 `running`。
+    ///
+    /// `resume()` 本身不改 status（保持 interrupted，避免会话再次中断时
+    /// 产生新的僵尸 running 记录）；真正有新消息写入（run 确实被继续）
+    /// 时才由首次 [`write_message`](Self::write_message) 激活为 running。
+    /// `begin()` 创建即已 running，初始为 true。
+    activated: AtomicBool,
 }
 
 fn now_ms() -> i64 {
@@ -75,8 +82,9 @@ impl RunRecorder {
         format!("{run_id}-persist")
     }
 
-    /// Begin recording a fresh run: insert the run row (`status = "running"`)
-    /// and the recorder's execution node, then the caller drives the run.
+    /// Begin recording a fresh run: 在**单事务**内插入 run 行
+    /// （`status = "running"`）与 recorder 的执行节点，然后由调用方驱动
+    /// run。合并为单事务是为了消除两条独立语句之间的崩溃窗口。
     pub async fn begin(
         store: SqliteStore,
         run_id: RunId,
@@ -85,21 +93,9 @@ impl RunRecorder {
         input_json: &str,
     ) -> Result<Self, StoreError> {
         let ts = now_ms();
-        store
-            .insert_run(&run_id.0, title, root_agent_id, "running", input_json, ts)
-            .await?;
         let node_id = Self::persist_node_id(&run_id);
         store
-            .insert_execution_node(
-                &node_id,
-                &run_id.0,
-                root_agent_id,
-                None,
-                None,
-                "running",
-                "{}",
-                ts,
-            )
+            .insert_run_with_persist_node(&run_id.0, title, root_agent_id, "running", input_json, ts, &node_id)
             .await?;
         Ok(Self {
             store,
@@ -107,6 +103,7 @@ impl RunRecorder {
             execution_node_id: node_id,
             agent_id: root_agent_id.to_owned(),
             last_seq: AtomicI64::new(0),
+            activated: AtomicBool::new(true),
         })
     }
 
@@ -114,6 +111,10 @@ impl RunRecorder {
     /// exist; the recorder's execution node is created on demand (idempotent
     /// across repeated resumes), and `seq` continues from the highest value
     /// already stored.
+    ///
+    /// **不修改 status**：run 保持原状态（通常为 interrupted）。避免
+    /// resume 后尚未写入任何消息就再次中断时，留下新的僵尸 `running`
+    /// 记录。真正继续会话时（首次写入消息），run 会被置回 running。
     pub async fn resume(
         store: SqliteStore,
         run_id: RunId,
@@ -149,6 +150,7 @@ impl RunRecorder {
             // (tree may have changed between sessions).
             agent_id: run.root_agent_id,
             last_seq: AtomicI64::new(last_seq),
+            activated: AtomicBool::new(false),
         })
     }
 
@@ -160,7 +162,15 @@ impl RunRecorder {
     /// Persist one message with the next `seq`. Fallible twin of the
     /// [`MessageSink::append`] impl — callers that want to surface errors
     /// (e.g. writing the initial user message) use this directly.
+    ///
+    /// resume 过的 recorder 在首次写入时把 run 置回 `running`
+    /// （一次性，`AtomicBool` 去重，避免每条消息都发 UPDATE）。
     pub async fn write_message(&self, message: &Message) -> Result<(), StoreError> {
+        if !self.activated.swap(true, Ordering::SeqCst) {
+            self.store
+                .activate_run(&self.run_id.0)
+                .await?;
+        }
         let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let content_json = serde_json::to_string(message)
             .map_err(|e| StoreError::WriteError(format!("message encode failed: {e}")))?;
@@ -180,10 +190,12 @@ impl RunRecorder {
     }
 
     /// Record the run's terminal state (status / optional output payload /
-    /// finish timestamp / accumulated cost in USD). `status` uses the
+    /// finish timestamp / accumulated cost in USD) —— 四项在**单事务**内
+    /// 落库，避免"已 completed 但成本缺失"的半状态。`status` uses the
     /// store's lowercase vocabulary ("completed", "interrupted",
     /// "cancelled", "failed"). `cost_usd` is the run's model spend (P2-3);
-    /// pass `0.0` when no pricing is configured.
+    /// pass `0.0` when no pricing is configured. `output_json` 为 `None`
+    /// 时保持原值。
     pub async fn finish(
         &self,
         status: &str,
@@ -191,9 +203,8 @@ impl RunRecorder {
         cost_usd: f64,
     ) -> Result<(), StoreError> {
         self.store
-            .update_run_status(&self.run_id.0, status, output_json, Some(now_ms()))
-            .await?;
-        self.store.update_run_cost(&self.run_id.0, cost_usd).await
+            .finish_run(&self.run_id.0, status, output_json, now_ms(), cost_usd)
+            .await
     }
 
     /// Load a run's persisted conversation in `seq` order, decoded back into
@@ -518,6 +529,82 @@ mod tests {
             .expect("load");
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[2].content, "again-1");
+    }
+
+    /// resume 不改 status（保持 interrupted），首次写入消息才置回
+    /// running —— 避免产生新的僵尸 running 记录。
+    #[tokio::test]
+    async fn resume_keeps_interrupted_until_first_message() {
+        let store = setup().await;
+        let run_id = RunId("r1".into());
+        let rec = RunRecorder::begin(store.clone(), run_id.clone(), "root", None, "{}")
+            .await
+            .expect("begin");
+        rec.write_message(&user_msg("go")).await.expect("write");
+        rec.finish("interrupted", None, 0.0).await.expect("finish");
+
+        // resume 本身不动 status
+        let rec2 = RunRecorder::resume(store.clone(), run_id.clone(), "root")
+            .await
+            .expect("resume");
+        let run = store.get_run("r1").await.expect("get").expect("exists");
+        assert_eq!(
+            run.status, "interrupted",
+            "resume 不应立即把 run 置回 running（否则中断会产生新僵尸记录）"
+        );
+
+        // 首条消息写入 → running
+        rec2.write_message(&user_msg("continue"))
+            .await
+            .expect("write");
+        let run = store.get_run("r1").await.expect("get").expect("exists");
+        assert_eq!(run.status, "running", "首次写入消息后 run 应为 running");
+
+        // begin 创建的 recorder 初始即已激活，写入不产生额外状态变化
+        let rec3 = RunRecorder::begin(store.clone(), RunId("r2".into()), "root", None, "{}")
+            .await
+            .expect("begin r2");
+        rec3.write_message(&user_msg("fresh")).await.expect("write");
+        let run2 = store.get_run("r2").await.expect("get").expect("exists");
+        assert_eq!(run2.status, "running");
+    }
+
+    /// finish 单事务：status / output / finished_at / cost 同时落库；
+    /// output_json=None 时保留已有值。
+    #[tokio::test]
+    async fn finish_writes_status_output_finished_and_cost_atomically() {
+        let store = setup().await;
+        let rec = RunRecorder::begin(store.clone(), RunId("r1".into()), "root", None, "{}")
+            .await
+            .expect("begin");
+
+        // 先落一个带 output 的终态
+        rec.finish("completed", Some(r#"{"out":1}"#), 0.5)
+            .await
+            .expect("finish 1");
+        let run = store.get_run("r1").await.expect("get").expect("exists");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.output_json.as_deref(), Some(r#"{"out":1}"#));
+        assert!(run.finished_at.is_some());
+        assert!((run.cost_usd - 0.5).abs() < 1e-12);
+
+        // 再 finish（interrupted、无 output、不同 cost）：output 必须保留
+        rec.finish("interrupted", None, 0.75)
+            .await
+            .expect("finish 2");
+        let run = store.get_run("r1").await.expect("get").expect("exists");
+        assert_eq!(run.status, "interrupted");
+        assert_eq!(
+            run.output_json.as_deref(),
+            Some(r#"{"out":1}"#),
+            "finish(None) 不应清空已有 output"
+        );
+        assert!(run.finished_at.is_some());
+        assert!(
+            (run.cost_usd - 0.75).abs() < 1e-12,
+            "cost 应为最新值，got {}",
+            run.cost_usd
+        );
     }
 
     #[tokio::test]

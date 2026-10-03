@@ -337,11 +337,15 @@ impl SqliteStore {
     }
 
     /// List runs ordered by most recently started, with pagination.
+    ///
+    /// 排序带 `id DESC` tiebreaker：`started_at` 是毫秒精度，同毫秒的
+    /// run 若无 tiebreaker，`LIMIT`/`OFFSET` 翻页时可能串页（同一行在
+    /// 相邻两页重复出现或被跳过）。
     pub async fn list_runs(&self, limit: i64, offset: i64) -> Result<Vec<RunRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<RunRow> = query_as(
             "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
-             FROM runs ORDER BY started_at DESC LIMIT ? OFFSET ?",
+             FROM runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -408,6 +412,10 @@ impl SqliteStore {
     /// List the full conversation of a run (all execution nodes merged),
     /// ordered by `seq`. This is the resume path: the root conversation is
     /// rebuilt from it.
+    ///
+    /// **注意**：这是无上限的全量读取，仅 resume 场景（必须重建完整
+    /// 历史）使用；UI / 列表场景请用 [`Self::list_messages_by_run_after_seq`]
+    /// 做 keyset 分页。
     pub async fn list_messages_by_run(
         &self,
         run_id: &str,
@@ -423,6 +431,44 @@ impl SqliteStore {
         .map_err(qerr)?;
 
         Ok(rows.into_iter().map(row_to_message).collect())
+    }
+
+    /// Keyset 分页读取一个 run 的会话：返回 `seq > after_seq` 的最早
+    /// `limit` 条（`ORDER BY seq ASC`）。
+    ///
+    /// UI / 列表场景应使用本方法而不是 [`Self::list_messages_by_run`]：
+    /// 相比 OFFSET 分页，keyset 在数据增长时不会跳行/串页；`after_seq`
+    /// 传 `0` 即从头发 `limit` 条，之后每页传上一页最后一条的 `seq`。
+    pub async fn list_messages_by_run_after_seq(
+        &self,
+        run_id: &str,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<MessageRow> = query_as(
+            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at \
+             FROM messages WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(run_id)
+        .bind(after_seq)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows.into_iter().map(row_to_message).collect())
+    }
+
+    /// 一个 run 的消息总数（分页 UI 显示总量 / 测试用）。
+    pub async fn count_messages_by_run(&self, run_id: &str) -> Result<i64, StoreError> {
+        let pool = self.pool();
+        let count: i64 = query_scalar("SELECT COUNT(*) FROM messages WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .map_err(qerr)?;
+        Ok(count)
     }
 
     /// Highest `seq` used by a run's messages (`0` when the run has none).
@@ -494,13 +540,14 @@ impl SqliteStore {
         Ok(rows.into_iter().map(row_to_trace_event).collect())
     }
 
-    /// Get the most recently started interrupted run.
+    /// Get the most recently started interrupted run
+    /// （`id DESC` tiebreaker，与 [`Self::list_runs`] 的全序一致）。
     pub async fn get_last_interrupted_run(&self) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
             "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
              FROM runs WHERE status = 'interrupted' \
-             ORDER BY started_at DESC LIMIT 1",
+             ORDER BY started_at DESC, id DESC LIMIT 1",
         )
         .fetch_optional(pool)
         .await
@@ -513,42 +560,19 @@ impl SqliteStore {
     /// not `failed` (running = crashed/mid-session, interrupted, cancelled,
     /// completed REPL sessions). Failed runs are excluded — their transcript
     /// typically ends mid-error, and the operator asked to fail.
+    /// （`id DESC` tiebreaker，与 [`Self::list_runs`] 的全序一致。）
     pub async fn get_last_resumable_run(&self) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
             "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
              FROM runs WHERE status != 'failed' \
-             ORDER BY started_at DESC LIMIT 1",
+             ORDER BY started_at DESC, id DESC LIMIT 1",
         )
         .fetch_optional(pool)
         .await
         .map_err(qerr)?;
 
         Ok(row.map(row_to_run))
-    }
-
-    /// List runs whose `input_json` contains the given CWD path.
-    pub async fn list_runs_by_cwd(
-        &self,
-        cwd: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<RunRecord>, StoreError> {
-        let pool = self.pool();
-        let pattern = format!("%{cwd}%");
-        let rows: Vec<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
-             FROM runs WHERE input_json LIKE ? \
-             ORDER BY started_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(pattern)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .map_err(qerr)?;
-
-        Ok(rows.into_iter().map(row_to_run).collect())
     }
 }
 
@@ -1033,52 +1057,144 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// 同毫秒 started_at：list_runs 必须以 id DESC 决定顺序，翻页不串页。
     #[tokio::test]
-    async fn test_list_runs_by_cwd() {
+    async fn test_list_runs_tiebreaks_on_id_when_same_started_at() {
         let store = setup_store().await;
         let pool = store.pool();
 
-        insert_run(
-            pool,
-            "run-1",
-            None,
-            "root",
-            "completed",
-            r#"{"cwd":"/home/user/project-a"}"#,
-            1000,
+        insert_run(pool, "run-a", None, "root", "completed", "{}", 5000).await;
+        insert_run(pool, "run-b", None, "root", "completed", "{}", 5000).await;
+        insert_run(pool, "run-c", None, "root", "completed", "{}", 5000).await;
+
+        let page1 = store.list_runs(2, 0).await.expect("page 1");
+        assert_eq!(
+            page1.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run-c", "run-b"],
+            "同毫秒时按 id DESC 排序"
+        );
+
+        let page2 = store.list_runs(2, 2).await.expect("page 2");
+        assert_eq!(
+            page2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["run-a"],
+            "tiebreaker 保证第二页不与第一页重复/漏行"
+        );
+    }
+
+    /// keyset 分页：after_seq 正确切页，且与其他 run 的消息隔离。
+    #[tokio::test]
+    async fn test_list_messages_by_run_after_seq_keyset_pagination() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
         )
         .await;
-        insert_run(
-            pool,
-            "run-2",
-            None,
-            "root",
-            "completed",
-            r#"{"cwd":"/home/user/project-b"}"#,
-            2000,
-        )
-        .await;
-        insert_run(
-            pool,
-            "run-3",
-            None,
-            "root",
-            "completed",
-            r#"{"cwd":"/home/user/project-a/sub"}"#,
-            3000,
+        // 另一个 run 的消息（不能泄漏进 run-1 的分页结果）
+        insert_run(pool, "run-2", None, "root", "running", "{}", 2000).await;
+        insert_execution_node(
+            pool, "en-2", "run-2", "root", None, None, "running", "{}", 2100,
         )
         .await;
 
-        let results = store
-            .list_runs_by_cwd("/home/user/project-a", 10, 0)
+        for (i, seq) in (1..=5).enumerate() {
+            sqlx::query(
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+                 VALUES (?, 'run-1', 'en-1', 'root', 'user', '\"x\"', ?, 1200)",
+            )
+            .bind(format!("m-{i}"))
+            .bind(seq)
+            .execute(pool)
             .await
-            .expect("list_runs_by_cwd");
+            .expect("insert run-1 message");
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+             VALUES ('other-1', 'run-2', 'en-2', 'root', 'user', '\"y\"', 1, 2200)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert run-2 message");
 
-        // Both run-1 and run-3 contain "/home/user/project-a"
-        assert_eq!(results.len(), 2);
-        // Ordered by started_at DESC
-        assert_eq!(results[0].id, "run-3");
-        assert_eq!(results[1].id, "run-1");
+        // 第一页：after_seq=0, limit=2 → seq 1,2
+        let page1 = store
+            .list_messages_by_run_after_seq("run-1", 0, 2)
+            .await
+            .expect("page 1");
+        assert_eq!(
+            page1.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // 第二页：after_seq=2, limit=2 → seq 3,4
+        let page2 = store
+            .list_messages_by_run_after_seq("run-1", 2, 2)
+            .await
+            .expect("page 2");
+        assert_eq!(
+            page2.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        // 第三页：after_seq=4, limit=2 → 仅 seq 5
+        let page3 = store
+            .list_messages_by_run_after_seq("run-1", 4, 2)
+            .await
+            .expect("page 3");
+        assert_eq!(page3.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![5]);
+
+        // 尾后为空
+        let empty = store
+            .list_messages_by_run_after_seq("run-1", 5, 2)
+            .await
+            .expect("after last");
+        assert!(empty.is_empty());
+
+        // 按 id 升序稳定（seq 升序）
+        assert_eq!(page1[0].id, "m-0");
+        assert_eq!(page1[1].id, "m-1");
+    }
+
+    #[tokio::test]
+    async fn test_count_messages_by_run() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
+
+        assert_eq!(
+            store.count_messages_by_run("run-1").await.expect("count"),
+            0,
+            "无消息时为 0"
+        );
+
+        for i in 0..3 {
+            sqlx::query(
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
+                 VALUES (?, 'run-1', 'en-1', 'root', 'user', '\"x\"', ?, 1200)",
+            )
+            .bind(format!("cm-{i}"))
+            .bind((i + 1) as i64)
+            .execute(pool)
+            .await
+            .expect("insert");
+        }
+
+        assert_eq!(
+            store.count_messages_by_run("run-1").await.expect("count"),
+            3
+        );
+        assert_eq!(
+            store.count_messages_by_run("no-such-run").await.expect("count"),
+            0
+        );
     }
 
     #[tokio::test]

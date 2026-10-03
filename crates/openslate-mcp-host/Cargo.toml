@@ -1,0 +1,43 @@
+[package]
+name = "openslate-mcp-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Termux 侧 MCP 聚合宿主（手机端 MCP 方案 Phase 1）。
+#
+# 职责：读清单 → spawn 下游 stdio MCP server（懒连接 + 失效重连）→
+# 聚合 tools/list（`alias__tool` 前缀）→ 按 `Mcp-Name` 前缀路由 tools/call →
+# 上游以 Streamable HTTP（stateless）暴露，仅绑 loopback，Bearer token 鉴权。
+#
+# 部署形态：aarch64 musl 静态二进制（零运行时依赖），adb push / /sdcard
+# 中转到 Termux 执行；与 App 共用同一 rmcr 版本，协议协商零分歧。
+
+[dependencies]
+# rmcp 独立声明（不走 workspace = true）：避免继承 workspace 统一 feature 集
+# 里的 transport-streamable-http-client-reqwest（reqwest+rustls+ring）——
+# musl 静态交叉构建 ring 需要额外工具链；host 上游是 server、下游是 stdio
+# 子进程，本就不需要 HTTP 客户端。版本与 workspace 保持同一 3.5 线。
+rmcp = { version = "3.5", default-features = false, features = [
+    "client",
+    "server",
+    "macros",
+    "transport-child-process",
+    "transport-streamable-http-server",
+    "transport-io",
+] }
+tokio = { workspace = true, features = ["net"] }
+axum = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+http = "1"

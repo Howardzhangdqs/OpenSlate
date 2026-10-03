@@ -8,6 +8,7 @@ members = [
     "crates/openslate-cli",
     "crates/openslate-tui",
     "crates/openslate-mcp-builtin",
+    "crates/openslate-mcp-host",
     "crates/openslate-ptc",
     "crates/openslate-protocol",
     "crates/openslate-server",

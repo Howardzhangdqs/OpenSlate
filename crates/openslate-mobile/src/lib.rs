@@ -34,3 +34,11 @@ pub use events::{EventCallback, EventSink, MOBILE_CONN_ID};
 pub use exec::{ExecSelection, ExecSelectionCell, NativeShellTool};
 pub use hostcall::{HostCallRouter, HostTool};
 pub use runtime::{MobileRuntime, RuntimeOptions};
+
+/// 注入 MCP host 鉴权 token（进程级 HTTP `Authorization: Bearer` 覆盖）。
+///
+/// 必须在 `MobileRuntime::create*` 之前调用——MCP 连接在装配期建立，
+/// 之后注入不影响已建连接。见 `openslate_core::mcp::set_mcp_auth_override`。
+pub fn set_mcp_host_token(token: &str) {
+    openslate_core::mcp::set_mcp_auth_override(Some(token.to_owned()));
+}

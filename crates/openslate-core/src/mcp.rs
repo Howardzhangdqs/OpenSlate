@@ -26,6 +26,7 @@
 //!   LLM context window).
 
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -57,6 +58,31 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Timeout for the initial handshake (`serve`) and tool listing (`list_all_tools`)
 /// at connect time. A single unreachable server must not block startup.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ── 进程级 HTTP 鉴权覆盖（mobile 宿主运行时注入）───────────────────────────
+
+/// 进程级 MCP HTTP 鉴权覆盖（`Authorization: Bearer <token>`）。
+///
+/// 默认 `None`——桌面端行为完全不变。mobile 宿主在 `create` 之前注入，
+/// 使 `openslate.toml` 不必持久化 host token（密钥不落盘）。仅作用于
+/// `TransportConfig::Http` 分支（stdio 子进程不受影响）；对所有 HTTP
+/// MCP server 统一生效。
+static MCP_AUTH_OVERRIDE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// 设置进程级 MCP HTTP 鉴权覆盖：`Some(token)` = 注入；`None` = 清除。
+///
+/// 覆盖发生在 transport 构建时（连接在装配期建立），因此必须在任何
+/// MCP 连接建立之前调用；连接建立后再改不影响已建连接。
+pub fn set_mcp_auth_override(token: Option<String>) {
+    let cell = MCP_AUTH_OVERRIDE.get_or_init(|| RwLock::new(None));
+    *cell.write().expect("MCP auth override 锁中毒") = token;
+}
+
+/// 读取当前覆盖值（未初始化视为 `None`）。
+fn mcp_auth_override() -> Option<String> {
+    let cell = MCP_AUTH_OVERRIDE.get()?;
+    cell.read().ok().and_then(|guard| guard.clone())
+}
 
 // ── pure helpers (kept module-private + unit-testable) ──────────────────────
 
@@ -381,15 +407,16 @@ pub async fn connect_mcp_server(
             // 自定义头（如 mcp-host 的 Bearer token）经 custom_headers 原样
             // 注入 —— rmcp 仅保留 accept/session/protocol-version/
             // last-event-id，Authorization 等鉴权头可安全透传。
-            let transport = match headers {
-                None => StreamableHttpClientTransport::from_uri(url.as_str()),
-                Some(map) if map.is_empty() => {
-                    StreamableHttpClientTransport::from_uri(url.as_str())
-                }
-                Some(map) => {
-                    let mut config =
-                        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::default();
-                    config.uri = url.as_str().into();
+            //
+            // 运行时鉴权覆盖（mobile）：存在时向 headers 插入/覆盖
+            // `Authorization: Bearer <token>`，使 toml 不必持久化 token。
+            let override_token = mcp_auth_override();
+            let has_config_headers = headers.as_ref().is_some_and(|m| !m.is_empty());
+            let transport = if has_config_headers || override_token.is_some() {
+                let mut config =
+                    rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::default();
+                config.uri = url.as_str().into();
+                if let Some(map) = headers {
                     for (name, value) in map {
                         let (name, value) = (http::HeaderName::try_from(name)
                             .map_err(|e| McpConnectError::Handshake {
@@ -403,11 +430,22 @@ pub async fn connect_mcp_server(
                             })?);
                         config.custom_headers.insert(name, value);
                     }
-                    StreamableHttpClientTransport::with_client(
-                        reqwest::Client::new(),
-                        config,
-                    )
                 }
+                if let Some(token) = override_token {
+                    // 插入/覆盖：与 toml 中已有的 Authorization 相比，
+                    // 运行时注入优先（覆盖语义）。
+                    let name = http::HeaderName::try_from("Authorization")
+                        .expect("常量头名必然合法");
+                    let value = http::HeaderValue::try_from(format!("Bearer {token}").as_str())
+                        .map_err(|e| McpConnectError::Handshake {
+                            server: server_name.into(),
+                            source: Box::new(e),
+                        })?;
+                    config.custom_headers.insert(name, value);
+                }
+                StreamableHttpClientTransport::with_client(reqwest::Client::new(), config)
+            } else {
+                StreamableHttpClientTransport::from_uri(url.as_str())
             };
             tokio::time::timeout(CONNECT_TIMEOUT, client_info.serve(transport))
                 .await
@@ -642,6 +680,21 @@ mod tests {
         // Empty object is still Some(empty map), not None — matches MCP semantics
         // where an empty argument object is a legitimate "no parameters" payload.
         assert!(args_to_json_object(&json!({})).is_some());
+    }
+
+    // ── 进程级鉴权覆盖（读写回环；仅本测试触碰该 static）─────────────────
+
+    #[test]
+    fn auth_override_roundtrip() {
+        // 默认未初始化 → None（桌面端语义）。
+        assert!(mcp_auth_override().is_none());
+        set_mcp_auth_override(Some("host-token-1".into()));
+        assert_eq!(mcp_auth_override().as_deref(), Some("host-token-1"));
+        // 覆盖写 + 清除。
+        set_mcp_auth_override(Some("host-token-2".into()));
+        assert_eq!(mcp_auth_override().as_deref(), Some("host-token-2"));
+        set_mcp_auth_override(None);
+        assert!(mcp_auth_override().is_none());
     }
 
     // ── connect_builtin_servers (in-process tuple transport) ─────────────

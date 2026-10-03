@@ -119,6 +119,98 @@ impl MobilePaths {
 
         Ok(config_path)
     }
+
+    /// 数据库路径对齐（修"首启烙印"）。
+    ///
+    /// 动机：`openslate.toml` 的 `[database] path` 是**绝对路径**，首启
+    /// 时被烙上当时的 data_dir；宿主之后迁移 data_dir（Android 迁移存储 /
+    /// 备份恢复等），配置仍指向旧位置 → 新旧数据分叉。本方法在每次启动
+    /// 时把 path 对齐到当前 `self.data_dir`：
+    /// - 已对齐（父目录 == data_dir）→ 不动（自定义文件名也尊重）；
+    /// - 旧库文件存在 → 迁移（rename，失败回退 copy+delete，再失败
+    ///   warn 放弃——不破坏可用安装，也不改写 toml）；
+    /// - 旧库文件不存在 → 直接改写 toml 指向新位置。
+    ///
+    /// toml_edit 原地改写 path，其余键/注释/格式零扰动。全程
+    /// best-effort：任何失败 warn 后返回 `Ok(())`，仅在 toml 完全无法
+    /// 解析时 `Err`（由调用方决定是否阻断）。
+    pub fn realign_database_path(&self) -> Result<()> {
+        let config_path = self.config_file();
+        let raw = fs::read_to_string(&config_path)
+            .with_context(|| format!("读取配置失败：{}", config_path.display()))?;
+        // 唯一的 Err 路径：toml 彻底无法解析（配置损坏，让上层暴露）。
+        let mut doc: toml_edit::DocumentMut = raw
+            .parse()
+            .with_context(|| format!("解析 {} 失败", config_path.display()))?;
+
+        // 读取现有 [database] path；缺失则无事可做（store 层会用默认）。
+        let Some(current) = doc
+            .get("database")
+            .and_then(|db| db.get("path"))
+            .and_then(|item| item.as_str())
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        let old_path = PathBuf::from(&current);
+        let target = self.data_dir.join("openslate.db");
+        // 已对齐：父目录一致即可（自定义文件名不改写）。
+        if old_path.parent() == Some(self.data_dir.as_path()) {
+            return Ok(());
+        }
+        crate::alog!(
+            "realign_database_path: {} → {}",
+            old_path.display(),
+            target.display()
+        );
+        // 目标已存在：可能是新位置已产生数据，迁移会覆盖它 → 放弃
+        // （warn 返回，不破坏可用安装）。
+        if target.exists() {
+            crate::alog!(
+                "realign_database_path: target {} 已存在，跳过迁移（避免覆盖新数据）",
+                target.display()
+            );
+            return Ok(());
+        }
+        // 旧库文件存在则迁移；失败回退 copy+delete；再失败放弃（保持
+        // toml 指向旧路径，安装仍可用）。
+        if old_path.exists() {
+            if let Some(parent) = target.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    crate::alog!("realign_database_path: 创建目标目录失败（放弃迁移）：{e}");
+                    return Ok(());
+                }
+            }
+            let moved = match fs::rename(&old_path, &target) {
+                Ok(()) => true,
+                Err(rename_err) => {
+                    // 跨文件系统 rename 会失败 → copy + delete 回退。
+                    let copied = fs::copy(&old_path, &target)
+                        .map(|_| ())
+                        .and_then(|()| fs::remove_file(&old_path));
+                    if let Err(copy_err) = &copied {
+                        crate::alog!(
+                            "realign_database_path: rename 失败（{rename_err}），copy+delete 亦失败（{copy_err}），保持旧路径",
+                        );
+                    }
+                    copied.is_ok()
+                }
+            };
+            if !moved {
+                return Ok(());
+            }
+        }
+        // 改写 toml（旧文件不存在也照样改写——指针本身要归位）。
+        // toml_edit 只动 path 的 value，decor/注释/其余键原样保留。
+        doc["database"]["path"] = toml_edit::value(target.display().to_string());
+        if let Err(e) = fs::write(&config_path, doc.to_string()) {
+            crate::alog!(
+                "realign_database_path: 写回 {} 失败（non-fatal）：{e}",
+                config_path.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// mobile 默认 openslate.toml（与 CLI `openslate init` 同源，差异：
@@ -193,5 +285,106 @@ mod tests {
         paths.ensure_layout().unwrap();
         let after = std::fs::read_to_string(&config).unwrap();
         assert_eq!(before, after);
+    }
+
+    /// 已对齐（父目录 == data_dir）→ toml 与文件均零改动。
+    #[test]
+    fn realign_noop_when_already_aligned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = MobilePaths {
+            config_dir: tmp.path().join("config"),
+            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        paths.ensure_layout().unwrap();
+        let config = paths.config_file();
+        let before = std::fs::read_to_string(&config).unwrap();
+        paths.realign_database_path().unwrap();
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// 未对齐 + 旧库文件存在 → 文件迁移 + toml 指针归位，其余内容
+    /// （含注释与自定义文件名以外的键）零扰动。
+    #[test]
+    fn realign_moves_db_file_and_rewrites_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_data = tmp.path().join("old_data");
+        let paths = MobilePaths {
+            config_dir: tmp.path().join("config"),
+            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        paths.ensure_layout().unwrap();
+        // 手工制造"烙印"：toml 指向 old_data，且旧库文件存在。
+        let old_db = old_data.join("openslate.db");
+        std::fs::create_dir_all(&old_data).unwrap();
+        std::fs::write(&old_db, b"sqlite-bytes").unwrap();
+        let config = paths.config_file();
+        let body = std::fs::read_to_string(&config).unwrap();
+        let patched = body.replace(
+            &paths.data_dir.join("openslate.db").display().to_string(),
+            &old_db.display().to_string(),
+        );
+        std::fs::write(&config, patched).unwrap();
+
+        paths.realign_database_path().unwrap();
+
+        // 旧文件被搬走，新位置有内容。
+        assert!(!old_db.exists(), "旧库文件应被迁移走");
+        let new_db = paths.data_dir.join("openslate.db");
+        assert_eq!(std::fs::read(&new_db).unwrap(), b"sqlite-bytes");
+        // toml 指针归位，且其余内容（注释等）与"从未烙印"时一致。
+        let after = std::fs::read_to_string(&config).unwrap();
+        let expected = body.replace(
+            &old_db.display().to_string(),
+            &paths.data_dir.join("openslate.db").display().to_string(),
+        );
+        assert_eq!(after, expected);
+        assert!(after.contains("# Mobile 关闭桌面内置文件/Shell 工具"));
+    }
+
+    /// 未对齐 + 旧库文件不存在 → 只改 toml 指针，不产生文件。
+    #[test]
+    fn realign_rewrites_toml_when_old_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = MobilePaths {
+            config_dir: tmp.path().join("config"),
+            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        paths.ensure_layout().unwrap();
+        let old_db = tmp.path().join("elsewhere").join("openslate.db");
+        let config = paths.config_file();
+        let body = std::fs::read_to_string(&config).unwrap();
+        let patched = body.replace(
+            &paths.data_dir.join("openslate.db").display().to_string(),
+            &old_db.display().to_string(),
+        );
+        std::fs::write(&config, patched).unwrap();
+
+        paths.realign_database_path().unwrap();
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(after.contains(&paths.data_dir.join("openslate.db").display().to_string()));
+        assert!(!paths.data_dir.join("openslate.db").exists(), "不应生成空库文件");
+    }
+
+    /// toml 彻底无法解析 → 唯一的 Err 路径。
+    #[test]
+    fn realign_errors_only_on_unparseable_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = MobilePaths {
+            config_dir: tmp.path().join("config"),
+            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        paths.ensure_layout().unwrap();
+        std::fs::write(paths.config_file(), "not [ valid toml").unwrap();
+        assert!(paths.realign_database_path().is_err());
     }
 }

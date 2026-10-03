@@ -195,17 +195,20 @@ async fn handle_submit(state: &Arc<AppState>, conn_id: u64, text: String) {
     };
 
     // 单行运行时事件：prompt 截 40 字符（CJK 安全，按字符截）。
-    {
+    // 摘要同时作为 run 标题落库（见 open_session_run）——历史会话列表
+    // 直接读 run.title，免逐 run 查 messages 的 N+1。
+    let title_hint = {
         let prompt = &user_message.content;
         let mut head: String = prompt.chars().take(40).collect();
         if prompt.chars().count() > 40 {
             head.push('…');
         }
         crate::session_event!("turn: {head}");
-    }
+        head
+    };
 
     // 2. lazy 打开持久化 run（无 store / 失败 → None = 本会话不落库）。
-    let session_run = open_session_run(state).await;
+    let session_run = open_session_run(state, Some(title_hint.as_str())).await;
 
     // 3. 用户消息落库（引擎侧逐条追加走同一 recorder，seq 连续）。
     if let Some(run) = &session_run {
@@ -296,7 +299,14 @@ async fn handle_submit(state: &Arc<AppState>, conn_id: u64, text: String) {
 
 /// lazy 打开持久化 run：已有 → clone；没有 → begin 新 run 并存回
 /// core（此刻 running=true，独占会话状态，无并发写者）。
-async fn open_session_run(state: &Arc<AppState>) -> Option<crate::state::SessionRun> {
+///
+/// `title_hint`：本回合 prompt 的 40 字符摘要，begin 时直接作为 run
+/// 标题落库（历史会话列表渲染用，免 N+1 查询）。`None` = 调用方无
+/// 摘要，退回 origin 占位标题（desktop/server 现状语义不变）。
+async fn open_session_run(
+    state: &Arc<AppState>,
+    title_hint: Option<&str>,
+) -> Option<crate::state::SessionRun> {
     {
         let inner = state.core.lock();
         if let Some(run) = &inner.session_run {
@@ -315,11 +325,14 @@ async fn open_session_run(state: &Arc<AppState>) -> Option<crate::state::Session
         "mobile" => ("mobile session", r#"{"kind":"mobile"}"#),
         _ => ("server session", r#"{"kind":"server"}"#),
     };
+    // begin 的第 4 参即 title：有 prompt 摘要用摘要；否则保持 origin
+    // 占位（兼容 desktop/server 调用方）。
+    let title = title_hint.or(Some(origin_label));
     match openslate_store_sqlite::recorder::RunRecorder::begin(
         store,
         run_id.clone(),
         &root_agent_id,
-        Some(origin_label),
+        title,
         origin_meta,
     )
     .await

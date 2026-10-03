@@ -6,6 +6,8 @@
 //! - `set_api_key(provider, value)` → 内存注入（宿主负责 Keystore 持久化）
 //! - `resolve_host_call(id, ok, payload)` → host tool request/resolve
 //! - `shutdown()` → host call fail-all + 审批全拒 + runtime 收束
+//! - `list_sessions(offset)` / `open_session` / `delete_session` → 历史会话
+//! - `set_mcp_host_token(token)`（namespace 函数）→ MCP host 鉴权注入
 //!
 //! 线程约定：所有方法立即返回（send 内部 spawn；shutdown 有限等待）；
 //! `callback.on_event` 从 Rust 泓线程调用——宿主实现必须线程安全、
@@ -157,9 +159,10 @@ impl OpenSlateRuntime {
     }
 
     /// 历史会话列表（JSON 数组：id/title/status/started_ms/cost_usd）。
-    pub fn list_sessions(&self) -> String {
-        openslate_mobile::alog!("ffi: list_sessions");
-        self.inner.list_sessions_json()
+    /// 分页：每页 50 条，offset 递增（0、50、100…；首页传 0）。
+    pub fn list_sessions(&self, offset: u32) -> String {
+        openslate_mobile::alog!("ffi: list_sessions(offset={offset})");
+        self.inner.list_sessions_json(offset)
     }
 
     /// 当前会话 run id（无进行中会话返回 null）。
@@ -177,10 +180,31 @@ impl OpenSlateRuntime {
             })
     }
 
+    /// 删除历史会话（连同全部消息/步骤数据）。返回是否删除成功：
+    /// false = 拒绝或失败——当前活动会话不可删（先新建会话切换走）；
+    /// run 不存在 / 数据库错误也返回 false。Kotlin 宿主负责同步删除
+    /// 自己的 transcript 文件（Rust 只管数据库行）。
+    pub fn delete_session(&self, run_id: String) -> bool {
+        openslate_mobile::alog!("ffi: delete_session {run_id}");
+        self.inner.delete_session(run_id)
+    }
+
     /// 优雅关停（幂等）。
     pub fn shutdown(&self) {
         self.inner.shutdown();
     }
+}
+
+/// 注入 MCP host 鉴权 token（进程级，对所有 HTTP MCP server 生效：
+/// 请求头加 `Authorization: Bearer <token>`，toml 不必持久化 token）。
+///
+/// **必须在 `create` 之前调用**——MCP 连接在装配期建立，之后注入不
+/// 影响已建连接。namespace 级函数（非对象方法）：它配置的是进程而非
+/// 某个 runtime 实例。
+#[uniffi::export]
+pub fn set_mcp_host_token(token: String) {
+    openslate_mobile::alog!("ffi: set_mcp_host_token ({} bytes)", token.len());
+    openslate_mobile::set_mcp_host_token(&token);
 }
 
 /// UniFFI foreign callback → mobile `EventCallback`（Box 装进适配器，

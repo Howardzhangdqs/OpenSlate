@@ -13,6 +13,8 @@ openslate-session = { path = "../openslate-session" }
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# bootstrap 的 [database] path 原地改写（保持其余注释/格式零扰动）。
+toml_edit = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }

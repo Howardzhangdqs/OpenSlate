@@ -71,5 +71,8 @@ dependencies {
     implementation(libs.markdown.renderer.core)
     // UniFFI 生成的 Kotlin 绑定依赖 JNA（com.sun.jna.*）。
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+    // Shizuku（设置页一键授权 Termux RUN_COMMAND；仅一次性 pm grant 用）。
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     debugImplementation(libs.androidx.ui.tooling)
 }

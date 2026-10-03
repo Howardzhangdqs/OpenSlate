@@ -1,23 +1,32 @@
 package dev.openslate.mobile.ui
 
+import android.os.Build
+import android.util.Log
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -30,11 +39,13 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -49,11 +60,31 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlurEffect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
+import kotlin.math.roundToInt
 
 /**
  * Phase 1 聊天主界面：transcript 流 + 输入框 + 审批横幅。
@@ -68,6 +99,15 @@ fun ChatScreen() {
     // 相邻的连续工具调用聚合为一组（圆角矩形容器内多个 chip），
     // 其余条目原样单行渲染。
     val renderItems: List<RenderItem> = remember(state.entries) { groupEntries(state.entries) }
+
+    // 磨砂玻璃：背景捕获层 + 全屏模糊副本（各玻璃面板共用一份，性能考虑），
+    // rootCoords 用于把模糊副本平移到每个玻璃面板自身位置。
+    val glass = rememberGlassLayers()
+    var rootCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    val blurPx = with(LocalDensity.current) { 20.dp.toPx() }
+    val blurEffect = remember(blurPx) {
+        BlurEffect(radiusX = blurPx, radiusY = blurPx, edgeTreatment = TileMode.Clamp)
+    }
 
     LaunchedEffect(state.entries.size) {
         if (renderItems.isNotEmpty()) {
@@ -89,40 +129,52 @@ fun ChatScreen() {
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("OpenSlate", style = MaterialTheme.typography.titleLarge)
-                        Text(
-                            text = when {
-                                !state.ready -> "runtime 启动中…"
-                                state.running ->
-                                    "${state.modelAlias} · Step ${state.step} · 工具 ${state.toolCalls}"
-                                else -> state.modelAlias.ifEmpty { "就绪" }
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { showHistory = true }) {
-                        Icon(
-                            androidx.compose.material.icons.Icons.Filled.History,
-                            contentDescription = "历史会话",
-                        )
-                    }
-                    IconButton(onClick = { showSettings = true }) {
-                        Icon(
-                            androidx.compose.material.icons.Icons.Filled.Settings,
-                            contentDescription = "模型配置",
-                        )
-                    }
-                    TextButton(onClick = { RuntimeBridge.newSession() }) { Text("新会话") }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
+            // 磨砂玻璃顶栏：GlassPanel 重绘背景模糊层（Android 12+）+ 半透明 tint；
+            // 低版本设备退化为半透明蒙层（无真模糊）。TopAppBar 自身容器全透明。
+            GlassPanel(
+                glass = glass,
+                rootCoords = { rootCoords },
+                tint = MaterialTheme.colorScheme.surface.copy(
+                    alpha = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0.55f else 0.82f,
                 ),
-            )
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text("OpenSlate", style = MaterialTheme.typography.titleLarge)
+                            Text(
+                                text = when {
+                                    !state.ready -> "runtime 启动中…"
+                                    state.running ->
+                                        "${state.modelAlias} · Step ${state.step} · 工具 ${state.toolCalls}"
+                                    else -> state.modelAlias.ifEmpty { "就绪" }
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { showHistory = true }) {
+                            Icon(
+                                androidx.compose.material.icons.Icons.Filled.History,
+                                contentDescription = "历史会话",
+                            )
+                        }
+                        IconButton(onClick = { showSettings = true }) {
+                            Icon(
+                                androidx.compose.material.icons.Icons.Filled.Settings,
+                                contentDescription = "模型配置",
+                            )
+                        }
+                        TextButton(onClick = { RuntimeBridge.newSession() }) { Text("新会话") }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Color.Transparent,
+                        scrolledContainerColor = Color.Transparent,
+                    ),
+                )
+            }
         },
         bottomBar = {
             if (state.pendingApproval != null) {
@@ -133,23 +185,52 @@ fun ChatScreen() {
             }
         },
     ) { padding ->
-        Column(
+        // 全屏列表 + 悬浮输入区：列表视口铺满整个 Scaffold（不被 padding 裁剪），
+        // 条目从磨砂顶栏下方、透明输入条下方穿过——底条由此成为"看得见的透明"。
+        // contentPadding 只负责给首末条目留出安全边距。
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
+                .onGloballyPositioned { rootCoords = it }
+                .padding(bottom = padding.calculateBottomPadding())
                 .imePadding(),
         ) {
-            Box(Modifier.weight(1f)) {
-                if (!state.ready) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
-                } else {
+            // 背景捕获层：把列表内容录制进 GraphicsLayer，再录制一份全屏模糊副本；
+            // 顶栏与输入胶囊共用同一份模糊层（每个玻璃区域各自全屏模糊会拖垮 GPU）。
+            // GraphicsLayer.renderEffect 依赖 RenderEffect，Android 12+ 才生效。
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .drawWithContent {
+                        val layerSize = IntSize(
+                            width = size.width.roundToInt(),
+                            height = size.height.roundToInt(),
+                        )
+                        glass.source.record(size = layerSize) {
+                            this@drawWithContent.drawContent()
+                        }
+                        glass.blurred.record(size = layerSize) {
+                            drawLayer(glass.source)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            glass.blurred.renderEffect = blurEffect
+                        }
+                        drawLayer(glass.source)
+                    },
+            ) {
+            if (!state.ready) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            } else {
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                            horizontal = 12.dp, vertical = 8.dp,
+                            start = 12.dp, end = 12.dp,
+                            top = padding.calculateTopPadding() + 8.dp,
+                            // 悬浮输入胶囊（约 60dp）+ 余量，末条消息不被盖住。
+                            bottom = 84.dp,
                         ),
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
@@ -164,13 +245,16 @@ fun ChatScreen() {
                         }) { _, item ->
                             when (item) {
                                 is RenderItem.Single -> EntryRow(item.entry)
-                                is RenderItem.ToolGroup -> ToolGroupCard(item.items)
+                                is RenderItem.ToolGroup -> ToolGroupCard(item.parts)
                             }
                         }
                     }
                 }
             }
             Composer(
+                glass = glass,
+                rootCoords = { rootCoords },
+                modifier = Modifier.align(Alignment.BottomCenter),
                 running = state.running,
                 onSend = { text ->
                     RuntimeBridge.submit(text)
@@ -181,10 +265,12 @@ fun ChatScreen() {
     }
 }
 
-/** 渲染投影：相邻的连续工具调用聚合为一组，其余条目单行。 */
+/** 渲染投影：相邻的连续工具调用聚合为一组（中间夹的 Meta/StepBreak 一并吸收），其余条目单行。 */
 private sealed class RenderItem {
     data class Single(val entry: UiEntry, val index: Int) : RenderItem()
-    data class ToolGroup(val items: List<UiEntry.ToolCall>, val startIdx: Int) : RenderItem()
+
+    /** parts 保序混装工具调用与夹缝中的 Meta/StepBreak；tools 是其中的 ToolCall 子集。 */
+    data class ToolGroup(val parts: List<UiEntry>, val startIdx: Int) : RenderItem()
 }
 
 private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {
@@ -194,12 +280,20 @@ private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {
         val e = entries[i]
         if (e is UiEntry.ToolCall) {
             val start = i
-            val group = mutableListOf<UiEntry.ToolCall>()
-            while (i < entries.size && entries[i] is UiEntry.ToolCall) {
-                group.add(entries[i] as UiEntry.ToolCall)
-                i++
+            val parts = mutableListOf<UiEntry>()
+            while (i < entries.size) {
+                val cur = entries[i]
+                when {
+                    cur is UiEntry.ToolCall -> { parts.add(cur); i++ }
+                    // 夹在工具调用之间的统计行/步分隔：向后看，若后面还是工具调用则吸收进组。
+                    (cur is UiEntry.Meta || cur == UiEntry.StepBreak) &&
+                        i + 1 < entries.size && entries[i + 1] is UiEntry.ToolCall -> {
+                        parts.add(cur); i++
+                    }
+                    else -> break
+                }
             }
-            out.add(RenderItem.ToolGroup(group, start))
+            out.add(RenderItem.ToolGroup(parts, start))
         } else {
             out.add(RenderItem.Single(e, i))
             i++
@@ -237,92 +331,137 @@ private fun EntryRow(entry: UiEntry) {
 }
 
 /**
- * 工具组容器：圆角矩形包裹相邻工具 chip；单个 chip 点击各自展开
- * （命令 + 输出），容器尺寸随展开动画过渡。
+ * 工具组容器：无外框，相邻工具条目紧贴堆叠、中间只留一条缝；
+ * 首条目显示上方圆角、末条目显示下方圆角、中间方角，体现一体感。
+ * 夹在工具调用之间的 Meta/StepBreak 行在组内原样渲染。
+ * 单个条目点击就地展开（命令 + 输出），展开后仍与上下条目紧贴。
  */
+private val TOOL_GROUP_RADIUS = 12.dp
+
 @Composable
-private fun ToolGroupCard(items: List<UiEntry.ToolCall>) {
-    Surface(
-        shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
-        border = androidx.compose.foundation.BorderStroke(
-            0.5.dp,
-            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
-        ),
-        modifier = Modifier
+private fun ToolGroupCard(parts: List<UiEntry>) {
+    val tools = parts.filterIsInstance<UiEntry.ToolCall>()
+    // 整组共用一条边框：外框按组形状绘制（四角 12dp），条目本身不带 border。
+    val groupShape = RoundedCornerShape(TOOL_GROUP_RADIUS)
+    val groupBorder = MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f)
+    Column(
+        Modifier
             .fillMaxWidth()
             .padding(horizontal = 4.dp)
-            .animateContentSize(),
+            .clip(groupShape)
+            .border(0.5.dp, groupBorder, groupShape),
+        verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
-        Column(
-            Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            items.forEach { tc -> ToolChipRow(tc) }
+        parts.forEach { part ->
+            when (part) {
+                is UiEntry.ToolCall -> {
+                    val idx = tools.indexOf(part)
+                    // 组内相邻工具之间保留一条分隔线（首个工具上方不需要），
+                    // 展开后也能直观看出每个工具调用的边界。
+                    if (idx > 0) {
+                        HorizontalDivider(
+                            thickness = 0.5.dp,
+                            color = groupBorder,
+                        )
+                    }
+                    // 条目自身的圆角规则：首条目上圆、末条目下圆（展开与否均保持）。
+                    val bottomR = if (idx == tools.lastIndex) TOOL_GROUP_RADIUS else 0.dp
+                    val shape = RoundedCornerShape(
+                        topStart = if (idx == 0) TOOL_GROUP_RADIUS else 0.dp,
+                        topEnd = if (idx == 0) TOOL_GROUP_RADIUS else 0.dp,
+                        bottomEnd = bottomR,
+                        bottomStart = bottomR,
+                    )
+                    ToolChipRow(part, shape)
+                }
+                is UiEntry.Meta -> Text(
+                    part.text,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.padding(start = 12.dp, top = 3.dp, bottom = 3.dp),
+                )
+                UiEntry.StepBreak -> Spacer(Modifier.widthIn(min = 4.dp))
+                else -> {}
+            }
         }
     }
 }
 
-/** 单个工具 chip（与思维链 chip 同风格）：状态图标 + 名称 + 参数摘要，点击展开。 */
+/** 单个工具条目：状态图标 + 名称 + 参数摘要，点击就地展开。 */
 @Composable
-private fun ToolChipRow(tc: UiEntry.ToolCall) {
+private fun ToolChipRow(tc: UiEntry.ToolCall, shape: RoundedCornerShape) {
+    // 不用 Surface(onClick)：M3 会强制 48dp 最小触摸目标，把条目撑高、组内出现大空隙。
+    // 改用 foundation 组合（clip+background+clickable）精确控制尺寸；
+    // 边框由 ToolGroupCard 统一绘制，条目只负责底色。
+    // 状态着色：成功淡绿、失败淡红、执行中保持中性紫。
+    // （主题的 secondaryContainer 是淡紫，绿色用固定色值表达。）
+    // tool_end 事件不带失败状态，native 工具的失败以非 0 exit_code 表达，
+    // 直接从输出里识别。
+    val exitFail = Regex("""exit_code: (?:[1-9]\d*)""").containsMatchIn(tc.output.orEmpty())
+    val ok = tc.status == "done" && !exitFail
+    val failed = tc.status == "failed" || exitFail
+    val statusTint = when {
+        ok -> androidx.compose.ui.graphics.Color(0xFF1E8A44)
+        failed -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.secondary
+    }
+    val chipColor = when {
+        ok -> androidx.compose.ui.graphics.Color(0xFFDDF3DE)
+        failed -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
+        else -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
+    }
     Column(Modifier.animateContentSize()) {
-        Surface(
-            shape = RoundedCornerShape(50),
-            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f),
-            border = androidx.compose.foundation.BorderStroke(
-                0.5.dp,
-                MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f),
-            ),
-            onClick = { RuntimeBridge.toggleToolExpanded(tc) },
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(shape)
+                .background(chipColor)
+                .clickable { RuntimeBridge.toggleToolExpanded(tc) }
+                .padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-            ) {
-                when (tc.status) {
-                    "running" -> CircularProgressIndicator(
-                        strokeWidth = 1.5.dp,
-                        modifier = Modifier.size(13.dp),
-                    )
-                    "failed" -> Icon(
-                        Icons.Filled.Close,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = MaterialTheme.colorScheme.error,
-                    )
-                    else -> Icon(
-                        Icons.Filled.Check,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = MaterialTheme.colorScheme.secondary,
-                    )
-                }
-                Spacer(Modifier.widthIn(min = 6.dp))
-                Text(
-                    tc.name,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.secondary,
+            when (tc.status) {
+                "running" -> CircularProgressIndicator(
+                    strokeWidth = 1.5.dp,
+                    modifier = Modifier.size(13.dp),
                 )
-                Spacer(Modifier.widthIn(min = 6.dp))
-                Text(
-                    tc.argsPreview,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                    maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
+                "failed" -> Icon(
+                    Icons.Filled.Close,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = MaterialTheme.colorScheme.error,
                 )
-                Icon(
-                    if (tc.expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                    contentDescription = if (tc.expanded) "收起" else "展开",
-                    modifier = Modifier.size(16.dp),
+                else -> Icon(
+                    Icons.Filled.Check,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
                     tint = MaterialTheme.colorScheme.secondary,
                 )
             }
+            Spacer(Modifier.widthIn(min = 6.dp))
+            Text(
+                tc.name,
+                style = MaterialTheme.typography.labelMedium,
+                color = statusTint,
+            )
+            Spacer(Modifier.widthIn(min = 6.dp))
+            Text(
+                tc.argsPreview,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Icon(
+                if (tc.expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = if (tc.expanded) "收起" else "展开",
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.secondary,
+            )
         }
         if (tc.expanded) {
-            Column(Modifier.padding(start = 10.dp, end = 4.dp, top = 2.dp)) {
+            Column(Modifier.padding(start = 10.dp, end = 4.dp, top = 2.dp, bottom = 6.dp)) {
                 Text(
                     "命令",
                     style = MaterialTheme.typography.labelSmall,
@@ -334,25 +473,232 @@ private fun ToolChipRow(tc: UiEntry.ToolCall) {
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                     ),
                 )
-                Text(
-                    "结果",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                Text(
-                    when {
-                        tc.status == "running" -> "（执行中…）"
-                        tc.output != null && tc.output!!.isNotBlank() -> tc.output!!
-                        else -> "（无输出）"
-                    },
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                    ),
-                    maxLines = 16,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
+                if (tc.status == "running") {
+                    Text(
+                        "结果（执行中…）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    ToolResultView(tc.output.orEmpty(), tc.status)
+                }
             }
         }
+    }
+}
+
+/**
+ * 展开后的结果区：`结果` 标签行右侧显示 exit_code（native 工具的输出带）；
+ * stdout / stderr 按 tab 切换，stderr 为空时不显示 stderr tab。
+ * 非格式化输出（如 termux 回传的合并文本）整体按 stdout 处理。
+ */
+@Composable
+private fun ToolResultView(raw: String, status: String = "done") {
+    if (raw.isBlank()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "结果",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "（无输出）",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+        return
+    }
+    val exitCode = Regex("""exit_code: (-?\d+)""").find(raw)?.groupValues?.get(1)
+    val hasSections = raw.contains("--- stdout ---")
+    val stdout = if (hasSections) {
+        raw.substringAfter("--- stdout ---").substringBefore("--- stderr ---").trim()
+    } else {
+        raw.trim()
+    }
+    val stderr = if (hasSections) {
+        raw.substringAfter("--- stderr ---", "").trim()
+            .takeUnless { it.isEmpty() || it == "(empty)" } ?: ""
+    } else {
+        ""
+    }
+    var tab by remember(raw) { mutableStateOf(0) }
+
+    // 标签行：结果 [stdout][stderr chip] …… [exit chip]
+    // stdout/stderr 用 chip 做切换（选中高亮）；exit chip 略小一号。
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "结果",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(Modifier.width(12.dp))
+        if (stderr.isNotEmpty()) {
+            listOf("stdout" to 0, "stderr" to 1).forEach { (label, idx) ->
+                val selected = tab == idx
+                val labelColor = if (selected) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.outline
+                }
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = labelColor,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(
+                            if (selected) {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                            },
+                        )
+                        .border(
+                            0.5.dp,
+                            labelColor.copy(alpha = 0.4f),
+                            RoundedCornerShape(50),
+                        )
+                        .clickable { tab = idx }
+                        .padding(horizontal = 10.dp, vertical = 3.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+            }
+        }
+        Spacer(Modifier.weight(1f))
+        if (exitCode != null) {
+            val ok = exitCode == "0"
+            // 颜色按状态分级：0 → 绿；非 0 → 红。
+            val tint = if (ok) {
+                androidx.compose.ui.graphics.Color(0xFF1E8A44)
+            } else {
+                MaterialTheme.colorScheme.error
+            }
+            // tooltip 状态机：tipMounted 决定 Popup 是否挂载，tipVisible 驱动
+            // AnimatedVisibility 的进出场动画（挂载首帧先以 false 进入组合，
+            // 再翻转触发入场；退场时 Popup 延迟卸载以播完退出动画）。
+            var tipMounted by remember(exitCode) { mutableStateOf(false) }
+            var tipVisible by remember(exitCode) { mutableStateOf(false) }
+            // 点击：未挂载→挂载（入场动画随后触发）；已显示→仅隐藏（播退场）。
+            val toggleTip = {
+                if (tipMounted) {
+                    tipVisible = false
+                } else {
+                    tipMounted = true
+                }
+                Unit
+            }
+            // 挂载后下一帧再置 visible=true，确保入场动画播放。
+            LaunchedEffect(tipMounted) {
+                if (tipMounted) tipVisible = true
+            }
+            // 显示 2.5s 后自动收起。
+            LaunchedEffect(tipVisible) {
+                if (tipVisible) {
+                    kotlinx.coroutines.delay(2500)
+                    tipVisible = false
+                }
+            }
+            // 退场动画（约 120ms）播完后卸载 Popup。
+            LaunchedEffect(tipMounted, tipVisible) {
+                if (tipMounted && !tipVisible) {
+                    kotlinx.coroutines.delay(160)
+                    tipMounted = false
+                }
+            }
+            Text(
+                exitCode,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                ),
+                color = tint,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(tint.copy(alpha = 0.12f))
+                    .border(0.5.dp, tint.copy(alpha = 0.4f), RoundedCornerShape(50))
+                    .clickable { toggleTip() }
+                    .padding(horizontal = 10.dp, vertical = 3.dp),
+            )
+            if (tipMounted) {
+                androidx.compose.ui.window.Popup(
+                    alignment = androidx.compose.ui.Alignment.TopEnd,
+                    offset = androidx.compose.ui.unit.IntOffset(0, 24),
+                    onDismissRequest = {
+                        tipVisible = false
+                    },
+                ) {
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = tipVisible,
+                        enter = androidx.compose.animation.fadeIn(
+                            androidx.compose.animation.core.tween(110),
+                        ) + androidx.compose.animation.scaleIn(
+                            initialScale = 0.85f,
+                            animationSpec = androidx.compose.animation.core.tween(110),
+                            transformOrigin = androidx.compose.ui.graphics.TransformOrigin(
+                                0.9f, 0f,
+                            ),
+                        ) + androidx.compose.animation.slideInVertically(
+                            initialOffsetY = { -it / 3 },
+                            animationSpec = androidx.compose.animation.core.tween(110),
+                        ),
+                        exit = androidx.compose.animation.fadeOut(
+                            androidx.compose.animation.core.tween(120),
+                        ) + androidx.compose.animation.scaleOut(
+                            targetScale = 0.9f,
+                            animationSpec = androidx.compose.animation.core.tween(120),
+                            transformOrigin = androidx.compose.ui.graphics.TransformOrigin(
+                                0.9f, 0f,
+                            ),
+                        ) + androidx.compose.animation.slideOutVertically(
+                            targetOffsetY = { -it / 4 },
+                            animationSpec = androidx.compose.animation.core.tween(120),
+                        ),
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.inverseSurface,
+                            shadowElevation = 2.dp,
+                        ) {
+                            Text(
+                                "Exit Code：命令退出码\n0 = 成功；非 0 = 失败或被信号终止",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.inverseOnSurface,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 内容区：切换 stdout/stderr 时按方向左右滑动 + 淡入淡出。
+    androidx.compose.animation.AnimatedContent(
+        targetState = tab,
+        transitionSpec = {
+            val dir = if (targetState > initialState) 1 else -1
+            (androidx.compose.animation.slideInHorizontally { it / 4 * dir } +
+                androidx.compose.animation.fadeIn()) togetherWith
+                (androidx.compose.animation.slideOutHorizontally { -it / 4 * dir } +
+                    androidx.compose.animation.fadeOut())
+        },
+        label = "resultTab",
+    ) { currentTab ->
+        Text(
+            when {
+                stderr.isNotEmpty() && currentTab == 1 ->
+                    stderr.ifBlank { "（空）" }
+                stdout.isNotBlank() -> stdout
+                else -> "（无输出）"
+            },
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            ),
+            maxLines = 16,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -366,43 +712,44 @@ private fun ReasoningBlock(text: String, meta: String? = null) {
             .padding(horizontal = 4.dp)
             .animateContentSize()
     ) {
-        androidx.compose.material3.AssistChip(
-            onClick = { expanded = !expanded },
-            label = {
-                Text(
-                    meta?.takeIf { it.isNotBlank() }?.let { "已思考 $it" } ?: "思维链 ${text.length} 字",
-                    style = MaterialTheme.typography.labelSmall,
+        // 迷你 pill（与工具结果区的 stdout/stderr chip 同款，更矮）：点击展开思维链。
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f))
+                .border(
+                    0.5.dp,
+                    MaterialTheme.colorScheme.tertiary.copy(alpha = 0.4f),
+                    RoundedCornerShape(50),
                 )
-            },
-            leadingIcon = {
-                Icon(
-                    Icons.Outlined.Psychology,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.tertiary,
-                )
-            },
-            trailingIcon = {
-                Icon(
-                    if (expanded) {
-                        Icons.Filled.ExpandLess
-                    } else {
-                        Icons.Filled.ExpandMore
-                    },
-                    contentDescription = if (expanded) "收起" else "展开",
-                    modifier = Modifier.size(18.dp),
-                    tint = MaterialTheme.colorScheme.tertiary,
-                )
-            },
-            colors = androidx.compose.material3.AssistChipDefaults.assistChipColors(
-                containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f),
-                labelColor = MaterialTheme.colorScheme.tertiary,
-            ),
-            border = androidx.compose.foundation.BorderStroke(
-                0.5.dp,
-                MaterialTheme.colorScheme.tertiary.copy(alpha = 0.4f),
-            ),
-        )
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 10.dp, vertical = 3.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Psychology,
+                contentDescription = null,
+                modifier = Modifier.size(13.dp),
+                tint = MaterialTheme.colorScheme.tertiary,
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                meta?.takeIf { it.isNotBlank() }?.let { "已思考 $it" } ?: "思维链 ${text.length} 字",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                if (expanded) {
+                    Icons.Filled.ExpandLess
+                } else {
+                    Icons.Filled.ExpandMore
+                },
+                contentDescription = if (expanded) "收起" else "展开",
+                modifier = Modifier.size(13.dp),
+                tint = MaterialTheme.colorScheme.tertiary,
+            )
+        }
         if (expanded) {
             Text(
                 text,
@@ -479,38 +826,162 @@ private fun Bubble(text: String, mine: Boolean) {
     }
 }
 
+/** 一份背景捕获层 + 一份全屏模糊副本；所有玻璃面板共用（避免每块玻璃各自全屏模糊）。 */
+private class GlassLayers(val source: GraphicsLayer, val blurred: GraphicsLayer)
+
 @Composable
-private fun Composer(running: Boolean, onSend: (String) -> Unit, onCancel: () -> Unit) {
+private fun rememberGlassLayers(): GlassLayers {
+    val source = rememberGraphicsLayer()
+    val blurred = rememberGraphicsLayer()
+    return remember(source, blurred) { GlassLayers(source, blurred) }
+}
+
+/**
+ * 磨砂玻璃面板（真·背景模糊，参考 Haze 的实现思路、零第三方依赖）：
+ * Android 12+ 时把共用的全屏模糊副本平移到自身位置、只露出被 shape 裁剪的一块，
+ * 再叠半透明 tint；低版本退化为纯半透明蒙层（renderEffect 依赖 API 31 的 RenderEffect）。
+ */
+@Composable
+private fun GlassPanel(
+    glass: GlassLayers,
+    rootCoords: () -> LayoutCoordinates?,
+    tint: Color,
+    modifier: Modifier = Modifier,
+    shape: Shape = RectangleShape,
+    border: Boolean = false,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    var offsetInRoot by remember { mutableStateOf(Offset.Zero) }
+    Box(
+        modifier = modifier
+            .onGloballyPositioned { coordinates ->
+                val root = rootCoords()
+                if (root != null && root.isAttached && coordinates.isAttached) {
+                    offsetInRoot = root.localPositionOf(coordinates, Offset.Zero)
+                }
+            }
+            // 圆角裁剪交给 graphicsLayer，保证模糊副本/蒙层都按 shape 裁形。
+            .graphicsLayer {
+                this.shape = shape
+                clip = true
+            }
+            .drawWithContent {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    translate(left = -offsetInRoot.x, top = -offsetInRoot.y) {
+                        drawLayer(glass.blurred)
+                    }
+                }
+                drawRect(tint)
+                drawContent()
+            }
+            .then(
+                if (border) {
+                    Modifier.border(
+                        0.5.dp,
+                        MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                        shape,
+                    )
+                } else {
+                    Modifier
+                },
+            ),
+        content = content,
+    )
+}
+
+/**
+ * 紧凑输入区：自绘 BasicTextField 替代 M3 OutlinedTextField（后者强制 56dp 最小高度，
+ * 显得过高）。输入胶囊为磨砂玻璃面板（GlassPanel）：Android 12+ 重绘背景模糊层，
+ * 低版本退化为半透明蒙层；配细边框 + 轻阴影悬浮于透明底条之上。
+ */
+@Composable
+private fun Composer(
+    glass: GlassLayers,
+    rootCoords: () -> LayoutCoordinates?,
+    running: Boolean,
+    onSend: (String) -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     var input by remember { mutableStateOf("") }
-    Surface(tonalElevation = 3.dp) {
+    // 底部条透明：去掉 tonalElevation 带来的色调底色，仅保留布局占位。
+    Surface(color = androidx.compose.ui.graphics.Color.Transparent, modifier = modifier) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp, vertical = 6.dp),
         ) {
-            OutlinedTextField(
-                value = input,
-                onValueChange = { input = it },
-                placeholder = { Text("发消息…") },
-                maxLines = 5,
-                modifier = Modifier.weight(1f),
-            )
-            IconButton(
-                onClick = {
-                    if (running) onCancel() else {
-                        val text = input.trim()
-                        if (text.isNotEmpty()) {
-                            onSend(text)
-                            input = ""
+            GlassPanel(
+                glass = glass,
+                rootCoords = rootCoords,
+                modifier = Modifier
+                    .weight(1f)
+                    .animateContentSize()
+                    .shadow(elevation = 2.dp, shape = RoundedCornerShape(20.dp), clip = false),
+                shape = RoundedCornerShape(20.dp),
+                tint = MaterialTheme.colorScheme.surfaceVariant.copy(
+                    alpha = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0.5f else 0.9f,
+                ),
+                border = true,
+            ) {
+                BasicTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                    ),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    maxLines = 5,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    decorationBox = { inner ->
+                        Box {
+                            if (input.isEmpty()) {
+                                Text(
+                                    "发消息…",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.outline,
+                                )
+                            }
+                            inner()
                         }
-                    }
-                },
+                    },
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(36.dp)
+                    .shadow(elevation = 2.dp, shape = RoundedCornerShape(50), clip = false)
+                    .clip(RoundedCornerShape(50))
+                    .background(MaterialTheme.colorScheme.primary)
+                    .clickable {
+                        if (running) onCancel() else {
+                            val text = input.trim()
+                            if (text.isNotEmpty()) {
+                                onSend(text)
+                                input = ""
+                            }
+                        }
+                    },
             ) {
                 if (running) {
-                    Icon(Icons.Filled.Stop, contentDescription = "取消")
+                    Icon(
+                        Icons.Filled.Stop,
+                        contentDescription = "取消",
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(18.dp),
+                    )
                 } else {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "发送",
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(16.dp),
+                    )
                 }
             }
         }

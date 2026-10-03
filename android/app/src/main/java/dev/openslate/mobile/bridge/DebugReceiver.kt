@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import kotlinx.coroutines.launch
 
 /**
  * 调试用 adb 注入通道（Phase 1 临时，设置页上线后移除）：
@@ -15,6 +16,10 @@ import android.util.Log
  *   # 发送任意 ClientMsg JSON
  *   adb shell am broadcast \
  *     -a dev.openslate.mobile.SEND --es msg '{"type":"submit","text":"hi"}'
+ *
+ *   # 在 Termux 中执行命令（RUN_COMMAND，结果进 logcat）
+ *   adb shell am broadcast \
+ *     -a dev.openslate.mobile.TERMUX --es cmd 'ls ~/.openslate'
  */
 class DebugReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -36,6 +41,21 @@ class DebugReceiver : BroadcastReceiver() {
                 val ok = RuntimeBridge.sendJson(msg)
                 Log.i(TAG, "send via broadcast: ok=$ok")
             }
+            ACTION_TERMUX -> {
+                // 不用 goAsync：其 pendingResult 有 ~10s 强制窗口，而
+                // RUN_COMMAND 往返可达 90s，超窗即 ANR（真机踩坑实测）。
+                // 直接投后台协程，receiver 立即返回；App 在前台时进程
+                // 存活，任务照常跑完（调试通道，可接受）。
+                val cmd = intent.getStringExtra("cmd") ?: return
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                    try {
+                        val (out, err) = McpHostManager.debugRun(context, cmd)
+                        Log.i(TAG, "termux debug result: out=${out?.take(2000)} err=${err.take(500)}")
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "termux debug failed", t)
+                    }
+                }
+            }
         }
     }
 
@@ -44,5 +64,6 @@ class DebugReceiver : BroadcastReceiver() {
         const val ACTION_SET_KEY = "dev.openslate.mobile.SET_KEY"
         const val ACTION_SET_PROXY = "dev.openslate.mobile.SET_PROXY"
         const val ACTION_SEND = "dev.openslate.mobile.SEND"
+        const val ACTION_TERMUX = "dev.openslate.mobile.TERMUX"
     }
 }

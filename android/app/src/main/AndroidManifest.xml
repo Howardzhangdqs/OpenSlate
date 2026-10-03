@@ -5,10 +5,16 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <!-- termux.run：读取 Termux 落在共享存储的输出文件 -->
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <!-- termux.run：Termux 的 RUN_COMMAND 自定义权限（Termux 未装时无副作用） -->
+    <!-- termux.run：Termux 的 RUN_COMMAND 自定义权限（dangerous runtime
+         permission，可在系统设置 → 应用 → OpenSlate → 权限 中授予，或经
+         Shizuku 一键 pm grant；Termux 未装时无副作用）。 -->
     <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+
+    <!-- Android 11+ 包可见性：探测 Termux 是否安装（termux.run 前置提示）。 -->
+    <queries>
+        <package android:name="com.termux" />
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
 
     <application
         android:name=".OpenSlateApp"
@@ -37,6 +43,21 @@
                 android:value="AI agent runtime host" />
         </service>
 
+        <!-- termux.run 结果回传目标（RUN_COMMAND_PENDING_INTENT 指向这里；
+             exported=false，PendingIntent 临时授权使 Termux 可达）。 -->
+        <receiver
+            android:name=".bridge.TermuxResultReceiver"
+            android:exported="false" />
+
+        <!-- Shizuku（设置页一键 pm grant 授权 RUN_COMMAND；仅首次配置用，
+             日常执行不经过它）。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
         <!-- Phase 1 调试注入通道（设置页上线后移除）：adb 注入 key / 发消息。
              exported=true 仅为 adb 调试广播可达（action 带包名前缀，风险可控）。 -->
         <receiver
@@ -46,6 +67,7 @@
                 <action android:name="dev.openslate.mobile.SET_KEY" />
                 <action android:name="dev.openslate.mobile.SET_PROXY" />
                 <action android:name="dev.openslate.mobile.SEND" />
+                <action android:name="dev.openslate.mobile.TERMUX" />
             </intent-filter>
         </receiver>
     </application>

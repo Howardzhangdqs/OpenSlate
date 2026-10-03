@@ -182,6 +182,7 @@ object RuntimeBridge {
                         }
                     }
                     restoreHttpProxy()
+                    restoreExecBackend()
                 } catch (e: Throwable) {
                     Log.e(TAG, "start: runtime create FAILED", e)
                     _state.value = _state.value.copy(ready = false, lastError = e.message ?: e.javaClass.simpleName)
@@ -234,6 +235,30 @@ object RuntimeBridge {
     fun setApiKeyAndPersist(provider: String, value: String) {
         setApiKey(provider, value)
         appContext?.let { SecretStore.save(it, provider, value) }
+    }
+
+    // ── bash 工具执行后端（native shell.run / termux）──────────────
+
+    private const val PREF_EXEC_BACKEND = "exec_backend"
+
+    /** 当前 bash 后端多选（CSV："native" / "termux" / "native,termux"）。 */
+    fun execBackends(): String =
+        appContext?.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
+            ?.getString(PREF_EXEC_BACKEND, "native") ?: "native"
+
+    /** 切换 bash 后端多选：FFI 热切换 + 本地持久化（重启恢复）。
+     *  命名规则（Rust 侧）：单选 → `bash`；双选 → `bash`=native + `termux_bash`。 */
+    fun setExecBackendsAndPersist(backends: String) {
+        runtimeRef.get()?.setExecBackends(backends)
+        appContext?.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
+            ?.edit()?.putString(PREF_EXEC_BACKEND, backends)?.apply()
+        Log.i(TAG, "exec backends set to $backends")
+    }
+
+    private fun restoreExecBackend() {
+        val backends = execBackends()
+        runtimeRef.get()?.setExecBackends(backends)
+        Log.i(TAG, "start: restored exec backends = $backends")
     }
 
     // ── HTTP 代理（受限网络出站；经 adb reverse 共享电脑侧代理）──
@@ -314,6 +339,16 @@ object RuntimeBridge {
         JSONObject().put("type", "set_model").put("alias", alias).toString()
     )
 
+    /** 注册/更新 MCP server（http 条目；重启会话后生效——MCP 无热更设计）。 */
+    fun upsertMcpServer(name: String, url: String, headers: Map<String, String>? = null) = sendJson(
+        JSONObject()
+            .put("type", "upsert_mcp_server")
+            .put("name", name)
+            .put("url", url)
+            .apply { headers?.let { put("headers", JSONObject(it)) } }
+            .toString()
+    )
+
     /** 审批应答（choice: approve / deny / approve_all）。 */
     fun answerApproval(id: Long, choice: String) = sendJson(
         JSONObject().put("type", "approval_answer").put("id", id).put("choice", choice).toString()
@@ -340,6 +375,7 @@ object RuntimeBridge {
                 runCatching { it.shutdown() }.onFailure { t -> Log.w(TAG, "shutdown: ${t.message}") }
             }
             started = false
+            TermuxExec.cancelAll()
             _state.value = RuntimeUiState()
         }
     }
@@ -369,9 +405,15 @@ object RuntimeBridge {
             }
             "tool_end" -> {
                 val name = obj.optString("name", "tool")
+                // 优先 Kotlin 侧缓存（host 工具的完整输出）；native 工具在 Rust
+                // 进程内执行，没有 host call，用事件携带的 preview 兜底。
                 val out = takeToolOutput(name)
+                    ?: obj.optString("preview", "").ifBlank { null }
                 mutate {
-                    val idx = entries.indexOfLast { it is UiEntry.ToolCall && it.name == name && it.status == "running" }
+                    // Rust 保证 tool_end 按工具调用顺序发射：并发多条同名调用时，
+                    // 第 N 个 tool_end 对应该名下第一个仍在 running 的条目。
+                    // （indexOfLast 会在并发时把输出互相配错。）
+                    val idx = entries.indexOfFirst { it is UiEntry.ToolCall && it.name == name && it.status == "running" }
                     if (idx >= 0) {
                         val e = entries[idx] as UiEntry.ToolCall
                         copy(entries = entries.toMutableList().also { it[idx] = e.copy(status = "done", output = out ?: e.output) })
@@ -381,13 +423,18 @@ object RuntimeBridge {
             "usage" -> {
                 // token 用量 → 回填最近思维链的 meta + 追加 Meta 行（含步耗时）。
                 // 事件形态：{"type":"usage","usage":{"input_tokens":…,"output_tokens":…,
-                //   "reasoning_tokens":…(可选，网关注入细分时)}}
+                //   "cached_input_tokens":…(可选),"reasoning_tokens":…(可选，网关注入细分时)}}
                 val u = obj.optJSONObject("usage")
                 val inTok = u?.optInt("input_tokens", -1) ?: obj.optInt("input_tokens", -1)
                 val outTok = u?.optInt("output_tokens", -1) ?: obj.optInt("output_tokens", -1)
                 // 思考专属 token：Rust 链路透传（vendor/genai anthropic 适配器提取网关
                 // 注入的 OpenAI 风格细分；网关未报时为 -1，退回仅时长显示）。
                 val thinkTok = u?.optInt("reasoning_tokens", -1) ?: -1
+                // 缓存命中 token：OpenAI prompt_tokens_details.cached_tokens /
+                // Anthropic cache_read_input_tokens 由 Rust 链路归一化为
+                // cached_input_tokens 透传；网关未报时为 -1，不显示该段。
+                val cachedTok = u?.optInt("cached_input_tokens", -1)
+                    ?: obj.optInt("cached_input_tokens", -1)
                 val elapsed = stepStartTs?.let { (System.currentTimeMillis() - it) / 1000.0 }
                 if (inTok >= 0) {
                     val fmtTok = { n: Int -> if (n >= 1000) "%.1fk".format(n / 1000.0) else "$n" }
@@ -400,10 +447,11 @@ object RuntimeBridge {
                             append("${fmtTok(thinkTok)} tok")
                         }
                     }.toString()
-                    // ⚡ 行用详细格式（含 in/out，细分存在时附 think）。
+                    // ⚡ 行用详细格式（含 in/out，缓存命中与 think 细分存在时附带）。
                     val detail = buildString {
                         elapsed?.let { append("%.1fs".format(it)) }
                         append(" · ↑${fmtTok(inTok)} ↓${fmtTok(outTok)}")
+                        if (cachedTok > 0) append(" · c${fmtTok(cachedTok)}")
                         if (thinkTok > 0) append(" · think ${fmtTok(thinkTok)}")
                     }
                     mutate {
@@ -609,7 +657,9 @@ object RuntimeBridge {
                     """{"pong":true,"runtime":"rust","host":"android"}""",
                 )
             }
-            "termux.run" -> runInTermux(runtime, id, obj.optJSONObject("args")?.optString("command") ?: "")
+            // termux 后端工具名随设置可为 termux.run（旧）或 termux_bash（现）。
+            "termux.run", "termux_bash" ->
+                runInTermux(runtime, id, obj.optJSONObject("args")?.optString("command") ?: "")
             else -> runtime.resolveHostCall(
                 id.toULong(), false,
                 "host tool '$tool' not implemented in Phase 1",
@@ -617,75 +667,27 @@ object RuntimeBridge {
         }
     }
 
-    /** RUN_COMMAND intent → Termux 执行 → 输出经局域网中继回传。
-     *  （Termux 直写 /sdcard 需 termux-setup-storage 交互授权，故走
-     *  PC 侧 outrelay：cmd | curl POST → App GET 取回。） */
+    /**
+     * termux.run：TermuxExec（RUN_COMMAND + 结果 PendingIntent 本机直传）。
+     * 无 PC、无 adb、无局域网中继；失败原因随错误返回供模型自纠。
+     */
     private fun runInTermux(runtime: OpenSlateRuntime, id: Long, command: String) {
         val ctx = appContext
-        if (ctx == null || command.isBlank()) {
-            runtime.resolveHostCall(id.toULong(), false, "termux.run: no command")
+        if (ctx == null) {
+            runtime.resolveHostCall(id.toULong(), false, "termux.run: no app context")
             return
         }
-        val relay = ctx.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
-            .getString("relay_host", "10.0.0.190")!!
         scope.launch(Dispatchers.IO) {
-            try {
-                // Termux 侧：命令输出打包 POST 给中继（curl 为 Termux 自带）。
-                val wrapped = "($command) 2>&1 | curl -s --max-time 18 --data-binary @- " +
-                    "-X POST http://$relay:8899/out/$id"
-                val intent = android.content.Intent("com.termux.RUN_COMMAND")
-                    .setClassName("com.termux", "com.termux.app.RunCommandService")
-                    .putExtra(
-                        "com.termux.RUN_COMMAND_PATH",
-                        "/data/data/com.termux/files/usr/bin/bash",
-                    )
-                    .putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-c", wrapped))
-                    .putExtra(
-                        "com.termux.RUN_COMMAND_WORKDIR",
-                        "/data/data/com.termux/files/home",
-                    )
-                    .putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
-                if (android.os.Build.VERSION.SDK_INT >= 26) {
-                    ctx.startForegroundService(intent)
-                } else {
-                    ctx.startService(intent)
-                }
-                Log.i(TAG, "termux.run dispatched (relay): $command")
-
-                // 从中继轮询取回输出（最长 20s）。
-                val deadline = System.currentTimeMillis() + 20_000
-                var output: String? = null
-                while (System.currentTimeMillis() < deadline) {
-                    runCatching {
-                        val url = java.net.URL("http://$relay:8899/out/$id")
-                        (url.openConnection() as java.net.HttpURLConnection).let { c ->
-                            c.connectTimeout = 2000
-                            c.readTimeout = 2000
-                            if (c.responseCode == 200) {
-                                output = c.inputStream.bufferedReader().readText()
-                            }
-                        }
-                    }
-                    if (output != null) break
-                    Thread.sleep(500)
-                }
-                val out = output
-                if (out != null) {
-                    val capped = if (out.length > 8_000) out.take(8_000) + "\n…(truncated)" else out
-                    recordToolOutput("termux.run", capped)
-                    runtime.resolveHostCall(
-                        id.toULong(), true,
-                        JSONObject().put("output", capped).put("command", command).toString(),
-                    )
-                } else {
-                    runtime.resolveHostCall(
-                        id.toULong(), false,
-                        "termux command produced no output within 20s (relay unreachable or command hung): $command",
-                    )
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "termux.run failed", t)
-                runtime.resolveHostCall(id.toULong(), false, "termux.run error: ${t.message}")
+            val (output, error) = TermuxExec.run(ctx, id, command)
+            if (output != null) {
+                recordToolOutput("termux_bash", output)
+                runtime.resolveHostCall(
+                    id.toULong(), true,
+                    JSONObject().put("output", output).put("command", command).toString(),
+                )
+            } else {
+                recordToolOutput("termux_bash", error)
+                runtime.resolveHostCall(id.toULong(), false, error)
             }
         }
     }
@@ -693,13 +695,27 @@ object RuntimeBridge {
     /** 展开/收起工具卡片（点击交互）。 */
     fun toggleToolExpanded(target: UiEntry.ToolCall) {
         Log.i(TAG, "toggleToolExpanded: ${target.name} args=${target.argsPreview.take(30)}")
+        // 优先按实例身份匹配：transcript 中可能存在多条同名同参的调用，
+        // 字段匹配会命中第一条导致"点了没反应"。身份失配（如恢复后引用失效）
+        // 才退回字段匹配。
+        var hit = -1
+        var newExpanded = false
         mutate {
-            val idx = entries.indexOfFirst { it is UiEntry.ToolCall && it === target || (it is UiEntry.ToolCall && it.name == target.name && it.argsPreview == target.argsPreview && it.status == target.status) }
+            var idx = entries.indexOfFirst { it === target }
+            if (idx < 0) {
+                idx = entries.indexOfFirst {
+                    it is UiEntry.ToolCall && it.name == target.name &&
+                        it.argsPreview == target.argsPreview && it.status == target.status
+                }
+            }
             if (idx >= 0) {
                 val e = entries[idx] as UiEntry.ToolCall
+                hit = idx
+                newExpanded = !e.expanded
                 copy(entries = entries.toMutableList().also { it[idx] = e.copy(expanded = !e.expanded) })
             } else this
         }
+        Log.i(TAG, "toggleToolExpanded: idx=$hit expanded=$newExpanded")
     }
 
     // ── 历史会话 ─────────────────────────────────────────────

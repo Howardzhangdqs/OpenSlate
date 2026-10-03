@@ -287,8 +287,16 @@ pub enum TransportConfig {
         env: Option<HashMap<String, String>>,
     },
     /// Connect to a remote MCP server via Streamable HTTP.
+    ///
+    /// `headers`：随每个请求原样注入的自定义头（如 mcp-host 的
+    /// `Authorization = "Bearer <token>"`；rmcp 仅保留 accept/session/
+    /// protocol-version/last-event-id，Authorization 可安全透传）。
     #[serde(rename = "http")]
-    Http { url: String },
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: Option<HashMap<String, String>>,
+    },
 }
 
 /// Wrapper for the agents YAML file.

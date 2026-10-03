@@ -18,7 +18,7 @@
 //! Built on the official `rmcp` crate (protocol `2025-11-25`).
 //!
 //! # v1 scope
-//! - No hot-reload: tools are listed once at connect time (the `ClientInfo`
+//! - No hot-reload: tools are listed once at connect time (the `ClientConfig`
 //!   handler doesn't react to `notifications/tools/list_changed`).
 //! - Runtime connect/call failures are non-fatal (warn + skip that server).
 //! - `Resource`/`ResourceLink` content blocks emit placeholders (no implicit
@@ -38,7 +38,7 @@ use openslate_mcp_builtin::skill::SkillServer;
 // type without depending on openslate-mcp-builtin directly.
 pub use openslate_mcp_builtin::SkillInfo;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, ContentBlock, Implementation,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, ContentBlock, Implementation,
     JsonObject, Tool as RmcpTool,
 };
 use rmcp::service::{RoleClient, RoleServer, RunningService, ServerSink, ServiceError, ServiceExt};
@@ -241,10 +241,10 @@ impl Tool for McpTool {
 /// Dropping the guard drops the services, which cancels the connections. For
 /// deterministic cleanup prefer [`McpConnectionGuard::graceful_shutdown`].
 ///
-/// The handler type is fixed to `ClientInfo` (we advertise ourselves to
+/// The handler type is fixed to `ClientConfig` (we advertise ourselves to
 /// servers); this keeps the `Vec` element type concrete.
 pub struct McpConnectionGuard {
-    services: Vec<RunningService<RoleClient, ClientInfo>>,
+    services: Vec<RunningService<RoleClient, ClientConfig>>,
 }
 
 impl McpConnectionGuard {
@@ -264,7 +264,7 @@ impl McpConnectionGuard {
     }
 
     /// Take ownership of a successfully connected service.
-    pub fn push(&mut self, svc: RunningService<RoleClient, ClientInfo>) {
+    pub fn push(&mut self, svc: RunningService<RoleClient, ClientConfig>) {
         self.services.push(svc);
     }
 
@@ -332,8 +332,8 @@ pub enum McpConnectError {
 pub async fn connect_mcp_server(
     server_name: &str,
     config: &McpServerConfig,
-) -> Result<(Vec<McpTool>, RunningService<RoleClient, ClientInfo>), McpConnectError> {
-    let client_info = ClientInfo::new(
+) -> Result<(Vec<McpTool>, RunningService<RoleClient, ClientConfig>), McpConnectError> {
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("openslate", env!("CARGO_PKG_VERSION")),
     );
@@ -377,8 +377,38 @@ pub async fn connect_mcp_server(
                     source: e.into(),
                 })?
         }
-        TransportConfig::Http { url } => {
-            let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+        TransportConfig::Http { url, headers } => {
+            // 自定义头（如 mcp-host 的 Bearer token）经 custom_headers 原样
+            // 注入 —— rmcp 仅保留 accept/session/protocol-version/
+            // last-event-id，Authorization 等鉴权头可安全透传。
+            let transport = match headers {
+                None => StreamableHttpClientTransport::from_uri(url.as_str()),
+                Some(map) if map.is_empty() => {
+                    StreamableHttpClientTransport::from_uri(url.as_str())
+                }
+                Some(map) => {
+                    let mut config =
+                        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::default();
+                    config.uri = url.as_str().into();
+                    for (name, value) in map {
+                        let (name, value) = (http::HeaderName::try_from(name)
+                            .map_err(|e| McpConnectError::Handshake {
+                                server: server_name.into(),
+                                source: Box::new(e),
+                            })?,
+                        http::HeaderValue::try_from(value.as_str())
+                            .map_err(|e| McpConnectError::Handshake {
+                                server: server_name.into(),
+                                source: Box::new(e),
+                            })?);
+                        config.custom_headers.insert(name, value);
+                    }
+                    StreamableHttpClientTransport::with_client(
+                        reqwest::Client::new(),
+                        config,
+                    )
+                }
+            };
             tokio::time::timeout(CONNECT_TIMEOUT, client_info.serve(transport))
                 .await
                 .map_err(|_| McpConnectError::Timeout {
@@ -424,7 +454,7 @@ pub async fn connect_mcp_server(
 /// must keep the returned `RunningService` alive for the tools to keep working.
 async fn connect_builtin_server<S>(
     server: S,
-) -> anyhow::Result<(Vec<McpTool>, RunningService<RoleClient, ClientInfo>)>
+) -> anyhow::Result<(Vec<McpTool>, RunningService<RoleClient, ClientConfig>)>
 where
     S: ServerHandler + Send + 'static,
 {
@@ -452,7 +482,7 @@ where
 
     // Same handshake as external servers, bounded by the same timeout so a
     // wedged builtin (should never happen, but) cannot hang startup.
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("openslate", env!("CARGO_PKG_VERSION")),
     );
@@ -511,7 +541,7 @@ pub async fn connect_builtin_servers(
     root: &Path,
     cfg: &BuiltinToolsConfig,
     skills: Vec<SkillInfo>,
-) -> anyhow::Result<(Vec<McpTool>, Vec<RunningService<RoleClient, ClientInfo>>)> {
+) -> anyhow::Result<(Vec<McpTool>, Vec<RunningService<RoleClient, ClientConfig>>)> {
     let any_tool = cfg.enabled && (cfg.read_file || cfg.write_file || cfg.shell || cfg.edit_file);
     if !any_tool && skills.is_empty() {
         return Ok((Vec::new(), Vec::new()));

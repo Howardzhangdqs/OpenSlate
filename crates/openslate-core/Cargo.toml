@@ -31,6 +31,7 @@ futures = { workspace = true }
 # json+rustls+stream); rmcp likewise pulls only the features listed in the
 # workspace root.
 reqwest = { workspace = true }
+http = "1"
 rmcp = { workspace = true }
 # In-process builtin MCP servers (read_file / write_file / shell / edit_file).
 openslate-mcp-builtin = { path = "../openslate-mcp-builtin" }

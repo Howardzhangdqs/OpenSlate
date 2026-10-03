@@ -70,7 +70,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # servers (openslate-mcp-builtin). base64 defaults still excluded. reqwest tls
 # feature stays rustls-only (see transport-streamable-http-client-reqwest:
 # pulls __reqwest w/o tls feature).
-rmcp = { version = "3.2", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.5", default-features = false, features = ["client", "server", "macros", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # SQLite (async)
 # default-features=false：仅 sqlite 后端（仓库本就只用 sqlite；默认特性

@@ -261,7 +261,7 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
                         });
                     }
                 }
-                TransportConfig::Http { url } => {
+                TransportConfig::Http { url, .. } => {
                     if url.trim().is_empty() {
                         errors.push(ValidationError {
                             field: format!("mcp.servers.{name}.url"),
@@ -1542,7 +1542,7 @@ url = "http://localhost:8000/mcp"
         let server = config.mcp.as_ref().unwrap().servers.get("remote").unwrap();
         assert!(!server.enabled, "enabled can be overridden to false");
         match &server.transport {
-            TransportConfig::Http { url } => assert_eq!(url, "http://localhost:8000/mcp"),
+            TransportConfig::Http { url, .. } => assert_eq!(url, "http://localhost:8000/mcp"),
             TransportConfig::Stdio { .. } => panic!("expected http"),
         }
         // A disabled server is still statically valid (connection is skipped later).

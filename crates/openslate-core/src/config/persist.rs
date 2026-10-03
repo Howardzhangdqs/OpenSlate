@@ -277,6 +277,87 @@ pub fn remove_provider(path: &Path, name: &str) -> Result<()> {
     remove_sub_key(path, "providers", name)
 }
 
+// ── MCP servers（两层嵌套 [mcp.servers.<name>]）─────────────────────────────
+
+/// Insert or replace an HTTP MCP server entry in `[mcp.servers.<name>]`
+/// (created when missing; parent `[mcp]`/`[mcp.servers]` created as needed).
+/// Semantics mirror the provider upsert: the sub-table body is rebuilt from
+/// the arguments, everything else round-trips. Idempotent.
+///
+/// Writes `transport = "http"` + `url` (+ optional `[mcp.servers.<name>.headers]`
+/// sub-table), matching `TransportConfig::Http`'s internally-tagged serde
+/// shape. The connection itself is established on next runtime start (MCP
+/// tools are listed at connect time — no hot-reload by design).
+pub fn upsert_mcp_server(
+    path: &Path,
+    name: &str,
+    url: &str,
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> Result<()> {
+    let mut doc = load_document(path)?;
+    // 拒绝把非表节点踩掉（与 upsert_sub_table 同守卫语义）。
+    for section in ["mcp", "servers"] {
+        if let Some(item) = doc.as_table().get(section) {
+            anyhow::ensure!(
+                item.is_table(),
+                "config entry '{section}' is not a standard TOML table"
+            );
+        }
+    }
+    if let Some(item) = doc.as_table().get("mcp").and_then(|t| t.get("servers")).and_then(|t| t.get(name)) {
+        anyhow::ensure!(
+            item.is_table(),
+            "config entry 'mcp.servers.{name}' is not a standard TOML table"
+        );
+    }
+
+    let mcp = doc
+        .as_table_mut()
+        .entry("mcp")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("[mcp] is not a table")?;
+    let servers = mcp
+        .entry("servers")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("[mcp.servers] is not a table")?;
+    let entry = servers
+        .entry(name)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("[mcp.servers.{name}] is not a table")?;
+    entry["transport"] = value("http");
+    entry["url"] = value(url.to_owned());
+    entry.remove("headers");
+    if let Some(map) = headers {
+        if !map.is_empty() {
+            let mut headers_table = Table::new();
+            for (k, v) in map {
+                headers_table[k.as_str()] = value(v.clone());
+            }
+            entry["headers"] = Item::Table(headers_table);
+        }
+    }
+    save_document(path, &doc)
+}
+
+/// Remove `[mcp.servers.<name>]`. Missing targets are a silent success
+/// (idempotent); refuses to touch non-table `mcp`/`servers` nodes.
+pub fn remove_mcp_server(path: &Path, name: &str) -> Result<()> {
+    let mut doc = load_document(path)?;
+    let Some(mcp) = doc.as_table_mut().get_mut("mcp").and_then(|i| i.as_table_mut()) else {
+        return Ok(());
+    };
+    let Some(servers) = mcp.get_mut("servers").and_then(|i| i.as_table_mut()) else {
+        return Ok(());
+    };
+    if servers.remove(name).is_none() {
+        return Ok(());
+    }
+    save_document(path, &doc)
+}
+
 /// Shared removal for `[<section>] <key>`. A missing section or key is a
 /// silent success leaving the file untouched (idempotent, no stray empty
 /// files); a section that is not a standard table is refused.
@@ -428,6 +509,51 @@ mod tests {
     // ── upsert_provider ──────────────────────────────────────────────────
 
     #[test]
+    // ── MCP servers ────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_mcp_server_creates_nested_table_with_headers() {
+        let (_dir, path) = temp_config();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok-1".to_string());
+        upsert_mcp_server(
+            &path,
+            "termux",
+            "http://127.0.0.1:8765/mcp",
+            Some(&headers),
+        )
+        .expect("upsert");
+
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.termux]"), "{text}");
+        assert!(text.contains(r#"transport = "http""#), "{text}");
+        assert!(text.contains("127.0.0.1:8765"), "{text}");
+        assert!(text.contains("Authorization = \"Bearer tok-1\""), "{text}");
+
+        // 幂等 + 无 headers 时清掉旧 headers 子表。
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8766/mcp", None).expect("re-upsert");
+        let text = text_at(&path);
+        assert!(!text.contains("Authorization"), "{text}");
+        let doc = parse_at(&path);
+        let entry = &doc["mcp"]["servers"]["termux"];
+        assert_eq!(entry["url"].as_str(), Some("http://127.0.0.1:8766/mcp"));
+    }
+
+    #[test]
+    fn remove_mcp_server_is_idempotent() {
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "a", "http://x/mcp", None).expect("upsert");
+        upsert_mcp_server(&path, "b", "http://y/mcp", None).expect("upsert");
+        remove_mcp_server(&path, "a").expect("remove");
+        let text = text_at(&path);
+        assert!(!text.contains("[mcp.servers.a]"), "{text}");
+        assert!(text.contains("[mcp.servers.b]"), "{text}");
+        // 不存在 → 静默成功；无 [mcp] 节点也一样。
+        remove_mcp_server(&path, "zz").expect("remove missing ok");
+        let (_dir2, path2) = temp_config();
+        remove_mcp_server(&path2, "any").expect("no mcp section ok");
+    }
+
     fn upsert_provider_creates_new_file() {
         let (_dir, path) = temp_config();
         upsert_provider(

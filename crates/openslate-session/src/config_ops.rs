@@ -40,6 +40,12 @@ pub enum ConfigChange {
     DeleteModel { entry: String },
     SetLevel { level: String, entry: String },
     DeleteLevel { level: String },
+    UpsertMcpServer {
+        name: String,
+        url: String,
+        headers: Option<std::collections::HashMap<String, String>>,
+    },
+    RemoveMcpServer { name: String },
 }
 
 impl ConfigChange {
@@ -53,6 +59,16 @@ impl ConfigChange {
             ClientMsg::DeleteModel { entry } => Some(Self::DeleteModel { entry }),
             ClientMsg::SetLevel { level, entry } => Some(Self::SetLevel { level, entry }),
             ClientMsg::DeleteLevel { level } => Some(Self::DeleteLevel { level }),
+            ClientMsg::UpsertMcpServer {
+                name,
+                url,
+                headers,
+            } => Some(Self::UpsertMcpServer {
+                name,
+                url,
+                headers,
+            }),
+            ClientMsg::RemoveMcpServer { name } => Some(Self::RemoveMcpServer { name }),
             _ => None,
         }
     }
@@ -66,6 +82,10 @@ impl ConfigChange {
             ConfigChange::DeleteModel { entry } => format!("delete_model {entry}"),
             ConfigChange::SetLevel { level, entry } => format!("set_level {level} → {entry}"),
             ConfigChange::DeleteLevel { level } => format!("delete_level {level}"),
+            ConfigChange::UpsertMcpServer { name, .. } => {
+                format!("upsert_mcp_server {name}")
+            }
+            ConfigChange::RemoveMcpServer { name } => format!("remove_mcp_server {name}"),
         }
     }
 }
@@ -178,6 +198,15 @@ pub fn apply_config_change(
                 .map(|_| format!("levels.{level} → {entry}")),
             ConfigChange::DeleteLevel { level } => {
                 persist::remove_level(&active, &level).map(|_| format!("删除级别 {level}"))
+            }
+            ConfigChange::UpsertMcpServer {
+                name,
+                url,
+                headers,
+            } => persist::upsert_mcp_server(&active, &name, &url, headers.as_ref())
+                .map(|_| format!("MCP server {name}（重启会话后生效）")),
+            ConfigChange::RemoveMcpServer { name } => {
+                persist::remove_mcp_server(&active, &name).map(|_| format!("删除 MCP server {name}"))
             }
         };
     let what = match what {

@@ -527,6 +527,18 @@ pub enum ClientMsg {
     DeleteLevel {
         level: String,
     },
+    /// 新增/更新 MCP server（Streamable HTTP 条目；手机端 mcp-host 场景）。
+    /// headers 如 `{ "Authorization": "Bearer <token>" }`，可选。
+    UpsertMcpServer {
+        name: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        headers: Option<std::collections::HashMap<String, String>>,
+    },
+    /// 删除 MCP server 条目（不存在时静默成功，幂等）。
+    RemoveMcpServer {
+        name: String,
+    },
     /// 直接粘贴 API key：server 派生 `<NAME>_API_KEY` 写 `.env`（0600），
     /// 值不回显、不广播。
     SetApiKey {

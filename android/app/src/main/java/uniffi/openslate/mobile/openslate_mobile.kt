@@ -697,7 +697,11 @@ internal object IntegrityCheckingUniffiLib {
     }
 
     internal fun ensureInitialized() = Unit
+    external fun uniffi_openslate_mobile_checksum_func_set_mcp_host_token(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_current_run_id(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_delete_session(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_list_sessions(
     ): Int
@@ -748,7 +752,9 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_current_run_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
-    external fun uniffi_openslate_mobile_fn_method_openslateruntime_list_sessions(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_delete_session(`ptr`: Long,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_list_sessions(`ptr`: Long,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_open_session(`ptr`: Long,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -765,6 +771,8 @@ internal object UniffiLib {
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_openslate_mobile_fn_init_callback_vtable_eventcallback(`vtable`: UniffiVTableCallbackInterfaceEventCallback,
+    ): Unit
+    external fun uniffi_openslate_mobile_fn_func_set_mcp_host_token(`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun ffi_openslate_mobile_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -885,10 +893,16 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if ((lib.uniffi_openslate_mobile_checksum_func_set_mcp_host_token() and 0xFFFF) != 20637) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_current_run_id() and 0xFFFF) != 41118) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_list_sessions() and 0xFFFF) != 48162) {
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_delete_session() and 0xFFFF) != 15461) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_list_sessions() and 0xFFFF) != 29641) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_open_session() and 0xFFFF) != 805) {
@@ -1109,6 +1123,29 @@ private class JavaLangRefCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterULong: FfiConverter<ULong, Long> {
     override fun lift(value: Long): ULong {
         return value.toULong()
@@ -1316,9 +1353,18 @@ public interface OpenSlateRuntimeInterface {
     fun `currentRunId`(): kotlin.String?
     
     /**
-     * 历史会话列表（JSON 数组：id/title/status/started_ms/cost_usd）。
+     * 删除历史会话（连同全部消息/步骤数据）。返回是否删除成功：
+     * false = 拒绝或失败——当前活动会话不可删（先新建会话切换走）；
+     * run 不存在 / 数据库错误也返回 false。Kotlin 宿主负责同步删除
+     * 自己的 transcript 文件（Rust 只管数据库行）。
      */
-    fun `listSessions`(): kotlin.String
+    fun `deleteSession`(`runId`: kotlin.String): kotlin.Boolean
+    
+    /**
+     * 历史会话列表（JSON 数组：id/title/status/started_ms/cost_usd）。
+     * 分页：每页 50 条，offset 递增（0、50、100…；首页传 0）。
+     */
+    fun `listSessions`(`offset`: kotlin.UInt): kotlin.String
     
     /**
      * 切换到指定历史会话（成功后回推新 snapshot 事件）。
@@ -1484,14 +1530,36 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 
     
     /**
+     * 删除历史会话（连同全部消息/步骤数据）。返回是否删除成功：
+     * false = 拒绝或失败——当前活动会话不可删（先新建会话切换走）；
+     * run 不存在 / 数据库错误也返回 false。Kotlin 宿主负责同步删除
+     * 自己的 transcript 文件（Rust 只管数据库行）。
+     */override fun `deleteSession`(`runId`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_delete_session(
+        it,
+        
+        FfiConverterString.lower(`runId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * 历史会话列表（JSON 数组：id/title/status/started_ms/cost_usd）。
-     */override fun `listSessions`(): kotlin.String {
+     * 分页：每页 50 条，offset 递增（0、50、100…；首页传 0）。
+     */override fun `listSessions`(`offset`: kotlin.UInt): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_list_sessions(
         it,
-        _status)
+        
+        FfiConverterUInt.lower(`offset`),_status)
 }
     }
     )
@@ -1910,4 +1978,22 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         }
     }
 }
+        /**
+         * 注入 MCP host 鉴权 token（进程级，对所有 HTTP MCP server 生效：
+         * 请求头加 `Authorization: Bearer <token>`，toml 不必持久化 token）。
+         *
+         * **必须在 `create` 之前调用**——MCP 连接在装配期建立，之后注入不
+         * 影响已建连接。namespace 级函数（非对象方法）：它配置的是进程而非
+         * 某个 runtime 实例。
+         */ fun `setMcpHostToken`(`token`: kotlin.String)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_func_set_mcp_host_token(
+    
+        
+        FfiConverterString.lower(`token`),_status)
+}
+    
+    
+
 

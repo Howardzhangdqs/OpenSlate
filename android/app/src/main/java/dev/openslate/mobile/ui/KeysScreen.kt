@@ -30,6 +30,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,6 +41,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.openslate.mobile.bridge.RuntimeBridge
+import kotlinx.coroutines.launch
 
 /**
  * API Key 统一管理页：所有 Provider 的密钥状态一览，点击任一条设置/更新密钥。
@@ -50,15 +52,19 @@ import dev.openslate.mobile.bridge.RuntimeBridge
 fun KeysScreen(onBack: () -> Unit) {
     val state by RuntimeBridge.state.collectAsState()
     val config = state.config
+    val scope = rememberCoroutineScope()
     // 批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，主线程调用会卡帧。
-    var keyStatus by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    // 三态：区分「未配置」与「密文在但解密失败（需重新录入）」。
+    var keyStatus by remember { mutableStateOf<Map<String, RuntimeBridge.KeyPresence>>(emptyMap()) }
     LaunchedEffect(config.providers) {
         val providers = config.providers
         keyStatus = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            providers.associate { it.name to RuntimeBridge.hasPersistedKey(it.name) }
+            providers.associate { it.name to RuntimeBridge.keyPresence(it.name) }
         }
     }
     var editing by remember { mutableStateOf<String?>(null) }
+    // 保存失败的 provider（加密持久化异常时弹窗提示，不置已配置）。
+    var saveFailedFor by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         topBar = {
@@ -98,19 +104,21 @@ fun KeysScreen(onBack: () -> Unit) {
                             Text(p.displayName, style = MaterialTheme.typography.titleSmall)
                             Text(
                                 when (hasKey) {
-                                    true -> "已配置 · 点击更换"
-                                    false -> "未配置 · 点击添加"
+                                    RuntimeBridge.KeyPresence.CONFIGURED -> "已配置 · 点击更换"
+                                    RuntimeBridge.KeyPresence.MISSING -> "未配置 · 点击添加"
+                                    RuntimeBridge.KeyPresence.DECRYPT_FAILED -> "密钥解密失败 · 点击重新录入"
                                     null -> "检查中…"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = when (hasKey) {
-                                    true -> MaterialTheme.colorScheme.primary
-                                    false -> MaterialTheme.colorScheme.error
+                                    RuntimeBridge.KeyPresence.CONFIGURED -> MaterialTheme.colorScheme.primary
+                                    RuntimeBridge.KeyPresence.MISSING -> MaterialTheme.colorScheme.error
+                                    RuntimeBridge.KeyPresence.DECRYPT_FAILED -> MaterialTheme.colorScheme.error
                                     null -> MaterialTheme.colorScheme.outline
                                 },
                             )
                         }
-                        if (hasKey == true) {
+                        if (hasKey == RuntimeBridge.KeyPresence.CONFIGURED) {
                             Icon(
                                 Icons.Filled.Check,
                                 contentDescription = "已存",
@@ -129,9 +137,36 @@ fun KeysScreen(onBack: () -> Unit) {
             display = config.providers.find { it.name == name }?.displayName ?: name,
             onDismiss = { editing = null },
             onSave = { key ->
-                RuntimeBridge.setApiKeyAndPersist(name, key)
-                keyStatus = keyStatus + (name to true)
-                editing = null
+                // 密钥保存链路（Keystore IPC + FFI 注入）离主线程；完成后再回主线程更新 UI。
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val ok = RuntimeBridge.setApiKeyAndPersist(name, key)
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        if (ok) {
+                            keyStatus = keyStatus + (name to RuntimeBridge.KeyPresence.CONFIGURED)
+                            editing = null
+                        } else {
+                            // 持久化失败：不置已配置，弹窗提示，输入框保留可重试。
+                            saveFailedFor = name
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    saveFailedFor?.let { name ->
+        AlertDialog(
+            onDismissRequest = { saveFailedFor = null },
+            title = { Text("密钥保存失败") },
+            text = {
+                Text(
+                    "「${config.providers.find { it.name == name }?.displayName ?: name}」的密钥" +
+                        "已注入本次运行，但加密持久化失败（Keystore 写入异常），下次启动将丢失。" +
+                        "请重试；若持续失败请检查设备安全硬件后重启应用。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { saveFailedFor = null }) { Text("知道了") }
             },
         )
     }

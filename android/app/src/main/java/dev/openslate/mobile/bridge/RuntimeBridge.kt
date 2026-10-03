@@ -2,8 +2,10 @@ package dev.openslate.mobile.bridge
 
 import android.content.Context
 import android.util.Log
+import dev.openslate.mobile.BuildConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -129,6 +131,9 @@ object RuntimeBridge {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val eventChannel = Channel<String>(Channel.UNLIMITED)
 
+    /** 当前事件消费协程（单例泵：start 前取消旧泵，避免 shutdown→start 后双消费者竞态）。 */
+    private var pumpJob: Job? = null
+
     private val _state = MutableStateFlow(RuntimeUiState())
     val state: StateFlow<RuntimeUiState> = _state.asStateFlow()
 
@@ -172,6 +177,13 @@ object RuntimeBridge {
                 val cacheDir = appContext.cacheDir.resolve("openslate").absolutePath
                 Log.i(TAG, "start: creating runtime (config=$configDir)")
                 try {
+                    // MCP host token 必须在 create 之前注入：Rust 侧在装配期
+                    // 建立 MCP 连接，运行时注入 Authorization（token 不落
+                    // openslate.toml，持久化仅走 SecretStore 加密）。
+                    // token() 可能触发 SecretStore 轮换写（首次/解密失败），
+                    // 此处已在 IO 线程，安全。
+                    val mcpToken = McpHostManager.token(appContext)
+                    uniffi.openslate.mobile.setMcpHostToken(mcpToken)
                     val runtime = OpenSlateRuntime.create(
                         paths = MobilePathsDto(
                             configDir = configDir,
@@ -184,29 +196,47 @@ object RuntimeBridge {
                     runtimeRef.set(runtime)
                     this@RuntimeBridge.appContext = appContext
                     Log.i(TAG, "start: runtime created ✓ (native=${runtime.uniffiIsDestroyed.not()})")
-                    // 重注入持久化密钥（Keystore → FFI 内存）。
+                    // 重注入持久化密钥（Keystore → FFI 内存）；解密失败的
+                    // provider 显式告警（UI 侧密钥管理页会显示"解密失败，
+                    // 请重新录入"，此处不静默混作未配置）。
                     for (p in SecretStore.allProviders(appContext)) {
-                        SecretStore.load(appContext, p)?.let { k ->
-                            runtime.setApiKey(p, k)
-                            Log.i(TAG, "start: restored api key for provider=$p")
+                        when (val r = SecretStore.load(appContext, p)) {
+                            is SecretStore.KeyLoadResult.Ok -> {
+                                runtime.setApiKey(p, r.value)
+                                Log.i(TAG, "start: restored api key for provider=$p")
+                            }
+                            is SecretStore.KeyLoadResult.Failed -> Log.w(
+                                TAG,
+                                "start: api key decrypt FAILED for provider=$p" +
+                                    " (${r.error?.message ?: r.error?.javaClass?.simpleName}), 需重新录入",
+                            )
+                            SecretStore.KeyLoadResult.Missing -> Unit
                         }
                     }
                     restoreHttpProxy()
                     restoreExecBackend()
+                    restoreModelAlias()
                 } catch (e: Throwable) {
                     Log.e(TAG, "start: runtime create FAILED", e)
                     _state.value = _state.value.copy(ready = false, lastError = e.message ?: e.javaClass.simpleName)
                     started = false
                     return@withContext
                 }
-                // 事件消费协程（start 后常驻）。
-                scope.launch {
+                // 事件消费协程（start 后常驻）。先取消旧泵：同进程
+                // shutdown→start 后 Channel 里可能残留旧消费者，双消费者
+                // 会竞态分走事件、打破"单消费保序"假设。
+                pumpJob?.cancel()
+                pumpJob = scope.launch {
                     Log.i(TAG, "event pump: started")
                     var n = 0
                     for (event in eventChannel) {
                         n++
                         if (n <= 20 || n % 100 == 0) {
-                            Log.d(TAG, "event #$n: ${event.take(160)}")
+                            // 内容型日志（事件可含对话/工具参数）仅 debug，
+                            // release 不剥离 logcat，防泄漏。
+                            if (BuildConfig.DEBUG) {
+                                Log.d(TAG, "event #$n: ${event.take(160)}")
+                            }
                         }
                         try {
                             handleEvent(event)
@@ -241,10 +271,12 @@ object RuntimeBridge {
         runtimeRef.get()?.setApiKey(provider, value)
     }
 
-    /** 设置页入口：注入内存 + Keystore 加密持久化。 */
-    fun setApiKeyAndPersist(provider: String, value: String) {
+    /** 设置页入口：注入内存 + Keystore 加密持久化。返回 false = 持久化失败
+     *  （内存注入仍完成，本回合可用但重启丢失），调用方不得置「已配置」。 */
+    fun setApiKeyAndPersist(provider: String, value: String): Boolean {
         setApiKey(provider, value)
-        appContext?.let { SecretStore.save(it, provider, value) }
+        val ctx = appContext ?: return false
+        return SecretStore.save(ctx, provider, value)
     }
 
     // ── bash 工具执行后端（native shell.run / termux）──────────────
@@ -253,14 +285,14 @@ object RuntimeBridge {
 
     /** 当前 bash 后端多选（CSV："native" / "termux" / "native,termux"）。 */
     fun execBackends(): String =
-        appContext?.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
             ?.getString(PREF_EXEC_BACKEND, "native") ?: "native"
 
     /** 切换 bash 后端多选：FFI 热切换 + 本地持久化（重启恢复）。
      *  命名规则（Rust 侧）：单选 → `bash`；双选 → `bash`=native + `termux_bash`。 */
     fun setExecBackendsAndPersist(backends: String) {
         runtimeRef.get()?.setExecBackends(backends)
-        appContext?.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
             ?.edit()?.putString(PREF_EXEC_BACKEND, backends)?.apply()
         Log.i(TAG, "exec backends set to $backends")
     }
@@ -271,18 +303,45 @@ object RuntimeBridge {
         Log.i(TAG, "start: restored exec backends = $backends")
     }
 
+    // ── 模型选择持久化（Rust set_model 仅内存态，重启即回默认；本地
+    //    持久化 + 启动重放，保证用户可感知的模型选择不丢）─────────
+
+    private const val PREF_MODEL_ALIAS = "model_alias"
+
+    /** 当前选中的模型别名（默认 main）。 */
+    fun modelAlias(): String =
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.getString(PREF_MODEL_ALIAS, "main") ?: "main"
+
+    /** 切换模型：FFI 热切换 + 本地持久化（重启重放）。 */
+    fun setModelAliasAndPersist(alias: String) {
+        setModelAlias(alias)
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.edit()?.putString(PREF_MODEL_ALIAS, alias)?.apply()
+        Log.i(TAG, "model alias set to $alias")
+    }
+
+    /** 启动重放：恢复用户上次选择的模型（仅非默认时发送）。 */
+    private fun restoreModelAlias() {
+        val alias = modelAlias()
+        if (alias != "main") {
+            setModelAlias(alias)
+            Log.i(TAG, "start: restored model alias = $alias")
+        }
+    }
+
     // ── HTTP 代理（受限网络出站；经 adb reverse 共享电脑侧代理）──
 
     fun setHttpProxy(url: String, persist: Boolean = true) {
         runtimeRef.get()?.setHttpProxy(url)
         if (persist) {
-            appContext?.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
+            appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
                 ?.edit()?.putString("http_proxy", url)?.apply()
         }
     }
 
     private fun restoreHttpProxy() {
-        val url = appContext?.getSharedPreferences("openslate_prefs", Context.MODE_PRIVATE)
+        val url = appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
             ?.getString("http_proxy", "") ?: ""
         if (url.isNotBlank()) {
             runtimeRef.get()?.setHttpProxy(url)
@@ -290,8 +349,17 @@ object RuntimeBridge {
         }
     }
 
-    fun hasPersistedKey(provider: String): Boolean =
-        appContext?.let { SecretStore.load(it, provider) != null } ?: false
+    /** 密钥三态（UI 展示用）：区分「未配置」与「密文在但解不开」。 */
+    enum class KeyPresence { CONFIGURED, MISSING, DECRYPT_FAILED }
+
+    fun keyPresence(provider: String): KeyPresence {
+        val ctx = appContext ?: return KeyPresence.MISSING
+        return when (SecretStore.load(ctx, provider)) {
+            is SecretStore.KeyLoadResult.Ok -> KeyPresence.CONFIGURED
+            SecretStore.KeyLoadResult.Missing -> KeyPresence.MISSING
+            is SecretStore.KeyLoadResult.Failed -> KeyPresence.DECRYPT_FAILED
+        }
+    }
 
     // ── 配置 CRUD（协议复用：persist 层落盘 → config_changed 刷新 UI）──
 
@@ -356,13 +424,14 @@ object RuntimeBridge {
         JSONObject().put("type", "set_model").put("alias", alias).toString()
     )
 
-    /** 注册/更新 MCP server（http 条目；重启会话后生效——MCP 无热更设计）。 */
-    fun upsertMcpServer(name: String, url: String, headers: Map<String, String>? = null) = sendJson(
+    /** 注册/更新 MCP server（http 条目；重启会话后生效——MCP 无热更设计）。
+     *  Authorization 不经此传入：token 由 start() 在 create 前经
+     *  setMcpHostToken() 运行时注入（SecretStore 加密持久化，不落 toml）。 */
+    fun upsertMcpServer(name: String, url: String) = sendJson(
         JSONObject()
             .put("type", "upsert_mcp_server")
             .put("name", name)
             .put("url", url)
-            .apply { headers?.let { put("headers", JSONObject(it)) } }
             .toString()
     )
 
@@ -373,7 +442,10 @@ object RuntimeBridge {
 
     fun sendJson(json: String): Boolean {
         val runtime = runtimeRef.get() ?: run {
-            Log.w(TAG, "send: runtime not ready, dropping: ${json.take(80)}")
+            // 内容型日志（json 可含用户消息）仅 debug，release 不剥离 logcat。
+            if (BuildConfig.DEBUG) {
+                Log.w(TAG, "send: runtime not ready, dropping: ${json.take(80)}")
+            }
             return false
         }
         return try {
@@ -392,6 +464,9 @@ object RuntimeBridge {
                 runCatching { it.shutdown() }.onFailure { t -> Log.w(TAG, "shutdown: ${t.message}") }
             }
             started = false
+            // 关停时取消事件泵（下次 start 会重建），防旧泵滞留消费。
+            pumpJob?.cancel()
+            pumpJob = null
             TermuxExec.cancelAll()
             _state.value = RuntimeUiState()
         }
@@ -759,10 +834,11 @@ object RuntimeBridge {
 
     // ── 历史会话 ─────────────────────────────────────────────
 
-    fun listSessions(): List<SessionSummaryUi> {
+    /** 拉取历史会话列表（分页：每页 50 条，offset 递增）。 */
+    fun listSessions(offset: Int = 0): List<SessionSummaryUi> {
         val runtime = runtimeRef.get() ?: return emptyList()
         return runCatching {
-            val arr = org.json.JSONArray(runtime.listSessions())
+            val arr = org.json.JSONArray(runtime.listSessions(offset.toUInt()))
             buildList {
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
@@ -787,6 +863,23 @@ object RuntimeBridge {
         }.isSuccess
     }
 
+    /** 当前活动会话 id（UI 用于禁删活动会话）。 */
+    fun currentRunId(): String? {
+        val runtime = runtimeRef.get() ?: return null
+        return runCatching { runtime.currentRunId() }.getOrNull()
+    }
+
+    /** 删除历史会话：Rust 侧 DB 级联删除 + 本地 transcript 文件同步清理。
+     *  当前活动会话由 Rust 侧拒绝（返回 false）；两侧都成功才算成功。 */
+    fun deleteSession(id: String): Boolean {
+        val runtime = runtimeRef.get() ?: return false
+        val ok = runCatching { runtime.deleteSession(id) }.onFailure {
+            Log.e(TAG, "deleteSession failed", it)
+        }.getOrDefault(false)
+        if (ok) deleteTranscript(id)
+        return ok
+    }
+
     private inline fun mutate(block: RuntimeUiState.() -> RuntimeUiState) {
         _state.value = block(_state.value)
     }
@@ -796,7 +889,8 @@ object RuntimeBridge {
     private fun transcriptFile(runId: String): java.io.File? =
         appContext?.let { java.io.File(java.io.File(it.filesDir, "transcripts"), "$runId.json") }
 
-    /** turn 结束后落盘当前聊天流（后台线程）。 */
+    /** turn 结束后落盘当前聊天流（后台线程；tmp+rename 原子替换，
+     *  进程中途被杀不留截断 JSON）。 */
     private fun persistTranscriptAsync() {
         val runtime = runtimeRef.get() ?: return
         val runId = runCatching { runtime.currentRunId() }.getOrNull() ?: return
@@ -807,27 +901,80 @@ object RuntimeBridge {
                 f.parentFile?.mkdirs()
                 val arr = org.json.JSONArray()
                 for (e in snapshotEntries) arr.put(entryToJson(e))
-                f.writeText(arr.toString())
+                // 顶层短键风格（对齐条目级 t/x/f…）：n = 条目数（恢复仲裁依据），
+                // e = 条目数组；旧版为裸数组，恢复侧兼容两种格式。
+                val payload = org.json.JSONObject()
+                    .put("n", snapshotEntries.size)
+                    .put("e", arr)
+                atomicWrite(f, payload.toString())
                 Log.d(TAG, "transcript persisted: $runId (${snapshotEntries.size} entries)")
             }.onFailure { Log.w(TAG, "persist transcript failed", it) }
         }
     }
 
-    /** snapshot 到达后，若本地有该 run 的完整 transcript（含思维链）则替换。 */
+    /** 同目录 tmp → rename 原子替换；rename 失败（跨文件系统等）回退
+     *  copyTo+delete，仍失败抛错交由调用方 warn。 */
+    private fun atomicWrite(target: java.io.File, content: String) {
+        val tmp = java.io.File(target.parentFile, target.name + ".tmp")
+        tmp.writeText(content)
+        if (tmp.renameTo(target)) return
+        Log.w(TAG, "atomicWrite: renameTo failed, fallback copy+delete: ${target.name}")
+        try {
+            tmp.copyTo(target, overwrite = true)
+            if (!tmp.delete()) Log.w(TAG, "atomicWrite: tmp cleanup failed: ${tmp.name}")
+        } catch (t: Throwable) {
+            runCatching { tmp.delete() }
+            throw t
+        }
+    }
+
+    /**
+     * snapshot 到达后与本地 transcript 仲裁：仅当本地条目数 **大于** 当前内存
+     * 条目数（applySnapshot 刚写入的 DB 快照）时才用本地版本整体覆盖——本地
+     * 含思维链/⚡meta，通常更丰富；本地更旧（DB 已推进更多对话）则忽略之，
+     * 避免旧文件遮蔽新数据。本函数只被 applySnapshot 末尾调用，比较时两者
+     * 均已可见，无先到后到问题。
+     */
     private fun tryRestoreLocalTranscript() {
         val runtime = runtimeRef.get() ?: return
         val runId = runCatching { runtime.currentRunId() }.getOrNull() ?: return
         val f = transcriptFile(runId) ?: return
         if (!f.exists()) return
         runCatching {
-            val arr = org.json.JSONArray(f.readText())
-            if (arr.length() == 0) return
+            val trimmed = f.readText().trim()
+            // 兼容旧版裸数组格式（无顶层 n）。
+            val (localCount, entriesArr) = if (trimmed.startsWith("[")) {
+                val arr = org.json.JSONArray(trimmed)
+                arr.length() to arr
+            } else {
+                val o = org.json.JSONObject(trimmed)
+                val arr = o.optJSONArray("e") ?: return
+                o.optInt("n", arr.length()) to arr
+            }
+            val memCount = _state.value.entries.size
+            if (localCount <= memCount) {
+                Log.d(
+                    TAG,
+                    "transcript restore skipped: local=$localCount <= snapshot=$memCount" +
+                        "（DB 快照更新或相同，忽略本地文件）",
+                )
+                return
+            }
             val restored = buildList {
-                for (i in 0 until arr.length()) add(entryFromJson(arr.optJSONObject(i) ?: continue))
+                for (i in 0 until entriesArr.length()) add(entryFromJson(entriesArr.optJSONObject(i) ?: continue))
             }
             _state.value = _state.value.copy(entries = restored)
-            Log.i(TAG, "transcript restored: $runId (${restored.size} entries)")
+            Log.i(TAG, "transcript restored: $runId (${restored.size} entries, snapshot had $memCount)")
         }.onFailure { Log.w(TAG, "restore transcript failed", it) }
+    }
+
+    /** 删除指定 run 的本地 transcript（filesDir/transcripts/<runId>.json；
+     *  不存在则忽略）。历史会话删除流程的清理入口——调用接入由后续任务完成。 */
+    fun deleteTranscript(runId: String) {
+        val f = transcriptFile(runId) ?: return
+        runCatching {
+            if (f.exists() && !f.delete()) Log.w(TAG, "deleteTranscript: delete failed for $runId")
+        }.onFailure { Log.w(TAG, "deleteTranscript failed for $runId", it) }
     }
 
     private fun entryToJson(e: UiEntry): org.json.JSONObject {

@@ -28,9 +28,9 @@ object McpHostManager {
 
     const val HOST_PORT = 8765
     const val HOST_URL = "http://127.0.0.1:$HOST_PORT/mcp"
-    private const val PREFS = "openslate_prefs"
-    private const val PREF_TOKEN = "mcp_host_token"
     private const val PREF_SERVERS = "mcp_host_servers"
+    /** SecretStore 中的固定 provider 键（token 加密持久化；不再明文入 prefs）。 */
+    private const val SECRET_KEY_TOKEN = "mcp_host_token"
     private const val ASSET_HOST = "mcp-host-aarch64"
 
     /** UI 发起的 Termux 调用 id 段（host call 的 runtime id 从 0 递增）。 */
@@ -44,15 +44,32 @@ object McpHostManager {
     )
 
     private fun prefs(ctx: Context) =
-        ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        ctx.applicationContext.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
 
-    /** 共享 token：首次生成（随机 hex），同时用于 host 清单与 App 侧连接头。 */
+    /**
+     * 共享 token：首次生成（随机 hex）经 SecretStore 加密持久化，同时用于
+     * host 清单与 App 侧连接头。解密失败（Keystore 密钥变更/密文损坏）视为
+     * 不可用 → 轮换新 token 并覆盖存储（清单每次推送都带当前 token，host
+     * 重启后自愈）。加密持久化失败时本次仅内存生效，重启后同样轮换。
+     */
     fun token(ctx: Context): String = synchronized(this) {
-        prefs(ctx).getString(PREF_TOKEN, null)?.takeIf { it.isNotEmpty() } ?: run {
-            val t = java.util.UUID.randomUUID().toString().replace("-", "") +
-                java.util.UUID.randomUUID().toString().replace("-", "")
-            prefs(ctx).edit().putString(PREF_TOKEN, t).apply()
-            t
+        val appCtx = ctx.applicationContext
+        when (val saved = SecretStore.load(appCtx, SECRET_KEY_TOKEN)) {
+            is SecretStore.KeyLoadResult.Ok -> saved.value
+            else -> {
+                if (saved is SecretStore.KeyLoadResult.Failed) {
+                    android.util.Log.w(
+                        "McpHost",
+                        "token 解密失败，轮换新 token（${saved.error?.message ?: "unknown"}）",
+                    )
+                }
+                val t = java.util.UUID.randomUUID().toString().replace("-", "") +
+                    java.util.UUID.randomUUID().toString().replace("-", "")
+                if (!SecretStore.save(appCtx, SECRET_KEY_TOKEN, t)) {
+                    android.util.Log.w("McpHost", "token 加密持久化失败，仅内存生效（重启后轮换）")
+                }
+                t
+            }
         }
     }
 
@@ -211,6 +228,9 @@ object McpHostManager {
     fun manifestToml(ctx: Context): String {
         val sb = StringBuilder()
         sb.append("bind = \"127.0.0.1:$HOST_PORT\"\n")
+        // token 明文写入 Termux 侧清单（保持现状）：mcp-host 是校验方，其
+        // home 目录本就是该 token 的信任边界，属于不同信任域，App 侧加密
+        // 对它无意义；App 侧的存取已改走 SecretStore（见 token()）。
         sb.append("token = \"${token(ctx)}\"\n")
         for (s in loadServers(ctx)) {
             val alias = s.alias.ifBlank { "srv" }.replace(Regex("[^A-Za-z0-9_-]"), "_")
@@ -273,8 +293,4 @@ object McpHostManager {
             )
         }
     }
-
-    /** App 侧 openslate.toml 的 [mcp.servers.termux] 连接头。 */
-    fun authHeaders(ctx: Context): Map<String, String> =
-        mapOf("Authorization" to "Bearer ${token(ctx)}")
 }

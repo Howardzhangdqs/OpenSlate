@@ -1,5 +1,7 @@
 package dev.openslate.mobile.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -10,6 +12,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -17,8 +20,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,29 +33,54 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.SessionSummaryUi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+private const val PAGE_SIZE = 50
+
 /**
- * 历史会话页：列出数据库中的 runs（最近 50 条），点击切换续聊。
+ * 历史会话页：分页列出数据库中的 runs（每页 50 条），点击切换续聊，
+ * 长按删除非活动会话（DB 记录 + 本地 transcript 一并清理）。
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     var sessions by remember { mutableStateOf<List<SessionSummaryUi>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
+    var loadError by remember { mutableStateOf(false) }
+    var canLoadMore by remember { mutableStateOf(false) }
+    var loadingMore by remember { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<SessionSummaryUi?>(null) }
+    var activeRunId by remember { mutableStateOf<String?>(null) }
 
-    // 加载（FFI 同步调用，轻量查询走后台线程足够快，这里简单阻塞一帧内）。
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        // FFI 阻塞查询（50 runs × 消息摘要）必须离主线程。
-        sessions = kotlinx.coroutines.withTimeoutOrNull(3000) {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                RuntimeBridge.listSessions()
+    fun refresh() {
+        scope.launch {
+            loading = true
+            val page = withTimeoutOrNull(3000) {
+                withContext(Dispatchers.IO) { RuntimeBridge.listSessions(0) }
             }
-        } ?: emptyList()
-        loading = false
+            if (page == null) {
+                // 超时/失败：显式错误态 + 重试，不静默伪装成"无历史"。
+                loadError = true
+                sessions = emptyList()
+                canLoadMore = false
+            } else {
+                loadError = false
+                sessions = page
+                canLoadMore = page.size >= PAGE_SIZE
+            }
+            activeRunId = withContext(Dispatchers.IO) { RuntimeBridge.currentRunId() }
+            loading = false
+        }
     }
+
+    LaunchedEffect(Unit) { refresh() }
 
     val fmt = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
 
@@ -70,6 +100,13 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
             Column(Modifier.padding(padding).padding(16.dp)) { Text("加载中…") }
             return@Scaffold
         }
+        if (loadError) {
+            Column(Modifier.padding(padding).padding(16.dp)) {
+                Text("加载失败（运行时未就绪或查询超时）", color = MaterialTheme.colorScheme.error)
+                TextButton(onClick = { refresh() }) { Text("重试") }
+            }
+            return@Scaffold
+        }
         LazyColumn(
             Modifier.fillMaxSize().padding(padding),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(
@@ -79,10 +116,22 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
         ) {
             items(sessions, key = { it.id }) { s ->
                 Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = {
-                        if (RuntimeBridge.openSession(s.id)) onOpened()
-                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            onClick = {
+                                // openSession 是同步 FFI 调用（DB 读取 + 会话装配），
+                                // 移出主线程；成功后再回主线程回调导航。
+                                scope.launch(Dispatchers.IO) {
+                                    val ok = RuntimeBridge.openSession(s.id)
+                                    withContext(Dispatchers.Main) {
+                                        if (ok) onOpened()
+                                    }
+                                }
+                            },
+                            // 活动会话由 Rust 侧拒绝删除；长按仅对非活动会话弹确认。
+                            onLongClick = { if (s.id != activeRunId) pendingDelete = s },
+                        ),
                 ) {
                     Row(
                         Modifier.padding(12.dp),
@@ -102,7 +151,7 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
                             )
                         }
                         Text(
-                            if (s.status == "running") "●" else "",
+                            if (s.id == activeRunId) "●" else "",
                             color = MaterialTheme.colorScheme.primary,
                         )
                     }
@@ -111,7 +160,70 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
             if (sessions.isEmpty()) {
                 item { Text("（还没有历史会话）", color = MaterialTheme.colorScheme.outline) }
             }
+            if (canLoadMore) {
+                item {
+                    TextButton(
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !loadingMore,
+                        onClick = {
+                            scope.launch {
+                                loadingMore = true
+                                val page = withTimeoutOrNull(5000) {
+                                    withContext(Dispatchers.IO) {
+                                        RuntimeBridge.listSessions(sessions.size)
+                                    }
+                                } ?: emptyList()
+                                sessions = sessions + page
+                                canLoadMore = page.size >= PAGE_SIZE
+                                loadingMore = false
+                            }
+                        },
+                    ) {
+                        Text(if (loadingMore) "加载中…" else "加载更多")
+                    }
+                }
+            }
+            if (sessions.isNotEmpty()) {
+                item {
+                    Text(
+                        "长按会话可删除（活动会话除外）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+            }
         }
+    }
+
+    // 删除确认：DB 级联删除 + 本地 transcript 清理，不可恢复，需显式确认。
+    pendingDelete?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除会话") },
+            text = {
+                Text("确定删除「${target.title.ifBlank { "(无标题)" }}」？对话记录与本地备份将一并删除，不可恢复。")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingDelete = null
+                        scope.launch {
+                            // deleteSession 内含 FFI 同步 DB 删除，离主线程执行；
+                            // 无论成败都刷新列表（反映真实状态，失败项仍保留）。
+                            withContext(Dispatchers.IO) { RuntimeBridge.deleteSession(target.id) }
+                            refresh()
+                        }
+                    },
+                ) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+            },
+        )
     }
 }
 

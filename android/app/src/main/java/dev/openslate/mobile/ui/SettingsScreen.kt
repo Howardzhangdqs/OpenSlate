@@ -98,6 +98,7 @@ import dev.openslate.mobile.bridge.RuntimeBridge
 fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
     val state by RuntimeBridge.state.collectAsState()
     val config = state.config
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     var editProvider by remember { mutableStateOf<ProviderUi?>(null) }
     var editProviderIsNew by remember { mutableStateOf(false) }
@@ -108,13 +109,16 @@ fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
 
     // API key 存在性批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，
     // 单次 5~50ms；此前在 provider 行组合期同步查、每次重组都查 → 进设置页必卡一帧。
-    var keyStatus by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    // 三态：区分「未配置」与「密文在但解密失败（需重新录入）」。
+    var keyStatus by remember { mutableStateOf<Map<String, RuntimeBridge.KeyPresence>>(emptyMap()) }
     androidx.compose.runtime.LaunchedEffect(config.providers) {
         val providers = config.providers
         keyStatus = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            providers.associate { it.name to RuntimeBridge.hasPersistedKey(it.name) }
+            providers.associate { it.name to RuntimeBridge.keyPresence(it.name) }
         }
     }
+    // 密钥持久化失败的 provider id（加密写入异常时弹窗提示，不置已配置）。
+    var keySaveError by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         topBar = {
@@ -180,7 +184,7 @@ fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
                             SlidingSegmentedControl(
                                 options = aliasChoices,
                                 selected = state.modelAlias,
-                                onSelect = { RuntimeBridge.setModelAlias(it) },
+                                onSelect = { RuntimeBridge.setModelAliasAndPersist(it) },
                             )
                         }
                         Section(title = "级别绑定（main = 对话主力 / fast = 摘要压缩）") {
@@ -258,7 +262,7 @@ fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
                                             // null = 预取进行中（避免先闪"未配置"再变"已存"）。
                                             val hasKey = keyStatus[p.name]
                                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                                if (hasKey == true) {
+                                                if (hasKey == RuntimeBridge.KeyPresence.CONFIGURED) {
                                                     Icon(
                                                         imageVector = Icons.Filled.Check,
                                                         contentDescription = "已存",
@@ -268,14 +272,16 @@ fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
                                                 }
                                                 Text(
                                                     when (hasKey) {
-                                                        true -> "  密钥已配置"
-                                                        false -> "密钥未配置"
+                                                        RuntimeBridge.KeyPresence.CONFIGURED -> "  密钥已配置"
+                                                        RuntimeBridge.KeyPresence.MISSING -> "密钥未配置"
+                                                        RuntimeBridge.KeyPresence.DECRYPT_FAILED -> "密钥解密失败，请重新录入"
                                                         null -> "密钥状态检查中…"
                                                     },
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = when (hasKey) {
-                                                        true -> MaterialTheme.colorScheme.primary
-                                                        false -> MaterialTheme.colorScheme.error
+                                                        RuntimeBridge.KeyPresence.CONFIGURED -> MaterialTheme.colorScheme.primary
+                                                        RuntimeBridge.KeyPresence.MISSING -> MaterialTheme.colorScheme.error
+                                                        RuntimeBridge.KeyPresence.DECRYPT_FAILED -> MaterialTheme.colorScheme.error
                                                         null -> MaterialTheme.colorScheme.outline
                                                     },
                                                 )
@@ -305,17 +311,45 @@ fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
         EditProviderDialog(
             initial = p,
             isNew = editProviderIsNew,
-            initialHasKey = keyStatus[p.name] == true,
+            initialHasKey = keyStatus[p.name] == RuntimeBridge.KeyPresence.CONFIGURED,
             existingIds = config.providers.map { it.name }.toSet(),
             onDismiss = { editProvider = null },
             onSave = { id, title, baseUrl, env, adapter, apiKey ->
                 RuntimeBridge.upsertProvider(id, baseUrl, env, adapter, title)
                 // 编辑时原地填写的 Key：直接落 Keystore（按内部 ID 关联）。
-                if (apiKey != null) {
-                    RuntimeBridge.setApiKeyAndPersist(id, apiKey!!)
-                    keyStatus = keyStatus + (id to true)
+                // 保存链路（Keystore IPC + FFI 注入）离主线程，完成后再回填 UI；
+                // 失败不置已配置，改由 keySaveError 弹窗提示。
+                val k = apiKey
+                if (k != null) {
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        val ok = RuntimeBridge.setApiKeyAndPersist(id, k)
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            if (ok) {
+                                keyStatus = keyStatus + (id to RuntimeBridge.KeyPresence.CONFIGURED)
+                            } else {
+                                keySaveError = id
+                            }
+                        }
+                    }
                 }
                 editProvider = null
+            },
+        )
+    }
+
+    keySaveError?.let { id ->
+        AlertDialog(
+            onDismissRequest = { keySaveError = null },
+            title = { Text("密钥保存失败") },
+            text = {
+                Text(
+                    "「${config.providers.find { it.name == id }?.displayName ?: id}」的密钥" +
+                        "已注入本次运行，但加密持久化失败（Keystore 写入异常），下次启动将丢失。" +
+                        "请到 API 密钥管理页重新保存；若持续失败请检查设备安全硬件后重启应用。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { keySaveError = null }) { Text("知道了") }
             },
         )
     }
@@ -961,10 +995,15 @@ private fun McpStatusLine(ok: Boolean, text: String) {
 private fun ExecBackendSection() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
-    var backends by remember {
-        mutableStateOf(RuntimeBridge.execBackends())
+    // prefs 读取预取到 IO 线程（组合期同步读盘会卡帧）；null = 加载中。
+    var backends by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        backends = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            RuntimeBridge.execBackends()
+        }
     }
-    fun isEnabled(name: String) = backends.split(',').map { it.trim() }.contains(name)
+    fun isEnabled(name: String) =
+        backends?.split(',')?.map { it.trim() }?.contains(name) == true
     /** 允许全不选（bash 功能整体下线）；空集持久化为空串。 */
     fun setEnabled(name: String, on: Boolean) {
         val set = linkedSetOf<String>()
@@ -973,8 +1012,11 @@ private fun ExecBackendSection() {
         if (name == "native" && !on) set.remove("native")
         if (name == "termux" && !on) set.remove("termux")
         val csv = set.joinToString(",")
-        RuntimeBridge.setExecBackendsAndPersist(csv)
-        backends = csv
+        // 写操作（FFI 热切换 + prefs 落盘）包 IO 协程；完成后回主线程更新 UI。
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            RuntimeBridge.setExecBackendsAndPersist(csv)
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { backends = csv }
+        }
     }
     val noneSelected = !isEnabled("native") && !isEnabled("termux")
     var hasPerm by remember {
@@ -996,94 +1038,99 @@ private fun ExecBackendSection() {
     }
 
     Section(title = "bash 工具执行后端（可多选）") {
-        CheckboxRow(
-            label = "native — Android 自带系统 shell（toybox 子集，零依赖零授权）",
-            checked = isEnabled("native"),
-            onChange = { setEnabled("native", it) },
-        )
-        CheckboxRow(
-            label = "termux — Termux 完整 Linux 环境（apt/python/…）",
-            checked = isEnabled("termux"),
-            onChange = { setEnabled("termux", it) },
-        )
-        when {
-            noneSelected -> Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Outlined.Warning,
-                    contentDescription = "警告",
-                    tint = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.height(14.dp).width(14.dp),
+        if (backends == null) {
+            // 预取进行中：占位一行，避免加载间隙闪"未选择任何后端"红色告警。
+            Text("加载中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+        } else {
+            CheckboxRow(
+                label = "native — Android 自带系统 shell（toybox 子集，零依赖零授权）",
+                checked = isEnabled("native"),
+                onChange = { setEnabled("native", it) },
+            )
+            CheckboxRow(
+                label = "termux — Termux 完整 Linux 环境（apt/python/…）",
+                checked = isEnabled("termux"),
+                onChange = { setEnabled("termux", it) },
+            )
+            when {
+                noneSelected -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Outlined.Warning,
+                        contentDescription = "警告",
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.height(14.dp).width(14.dp),
+                    )
+                    Text(
+                        "  未选择任何后端：模型将没有 bash 工具，无法执行任何命令。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                isEnabled("native") && isEnabled("termux") -> Text(
+                    "已多选：native 工具名为 bash，Termux 工具名为 termux_bash。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+                isEnabled("termux") -> Text(
+                    "仅 termux：工具名为 bash（Termux 后端）。完整环境需在 " +
+                        "~/.termux/termux.properties 设置 allow-external-apps=true。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+                else -> Text(
+                    "仅 native：工具名为 bash，零依赖、零授权，无需 Termux。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+
+            if (isEnabled("termux")) {
+                val installed = dev.openslate.mobile.bridge.TermuxExec.isTermuxInstalled(context)
+                Text(
+                    if (installed) "Termux：已安装" else "Termux：未安装（请先安装 Termux）",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
                 )
                 Text(
-                    "  未选择任何后端：模型将没有 bash 工具，无法执行任何命令。",
+                    if (hasPerm) "RUN_COMMAND 权限：已授予" else "RUN_COMMAND 权限：未授予",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
+                    color = MaterialTheme.colorScheme.outline,
                 )
-            }
-            isEnabled("native") && isEnabled("termux") -> Text(
-                "已多选：native 工具名为 bash，Termux 工具名为 termux_bash。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-            isEnabled("termux") -> Text(
-                "仅 termux：工具名为 bash（Termux 后端）。完整环境需在 " +
-                    "~/.termux/termux.properties 设置 allow-external-apps=true。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-            else -> Text(
-                "仅 native：工具名为 bash，零依赖、零授权，无需 Termux。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-        }
-
-        if (isEnabled("termux")) {
-            val installed = dev.openslate.mobile.bridge.TermuxExec.isTermuxInstalled(context)
-            Text(
-                if (installed) "Termux：已安装" else "Termux：未安装（请先安装 Termux）",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-            Text(
-                if (hasPerm) "RUN_COMMAND 权限：已授予" else "RUN_COMMAND 权限：未授予",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (!hasPerm) {
-                    CompactButton(text = "申请权限", onClick = {
-                        val activity = context as? android.app.Activity
-                        if (activity != null) {
-                            activity.requestPermissions(
-                                arrayOf(dev.openslate.mobile.bridge.TermuxExec.RUN_COMMAND_PERMISSION),
-                                1002,
-                            )
-                        } else {
-                            openOwnAppSettings(context)
-                        }
-                    })
-                    CompactButton(text = "打开应用设置", onClick = { openOwnAppSettings(context) })
-                    CompactButton(text = "申请 Shizuku 授权", onClick = {
-                        dev.openslate.mobile.bridge.ShizukuGrant.requestShizukuPermission()
-                    })
-                    CompactButton(text = "Shizuku 一键授权", enabled = !granting, onClick = {
-                        granting = true
-                        grantMsg = null
-                        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                            val err = dev.openslate.mobile.bridge.ShizukuGrant
-                                .grantTermuxPermission(context)
-                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                granting = false
-                                hasPerm = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context)
-                                grantMsg = err ?: "授权成功"
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!hasPerm) {
+                        CompactButton(text = "申请权限", onClick = {
+                            val activity = context as? android.app.Activity
+                            if (activity != null) {
+                                activity.requestPermissions(
+                                    arrayOf(dev.openslate.mobile.bridge.TermuxExec.RUN_COMMAND_PERMISSION),
+                                    1002,
+                                )
+                            } else {
+                                openOwnAppSettings(context)
                             }
-                        }
-                    })
+                        })
+                        CompactButton(text = "打开应用设置", onClick = { openOwnAppSettings(context) })
+                        CompactButton(text = "申请 Shizuku 授权", onClick = {
+                            dev.openslate.mobile.bridge.ShizukuGrant.requestShizukuPermission()
+                        })
+                        CompactButton(text = "Shizuku 一键授权", enabled = !granting, onClick = {
+                            granting = true
+                            grantMsg = null
+                            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                val err = dev.openslate.mobile.bridge.ShizukuGrant
+                                    .grantTermuxPermission(context)
+                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                    granting = false
+                                    hasPerm = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context)
+                                    grantMsg = err ?: "授权成功"
+                                }
+                            }
+                        })
+                    }
                 }
-            }
-            grantMsg?.let {
-                Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                grantMsg?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                }
             }
         }
     }
@@ -1113,7 +1160,13 @@ private fun McpSection() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     var status by remember { mutableStateOf(McpStatus()) }
-    var servers by remember { mutableStateOf(McpHostManager.loadServers(context)) }
+    // server 清单（prefs JSON）预取到 IO 线程，避免组合期主线程读盘。
+    var servers by remember { mutableStateOf<List<McpHostManager.McpServerEntry>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        servers = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            McpHostManager.loadServers(context)
+        }
+    }
     var installLog by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var editServer by remember { mutableStateOf<Pair<String, String>?>(null) } // alias to command
@@ -1144,9 +1197,7 @@ private fun McpSection() {
                     McpHostManager.pushManifest(context)
                     McpHostManager.restartHost(context)
                 }
-                RuntimeBridge.upsertMcpServer(
-                    "termux", McpHostManager.HOST_URL, McpHostManager.authHeaders(context),
-                )
+                RuntimeBridge.upsertMcpServer("termux", McpHostManager.HOST_URL)
             }.fold(
                 onSuccess = { installLog = "已更新（新工具重启会话后生效）" },
                 onFailure = { installLog = "失败：${it.message}" },
@@ -1251,9 +1302,7 @@ private fun McpSection() {
                         runCatching { McpHostManager.installHost(context) { installLog = it } }
                             .onSuccess { msg ->
                                 installLog = msg
-                                RuntimeBridge.upsertMcpServer(
-                                    "termux", McpHostManager.HOST_URL, McpHostManager.authHeaders(context),
-                                )
+                                RuntimeBridge.upsertMcpServer("termux", McpHostManager.HOST_URL)
                             }
                             .onFailure { installLog = "失败：${it.message}" }
                         busy = false

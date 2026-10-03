@@ -9,7 +9,8 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO/android"
-timeout 900 ./gradlew :app:assembleDebug --console=plain 2>&1 | tr '\r' '\n' | grep -aE "BUILD|FAILURE|e: " || true
+# pipefail：gradle 失败时管道整体非零 → 直接中止，绝不能把旧 APK 装到设备上。
+timeout 900 ./gradlew :app:assembleDebug --console=plain 2>&1 | tr '\r' '\n' | grep -aE "BUILD|FAILURE|e: " || { echo "BUILD FAILED — abort"; exit 1; }
 APK="$REPO/android/app/build/outputs/apk/debug/app-debug.apk"
 [ -f "$APK" ] || { echo "APK missing"; exit 1; }
 ls -la "$APK"

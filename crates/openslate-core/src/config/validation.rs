@@ -1309,6 +1309,7 @@ path = ""
                 base_url: "https://orphan.example.com".into(),
                 api_key_env: "ORPHAN_KEY".into(),
                 adapter: None,
+                title: None,
                 max_attempts: 3,
                 retry_base_ms: 500,
             },

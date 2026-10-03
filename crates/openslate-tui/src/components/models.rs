@@ -1075,10 +1075,18 @@ impl ModelsComponent {
             return ModelsIntent::None;
         };
 
+        // 编辑既有 provider 时保留原显示名（title）：表单只管 ID/base_url/key，
+        // title 属于展示层，避免桌面端编辑意外清掉移动端设置的显示名。
+        let preserved_title = self
+            .providers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, p)| p.title.clone());
         let cfg = ProviderConfig {
             base_url: base_url.trim().to_owned(),
             api_key_env,
             adapter: (!adapter.trim().is_empty()).then(|| adapter.trim().to_owned()),
+            title: preserved_title,
             max_attempts: 3,
             retry_base_ms: 500,
         };

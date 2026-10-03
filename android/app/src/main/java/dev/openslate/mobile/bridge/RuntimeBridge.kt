@@ -29,6 +29,8 @@ sealed class UiEntry {
         val text: String,
         /** 折叠标签元数据："12.3s · ↑1.2k ↓3.4k"（usage 事件回填）。 */
         var meta: String? = null,
+        /** 本条思维链开始流式输出的时间戳（appendDelta 打点），思考中 chip 实时秒数用。 */
+        val startTs: Long = 0L,
     ) : UiEntry()
     data class Meta(val text: String) : UiEntry()
     data class ToolCall(
@@ -57,7 +59,12 @@ data class ProviderUi(
     val baseUrl: String,
     val apiKeyEnv: String,
     val adapter: String?,
-)
+    /** 人类可读显示名（中文/空格/大小写均可）；null = 显示 name（内部 ID）。 */
+    val title: String? = null,
+) {
+    /** UI 展示用：优先显示名，无则回退内部 ID。 */
+    val displayName: String get() = title?.takeIf { it.isNotBlank() } ?: name
+}
 
 data class ModelUi(
     val entry: String,
@@ -91,6 +98,9 @@ data class RuntimeUiState(
     /** 进度：当前 step / 本回合工具调用数。 */
     val step: Int = 0,
     val toolCalls: Int = 0,
+    /** 请求已发出但尚未收到任何首个 token（reasoning/content/tool）：
+     *  期间若模型支持思维链则显示"思考中"，TTFT 等待计入思考时长。 */
+    val awaitingFirstToken: Boolean = false,
 )
 
 /**
@@ -285,7 +295,13 @@ object RuntimeBridge {
 
     // ── 配置 CRUD（协议复用：persist 层落盘 → config_changed 刷新 UI）──
 
-    fun upsertProvider(name: String, baseUrl: String, apiKeyEnv: String, adapter: String?) = sendJson(
+    fun upsertProvider(
+        name: String,
+        baseUrl: String,
+        apiKeyEnv: String,
+        adapter: String?,
+        title: String? = null,
+    ) = sendJson(
         JSONObject()
             .put("type", "upsert_provider")
             .put("name", name)
@@ -294,6 +310,7 @@ object RuntimeBridge {
                 JSONObject()
                     .put("base_url", baseUrl)
                     .put("api_key_env", apiKeyEnv)
+                    .apply { title?.let { put("title", it) } }
                     .put("max_attempts", 3)
                     .put("retry_base_ms", 500)
                     .put("adapter", adapter ?: JSONObject.NULL),
@@ -394,6 +411,7 @@ object RuntimeBridge {
                 mutate {
                     copy(
                         toolCalls = toolCalls + 1,
+                        awaitingFirstToken = false,
                         entries = entries + UiEntry.ToolCall(
                             name = name,
                             argsPreview = fullArgs.take(64),
@@ -464,8 +482,8 @@ object RuntimeBridge {
                                 break
                             }
                         }
-                        entries2.add(UiEntry.Meta("⚡ $detail"))
-                        copy(entries = entries2)
+                        entries2.add(UiEntry.Meta(detail))
+                        copy(entries = entries2, awaitingFirstToken = false)
                     }
                 }
             }
@@ -475,12 +493,16 @@ object RuntimeBridge {
                     running = true,
                     step = obj.optInt("step", step),
                     toolCalls = if (turnBegan) 0 else toolCalls,
+                    awaitingFirstToken = true,
                 )
             }.also { stepStartTs = System.currentTimeMillis() }
-            "turn_ok" -> mutate { copy(running = false) }.also { persistTranscriptAsync() }
+            "turn_ok" -> mutate {
+                copy(running = false, awaitingFirstToken = false)
+            }.also { persistTranscriptAsync() }
             "turn_error" -> mutate {
                 copy(
                     running = false,
+                    awaitingFirstToken = false,
                     entries = entries + UiEntry.Meta("⚠ " + obj.optString("message", "error")),
                 )
             }.also { persistTranscriptAsync() }
@@ -522,6 +544,7 @@ object RuntimeBridge {
                         baseUrl = p.optString("base_url"),
                         apiKeyEnv = p.optString("api_key_env"),
                         adapter = if (p.has("adapter") && !p.isNull("adapter")) p.optString("adapter") else null,
+                        title = if (p.has("title") && !p.isNull("title")) p.optString("title") else null,
                     )
                 )
             }
@@ -635,9 +658,25 @@ object RuntimeBridge {
             } else if (!assistant && last is UiEntry.Reasoning) {
                 entries[entries.size - 1] = last.copy(text = last.text + text)
             } else {
-                entries.add(if (assistant) UiEntry.Assistant(text) else UiEntry.Reasoning(text))
+                entries.add(
+                    if (assistant) {
+                        UiEntry.Assistant(text)
+                    } else {
+                        // TTFT 等待期计入思考时长：awaiting 期间新起思维链，
+                        // 计时起点回拨到 request_start（而非首个思考 token）。
+                        UiEntry.Reasoning(
+                            text,
+                            startTs = if (awaitingFirstToken) {
+                                stepStartTs ?: System.currentTimeMillis()
+                            } else {
+                                System.currentTimeMillis()
+                            },
+                        )
+                    }
+                )
             }
-            copy(entries = entries)
+            // 首个 token 已到：思考中 chip 的使命结束。
+            copy(entries = entries, awaitingFirstToken = false)
         }
     }
 

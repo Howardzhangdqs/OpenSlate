@@ -248,6 +248,10 @@ pub struct ProviderDto {
     /// 未配置（按 base_url 猜测的旧行为）。
     #[serde(default)]
     pub adapter: Option<String>,
+    /// 人类可读显示名（中文/空格/大小写均可）；`None` = 显示用键名。
+    /// 键名（`name`）恒为内部 ID：模型引用、env 派生、Keystore 均按 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub max_attempts: u32,
     pub retry_base_ms: u64,
 }
@@ -258,6 +262,7 @@ impl From<&ProviderConfig> for ProviderDto {
             base_url: p.base_url.clone(),
             api_key_env: p.api_key_env.clone(),
             adapter: p.adapter.clone(),
+            title: p.title.clone(),
             max_attempts: p.max_attempts,
             retry_base_ms: p.retry_base_ms,
         }
@@ -270,6 +275,7 @@ impl From<ProviderDto> for ProviderConfig {
             base_url: p.base_url,
             api_key_env: p.api_key_env,
             adapter: p.adapter,
+            title: p.title,
             max_attempts: p.max_attempts,
             retry_base_ms: p.retry_base_ms,
         }

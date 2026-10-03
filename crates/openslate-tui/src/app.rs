@@ -2716,6 +2716,7 @@ fn client_msgs_for_change(change: &ModelsChange) -> (String, Vec<ClientMsg>) {
                     base_url: cfg.base_url.clone(),
                     api_key_env: cfg.api_key_env.clone(),
                     adapter: cfg.adapter.clone(),
+                    title: cfg.title.clone(),
                     max_attempts: cfg.max_attempts,
                     retry_base_ms: cfg.retry_base_ms,
                 },

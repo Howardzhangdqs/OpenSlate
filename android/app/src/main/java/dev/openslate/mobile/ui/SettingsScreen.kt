@@ -1,10 +1,15 @@
 package dev.openslate.mobile.ui
 
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
@@ -40,6 +45,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -47,23 +54,48 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.LocalTextSelectionColors
+import androidx.compose.foundation.text.selection.TextSelectionColors
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.ModelUi
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import dev.openslate.mobile.bridge.ProviderUi
 import dev.openslate.mobile.bridge.RuntimeBridge
 
 /**
- * 模型配置页：提供商 / 模型条目 / 级别绑定 / API key。
+ * 模型配置页：Provider / 模型条目 / 级别绑定 / API key。
  * 全部改动经 ClientMsg CRUD → Rust persist 层落盘 openslate.toml →
  * config_changed 事件回刷（协议复用，与桌面 TUI 同一条写回链）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onBack: () -> Unit) {
+fun SettingsScreen(onBack: () -> Unit, onOpenKeys: () -> Unit) {
     val state by RuntimeBridge.state.collectAsState()
     val config = state.config
 
@@ -71,9 +103,18 @@ fun SettingsScreen(onBack: () -> Unit) {
     var editProviderIsNew by remember { mutableStateOf(false) }
     var editModel by remember { mutableStateOf<ModelUi?>(null) }
     var editModelIsNew by remember { mutableStateOf(false) }
-    var keyProvider by remember { mutableStateOf<String?>(null) }
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
     var toolTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+
+    // API key 存在性批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，
+    // 单次 5~50ms；此前在 provider 行组合期同步查、每次重组都查 → 进设置页必卡一帧。
+    var keyStatus by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    androidx.compose.runtime.LaunchedEffect(config.providers) {
+        val providers = config.providers
+        keyStatus = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            providers.associate { it.name to RuntimeBridge.hasPersistedKey(it.name) }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -82,6 +123,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                },
+                actions = {
+                    // 统一密钥管理页入口（所有 Provider 的 API 密钥一处管理）。
+                    IconButton(onClick = onOpenKeys) {
+                        Icon(Icons.Filled.Key, contentDescription = "API 密钥管理")
                     }
                 },
             )
@@ -94,7 +141,7 @@ fun SettingsScreen(onBack: () -> Unit) {
         ) {
             // ── Tab 栏：每个域独立负责一类设置 ──────────────────
             androidx.compose.material3.TabRow(selectedTabIndex = tab) {
-                val tabs = listOf("会话" to 0, "模型" to 1, "提供商" to 2, "工具" to 3)
+                val tabs = listOf("会话" to 0, "模型" to 1, "Provider" to 2, "工具" to 3)
                 for ((label, idx) in tabs) {
                     androidx.compose.material3.Tab(
                         selected = tab == idx,
@@ -130,8 +177,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         // ── 会话域：当前模型 + 级别绑定 ─────────────
                         Section(title = "当前模型（会话即时切换）") {
                             val aliasChoices = (config.levels.keys + config.models.map { it.entry }).distinct()
-                            ChoiceRow(
-                                label = "使用别名",
+                            SlidingSegmentedControl(
                                 options = aliasChoices,
                                 selected = state.modelAlias,
                                 onSelect = { RuntimeBridge.setModelAlias(it) },
@@ -139,8 +185,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                         Section(title = "级别绑定（main = 对话主力 / fast = 摘要压缩）") {
                             for (level in config.levels.keys.sorted()) {
-                                ChoiceRow(
-                                    label = level,
+                                SlidingSegmentedControl(
                                     options = config.models.map { it.entry },
                                     selected = config.levels[level] ?: "",
                                     onSelect = { RuntimeBridge.setLevel(level, it) },
@@ -183,12 +228,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                         }
                     }
                     2 -> {
-                        // ── 提供商域：提供商 CRUD + API key ─────────
+                        // ── Provider 域：Provider CRUD + API key ─────────
                         Section(
-                            title = "提供商",
+                            title = "Provider",
                             action = {
                                 IconButton(onClick = { editProvider = ProviderUi("", "", "", null); editProviderIsNew = true }) {
-                                    Icon(Icons.Filled.Add, contentDescription = "新增提供商")
+                                    Icon(Icons.Filled.Add, contentDescription = "新增 Provider")
                                 }
                             },
                         ) {
@@ -203,16 +248,17 @@ fun SettingsScreen(onBack: () -> Unit) {
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
                                         Column(Modifier.weight(1f)) {
-                                            Text(p.name, style = MaterialTheme.typography.titleSmall)
+                                            Text(p.displayName, style = MaterialTheme.typography.titleSmall)
                                             Text(
                                                 p.baseUrl,
                                                 style = MaterialTheme.typography.bodySmall,
                                                 fontFamily = FontFamily.Monospace,
                                                 color = MaterialTheme.colorScheme.outline,
                                             )
-                                            val hasKey = RuntimeBridge.hasPersistedKey(p.name)
+                                            // null = 预取进行中（避免先闪"未配置"再变"已存"）。
+                                            val hasKey = keyStatus[p.name]
                                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                                if (hasKey) {
+                                                if (hasKey == true) {
                                                     Icon(
                                                         imageVector = Icons.Filled.Check,
                                                         contentDescription = "已存",
@@ -221,15 +267,19 @@ fun SettingsScreen(onBack: () -> Unit) {
                                                     )
                                                 }
                                                 Text(
-                                                    if (hasKey) "  API key 已存（Keystore）" else "API key 未配置",
+                                                    when (hasKey) {
+                                                        true -> "  密钥已配置"
+                                                        false -> "密钥未配置"
+                                                        null -> "密钥状态检查中…"
+                                                    },
                                                     style = MaterialTheme.typography.labelSmall,
-                                                    color = if (hasKey) MaterialTheme.colorScheme.primary
-                                                    else MaterialTheme.colorScheme.error,
+                                                    color = when (hasKey) {
+                                                        true -> MaterialTheme.colorScheme.primary
+                                                        false -> MaterialTheme.colorScheme.error
+                                                        null -> MaterialTheme.colorScheme.outline
+                                                    },
                                                 )
                                             }
-                                        }
-                                        IconButton(onClick = { keyProvider = p.name }) {
-                                            Icon(Icons.Filled.Key, contentDescription = "设置 API Key")
                                         }
                                     }
                                 }
@@ -255,9 +305,16 @@ fun SettingsScreen(onBack: () -> Unit) {
         EditProviderDialog(
             initial = p,
             isNew = editProviderIsNew,
+            initialHasKey = keyStatus[p.name] == true,
+            existingIds = config.providers.map { it.name }.toSet(),
             onDismiss = { editProvider = null },
-            onSave = { name, baseUrl, env, adapter ->
-                RuntimeBridge.upsertProvider(name, baseUrl, env, adapter)
+            onSave = { id, title, baseUrl, env, adapter, apiKey ->
+                RuntimeBridge.upsertProvider(id, baseUrl, env, adapter, title)
+                // 编辑时原地填写的 Key：直接落 Keystore（按内部 ID 关联）。
+                if (apiKey != null) {
+                    RuntimeBridge.setApiKeyAndPersist(id, apiKey!!)
+                    keyStatus = keyStatus + (id to true)
+                }
                 editProvider = null
             },
         )
@@ -266,7 +323,7 @@ fun SettingsScreen(onBack: () -> Unit) {
         EditModelDialog(
             initial = m,
             isNew = editModelIsNew,
-            providers = config.providers.map { it.name },
+            providers = config.providers.map { it.displayName to it.name },
             onDismiss = { editModel = null },
             onSave = { ui ->
                 RuntimeBridge.upsertModel(ui)
@@ -274,19 +331,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             },
         )
     }
-    keyProvider?.let { name ->
-        ApiKeyDialog(
-            provider = name,
-            onDismiss = { keyProvider = null },
-            onSave = { key ->
-                RuntimeBridge.setApiKeyAndPersist(name, key)
-                keyProvider = null
-            },
-        )
-    }
-}
-
-@Composable
+}@Composable
 private fun Section(
     title: String,
     action: (@Composable () -> Unit)? = null,
@@ -305,93 +350,444 @@ private fun Section(
     }
 }
 
+/**
+ * Termux 放行外部应用（allow-external-apps）的一条式修复命令。
+ * 写入内容前后各带一个换行：无论原文件末行是否有换行符，都不会与旧内容拼接；
+ */
+private const val TERMUX_ALLOW_EXTERNAL_CMD =
+    "mkdir -p ~/.termux && printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties && termux-reload-settings"
+
+/**
+ * 滑动药丸分段选择器：所有选项平铺在一个圆角容器里，选中项背后是一块
+ * 半透明着色区域；切换时色块以动画平滑滑动到目标位置。
+ */
 @Composable
-private fun ChoiceRow(label: String, options: List<String>, selected: String, onSelect: (String) -> Unit) {
-    var expanded by remember { mutableStateOf(false) }
-    Column {
-        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.outline)
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            for (opt in options) {
-                val isSel = opt == selected
-                TextButton(onClick = { onSelect(opt); expanded = false }) {
-                    Text(
-                        opt + if (isSel) " ✓" else "",
-                        color = if (isSel) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                    )
+private fun SlidingSegmentedControl(
+    options: List<String>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val selectedIndex = options.indexOf(selected).coerceAtLeast(0)
+    // 色块位置用「选中索引」的浮点动画驱动，index 连续变化 → 色块连续滑动。
+    val anim by animateFloatAsState(
+        targetValue = selectedIndex.toFloat(),
+        animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing),
+        label = "segmentSlide",
+    )
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val segWidth = maxWidth / options.size
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(44.dp)
+                .clip(RoundedCornerShape(22.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
+        ) {
+            // 半透明高亮色块：x = 段宽 × 动画进度，4dp 内边距形成描边感。
+            Box(
+                Modifier
+                    .offset(x = segWidth * anim)
+                    .size(width = segWidth, height = 44.dp)
+                    .padding(4.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.35f)),
+            )
+            Row(Modifier.fillMaxSize()) {
+                options.forEach { opt ->
+                    val isSel = opt == selected
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null, // 滑动色块本身就是反馈，不再叠加矩形涟漪
+                            ) { onSelect(opt) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            opt,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = if (isSel) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
     }
 }
 
+/**
+ * 代码块：header 带「复制」按钮（可见、可发现）+ 等宽代码体。
+ * - 快路径：点代码体或「复制」按钮 → 直接写剪贴板，header 变「已复制」；
+ * - 回退：复制失败 → 自动切手动模式：代码变可编辑块并全选，用户长按手动复制。
+ */
+@Composable
+private fun CodeBlock(text: String, modifier: Modifier = Modifier) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var copied by remember { mutableStateOf(false) }
+    var manual by remember { mutableStateOf(false) }
+    // 手动模式的可编辑块：初始即整段全选。
+    var value by remember(text) { mutableStateOf(TextFieldValue(text, TextRange(0, text.length))) }
+    var everFocused by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    LaunchedEffect(copied) {
+        if (copied) {
+            kotlinx.coroutines.delay(2000)
+            copied = false
+        }
+    }
+    LaunchedEffect(manual) {
+        if (manual) focusRequester.requestFocus()
+    }
+
+    fun copyToClipboard(): Boolean = try {
+        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+            as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("termux", text))
+        true
+    } catch (t: Throwable) {
+        false
+    }
+
+    Column(modifier.fillMaxWidth()) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)),
+        ) {
+            // header：标识 + 复制按钮（可发现性）
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(horizontal = 10.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Termux 命令",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.weight(1f),
+                )
+                // 紧凑型复制按钮：淡色背景胶囊（不用 TextButton，其最小高度会把 header 撑高）。
+                Box(
+                    Modifier
+                        .background(
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                            RoundedCornerShape(8.dp),
+                        )
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                        ) {
+                            if (manual) {
+                                manual = false
+                            } else if (copyToClipboard()) {
+                                copied = true
+                            } else {
+                                manual = true
+                            }
+                        }
+                        .padding(horizontal = 10.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        when {
+                            manual -> "完成"
+                            copied -> "已复制"
+                            else -> "复制"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            // 代码体
+            Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                if (manual) {
+                    CompositionLocalProvider(
+                        LocalTextSelectionColors provides TextSelectionColors(
+                            handleColor = MaterialTheme.colorScheme.primary,
+                            backgroundColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.30f),
+                        ),
+                    ) {
+                        BasicTextField(
+                            value = value,
+                            onValueChange = { value = it },
+                            readOnly = true,
+                            textStyle = TextStyle(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp,
+                                lineHeight = 17.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged {
+                                    if (it.isFocused) {
+                                        everFocused = true
+                                    } else if (manual && everFocused) {
+                                        // 失焦即自动退出手动模式，无需点「完成」。
+                                        manual = false
+                                        everFocused = false
+                                    }
+                                }
+                                .focusRequester(focusRequester),
+                        )
+                    }
+                    Text(
+                        "内容已全选：长按点「复制」，或改完点右上角「完成」退出。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                } else {
+                    Text(
+                        text,
+                        style = TextStyle(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        ),
+                        modifier = Modifier.fillMaxWidth().clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                        ) {
+                            // 点代码块 = 变成可全选的文本框（直接复制走 header 按钮）。
+                            manual = true
+                        },
+                    )
+                }
+            }
+        }
+        // 复制反馈只体现在 header 按钮（复制 → 已复制），不再额外加提示行。
+    }
+}
+
+// dismissKeyboardOnTap / ApiKeyDialog 已移至 KeysScreen.kt（internal，同包共用）。
+
+/** Provider 新增/编辑对话框（表单复用 ProviderEditForm）。 */
 @Composable
 private fun EditProviderDialog(
     initial: ProviderUi,
     isNew: Boolean,
+    initialHasKey: Boolean,
+    existingIds: Set<String>,
     onDismiss: () -> Unit,
-    onSave: (name: String, baseUrl: String, apiKeyEnv: String, adapter: String?) -> Unit,
+    onSave: (id: String, title: String?, baseUrl: String, apiKeyEnv: String, adapter: String?, apiKey: String?) -> Unit,
 ) {
-    var name by remember { mutableStateOf(initial.name) }
-    var baseUrl by remember { mutableStateOf(initial.baseUrl) }
-    var apiKeyEnv by remember { mutableStateOf(initial.apiKeyEnv) }
-    var adapter by remember { mutableStateOf(initial.adapter ?: "openai") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (isNew) "新增提供商" else "编辑提供商") },
+        title = { Text(if (isNew) "新增 Provider" else "编辑 Provider") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(name, { name = it }, label = { Text("名称（如 zhipu / deepseek）") }, enabled = isNew)
-                OutlinedTextField(baseUrl, { baseUrl = it }, label = { Text("Base URL") })
-                OutlinedTextField(
-                    apiKeyEnv, { apiKeyEnv = it },
-                    label = { Text("API Key 环境变量名（占位，密钥在 Key 图标处设置）") },
-                    enabled = false,
-                )
-                // 协议适配：下拉选择（openai/anthropic/gemini/ollama）。
-                Text("协议适配", style = MaterialTheme.typography.labelMedium)
-                DropdownChoice(
-                    options = listOf("openai", "anthropic", "gemini", "ollama"),
-                    selected = adapter,
-                    onSelect = { adapter = it },
-                )
-            }
+            ProviderEditForm(
+                initial = initial,
+                isNew = isNew,
+                initialHasKey = initialHasKey,
+                existingIds = existingIds,
+                onSave = onSave,
+                onCancel = onDismiss,
+            )
         },
-        confirmButton = {
-            TextButton(
-                onClick = { if (name.isNotBlank() && baseUrl.isNotBlank()) onSave(name.trim(), baseUrl.trim(), apiKeyEnv.ifBlank { (name.uppercase() + "_API_KEY") }, adapter.ifBlank { null }) },
-            ) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        confirmButton = {},
     )
 }
 
-/** 选项不多的下拉（Material3 菜单风格，单行胶囊）。 */
+/** Provider 编辑表单（对话框新建 / 列表行内展开编辑 共用）。 */
 @Composable
-private fun DropdownChoice(options: List<String>, selected: String, onSelect: (String) -> Unit) {
-    var expanded by remember { mutableStateOf(false) }
-    Column {
+private fun ProviderEditForm(
+    initial: ProviderUi,
+    isNew: Boolean,
+    initialHasKey: Boolean,
+    existingIds: Set<String>,
+    onSave: (id: String, title: String?, baseUrl: String, apiKeyEnv: String, adapter: String?, apiKey: String?) -> Unit,
+    onCancel: () -> Unit,
+) {
+    // 显示名：人类可读（中文/空格/大小写均可，随时可改）。
+    // 内部 ID：新建时由软件从显示名自动生成（ascii 词 → slug；非 ascii → 随机短 ID），
+    // 编辑时保持不变——模型引用、env 派生、Keystore 均按 ID 关联，改名零迁移成本。
+    var title by remember { mutableStateOf(initial.title ?: initial.name) }
+    var baseUrl by remember { mutableStateOf(initial.baseUrl) }
+    var adapter by remember { mutableStateOf(initial.adapter ?: "openai") }
+    // 密钥：默认只展示状态（已配置/未配置），点「更换/添加」才进入输入态——
+    // 避免"空输入框 = 已有值"的歧义（外部 UI 审查建议）。
+    var editingKey by remember { mutableStateOf(false) }
+    var apiKey by remember { mutableStateOf("") }
+    // 长文本输入框（URL/密钥）：未聚焦时单行省空间；聚焦后关闭 singleLine，
+    // 高度随内容换行自动展开（编辑长 URL/密钥不用左右滚动找光标）。
+    var urlFocused by remember { mutableStateOf(false) }
+    var keyFocused by remember { mutableStateOf(false) }
+    val id = if (isNew) genProviderId(title, existingIds) else initial.name
+    val modified = title.trim() != (initial.title ?: initial.name).trim() ||
+        baseUrl.trim() != initial.baseUrl.trim() ||
+        adapter != (initial.adapter ?: "openai") ||
+        (editingKey && apiKey.isNotBlank())
+
+    Column(
+        Modifier.dismissKeyboardOnTap().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
         OutlinedTextField(
-            value = selected,
-            onValueChange = {},
-            readOnly = true,
-            label = { Text(selected) },
-            trailingIcon = {
-                TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "▲" else "▼") }
-            },
+            title, { title = it },
+            label = { Text("显示名称") },
+            supportingText = { Text("显示在应用中的名称，可随时修改") },
+            singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        if (expanded) {
-            Card(Modifier.fillMaxWidth()) {
-                Column {
-                    for (opt in options) {
-                        TextButton(
-                            onClick = { onSelect(opt); expanded = false },
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text(opt + if (opt == selected) " ✓" else "")
-                        }
-                    }
+        OutlinedTextField(
+            baseUrl, { baseUrl = it },
+            label = { Text("API 地址（Base URL）") },
+            singleLine = !urlFocused,
+            modifier = Modifier
+                .fillMaxWidth()
+                .onFocusChanged { urlFocused = it.isFocused },
+        )
+        DropdownChoice(
+            options = listOf(
+                "openai" to "OpenAI 兼容",
+                "anthropic" to "Anthropic 兼容",
+                "gemini" to "Gemini",
+                "ollama" to "Ollama",
+            ),
+            selected = adapter,
+            onSelect = { adapter = it },
+            fieldLabel = "API 协议",
+            supportingText = "选择此服务使用的请求格式",
+        )
+        if (!editingKey) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (initialHasKey) {
+                    Icon(
+                        Icons.Filled.Check, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.height(14.dp).width(14.dp),
+                    )
+                    Text(
+                        "  密钥已配置",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    Text(
+                        "密钥未配置",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { editingKey = true }) {
+                    Text(if (initialHasKey) "更换" else "添加")
+                }
+            }
+        } else {
+            OutlinedTextField(
+                apiKey, { apiKey = it },
+                label = { Text("API 密钥") },
+                visualTransformation = PasswordVisualTransformation(),
+                singleLine = !keyFocused,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { keyFocused = it.isFocused },
+            )
+            Text(
+                "加密存入 Android Keystore，注入运行时内存；不写入配置文件。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+        if (!isNew && initial.apiKeyEnv.isNotBlank()) {
+            Text(
+                "密钥引用（高级）：${initial.apiKeyEnv}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+        // 操作行：取消靠左留白、保存为主按钮靠右；无修改时禁用。
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onCancel) { Text("取消") }
+            Button(
+                enabled = modified && title.isNotBlank() && baseUrl.isNotBlank(),
+                onClick = {
+                    val env = initial.apiKeyEnv.ifBlank {
+                        id.uppercase().filter { it.isLetterOrDigit() || it == '_' }
+                            .let { e -> if (e.isBlank()) "PROVIDER_API_KEY" else "${e}_API_KEY" }
+                    }
+                    onSave(
+                        id, title.trim(), baseUrl.trim(), env, adapter.ifBlank { null },
+                        if (editingKey && apiKey.isNotBlank()) apiKey.trim() else null,
+                    )
+                },
+            ) { Text("保存") }
+        }
+    }
+}
+
+/**
+ * 从显示名生成内部 ID：小写 ascii 词以 `-` 连接（"Zhipu AI" → "zhipu-ai"）；
+ * 无 ascii 词（如纯中文）或为空 → `p-<随机>`；与现有 ID 冲突时追加随机后缀。
+ * ID 仅软件内部使用（模型引用 / env 派生 / Keystore 键），不要求人类可读。
+ */
+private fun genProviderId(title: String, existing: Set<String>): String {
+    val chars = ('a'..'f') + ('0'..'9')
+    fun rand(n: Int) = List(n) { chars.random() }.joinToString("")
+    val slug = title.trim().lowercase()
+        .split(Regex("[^a-z0-9]+"))
+        .filter { it.isNotEmpty() }
+        .joinToString("-")
+        .take(24)
+        .trim('-')
+    var id = slug.ifEmpty { "p-${rand(5)}" }
+    if (id in existing) id = "${slug.ifEmpty { "p" }}-${rand(3)}"
+    return id
+}
+
+/** 选项不多的下拉（M3 ExposedDropdownMenu）：点击整个框直接弹出菜单，
+ *  纯选择器语义——无文本编辑态、无焦点，选中项带 ✓。选项为 (协议值, 显示标签)。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DropdownChoice(
+    options: List<Pair<String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    fieldLabel: String,
+    supportingText: String? = null,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = options.firstOrNull { it.first == selected }?.second ?: selected
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = selectedLabel,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(fieldLabel) },
+            supportingText = supportingText?.let { s -> { Text(s) } },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            for ((value, label) in options) {
+                DropdownMenuItem(
+                    text = { Text(label) },
+                    onClick = {
+                        onSelect(value)
+                        expanded = false
+                    },
+                    trailingIcon = if (value == selected) {
+                        { Icon(Icons.Filled.Check, contentDescription = null) }
+                    } else {
+                        null
+                    },
+                )
             }
         }
     }
@@ -401,12 +797,12 @@ private fun DropdownChoice(options: List<String>, selected: String, onSelect: (S
 private fun EditModelDialog(
     initial: ModelUi,
     isNew: Boolean,
-    providers: List<String>,
+    providers: List<Pair<String, String>>, // (显示名, 内部 ID)
     onDismiss: () -> Unit,
     onSave: (ModelUi) -> Unit,
 ) {
     var entry by remember { mutableStateOf(initial.entry) }
-    var provider by remember { mutableStateOf(initial.provider.ifBlank { providers.firstOrNull() ?: "" }) }
+    var provider by remember { mutableStateOf(initial.provider.ifBlank { providers.firstOrNull()?.second ?: "" }) }
     var modelId by remember { mutableStateOf(initial.modelId) }
     var showAdvanced by remember { mutableStateOf(false) }
     var toolCall by remember { mutableStateOf(initial.supportsToolCall) }
@@ -421,19 +817,19 @@ private fun EditModelDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (isNew) "新增模型" else "编辑模型") },
         text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.dismissKeyboardOnTap().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(entry, { entry = it }, label = { Text("别名（如 glm-main）") }, enabled = isNew)
                 if (providers.isNotEmpty()) {
-                    Text("提供商", style = MaterialTheme.typography.labelMedium)
+                    Text("Provider", style = MaterialTheme.typography.labelMedium)
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for (p in providers) {
-                            TextButton(onClick = { provider = p }) {
-                                Text(p + if (p == provider) " ✓" else "")
+                        for ((label, pid) in providers) {
+                            TextButton(onClick = { provider = pid }) {
+                                Text(label + if (pid == provider) " ✓" else "")
                             }
                         }
                     }
                 } else {
-                    OutlinedTextField(provider, { provider = it }, label = { Text("提供商名") })
+                    OutlinedTextField(provider, { provider = it }, label = { Text("Provider ID") })
                 }
                 OutlinedTextField(modelId, { modelId = it }, label = { Text("模型 ID（如 glm-4.7）") })
 
@@ -485,33 +881,6 @@ private fun Toggle(label: String, value: Boolean, onToggle: () -> Unit) {
     TextButton(onClick = onToggle) {
         Text((if (value) "● " else "○ ") + label)
     }
-}
-
-@Composable
-private fun ApiKeyDialog(provider: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
-    var key by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("设置 $provider 的 API Key") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    key, { key = it },
-                    label = { Text("API Key") },
-                    visualTransformation = PasswordVisualTransformation(),
-                )
-                Text(
-                    "加密存入 Android Keystore，注入 Rust 运行时内存；不会写入配置文件。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { if (key.isNotBlank()) onSave(key.trim()) }) { Text("保存并生效") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-    )
 }
 
 /** 方形复选框行（多选场景；Checkbox 圆形默认改为方角以区分单选语义）。 */
@@ -835,28 +1204,19 @@ private fun McpSection() {
             // ── 未放行时给一键指引：复制命令到 Termux 执行 ──────
             if (!status.termuxAllowed) {
                 Text(
-                    "在 Termux 中粘贴执行下面这条命令即可放行（执行后点「刷新」）：",
+                    "在 Termux 中粘贴执行下面这条命令即可放行（命令前后已带换行，不破坏原配置；执行后点「刷新」）：",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "mkdir -p ~/.termux && echo \"allow-external-apps=true\" >> ~/.termux/termux.properties && termux-reload-settings",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.outline,
-                        modifier = Modifier.weight(1f),
-                    )
-                    CompactButton(text = "复制命令", onClick = {
-                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                            as android.content.ClipboardManager
-                        cm.setPrimaryClip(
-                            android.content.ClipData.newPlainText(
-                                "termux",
-                                "mkdir -p ~/.termux && echo \"allow-external-apps=true\" >> ~/.termux/termux.properties && termux-reload-settings",
-                            )
-                        )
-                        installLog = "命令已复制，粘贴到 Termux 执行后点「刷新」"
+                // 代码块样式：点击整块直接复制。
+                CodeBlock(TERMUX_ALLOW_EXTERNAL_CMD)
+                if (status.termuxInstalled) {
+                    // 复制后一键跳到 Termux 粘贴执行。
+                    CompactButton(text = "打开 Termux", onClick = {
+                        context.packageManager.getLaunchIntentForPackage("com.termux")?.let { intent ->
+                            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                            context.startActivity(intent)
+                        }
                     })
                 }
             }

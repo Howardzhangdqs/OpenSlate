@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -25,8 +26,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -58,6 +61,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -78,27 +82,38 @@ import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 
 /**
  * Phase 1 聊天主界面：transcript 流 + 输入框 + 审批横幅。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen() {
+fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
     val state by RuntimeBridge.state.collectAsState()
     val listState = rememberLazyListState()
-    var showSettings by remember { mutableStateOf(false) }
-    var showHistory by remember { mutableStateOf(false) }
+    // 点击空白区域 → 收起输入法 + 取消输入框焦点。可点击的子组件（按钮、工具 chip、
+    // 输入胶囊）会消费 tap 事件，不会走到这里，行为互不影响。
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
     // 相邻的连续工具调用聚合为一组（圆角矩形容器内多个 chip），
     // 其余条目原样单行渲染。
     val renderItems: List<RenderItem> = remember(state.entries) { groupEntries(state.entries) }
+    // 当前模型声明支持思维链时，TTFT 等待期显示"思考中"；无思维链模型不显示。
+    val thinkEligible = state.config.models
+        .find { it.entry == state.modelAlias }?.supportsReasoning == true
+    val showThinking = state.running && state.awaitingFirstToken && thinkEligible
 
     // 磨砂玻璃：背景捕获层 + 全屏模糊副本（各玻璃面板共用一份，性能考虑），
     // rootCoords 用于把模糊副本平移到每个玻璃面板自身位置。
@@ -109,22 +124,11 @@ fun ChatScreen() {
         BlurEffect(radiusX = blurPx, radiusY = blurPx, edgeTreatment = TileMode.Clamp)
     }
 
-    LaunchedEffect(state.entries.size) {
-        if (renderItems.isNotEmpty()) {
-            listState.animateScrollToItem(renderItems.lastIndex)
+    LaunchedEffect(state.entries.size, showThinking) {
+        val target = renderItems.lastIndex + if (showThinking) 1 else 0
+        if (target >= 0) {
+            listState.animateScrollToItem(target)
         }
-    }
-
-    if (showSettings) {
-        SettingsScreen(onBack = { showSettings = false })
-        return
-    }
-    if (showHistory) {
-        HistoryScreen(
-            onBack = { showHistory = false },
-            onOpened = { showHistory = false },
-        )
-        return
     }
 
     Scaffold(
@@ -155,13 +159,13 @@ fun ChatScreen() {
                         }
                     },
                     actions = {
-                        IconButton(onClick = { showHistory = true }) {
+                        IconButton(onClick = onOpenHistory) {
                             Icon(
                                 androidx.compose.material.icons.Icons.Filled.History,
                                 contentDescription = "历史会话",
                             )
                         }
-                        IconButton(onClick = { showSettings = true }) {
+                        IconButton(onClick = onOpenSettings) {
                             Icon(
                                 androidx.compose.material.icons.Icons.Filled.Settings,
                                 contentDescription = "模型配置",
@@ -192,6 +196,13 @@ fun ChatScreen() {
             modifier = Modifier
                 .fillMaxSize()
                 .onGloballyPositioned { rootCoords = it }
+                // 放在 padding/imePadding 之前，手势区域覆盖整个内容区（含 padding 带）。
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = {
+                        keyboard?.hide()
+                        focusManager.clearFocus()
+                    })
+                }
                 .padding(bottom = padding.calculateBottomPadding())
                 .imePadding(),
         ) {
@@ -242,10 +253,49 @@ fun ChatScreen() {
                                 is RenderItem.Single -> "s-${item.index}"
                                 is RenderItem.ToolGroup -> "g-${item.startIdx}"
                             }
-                        }) { _, item ->
+                        }) { idx, item ->
                             when (item) {
-                                is RenderItem.Single -> EntryRow(item.entry)
+                                is RenderItem.Single -> EntryRow(
+                                    item.entry,
+                                    // 会话进行中且是最后一条 → 思考中态（实时秒数 + 贴底跟随）。
+                                    activeLast = state.running && idx == renderItems.lastIndex,
+                                )
                                 is RenderItem.ToolGroup -> ToolGroupCard(item.parts)
+                            }
+                        }
+                        // TTFT 等待期（request_start → 首个 token）的"思考中"提示，
+                        // 仅对声明支持思维链的模型显示；样式与思维链 chip 同款。
+                        if (showThinking) {
+                            item(key = "thinking-pending") {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .padding(horizontal = 4.dp)
+                                        .clip(RoundedCornerShape(50))
+                                        .background(
+                                            MaterialTheme.colorScheme.tertiaryContainer
+                                                .copy(alpha = 0.35f)
+                                        )
+                                        .border(
+                                            0.5.dp,
+                                            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.4f),
+                                            RoundedCornerShape(50),
+                                        )
+                                        .padding(horizontal = 10.dp, vertical = 3.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Outlined.Psychology,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(13.dp),
+                                        tint = MaterialTheme.colorScheme.tertiary,
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        "思考中…",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.tertiary,
+                                    )
+                                }
                             }
                         }
                     }
@@ -303,11 +353,11 @@ private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {
 }
 
 @Composable
-private fun EntryRow(entry: UiEntry) {
+private fun EntryRow(entry: UiEntry, activeLast: Boolean = false) {
     when (entry) {
         is UiEntry.User -> Bubble(entry.text, mine = true)
         is UiEntry.Assistant -> MarkdownBubble(entry.text)
-        is UiEntry.Reasoning -> ReasoningBlock(entry.text, entry.meta)
+        is UiEntry.Reasoning -> ReasoningBlock(entry.text, entry.meta, entry.startTs, activeLast)
         is UiEntry.Meta -> Text(
             entry.text,
             style = MaterialTheme.typography.labelSmall,
@@ -702,10 +752,30 @@ private fun ToolResultView(raw: String, status: String = "done") {
     }
 }
 
-/** 思维链：默认折叠（超长文本布局昂贵 + 干扰正文），点击展开。 */
+/**
+ * 思维链：默认折叠（超长文本布局昂贵 + 干扰正文），点击展开。
+ * 展开后限高（180dp）内滚动：思考中（active）chip 实时显示"已思考 Ns"、
+ * 内容始终贴底跟随；思考完毕后再展开则停留在这段思维链的开头。
+ */
 @Composable
-private fun ReasoningBlock(text: String, meta: String? = null) {
+private fun ReasoningBlock(
+    text: String,
+    meta: String? = null,
+    startTs: Long = 0L,
+    active: Boolean = false,
+) {
     var expanded by remember { mutableStateOf(false) }
+    // 思考中的实时秒数：每秒跳一次；结束（active=false）后保留最后值，
+    // usage 回填 meta 前的空窗期 chip 仍显示"已思考 Ns"而非退回字数。
+    var elapsedSec by remember { mutableStateOf(-1L) }
+    LaunchedEffect(active, startTs) {
+        // 镜像恢复的旧条目没有 startTs，无法计算真实时长，保持字数兜底。
+        if (startTs <= 0) return@LaunchedEffect
+        while (active) {
+            elapsedSec = ((System.currentTimeMillis() - startTs) / 1000L).coerceAtLeast(0)
+            delay(1000)
+        }
+    }
     // 展开/收起平滑动画。
     Column(
         Modifier
@@ -734,7 +804,11 @@ private fun ReasoningBlock(text: String, meta: String? = null) {
             )
             Spacer(Modifier.width(4.dp))
             Text(
-                meta?.takeIf { it.isNotBlank() }?.let { "已思考 $it" } ?: "思维链 ${text.length} 字",
+                when {
+                    !meta.isNullOrBlank() -> "已思考 $meta"
+                    elapsedSec >= 0 -> "已思考 ${elapsedSec}s"
+                    else -> "思维链 ${text.length} 字"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.tertiary,
             )
@@ -751,11 +825,26 @@ private fun ReasoningBlock(text: String, meta: String? = null) {
             )
         }
         if (expanded) {
+            val scroll = rememberScrollState()
+            // 思考中：内容增长（含刚展开）时始终贴底跟随。
+            LaunchedEffect(active, expanded, text) {
+                if (expanded && active) {
+                    withFrameNanos {} // 等一帧布局完成，maxValue 才准确
+                    scroll.scrollTo(scroll.maxValue)
+                }
+            }
+            // 思考完毕后（重新）展开：回到这段思维链的开头。
+            LaunchedEffect(expanded) {
+                if (expanded && !active) scroll.scrollTo(0)
+            }
             Text(
                 text,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.outline,
-                modifier = Modifier.padding(top = 2.dp, start = 8.dp, end = 8.dp),
+                modifier = Modifier
+                    .padding(top = 2.dp, start = 8.dp, end = 8.dp)
+                    .heightIn(max = 180.dp)
+                    .verticalScroll(scroll),
             )
         }
     }

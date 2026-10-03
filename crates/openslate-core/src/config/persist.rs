@@ -168,6 +168,9 @@ pub fn upsert_provider(path: &Path, name: &str, cfg: &super::ProviderConfig) -> 
         if let Some(adapter) = &cfg.adapter {
             table["adapter"] = value(adapter.clone());
         }
+        if let Some(title) = &cfg.title {
+            table["title"] = value(title.clone());
+        }
         if cfg.max_attempts != DEFAULT_MAX_ATTEMPTS {
             table["max_attempts"] = value(i64::from(cfg.max_attempts));
         }
@@ -476,6 +479,7 @@ mod tests {
             base_url: base_url.to_owned(),
             api_key_env: env.to_owned(),
             adapter: None,
+            title: None,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
         }
@@ -578,6 +582,26 @@ mod tests {
             doc["providers"]["zhipu"].get("max_attempts").is_none(),
             "default retry fields are omitted"
         );
+    }
+
+    #[test]
+    fn upsert_provider_writes_and_drops_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openslate.toml");
+
+        let mut with_title = provider("https://x", "K");
+        with_title.title = Some("智谱 开放平台".into());
+        upsert_provider(&path, "zhipu", &with_title).expect("write title");
+        let doc = load_document(&path).unwrap();
+        assert_eq!(
+            doc["providers"]["zhipu"]["title"].as_str(),
+            Some("智谱 开放平台")
+        );
+
+        // 清空 title（None）→ 重建表体时该键被移除，不残留。
+        upsert_provider(&path, "zhipu", &provider("https://x", "K")).expect("drop title");
+        let doc = load_document(&path).unwrap();
+        assert!(doc["providers"]["zhipu"].get("title").is_none());
     }
 
     #[test]

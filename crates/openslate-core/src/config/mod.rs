@@ -186,6 +186,11 @@ impl Default for LimitsConfig {
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key_env: String,
+    /// 人类可读显示名（中文/空格/大小写均可）；`None` = 显示用键名。
+    /// toml 键恒为内部 ID：模型引用（`models.<entry>.provider`）、env 派生、
+    /// Android Keystore 均按 ID 关联，改名（title）不影响它们。
+    #[serde(default)]
+    pub title: Option<String>,
     /// The genai adapter protocol (e.g. `"anthropic"`, `"gemini"`, `"openai"`,
     /// `"ollama"`). When omitted, defaults to `"openai"` (the common case for
     /// OpenAI-compatible endpoints) to avoid genai's silent Ollama fallthrough

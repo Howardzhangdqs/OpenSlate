@@ -31,6 +31,7 @@ fn provider_dto() -> ProviderDto {
         base_url: "https://api.example.com/v1".into(),
         api_key_env: "EXAMPLE_KEY".into(),
         adapter: Some("openai".into()),
+        title: None,
         max_attempts: 3,
         retry_base_ms: 500,
     }
@@ -575,6 +576,7 @@ fn provider_model_dto_roundtrip_with_core() {
         base_url: "u".into(),
         api_key_env: "K".into(),
         adapter: None,
+        title: None,
         max_attempts: 2,
         retry_base_ms: 100,
     });

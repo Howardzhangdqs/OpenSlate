@@ -14,6 +14,9 @@ PROFILE="mobile"
 
 echo "==> [1/3] 交叉编译 $FFI_CRATE (arm64-v8a, $PROFILE)"
 cd "$ROOT"
+# ELF LOAD 段 16KB 对齐（Android 15+ 16KB 页设备要求，对 4KB 页设备向下兼容）：
+# 该参数位于 ~/.cargo-android/config.toml 的 rustflags（-z max-page-size=16384）。
+# 注意：不要在环境变量里设 RUSTFLAGS，否则会覆盖 config 中的 lld/unwind 配置。
 CARGO_TARGET_DIR=target-android \
 CC_aarch64_linux_android="$NDKB/aarch64-linux-android26-clang" \
 AR_aarch64_linux_android="$NDKB/llvm-ar" \

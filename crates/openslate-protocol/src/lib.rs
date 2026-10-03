@@ -584,10 +584,13 @@ pub enum ServerMsg {
     },
     /// 工具调用结束（镜像 TuiEvent::ToolEnd；失败与否由回合结束的
     /// Tool 消息折叠判定，事件本身只带字节数/截断位）。
+    /// `preview` 为输出前若干字符（UI 投影兜底；None = 无输出或未携带）。
     ToolEnd {
         name: String,
         bytes: usize,
         truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
     },
     ApprovalRequested {
         id: u64,

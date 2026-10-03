@@ -111,7 +111,7 @@ impl ProgressCallback for SessionProgressBridge {
         });
     }
 
-    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool) {
+    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, preview: &str) {
         {
             let mut inner = self.state.core.lock();
             tool_end_entry(&mut inner, name, bytes, truncated);
@@ -120,6 +120,7 @@ impl ProgressCallback for SessionProgressBridge {
             name: name.to_owned(),
             bytes,
             truncated,
+            preview: if preview.is_empty() { None } else { Some(preview.to_owned()) },
         });
     }
 

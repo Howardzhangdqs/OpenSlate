@@ -348,6 +348,7 @@ fn server_tool_events() {
             name: "read_file".into(),
             bytes: 1024,
             truncated: false,
+            preview: None,
         },
         r#"{"type":"tool_end","name":"read_file","bytes":1024,"truncated":false}"#,
     );

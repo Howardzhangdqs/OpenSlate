@@ -1231,7 +1231,7 @@ impl ProgressCallback for ChildProgress {
         tracing::info!("{}  -> {}({})", self.indent, name, args);
     }
 
-    fn on_tool_end(&mut self, name: &str, bytes: usize, _truncated: bool) {
+    fn on_tool_end(&mut self, name: &str, bytes: usize, _truncated: bool, _preview: &str) {
         tracing::info!("{}  <- {} [{} bytes]", self.indent, name, bytes);
     }
 

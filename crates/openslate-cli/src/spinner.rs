@@ -569,7 +569,7 @@ impl ProgressCallback for SpinnerCallback {
         self.emit_line(&format!("  -> {}({})", name, args));
     }
 
-    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool) {
+    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, _preview: &str) {
         let suffix = if truncated { " ..." } else { "" };
         self.emit_line(&format!("  <- {} [{} bytes]{}", name, bytes, suffix));
     }

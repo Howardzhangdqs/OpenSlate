@@ -83,6 +83,7 @@ pub fn to_tui(msg: ServerMsg) -> Vec<TuiEvent> {
             name,
             bytes,
             truncated,
+            ..
         } => TuiEvent::ToolEnd {
             name,
             bytes,
@@ -758,7 +759,8 @@ mod tests {
             to_tui(ServerMsg::ToolEnd {
                 name: "t".into(),
                 bytes: 9,
-                truncated: true
+                truncated: true,
+                preview: None
             }),
             vec![TuiEvent::ToolEnd {
                 name: "t".into(),

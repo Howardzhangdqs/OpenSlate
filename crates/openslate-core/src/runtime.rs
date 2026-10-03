@@ -747,7 +747,12 @@ pub async fn execute_run(
 
                     let truncated = output.bytes > 80;
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_end(&tc.name, output.bytes, truncated);
+                        cb.on_tool_end(
+                            &tc.name,
+                            output.bytes,
+                            truncated,
+                            &truncate_str(&output.content, 512),
+                        );
                     } else {
                         let result_preview = truncate_str(&output.content, 80);
                         tracing::info!(
@@ -912,7 +917,12 @@ pub async fn execute_run(
                             };
                             let truncated = output.bytes > 80;
                             if let Some(cb) = progress.as_mut() {
-                                cb.on_tool_end(&tc.name, output.bytes, truncated);
+                                cb.on_tool_end(
+                            &tc.name,
+                            output.bytes,
+                            truncated,
+                            &truncate_str(&output.content, 512),
+                        );
                             } else {
                                 let result_preview = truncate_str(&output.content, 80);
                                 tracing::info!(
@@ -2638,7 +2648,7 @@ mod tests {
         fn on_usage(&mut self, _usage: crate::types::Usage) {}
         fn on_request_end(&mut self) {}
         fn on_tool_start(&mut self, _name: &str, _args: &str) {}
-        fn on_tool_end(&mut self, _name: &str, _bytes: usize, _truncated: bool) {}
+        fn on_tool_end(&mut self, _name: &str, _bytes: usize, _truncated: bool, _preview: &str) {}
     }
 
     /// Provider that streams a scripted first turn (Delta + Done with a
@@ -3133,7 +3143,7 @@ mod tests {
                 .expect("progress poisoned")
                 .push(format!("start:{name}"));
         }
-        fn on_tool_end(&mut self, name: &str, _bytes: usize, _truncated: bool) {
+        fn on_tool_end(&mut self, name: &str, _bytes: usize, _truncated: bool, _preview: &str) {
             self.0
                 .lock()
                 .expect("progress poisoned")

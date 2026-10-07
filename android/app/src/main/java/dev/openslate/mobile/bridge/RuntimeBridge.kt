@@ -85,6 +85,8 @@ data class ConfigUi(
     val providers: List<ProviderUi> = emptyList(),
     val models: List<ModelUi> = emptyList(),
     val levels: Map<String, String> = emptyMap(),
+    /** 功能 → 代号（server 侧已并入缺省回退的生效值）。 */
+    val capabilities: Map<String, String> = emptyMap(),
     val activeConfig: String = "",
 )
 
@@ -103,6 +105,10 @@ data class RuntimeUiState(
     /** 请求已发出但尚未收到任何首个 token（reasoning/content/tool）：
      *  期间若模型支持思维链则显示"思考中"，TTFT 等待计入思考时长。 */
     val awaitingFirstToken: Boolean = false,
+    /** run 标题异步生成完成的版本号（run_title 事件递增）。历史会话页
+     *  观察它做增量刷新——LLM 标题通常在首条消息后几秒到达，此时
+     *  列表里的占位标题需要原位替换。 */
+    val titlesVersion: Int = 0,
 )
 
 /**
@@ -123,6 +129,53 @@ data class SessionSummaryUi(
     val startedMs: Long,
     val costUsd: Double,
 )
+
+/** 模型元数据（registry 查询投影；字段可空 = 数据源未提供）。 */
+data class ModelMetaUi(
+    val displayName: String? = null,
+    val contextTokens: Long? = null,
+    val maxOutputTokens: Long? = null,
+    val supportsVision: Boolean? = null,
+    val supportsReasoning: Boolean? = null,
+    val supportsToolCall: Boolean? = null,
+    val inputPricePerMtok: Double? = null,
+    val outputPricePerMtok: Double? = null,
+    val source: String? = null,
+) {
+    val hasAny: Boolean
+        get() = contextTokens != null || maxOutputTokens != null || supportsVision != null ||
+            supportsReasoning != null || supportsToolCall != null ||
+            inputPricePerMtok != null || outputPricePerMtok != null
+}
+
+/** 数据源本地状态（数据源页面渲染）。 */
+data class RegistrySourceUi(
+    val id: String,
+    val name: String,
+    val desc: String,
+    val url: String,
+    val fetchedAtMs: Long?,
+    val entries: Int?,
+    val zstBytes: Long?,
+    val staleAfterHrs: Long,
+)
+
+/** registry 条目（数据源详情浏览 / 跨源搜索结果；null = 源未提供该字段）。 */
+data class RegistryEntryUi(
+    val source: String, // 展示名（如 models.dev）
+    val sourceId: String, // 稳定 id
+    val id: String, // 源内原始键（保留 provider 前缀，如 zai/glm-5.3）
+    val ctx: Long?,
+    val out: Long?,
+    val vision: Boolean?,
+    val reasoning: Boolean?,
+    val tool: Boolean?,
+    val priceIn: Double?,
+    val priceOut: Double?,
+)
+
+/** registry 搜索结果：total = 匹配总数，results 截断到 limit。 */
+data class RegistrySearchUi(val total: Int, val results: List<RegistryEntryUi>)
 
 object RuntimeBridge {
 
@@ -215,7 +268,11 @@ object RuntimeBridge {
                     }
                     restoreHttpProxy()
                     restoreExecBackend()
-                    restoreModelAlias()
+                    // 模型元数据注册表：启动时按需自动更新（后台执行；
+                    // 本地缺失或超过各源 stale_after 才真正拉取）。
+                    runtime.registryScheduleAutoUpdate()
+                    // 模型选择不再本地重放：[capabilities].main 是唯一真相源
+                    // （openslate.toml），Rust 侧 open_session 初始别名已取它。
                 } catch (e: Throwable) {
                     Log.e(TAG, "start: runtime create FAILED", e)
                     _state.value = _state.value.copy(ready = false, lastError = e.message ?: e.javaClass.simpleName)
@@ -303,32 +360,10 @@ object RuntimeBridge {
         Log.i(TAG, "start: restored exec backends = $backends")
     }
 
-    // ── 模型选择持久化（Rust set_model 仅内存态，重启即回默认；本地
-    //    持久化 + 启动重放，保证用户可感知的模型选择不丢）─────────
-
-    private const val PREF_MODEL_ALIAS = "model_alias"
-
-    /** 当前选中的模型别名（默认 main）。 */
-    fun modelAlias(): String =
-        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
-            ?.getString(PREF_MODEL_ALIAS, "main") ?: "main"
-
-    /** 切换模型：FFI 热切换 + 本地持久化（重启重放）。 */
-    fun setModelAliasAndPersist(alias: String) {
-        setModelAlias(alias)
-        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
-            ?.edit()?.putString(PREF_MODEL_ALIAS, alias)?.apply()
-        Log.i(TAG, "model alias set to $alias")
-    }
-
-    /** 启动重放：恢复用户上次选择的模型（仅非默认时发送）。 */
-    private fun restoreModelAlias() {
-        val alias = modelAlias()
-        if (alias != "main") {
-            setModelAlias(alias)
-            Log.i(TAG, "start: restored model alias = $alias")
-        }
-    }
+    // ── 模型选择（持久化已迁移到 [capabilities].main：设置页改绑即
+    //    落盘 openslate.toml 并热切换；不再本地 SharedPreferences 重放，
+    //    双真相源会互相覆盖）。会话内即时切换用下方 setModelAlias()
+    //    （协议 set_model，不落盘）。──────────────────────────────
 
     // ── HTTP 代理（受限网络出站；经 adb reverse 共享电脑侧代理）──
 
@@ -416,8 +451,24 @@ object RuntimeBridge {
             ).toString()
     )
 
+    /** 删除模型条目（被代号引用时服务端拒绝并定向 notice）。 */
+    fun deleteModel(entry: String) = sendJson(
+        JSONObject().put("type", "delete_model").put("entry", entry).toString()
+    )
+
     fun setLevel(level: String, entry: String) = sendJson(
         JSONObject().put("type", "set_level").put("level", level).put("entry", entry).toString()
+    )
+
+    fun deleteLevel(level: String) = sendJson(
+        JSONObject().put("type", "delete_level").put("level", level).toString()
+    )
+
+    /** 功能 → 代号绑定（main/compact/title → 代号）。main 同时热切换
+     *  会话模型（Rust 侧处理，广播 model_changed + config_changed）。 */
+    fun setCapability(capability: String, alias: String) = sendJson(
+        JSONObject().put("type", "set_capability")
+            .put("capability", capability).put("alias", alias).toString()
     )
 
     fun setModelAlias(alias: String) = sendJson(
@@ -601,6 +652,9 @@ object RuntimeBridge {
             "approval_resolved" -> mutate { copy(pendingApproval = null) }
             "session_reset" -> mutate { copy(entries = emptyList(), pendingApproval = null) }
             "model_changed" -> mutate { copy(modelAlias = obj.optString("alias")) }
+            // run 标题生成完成：只递增版本号，历史页观察到后自行刷新
+            // （会话列表不在全局 state 里，拉取式投影）。
+            "run_title" -> mutate { copy(titlesVersion = titlesVersion + 1) }
             "config_changed" -> obj.optJSONObject("config")?.let { applyConfig(it) } ?: Unit
             "host_call_requested" -> handleHostCall(obj)
             else -> Unit // step_end / first_token 等暂不投影
@@ -652,10 +706,15 @@ object RuntimeBridge {
             val ls = c.optJSONObject("levels") ?: return@buildMap
             for (k in ls.keys()) put(k, ls.optString(k))
         }
+        val capabilities = buildMap {
+            val cs = c.optJSONObject("capabilities") ?: return@buildMap
+            for (k in cs.keys()) put(k, cs.optString(k))
+        }
         return ConfigUi(
             providers = providers,
             models = models,
             levels = levels,
+            capabilities = capabilities,
             activeConfig = c.optString("active_config"),
         )
     }
@@ -833,6 +892,118 @@ object RuntimeBridge {
     }
 
     // ── 历史会话 ─────────────────────────────────────────────
+
+    // ── Provider 模型自动检测（设置页 Provider 域）──────────────
+
+    /** 检测结果：ok=false 时 error 带可直接展示的中文文案。 */
+    data class ModelsProbe(
+        val ok: Boolean,
+        val models: List<String> = emptyList(),
+        val error: String? = null,
+    )
+
+    /** 拉取 provider 的可用模型清单（Rust 侧 10s 超时；必须 IO 线程调用）。 */
+    fun listProviderModels(provider: String): ModelsProbe {
+        val runtime = runtimeRef.get() ?: return ModelsProbe(false, error = "运行时未启动")
+        return runCatching {
+            val o = JSONObject(runtime.listProviderModels(provider))
+            if (o.optBoolean("ok")) {
+                val arr = o.optJSONArray("models") ?: org.json.JSONArray()
+                ModelsProbe(true, List(arr.length()) { arr.optString(it) })
+            } else {
+                ModelsProbe(false, error = o.optString("error", "检测失败"))
+            }
+        }.getOrElse { ModelsProbe(false, error = it.message ?: it.javaClass.simpleName) }
+    }
+
+    // ── 模型元数据注册表（数据源页面 / 元数据自动补全）──────────
+
+    /** 数据源列表（含本地状态）。IO 线程调用。 */
+    fun registrySources(): List<RegistrySourceUi> {
+        val runtime = runtimeRef.get() ?: return emptyList()
+        return runCatching {
+            val arr = JSONObject(runtime.registrySources()).optJSONArray("sources")
+                ?: return emptyList()
+            List(arr.length()) { i ->
+                val o = arr.getJSONObject(i)
+                RegistrySourceUi(
+                    id = o.optString("id"),
+                    name = o.optString("name"),
+                    desc = o.optString("desc"),
+                    url = o.optString("url"),
+                    fetchedAtMs = if (o.isNull("fetched_at_ms")) null else o.optLong("fetched_at_ms"),
+                    entries = if (o.isNull("entries")) null else o.optInt("entries"),
+                    zstBytes = if (o.isNull("zst_bytes")) null else o.optLong("zst_bytes"),
+                    staleAfterHrs = o.optLong("stale_after_hrs"),
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** 手动更新一个数据源。IO 线程调用（阻塞至完成，最长 120s）。 */
+    fun updateRegistrySource(id: String): ModelsProbe {
+        val runtime = runtimeRef.get() ?: return ModelsProbe(false, error = "运行时未启动")
+        return runCatching {
+            val o = JSONObject(runtime.registryUpdateSource(id))
+            if (o.optBoolean("ok")) {
+                ModelsProbe(true, models = listOf(o.optInt("entries").toString()))
+            } else {
+                ModelsProbe(false, error = o.optString("error", "更新失败"))
+            }
+        }.getOrElse { ModelsProbe(false, error = it.message ?: it.javaClass.simpleName) }
+    }
+
+    /** 搜索/浏览 registry 条目。sourceId 空 = 跨全部本地已缓存源；
+     *  query 空 = 浏览前 limit 条（键字典序）。IO 线程调用。 */
+    fun registrySearch(sourceId: String, query: String, limit: Int): RegistrySearchUi {
+        val runtime = runtimeRef.get() ?: return RegistrySearchUi(0, emptyList())
+        return runCatching {
+            val o = JSONObject(runtime.registrySearch(sourceId, query, limit))
+            val arr = o.optJSONArray("results")
+            val list = if (arr == null) {
+                emptyList()
+            } else {
+                List(arr.length()) { i ->
+                    val e = arr.getJSONObject(i)
+                    RegistryEntryUi(
+                        source = e.optString("source"),
+                        sourceId = e.optString("sourceId"),
+                        id = e.optString("id"),
+                        ctx = if (e.isNull("ctx")) null else e.optLong("ctx"),
+                        out = if (e.isNull("out")) null else e.optLong("out"),
+                        vision = if (e.isNull("vision")) null else e.optBoolean("vision"),
+                        reasoning = if (e.isNull("reasoning")) null else e.optBoolean("reasoning"),
+                        tool = if (e.isNull("tool")) null else e.optBoolean("tool"),
+                        priceIn = if (e.isNull("priceIn")) null else e.optDouble("priceIn"),
+                        priceOut = if (e.isNull("priceOut")) null else e.optDouble("priceOut"),
+                    )
+                }
+            }
+            RegistrySearchUi(o.optInt("total"), list)
+        }.getOrDefault(RegistrySearchUi(0, emptyList()))
+    }
+
+    /** 模型元数据查询（本地优先，miss 在线兜底）。IO 线程调用。 */
+    fun lookupModelMeta(modelId: String): ModelMetaUi? {
+        val runtime = runtimeRef.get() ?: return null
+        return runCatching {
+            val o = JSONObject(runtime.lookupModelMeta(modelId))
+            fun bl(k: String) = if (o.isNull(k)) null else o.optBoolean(k)
+            fun ln(k: String) = if (o.isNull(k)) null else o.optLong(k)
+            fun db(k: String) = if (o.isNull(k)) null else o.optDouble(k)
+            ModelMetaUi(
+                displayName = o.optString("display_name").ifEmpty { null },
+                contextTokens = ln("context_tokens"),
+                maxOutputTokens = ln("max_output_tokens"),
+                supportsVision = bl("supports_vision"),
+                supportsReasoning = bl("supports_reasoning"),
+                supportsToolCall = bl("supports_tool_call"),
+                inputPricePerMtok = db("input_price_per_mtok"),
+                outputPricePerMtok = db("output_price_per_mtok"),
+                source = o.optString("source").ifEmpty { null },
+            )
+        }.getOrNull()
+    }
 
     /** 拉取历史会话列表（分页：每页 50 条，offset 递增）。 */
     fun listSessions(offset: Int = 0): List<SessionSummaryUi> {

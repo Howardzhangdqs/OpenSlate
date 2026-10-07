@@ -17,6 +17,7 @@
 //! | `providers` | `Map<String, ProviderConfig>` | yes | LLM provider endpoints |
 //! | `models`    | `Map<String, ModelConfig>`    | yes | Model library entries (each binds provider + model id) |
 //! | `levels`    | `Map<String, String>`         | no  | Model level → model library entry name (legacy configs without `[levels]` treat each `models` key directly as an alias) |
+//! | `capabilities` | `Map<String, String>`      | no  | Capability id (`main`/`compact`/`title`) → level name; defaults via `capability_alias` |
 //! | `trace`     | `TraceConfig`       | no       | Observability settings             |
 //! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
 //! | `skills`    | `SkillsConfig`      | no       | Skill discovery / injection        |
@@ -75,6 +76,16 @@ pub struct OpenSlateConfig {
     /// section keep their exact pre-existing behavior.
     #[serde(default)]
     pub levels: HashMap<String, String>,
+    /// Capabilities (`[capabilities]`): 固定功能 id → 代号（`[levels]` key
+    /// 或 legacy `[models]` 条目名）。功能 id 见 [`crate::model_config`]
+    /// 的 `CAP_*` 常量（`main` 主对话 / `compact` 上下文压缩 / `title`
+    /// 会话标题生成）。缺省回退：`main`→"main"、`compact`→"fast"、
+    /// `title`→"fast"（[`crate::model_config::capability_alias`]）。
+    /// levels 是用户自由命名的"代号"；capabilities 决定每个功能用哪个
+    /// 代号——两层解耦：换模型只动 levels 绑定，换功能分工只动
+    /// capabilities。
+    #[serde(default)]
+    pub capabilities: HashMap<String, String>,
     #[serde(default)]
     pub trace: Option<TraceConfig>,
     /// MCP (Model Context Protocol) client servers.
@@ -766,6 +777,43 @@ name = "test"
         let config = parse_openslate_toml(toml).expect("should parse");
         assert!(config.models.is_empty());
         assert!(config.providers.is_empty());
+        assert!(
+            config.capabilities.is_empty(),
+            "no [capabilities] section → empty map (defaults applied at use site)"
+        );
+    }
+
+    #[test]
+    fn parse_capabilities_section() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://api.example.com"
+api_key_env = "ZHIPU_API_KEY"
+
+[models.big]
+provider = "zhipu"
+model = "big-m"
+
+[models.small]
+provider = "zhipu"
+model = "small-m"
+
+[levels]
+main = "big"
+fast = "small"
+vision = "big"
+
+[capabilities]
+main = "main"
+compact = "fast"
+title = "fast"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.capabilities.get("main").map(String::as_str), Some("main"));
+        assert_eq!(config.capabilities.get("compact").map(String::as_str), Some("fast"));
+        assert_eq!(config.capabilities.get("title").map(String::as_str), Some("fast"));
+        // levels 仍是自由命名：vision 无 capability 引用也照常解析。
+        assert!(crate::model_config::resolve_model(&config, "vision").is_ok());
     }
 
     #[test]

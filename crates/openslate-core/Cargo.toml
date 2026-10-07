@@ -39,6 +39,13 @@ openslate-mcp-builtin = { path = "../openslate-mcp-builtin" }
 # and the sandbox executor (see PTC_PLAN.md).
 openslate-ptc = { workspace = true }
 
+# Android：rustls-platform-verifier 需要 JNI 宿主初始化（纯 .so 场景不可
+# 满足，未初始化即 panic）。provider::list_remote_models 的直连 reqwest
+# 与 model-genai 同款：webpki 静态根证书预配置 TLS。
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "tls12"] }
+webpki-roots = "0.26"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rmcp = { workspace = true }

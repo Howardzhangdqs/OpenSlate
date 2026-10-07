@@ -27,6 +27,7 @@ pub mod events;
 pub mod exec;
 pub mod hostcall;
 pub mod provider;
+pub mod registry;
 pub mod runtime;
 
 pub use bootstrap::MobilePaths;

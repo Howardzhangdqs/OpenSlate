@@ -100,6 +100,9 @@ pub fn to_tui(msg: ServerMsg) -> Vec<TuiEvent> {
         ServerMsg::TurnError { message } => return vec![TuiEvent::TurnDone(Err(message))],
         ServerMsg::ConfigChanged { config } => TuiEvent::ConfigChanged(config),
         ServerMsg::ModelChanged { alias } => TuiEvent::ModelChanged(alias),
+        // run 标题属历史列表投影（mobile / REST 消费）；TUI 无历史列
+        // 表浮层，静默丢弃。
+        ServerMsg::RunTitle { .. } => return vec![],
         ServerMsg::SessionReset => TuiEvent::SessionReset,
         ServerMsg::Notice { text, .. } => TuiEvent::Notice(text),
         ServerMsg::Error { message, .. } => TuiEvent::Notice(message),
@@ -224,6 +227,7 @@ pub fn config_from_view(view: &ConfigViewDto) -> openslate_core::config::OpenSla
         providers,
         models,
         levels,
+        capabilities: view.capabilities.clone().into_iter().collect(),
         limits: Some(limits),
         // Display-only sections the wire view intentionally omits; the
         // local `[tui]` read in `main` overlays the real icon overrides.
@@ -273,6 +277,15 @@ pub fn view_from_config(config: &openslate_core::config::OpenSlateConfig) -> Con
             .map(|(k, v)| (k.clone(), ModelDto::from(v)))
             .collect(),
         levels: config.levels.clone().into_iter().collect(),
+        capabilities: openslate_core::model_config::CAPABILITIES
+            .iter()
+            .map(|cap| {
+                (
+                    (*cap).to_owned(),
+                    openslate_core::model_config::capability_alias(config, cap),
+                )
+            })
+            .collect(),
         limits: LimitsDto {
             max_steps: limits.max_steps,
             max_depth: limits.max_depth,
@@ -968,6 +981,7 @@ mod tests {
             levels: [("main".to_owned(), "main".to_owned())]
                 .into_iter()
                 .collect(),
+            capabilities: Default::default(),
             limits: openslate_protocol::LimitsDto {
                 max_steps: 8,
                 max_depth: 4,

@@ -8,6 +8,7 @@ pub mod error;
 pub mod execution;
 pub mod mcp;
 pub mod model_config;
+pub mod model_registry;
 pub mod paths;
 pub mod prompt;
 pub mod provider;

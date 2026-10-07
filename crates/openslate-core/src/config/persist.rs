@@ -266,6 +266,42 @@ pub fn remove_level(path: &Path, level: &str) -> Result<()> {
     save_document(path, &doc)
 }
 
+// ── Capabilities（功能 → 代号）──────────────────────────────────────────
+
+/// Comment placed above a newly created `[capabilities]` table.
+const CAPABILITIES_HEADER_COMMENT: &str =
+    "# Capability -> level mapping: main (主对话) / compact (上下文压缩) / title (标题生成)\n";
+
+/// Set `capabilities.<cap> = <alias>` in the config file at `path`. The
+/// `[capabilities]` table is created (with a comment header) when missing.
+/// An existing `[capabilities]` that is not a standard table is refused
+/// rather than overwritten. Semantics mirror [`set_level`].
+pub fn set_capability(path: &Path, cap: &str, alias: &str) -> Result<()> {
+    let mut doc = load_document(path)?;
+    let created = match doc.as_table().get("capabilities") {
+        None => true,
+        Some(item) if item.is_table() => false,
+        Some(_) => {
+            anyhow::bail!(
+                "config section [capabilities] is not a standard TOML table; \
+                 refusing to rewrite it"
+            )
+        }
+    };
+    if created {
+        let mut fresh = Table::new();
+        fresh.decor_mut().set_prefix(CAPABILITIES_HEADER_COMMENT);
+        doc.as_table_mut().insert("capabilities", Item::Table(fresh));
+    }
+    // An existing [capabilities] table keeps its decor untouched.
+    doc.as_table_mut()
+        .get_mut("capabilities")
+        .and_then(|item| item.as_table_mut())
+        .expect("capabilities table was just ensured")
+        .insert(cap, value(alias));
+    save_document(path, &doc)
+}
+
 /// Remove model entry `entry` from `[models]`. Missing entry or section is a
 /// silent success (idempotent). Reference integrity (levels/agents pointing
 /// at the entry) is the caller's responsibility.
@@ -818,6 +854,41 @@ mod tests {
         let parsed = crate::config::parse_openslate_toml(&once).expect("valid");
         assert_eq!(parsed.levels.get("main").map(String::as_str), Some("other"));
         assert_eq!(parsed.levels.get("fast").map(String::as_str), Some("mini"));
+    }
+
+    // ── set_capability ──────────────────────────────────────────────────
+
+    #[test]
+    fn set_capability_creates_commented_table_and_updates() {
+        let (_dir, path) = temp_config();
+        set_capability(&path, "compact", "fast").expect("set 1");
+
+        let text = text_at(&path);
+        assert!(text.contains("[capabilities]"), "{text}");
+        assert!(
+            text.contains("Capability -> level mapping"),
+            "new [capabilities] table carries the comment header: {text}"
+        );
+        let parsed = crate::config::parse_openslate_toml(&text).expect("valid");
+        assert_eq!(
+            parsed.capabilities.get("compact").map(String::as_str),
+            Some("fast")
+        );
+
+        set_capability(&path, "compact", "vision").expect("overwrite");
+        set_capability(&path, "main", "main").expect("second key");
+        let once = text_at(&path);
+        set_capability(&path, "compact", "vision").expect("repeat");
+        assert_eq!(once, text_at(&path), "idempotent");
+        let parsed = crate::config::parse_openslate_toml(&once).expect("valid");
+        assert_eq!(
+            parsed.capabilities.get("compact").map(String::as_str),
+            Some("vision")
+        );
+        assert_eq!(
+            parsed.capabilities.get("main").map(String::as_str),
+            Some("main")
+        );
     }
 
     #[test]

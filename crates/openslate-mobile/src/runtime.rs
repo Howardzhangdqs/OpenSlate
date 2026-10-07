@@ -68,6 +68,8 @@ pub struct MobileRuntime {
     host_router: Arc<HostCallRouter>,
     /// bash 工具注册表（设置页多选热换名）。
     registry: Arc<openslate_core::tool::ToolRegistry>,
+    /// 模型元数据注册表（数据源页面 / 元数据自动补全）。
+    model_registry: Arc<crate::registry::RegistryStore>,
     /// bash 工具工作区路径（重注册时用）。
     workspace_dir: PathBuf,
     /// bash 后端多选状态（设置页热切换；bash / termux_bash 命名规则）。
@@ -125,6 +127,8 @@ impl MobileRuntime {
         let factory = opts
             .provider_factory
             .unwrap_or_else(|| mobile_provider_factory(secrets.clone()));
+        // 模型元数据注册表（数据源页面 / 自动补全；本地 ZSTD 持久化）。
+        let model_registry = Arc::new(crate::registry::RegistryStore::new(&paths.config_dir));
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -158,6 +162,7 @@ impl MobileRuntime {
             secrets,
             host_router: host_router.clone(),
             registry: runtime_registry.clone(),
+            model_registry,
             workspace_dir: paths.workspace_dir.clone(),
             exec_selection: exec_selection.clone(),
             shutdown_flag: std::sync::atomic::AtomicBool::new(false),
@@ -315,6 +320,134 @@ impl MobileRuntime {
             .session_run
             .as_ref()
             .map(|r| r.run_id.0.clone())
+    }
+
+    // ── Provider 模型自动检测（设置页 Provider 域）────────────────
+
+    /// 数据源列表（含各源本地状态：条目数 / 更新时间 / 体积）。
+    pub fn registry_sources_json(&self) -> String {
+        self.model_registry.sources_json()
+    }
+
+    /// 手动更新一个数据源（阻塞至完成，最长 120s；宿主须在 IO 线程
+    /// 调用）。返回 `{"ok":true,"entries":N}` 或 `{"ok":false,"error"}`。
+    pub fn registry_update_source_json(&self, id: String) -> String {
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let rt = guard.as_ref().expect("runtime shut down").handle().clone();
+            rt
+        };
+        let store = self.model_registry.clone();
+        handle.block_on(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                store.update_source(&id),
+            )
+            .await
+            {
+                Ok(Ok(entries)) => serde_json::json!({ "ok": true, "entries": entries }).to_string(),
+                Ok(Err(e)) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
+                Err(_) => serde_json::json!({ "ok": false, "error": "更新超时（120s）" }).to_string(),
+            }
+        })
+    }
+
+    /// 启动时的按需自动更新（后台 spawn，不阻塞；本地缺失或超过各源
+    /// stale_after 才拉取）。
+    pub fn registry_schedule_auto_update(&self) {
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let rt = guard.as_ref().expect("runtime shut down").handle().clone();
+            rt
+        };
+        let store = self.model_registry.clone();
+        handle.spawn(async move {
+            store.auto_update_if_stale().await;
+        });
+    }
+
+    /// 本地条目搜索 / 浏览（数据源页面「查看条目 / 跨源搜索」）。纯
+    /// 本地文件 + 内存缓存，同步返回：
+    /// `{"total":N,"results":[{source,sourceId,id,ctx,out,vision,reasoning,tool,priceIn,priceOut},…]}`。
+    /// `source_id` 空 = 跨全部已缓存源；`query` 空 = 浏览模式（前
+    /// `limit` 条，键字典序）；`limit <= 0` 按 50 处理；数值 / 能力 /
+    /// 计价字段源没给为 null；`id` 为源 JSON 原始键（保留 provider
+    /// 前缀）。未知 source_id → `{"total":0,"results":[]}`。
+    pub fn registry_search_json(&self, source_id: String, query: String, limit: i32) -> String {
+        self.model_registry.search_json(&source_id, &query, limit)
+    }
+
+    /// 模型元数据查询：本地三源合并（源优先级 models.dev > LiteLLM >
+    /// CloudPrice）即时返回；本地全 miss 时在线单查 CloudPrice 兜底
+    /// （10s 超时）。字段缺失为 null。
+    pub fn lookup_model_meta_json(&self, model_id: String) -> String {
+        let local = self.model_registry.lookup_local(&model_id);
+        if !local.is_empty() {
+            return meta_to_json(&local);
+        }
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let rt = guard.as_ref().expect("runtime shut down").handle().clone();
+            rt
+        };
+        let store = self.model_registry.clone();
+        let id = model_id.clone();
+        let meta = handle.block_on(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                store.lookup_with_online_fallback(&id),
+            )
+            .await
+            .unwrap_or_default()
+        });
+        meta_to_json(&meta)
+    }
+
+    /// 拉取 provider 的可用模型清单（GET /models，adapter 感知）。
+    /// 返回 `{"ok":true,"models":["glm-4.7",...]}`；失败返回
+    /// `{"ok":false,"error":"..."}`（密钥未配置 / 网络 / 协议错误均走
+    /// 此路，UI 直接展示 error 文案）。
+    pub fn list_provider_models(&self, provider: String) -> String {
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let rt = guard.as_ref().expect("runtime shut down").handle().clone();
+            rt
+        };
+        let state = self.state.clone();
+        let secrets = self.secrets.clone();
+        let provider_id = provider.clone();
+        handle.block_on(async move {
+            let pc = {
+                let inner = state.core.lock();
+                inner.config.providers.get(&provider_id).cloned()
+            };
+            let Some(pc) = pc else {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": format!("provider '{provider_id}' 不存在"),
+                })
+                .to_string();
+            };
+            // 密钥：FFI 注入的内存 key 优先，env 兜底（ollama 等本地
+            // 端点允许无 key）。
+            let key = secrets
+                .get(&provider_id)
+                .or_else(|| std::env::var(&pc.api_key_env).ok());
+            match openslate_core::provider::list_remote_models(
+                &pc.base_url,
+                pc.adapter.as_deref().unwrap_or("openai"),
+                key.as_deref(),
+            )
+            .await
+            {
+                Ok(models) => serde_json::json!({ "ok": true, "models": models }).to_string(),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "error": format!("{e:#}"),
+                })
+                .to_string(),
+            }
+        })
     }
 
     // ── 历史会话（列表 / 切换）──────────────────────────────────
@@ -541,7 +674,17 @@ async fn assemble_state(
     let approval_bridge = Arc::new(SessionApprovalBridge::new(sink.clone()));
     manager.approval = ApprovalManager::new(policy).with_callback(approval_bridge.clone());
 
+    // 初始会话模型：capabilities.main（用户在设置页改的主对话模型）
+    // 优先；无该节/代号不可解析时回退 root agent 的别名（旧配置行为）。
     let root_alias = agent_tree.get_root().model_alias.clone();
+    let main_alias =
+        openslate_core::model_config::capability_alias(&config, openslate_core::model_config::CAP_MAIN);
+    let initial_alias = if openslate_core::model_config::resolve_model(&config, &main_alias).is_ok()
+    {
+        main_alias
+    } else {
+        root_alias
+    };
     let session_label = config
         .project
         .as_ref()
@@ -640,7 +783,7 @@ async fn assemble_state(
         depth_cur: 0,
         agents_running: 0,
         tool_calls_cur: 0,
-        model_alias: root_alias,
+        model_alias: initial_alias,
         cancel: None,
         config,
         agents_cfg: agents,
@@ -680,6 +823,23 @@ async fn assemble_state(
         origin: "mobile",
         _mcp: mcp_connections,
     }))
+}
+
+/// ModelMeta → FFI JSON（字段缺失为 null；completeness 便于调用方判断）。
+fn meta_to_json(m: &openslate_core::model_registry::ModelMeta) -> String {
+    serde_json::json!({
+        "ok": !m.is_empty(),
+        "display_name": m.display_name,
+        "context_tokens": m.context_tokens,
+        "max_output_tokens": m.max_output_tokens,
+        "supports_vision": m.supports_vision,
+        "supports_reasoning": m.supports_reasoning,
+        "supports_tool_call": m.supports_tool_call,
+        "input_price_per_mtok": m.input_price_per_mtok,
+        "output_price_per_mtok": m.output_price_per_mtok,
+        "source": m.source,
+    })
+    .to_string()
 }
 
 /// 恢复的 history → transcript 镜像投影（User/Assistant/Tool 三类核心

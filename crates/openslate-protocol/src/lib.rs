@@ -410,6 +410,12 @@ pub struct ConfigViewDto {
     pub providers: BTreeMap<String, ProviderDto>,
     pub models: BTreeMap<String, ModelDto>,
     pub levels: BTreeMap<String, String>,
+    /// 功能 → 代号（server 侧已并入缺省回退，非 Option —— 客户端拿到的
+    /// 即生效值；语义同 `limits` 的"server 解析默认值"先例）。
+    /// `serde(default)`：旧客户端反序列化新快照 / 新客户端反序列化旧
+    /// 快照都安全。
+    #[serde(default)]
+    pub capabilities: BTreeMap<String, String>,
     /// 执行限额（server 侧已解析默认值，非 Option）。
     pub limits: LimitsDto,
     /// agents 树（root 起递归）。
@@ -533,6 +539,14 @@ pub enum ClientMsg {
     DeleteLevel {
         level: String,
     },
+    /// 功能 → 代号绑定（capability ∈ main/compact/title；alias 必须可
+    /// 解析为 levels key 或 models 条目，server 校验后落盘并广播
+    /// config_changed；capability == "main" 同时热切换会话模型并广播
+    /// model_changed）。
+    SetCapability {
+        capability: String,
+        alias: String,
+    },
     /// 新增/更新 MCP server（Streamable HTTP 条目；手机端 mcp-host 场景）。
     /// headers 如 `{ "Authorization": "Bearer <token>" }`，可选。
     UpsertMcpServer {
@@ -633,6 +647,12 @@ pub enum ServerMsg {
     },
     ModelChanged {
         alias: String,
+    },
+    /// run 标题异步生成完成（首条消息的 LLM 标题替换 run 开始时的
+    /// prompt 截断占位）。历史列表按 `run_id` 原位更新标题。
+    RunTitle {
+        run_id: String,
+        title: String,
     },
     SessionReset,
     Notice {

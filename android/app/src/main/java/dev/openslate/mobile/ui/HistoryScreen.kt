@@ -20,10 +20,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -82,6 +82,13 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
 
     LaunchedEffect(Unit) { refresh() }
 
+    // LLM 标题异步到达（run_title）→ 原位替换列表里的占位标题。
+    // 只在已完成首次加载后触发刷新（首刷自己就有 LaunchedEffect(Unit)）。
+    val state by RuntimeBridge.state.collectAsState()
+    LaunchedEffect(state.titlesVersion) {
+        if (state.titlesVersion > 0 && !loading) refresh()
+    }
+
     val fmt = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
 
     Scaffold(
@@ -103,7 +110,7 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
         if (loadError) {
             Column(Modifier.padding(padding).padding(16.dp)) {
                 Text("加载失败（运行时未就绪或查询超时）", color = MaterialTheme.colorScheme.error)
-                TextButton(onClick = { refresh() }) { Text("重试") }
+                SoftButton(onClick = { refresh() }) { Text("重试") }
             }
             return@Scaffold
         }
@@ -162,7 +169,7 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
             }
             if (canLoadMore) {
                 item {
-                    TextButton(
+                    SoftButton(
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !loadingMore,
                         onClick = {
@@ -206,7 +213,8 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
                 Text("确定删除「${target.title.ifBlank { "(无标题)" }}」？对话记录与本地备份将一并删除，不可恢复。")
             },
             confirmButton = {
-                TextButton(
+                SoftButton(
+                    tint = MaterialTheme.colorScheme.error,
                     onClick = {
                         pendingDelete = null
                         scope.launch {
@@ -221,7 +229,7 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
                 }
             },
             dismissButton = {
-                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+                SoftButton(onClick = { pendingDelete = null }) { Text("取消") }
             },
         )
     }

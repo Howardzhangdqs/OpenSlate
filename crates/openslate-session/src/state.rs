@@ -186,10 +186,22 @@ pub fn build_config_view(inner: &CoreInner) -> ConfigViewDto {
         .map(|(k, v)| (k.clone(), openslate_protocol::ModelDto::from(v)))
         .collect();
     let levels = inner.config.levels.clone().into_iter().collect();
+    // 功能映射出"生效值"（并入缺省回退）——客户端拿到的即真相，
+    // 与 limits 的"server 解析默认值"同一先例。
+    let capabilities = openslate_core::model_config::CAPABILITIES
+        .iter()
+        .map(|cap| {
+            (
+                (*cap).to_owned(),
+                openslate_core::model_config::capability_alias(&inner.config, cap),
+            )
+        })
+        .collect();
     ConfigViewDto {
         providers,
         models,
         levels,
+        capabilities,
         limits: LimitsDto::from(&effective_limits(&inner.config)),
         agents: AgentNodeDto::from(&inner.agent_tree),
         skills: inner.skills.clone(),

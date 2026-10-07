@@ -29,19 +29,38 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.openslate.mobile.service.AgentService
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.CompositionLocalProvider
+import dev.openslate.mobile.ui.LocalDarkTheme
+import dev.openslate.mobile.ui.ThemeMode
+import dev.openslate.mobile.ui.ThemePrefs
 import dev.openslate.mobile.ui.ChatScreen
 import dev.openslate.mobile.ui.HistoryScreen
 import dev.openslate.mobile.ui.KeysScreen
+import dev.openslate.mobile.ui.ModelRegistryScreen
 import dev.openslate.mobile.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AgentService.start(this)
+        // MCP 预热：配置了服务器时后台拉起 Termux / 恢复 host（冷启动提前消化）。
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { dev.openslate.mobile.bridge.McpHostManager.prewarm(this@MainActivity) }
+        }
         setContent {
-            OpenSlateTheme {
+            val ctx = applicationContext
+            var themeMode by remember { mutableStateOf(ThemePrefs.read(ctx)) }
+            OpenSlateTheme(mode = themeMode) {
                 Surface {
-                    AppNavHost()
+                    AppNavHost(
+                        themeMode = themeMode,
+                        onThemeModeChange = { m ->
+                            themeMode = m
+                            ThemePrefs.write(ctx, m)
+                        },
+                    )
                 }
             }
         }
@@ -50,7 +69,7 @@ class MainActivity : ComponentActivity() {
 
 /** 页面导航栈：chat（起点）/ settings / history，回退键沿栈逐级返回。 */
 @Composable
-private fun AppNavHost() {
+private fun AppNavHost(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Unit) {
     val nav = rememberNavController()
     WarmUpSecondaryScreens()
     NavHost(navController = nav, startDestination = "chat") {
@@ -71,7 +90,19 @@ private fun AppNavHost() {
             SettingsScreen(
                 onBack = { nav.popBackStack() },
                 onOpenKeys = { nav.navigate("keys") { launchSingleTop = true } },
+                onOpenRegistry = { nav.navigate("registry") { launchSingleTop = true } },
+                themeMode = themeMode,
+                onThemeModeChange = onThemeModeChange,
             )
+        }
+        composable(
+            "registry",
+            enterTransition = { slideInHorizontally(tween(280)) { it } + fadeIn(tween(280)) },
+            exitTransition = { slideOutHorizontally(tween(280)) { -it / 4 } + fadeOut(tween(280)) },
+            popEnterTransition = { slideInHorizontally(tween(280)) { -it / 4 } + fadeIn(tween(280)) },
+            popExitTransition = { slideOutHorizontally(tween(280)) { it } + fadeOut(tween(280)) },
+        ) {
+            ModelRegistryScreen(onBack = { nav.popBackStack() })
         }
         composable(
             "keys",
@@ -114,7 +145,7 @@ private fun WarmUpSecondaryScreens() {
     }
     if (warming) {
         Box(Modifier.size(0.dp)) {
-            SettingsScreen(onBack = {}, onOpenKeys = {})
+            SettingsScreen(onBack = {}, onOpenKeys = {}, onOpenRegistry = {})
             KeysScreen(onBack = {})
             HistoryScreen(onBack = {}, onOpened = {})
         }
@@ -181,10 +212,16 @@ private val DarkCyanColors = darkColorScheme(
 )
 
 @Composable
-fun OpenSlateTheme(content: @Composable () -> Unit) {
-    val dark = isSystemInDarkTheme()
-    MaterialTheme(
-        colorScheme = if (dark) DarkCyanColors else LightCyanColors,
-        content = content,
-    )
+fun OpenSlateTheme(mode: ThemeMode = ThemeMode.SYSTEM, content: @Composable () -> Unit) {
+    val dark = when (mode) {
+        ThemeMode.SYSTEM -> isSystemInDarkTheme()
+        ThemeMode.LIGHT -> false
+        ThemeMode.DARK -> true
+    }
+    CompositionLocalProvider(LocalDarkTheme provides dark) {
+        MaterialTheme(
+            colorScheme = if (dark) DarkCyanColors else LightCyanColors,
+            content = content,
+        )
+    }
 }

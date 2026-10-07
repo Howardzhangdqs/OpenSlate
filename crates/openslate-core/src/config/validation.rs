@@ -3,6 +3,13 @@
 //! Validates that `openslate.toml` + `agents/*.md` form a consistent,
 //! complete configuration. Returns structured errors (and optional warnings)
 //! instead of panicking.
+//!
+//! Error vs warning split: startup assembly and hot-swap treat
+//! [`validate_config`] errors as fatal, so anything a legitimate runtime
+//! write path can produce — e.g. a dangling `[levels]` value (rule 17) or a
+//! dangling `[capabilities]` value (rule 18's value half) after deleting a
+//! model entry — must be a warning, surfaced by [`validate_strict`] /
+//! [`validate_config_full`].
 
 use std::collections::HashSet;
 
@@ -180,7 +187,9 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
         }
     }
 
-    // ── New validation rules (9–18) ──────────────────────────────────────
+    // ── New validation rules (9–18; rules 17 and 18's value half are
+    // ── enforced at warning level — `dangling_level_warnings`,
+    // ── `dangling_capability_warnings` — not here) ──────────────────────
 
     // 9. Provider base_url must be a valid URL
     for (name, provider) in &config.providers {
@@ -284,13 +293,31 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
     //     here and at config load (`parse_openslate_toml`).
     errors.extend(ptc_floor_errors(&config.ptc));
 
-    // 17. Every `[levels]` value must reference an existing `[models]` entry
-    //     (the level would otherwise be unresolvable at use time).
-    for (name, entry) in &config.levels {
-        if !config.models.contains_key(entry) {
+    // 17. (moved to warning level — see `dangling_level_warnings`) A
+    //     `[levels]` value referencing a non-existent `[models]` entry is
+    //     no longer an error: levels are a loosely coupled mapping and may
+    //     legitimately dangle after the model entry they point at is
+    //     deleted (`resolve_model` reports `InvalidLevelRef` at use time,
+    //     the UI shows "binding missing"). Startup assembly and hot-swap
+    //     treat `validate_config` errors as fatal, so keeping this an
+    //     error would brick the app on "delete every model, restart".
+
+    // 18. Every `[capabilities]` key must be a known capability id —
+    //     unknown ids are typos waiting to happen and stay errors. The
+    //     VALUE being unresolvable (neither a `[levels]` key nor a
+    //     `[models]` entry) is a dangling capability and moved to warning
+    //     level (`dangling_capability_warnings`): same reasoning as rule
+    //     17 — startup assembly and hot-swap treat `validate_config`
+    //     errors as fatal, while runtime degrades safely (compact/title
+    //     silently fall back to the default tier).
+    for cap in config.capabilities.keys() {
+        if !crate::model_config::CAPABILITIES.contains(&cap.as_str()) {
             errors.push(ValidationError {
-                field: format!("levels.{name}"),
-                message: format!("Level '{name}' points to non-existent model entry '{entry}'"),
+                field: format!("capabilities.{cap}"),
+                message: format!(
+                    "Unknown capability id '{cap}' (known: {})",
+                    crate::model_config::CAPABILITIES.join(", ")
+                ),
             });
         }
     }
@@ -379,6 +406,11 @@ pub fn validate_strict(
 
     warnings.extend(disabled_builtin_tool_warnings(config, agents));
     warnings.extend(approval_warnings(config, agents));
+    // Rules 17 & 18 (value half) at warning level: dangling `[levels]`
+    // values and dangling `[capabilities]` values (both loosely coupled to
+    // the model entries they reference; deleting those entries is legal).
+    warnings.extend(dangling_level_warnings(config));
+    warnings.extend(dangling_capability_warnings(config));
 
     (errors, warnings)
 }
@@ -441,6 +473,12 @@ pub fn validate_config_full(config: &OpenSlateConfig, agents: &AgentsConfig) -> 
     // ── Warning: agent whitelists reference disabled builtin tools ───────
     warnings.extend(disabled_builtin_tool_warnings(config, agents));
     warnings.extend(approval_warnings(config, agents));
+
+    // ── Warning (rule 17): dangling [levels] values ─────────────────────
+    warnings.extend(dangling_level_warnings(config));
+
+    // ── Warning (rule 18, value half): dangling [capabilities] values ──
+    warnings.extend(dangling_capability_warnings(config));
 
     ValidationResult { errors, warnings }
 }
@@ -538,6 +576,51 @@ fn approval_warnings(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<Val
         }
     }
     warnings
+}
+
+/// Warning-level rule 17: every `[levels]` value pointing at a
+/// non-existent `[models]` entry (a dangling level).
+///
+/// Levels are a loosely coupled alias→entry mapping, so deleting a
+/// referenced model entry is allowed and leaves the level dangling: the UI
+/// shows "binding missing" and `resolve_model` fails with `InvalidLevelRef`
+/// at use time. Because startup assembly and hot-swap treat
+/// `validate_config` errors as fatal, this must stay a warning — otherwise
+/// "delete every model entry, restart" would brick the app.
+fn dangling_level_warnings(config: &OpenSlateConfig) -> Vec<ValidationError> {
+    config
+        .levels
+        .iter()
+        .filter(|(_, entry)| !config.models.contains_key(*entry))
+        .map(|(name, entry)| ValidationError {
+            field: format!("levels.{name}"),
+            message: format!("Level '{name}' points to non-existent model entry '{entry}'"),
+        })
+        .collect()
+}
+
+/// Warning-level rule 18 (value half): `[capabilities]` values resolving to
+/// neither a `[levels]` key nor a `[models]` entry (dangling capabilities).
+///
+/// Same reasoning as [`dangling_level_warnings`]: deleting the model entry a
+/// capability is bound to (directly or via a level) is allowed, and runtime
+/// degrades safely — compact/title silently fall back to the default tier —
+/// while `validate_config` errors would brick startup assembly and hot-swap.
+fn dangling_capability_warnings(config: &OpenSlateConfig) -> Vec<ValidationError> {
+    config
+        .capabilities
+        .iter()
+        .filter(|(_, alias)| {
+            !config.levels.contains_key(*alias) && !config.models.contains_key(*alias)
+        })
+        .map(|(cap, alias)| ValidationError {
+            field: format!("capabilities.{cap}"),
+            message: format!(
+                "Capability '{cap}' points to unknown alias '{alias}' \
+                 (not a [levels] key or [models] entry)"
+            ),
+        })
+        .collect()
 }
 
 /// Check if a string is a valid HTTP(S) URL.
@@ -768,10 +851,10 @@ fast = "mini"
         );
     }
 
-    // ── Rule 17: [levels] values must reference existing [models] entries ─
+    // ── Rule 17 (warning level): dangling [levels] values ────────────────
 
     #[test]
-    fn levels_unknown_entry_rejected() {
+    fn levels_unknown_entry_warns() {
         let toml = r#"
 [providers.zhipu]
 base_url = "https://example.com"
@@ -789,24 +872,110 @@ model = "m2"
 deep = "ghost"
 "#;
         let config = parse_openslate_toml(toml).expect("should parse");
-        let errors = validate_config(&config, &valid_agents());
+        let result = validate_config_full(&config, &valid_agents());
         assert!(
-            errors.iter().any(|e| e.field == "levels.deep"
-                && e.message.contains("ghost")
-                && e.message.contains("non-existent")),
-            "{errors:?}"
+            result.errors.iter().all(|e| e.field != "levels.deep"),
+            "dangling levels are warnings, not errors: {:?}",
+            result.errors
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.field == "levels.deep"
+                    && w.message.contains("ghost")
+                    && w.message.contains("non-existent")),
+            "{:?}",
+            result.warnings
+        );
+        // The same finding must surface through validate_strict's warnings.
+        let (_errors, warnings) = validate_strict(&config, &valid_agents());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "levels.deep" && w.message.contains("non-existent")),
+            "strict warnings carry the dangling level: {warnings:?}"
         );
     }
 
     #[test]
     fn levels_self_pointing_entries_valid() {
         // Self-referencing levels (entry name == level name) — the backward
-        // compatible layout — must produce no rule-17 errors.
+        // compatible layout — must produce no rule-17 findings.
         let mut config = valid_config();
         config.levels.insert("main".into(), "main".into());
         config.levels.insert("fast".into(), "fast".into());
+        let result = validate_config_full(&config, &valid_agents());
+        assert!(
+            result.errors.is_empty(),
+            "self-pointing levels valid: {:?}",
+            result.errors
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("non-existent")),
+            "self-pointing levels are not dangling: {:?}",
+            result.warnings
+        );
+    }
+
+    // ── Rule 18: unknown capability id stays an error; a dangling value
+    // ── is a warning ─────────────────────────────────────────────────────
+
+    #[test]
+    fn capabilities_unknown_id_stays_error() {
+        let mut config = valid_config();
+        config.capabilities.insert("tittle".into(), "fast".into());
         let errors = validate_config(&config, &valid_agents());
-        assert!(errors.is_empty(), "self-pointing levels valid: {errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "capabilities.tittle" && e.message.contains("Unknown capability id")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn capabilities_dangling_value_warns() {
+        let mut config = valid_config();
+        // compact 直绑幽灵条目（悬空）；title 正常（models.fast 存在）。
+        config.capabilities.insert("compact".into(), "ghost".into());
+        config.capabilities.insert("title".into(), "fast".into());
+        let result = validate_config_full(&config, &valid_agents());
+        assert!(
+            result
+                .errors
+                .iter()
+                .all(|e| e.field != "capabilities.compact"),
+            "dangling capability values are warnings, not errors: {:?}",
+            result.errors
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.field == "capabilities.compact"
+                && w.message.contains("ghost")
+                && w.message.contains("unknown alias")),
+            "{:?}",
+            result.warnings
+        );
+        // title 可解析 → 不产生该 warning。
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.field == "capabilities.title"),
+            "resolvable capability values must not warn: {:?}",
+            result.warnings
+        );
+        // 同一发现也要出现在 validate_strict 的 warnings 里。
+        let (_errors, warnings) = validate_strict(&config, &valid_agents());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "capabilities.compact" && w.message.contains("unknown alias")),
+            "strict warnings carry the dangling capability: {warnings:?}"
+        );
     }
 
     // ── Rule 3: model → provider reference ───────────────────────────────

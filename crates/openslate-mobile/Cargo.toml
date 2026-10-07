@@ -22,6 +22,9 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 # 仅为注册原始 usage 诊断钩子（genai::chat::set_raw_usage_logger → logcat）。
 genai = { path = "../../vendor/genai" }
+# 模型元数据注册表本地存储压缩（数据源页面 / registry 模块）。
+zstd = "0.13"
+serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -165,6 +165,56 @@ impl OpenSlateRuntime {
         self.inner.list_sessions_json(offset)
     }
 
+    /// 拉取 provider 的可用模型清单（设置页 Provider 域"自动检测"）。
+    /// 返回 `{"ok":true,"models":[...]}` 或 `{"ok":false,"error":"..."}`
+    /// （密钥未配置 / 网络 / 协议错误）。含 10s 超时，宿主须在 IO 线程调用。
+    pub fn list_provider_models(&self, provider: String) -> String {
+        openslate_mobile::alog!("ffi: list_provider_models(provider={provider})");
+        self.inner.list_provider_models(provider)
+    }
+
+    // ── 模型元数据注册表（数据源页面 / 元数据自动补全）────────────
+
+    /// 数据源列表 + 各源本地状态（条目数 / 更新时间 / 体积）。
+    pub fn registry_sources(&self) -> String {
+        openslate_mobile::alog!("ffi: registry_sources");
+        self.inner.registry_sources_json()
+    }
+
+    /// 手动更新一个数据源（阻塞，最长 120s；IO 线程调用）。
+    /// 返回 `{"ok":true,"entries":N}` 或 `{"ok":false,"error":"..."}`。
+    pub fn registry_update_source(&self, id: String) -> String {
+        openslate_mobile::alog!("ffi: registry_update_source(id={id})");
+        self.inner.registry_update_source_json(id)
+    }
+
+    /// 启动时按需自动更新（后台执行；本地缺失或过期才拉取）。
+    pub fn registry_schedule_auto_update(&self) {
+        openslate_mobile::alog!("ffi: registry_schedule_auto_update");
+        self.inner.registry_schedule_auto_update();
+    }
+
+    /// 本地条目搜索 / 浏览（数据源页面「查看条目 / 跨源搜索」）。纯
+    /// 本地（首次会读盘解压，宿主建议 IO 线程调用）。`source_id` 空 =
+    /// 跨全部已缓存源搜索；`query` 空 = 浏览模式（前 limit 条，键字
+    /// 典序）；`limit <= 0` 按 50 处理。返回
+    /// `{"total":N,"results":[{source,sourceId,id,ctx,out,vision,reasoning,tool,priceIn,priceOut}]}`：
+    /// `total` = 匹配总数（分页计数），`results` 截断到 limit；`id`
+    /// 为源 JSON 原始键（保留 provider 前缀）；数值 / 能力 / 计价字段
+    /// 源没给为 null。未知 source_id → `{"total":0,"results":[]}`。
+    pub fn registry_search(&self, source_id: String, query: String, limit: i32) -> String {
+        openslate_mobile::alog!(
+            "ffi: registry_search(source_id={source_id:?}, query={query:?}, limit={limit})"
+        );
+        self.inner.registry_search_json(source_id, query, limit)
+    }
+
+    /// 模型元数据查询（本地优先，miss 时在线兜底；IO 线程调用）。
+    pub fn lookup_model_meta(&self, model_id: String) -> String {
+        openslate_mobile::alog!("ffi: lookup_model_meta(model_id={model_id})");
+        self.inner.lookup_model_meta_json(model_id)
+    }
+
     /// 当前会话 run id（无进行中会话返回 null）。
     pub fn current_run_id(&self) -> Option<String> {
         self.inner.current_run_id()

@@ -239,6 +239,12 @@ model = "glm-5.3-flash"
 main = "main"
 fast = "fast"
 
+# 功能 → 代号映射（主对话/上下文压缩/标题生成各用哪档模型）。
+[capabilities]
+main = "main"
+compact = "fast"
+title = "fast"
+
 [limits]
 auto_compact = true
 max_context_bytes = 60000

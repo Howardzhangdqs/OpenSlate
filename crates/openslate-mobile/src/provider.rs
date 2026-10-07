@@ -30,7 +30,8 @@ impl MobileSecrets {
         tracing::info!(target: "openslate_mobile", "api key injected for provider '{provider}'");
     }
 
-    fn get(&self, provider: &str) -> Option<String> {
+    /// 取 key（runtime 的模型检测等同步路径复用；null = 未注入）。
+    pub fn get(&self, provider: &str) -> Option<String> {
         self.keys
             .read()
             .expect("mobile secrets lock poisoned")

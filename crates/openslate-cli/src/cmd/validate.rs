@@ -9,7 +9,9 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use openslate_core::config::validation::{validate_config, validate_strict, ValidationError};
+use openslate_core::config::validation::{
+    validate_config, validate_config_full, validate_strict, ValidationError,
+};
 use openslate_core::config::{
     parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig,
 };
@@ -419,9 +421,11 @@ model = "m2"
     /// `[levels] main = "bad"` (a level remap of a global entry).
     ///
     /// Expected: the merged validate run reports the ghost PROVIDER for
-    /// models.bad (the global library WAS merged), not "levels.main points
-    /// to non-existent model entry 'bad'" (which a single-file read of the
-    /// local config would produce).
+    /// models.bad (the global library WAS merged), and the dangling-level
+    /// finding (warning-level since model-mgmt-2: levels are loosely
+    /// coupled) stays silent because the remap resolves against the merged
+    /// library — unlike a single-file read of the local config, which does
+    /// warn "levels.main points to non-existent model entry 'bad'".
     #[test]
     fn test_validate_merges_global_library_under_local_override() {
         let project = TempDir::new().expect("tmp project");
@@ -477,23 +481,26 @@ model = "m2"
             ghost_err.is_some(),
             "merged validate must report the ghost provider: {errors:?}"
         );
+        // Dangling levels are warning-level now: the merged run must not
+        // even warn, because the remap resolves against the MERGED library.
+        let merged_warnings = validate_config_full(&merged, &agents).warnings;
         assert!(
-            !errors
+            !merged_warnings
                 .iter()
-                .any(|e| e.message.contains("points to non-existent model entry")),
-            "the local level remap must resolve against the MERGED library: {errors:?}"
+                .any(|w| w.message.contains("points to non-existent model entry")),
+            "the local level remap must resolve against the MERGED library: {merged_warnings:?}"
         );
 
         // Contrast: the local file ALONE (pre-layering behavior) would flag
         // the dangling level — this is the bug this integration fixes.
         let local_alone =
             openslate_app::wiring::load_config_layered(&active, None).expect("single-file load");
-        let errors_alone = validate_config(&local_alone, &agents);
+        let warnings_alone = validate_config_full(&local_alone, &agents).warnings;
         assert!(
-            errors_alone
+            warnings_alone
                 .iter()
-                .any(|e| e.message.contains("points to non-existent model entry")),
-            "sanity: single-file read does NOT see the global library: {errors_alone:?}"
+                .any(|w| w.message.contains("points to non-existent model entry")),
+            "sanity: single-file read does NOT see the global library: {warnings_alone:?}"
         );
     }
 
@@ -546,8 +553,10 @@ model = "m2"
     #[test]
     fn test_explicit_config_stays_single_file() {
         // An explicit --config must NOT consult any global library: this
-        // config has a dangling level and no matching model, which only
-        // fails via the plain single-file finding (no merge can rescue it).
+        // config has a dangling level and no matching model. The dangling
+        // finding surfaces via warnings (single-file read; no merge can
+        // rescue it), and the command still fails overall because the
+        // required `fast` level is missing.
         let tmp = TempDir::new().expect("tmp");
         let config_path = tmp.path().join("only-levels.toml");
         std::fs::write(&config_path, "[levels]\nmain = \"ghost2\"\n").expect("write toml");
@@ -561,15 +570,15 @@ model = "m2"
 
         let config = load_config(&config_path).expect("config parses");
         let agents = parse_agents_dir(&agents_path).expect("agents parse");
-        let errors = validate_config(&config, &agents);
+        let warnings = validate_config_full(&config, &agents).warnings;
         assert!(
-            errors.iter().any(|e| e.message.contains("ghost2")
-                && e.message.contains("points to non-existent model entry")),
-            "explicit single file sees only itself (dangling level): {errors:?}"
+            warnings.iter().any(|w| w.message.contains("ghost2")
+                && w.message.contains("points to non-existent model entry")),
+            "explicit single file sees only itself (dangling level): {warnings:?}"
         );
         assert!(
             run_validate_command(&config_path, &agents_path, false).is_err(),
-            "explicit --config with a dangling level must fail"
+            "explicit --config with no resolvable models must fail (missing fast level)"
         );
     }
 

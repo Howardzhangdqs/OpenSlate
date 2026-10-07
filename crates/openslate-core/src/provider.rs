@@ -88,6 +88,125 @@ pub trait ProgressCallback: Send {
     fn on_step_end(&mut self) {}
 }
 
+// ── 远端模型清单拉取（Provider 设置页"自动检测"）────────────────────
+//
+// adapter 感知：不同协议族的 /models 端点与鉴权头不同。响应解析刻意
+// 宽松（data[].id / models[].name / models[].id 都认），只提取 id 列表。
+
+/// 拉取 provider 的可用模型清单。`adapter` 为空按 "openai" 处理
+/// （与 `ProviderConfig::adapter` 的缺省语义一致）。10s 超时。
+///
+/// 端点/鉴权矩阵：
+/// - `openai`（含所有兼容端点，如 zhipu）：`GET {base}/models`，`Authorization: Bearer`
+/// - `anthropic`：`GET {base}/v1/models`，`x-api-key` + `anthropic-version`
+/// - `gemini`：`GET {base}/v1beta/models`，`x-goog-api-key`
+/// - `ollama`：`GET {base}/api/tags`，无鉴权
+pub async fn list_remote_models(
+    base_url: &str,
+    adapter: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let base = base_url.trim_end_matches('/');
+    let adapter = if adapter.is_empty() { "openai" } else { adapter };
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("openslate/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10));
+    // Android：rustls-platform-verifier 需要 JNI 宿主初始化（纯 .so 场景
+    // 不可用）——与 model-genai 同款 webpki 静态根证书预配置 TLS。
+    #[cfg(target_os = "android")]
+    {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let tls = rustls::ClientConfig::builder_with_provider(provider.into())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("tls config: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        builder = builder.use_preconfigured_tls(tls);
+    }
+    // 与 provider 工厂同款代理语义：OPENSLATE_HTTP_PROXY 显式启用，
+    // 否则 no_proxy（desktop 默认直连）。
+    match std::env::var("OPENSLATE_HTTP_PROXY").ok().filter(|u| !u.is_empty()) {
+        Some(proxy_url) => {
+            let proxy = reqwest::Proxy::all(&proxy_url)
+                .map_err(|e| anyhow::anyhow!("invalid proxy url '{proxy_url}': {e}"))?;
+            builder = builder.proxy(proxy);
+        }
+        None => builder = builder.no_proxy(),
+    }
+    let mut req = builder.build()?.get(match adapter {
+            // base 带版本后缀时不再重复拼（anthropic 代理常配成
+            // "…/v1"：直接拼 /v1/models 会变成 /v1/v1/models → 404）。
+            "anthropic" => {
+                if base.ends_with("/v1") {
+                    format!("{base}/models")
+                } else {
+                    format!("{base}/v1/models")
+                }
+            }
+            "gemini" => {
+                let b = base.strip_suffix("/v1beta").unwrap_or(base);
+                format!("{b}/v1beta/models")
+            }
+            "ollama" => format!("{base}/api/tags"),
+            _ => format!("{base}/models"),
+        });
+    match adapter {
+        "anthropic" => {
+            req = req.header("anthropic-version", "2023-06-01");
+            if let Some(k) = api_key {
+                req = req.header("x-api-key", k);
+            }
+        }
+        "gemini" => {
+            if let Some(k) = api_key {
+                req = req.header("x-goog-api-key", k);
+            }
+        }
+        "ollama" => {}
+        _ => {
+            if let Some(k) = api_key {
+                req = req.header("Authorization", format!("Bearer {k}"));
+            }
+        }
+    }
+    let body: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+    let mut ids: Vec<String> = Vec::new();
+    // OpenAI/Anthropic: {"data":[{"id":...}]}；Gemini: {"models":[{"name":
+    // "models/xxx"}]}；Ollama /api/tags: {"models":[{"name":...}]}。逐个
+    // 探测，兼容各家变体与代理实现。
+    if let Some(arr) = body.get("data").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    if let Some(arr) = body.get("models").and_then(|v| v.as_array()) {
+        for item in arr {
+            let name = item
+                .get("name")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str());
+            if let Some(id) = name {
+                // Gemini 的 name 带 "models/" 前缀，剥掉。
+                ids.push(id.strip_prefix("models/").unwrap_or(id).to_owned());
+            }
+        }
+    }
+    if ids.is_empty() {
+        anyhow::bail!(
+            "models 响应里没有可识别的模型条目（adapter={adapter}，响应片段：{}）",
+            serde_json::to_string(&body).unwrap_or_default().chars().take(200).collect::<String>()
+        );
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

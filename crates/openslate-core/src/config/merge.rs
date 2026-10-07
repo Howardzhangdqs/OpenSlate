@@ -33,6 +33,7 @@ pub fn merge_configs(global: &OpenSlateConfig, local: &OpenSlateConfig) -> OpenS
         providers: merge_map(&global.providers, &local.providers),
         models: merge_map(&global.models, &local.models),
         levels: merge_map(&global.levels, &local.levels),
+        capabilities: merge_map(&global.capabilities, &local.capabilities),
         trace: local.trace.clone().or_else(|| global.trace.clone()),
         mcp: local.mcp.clone().or_else(|| global.mcp.clone()),
         builtin_tools: local.builtin_tools.clone(),

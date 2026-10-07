@@ -208,12 +208,32 @@ async fn handle_submit(state: &Arc<AppState>, conn_id: u64, text: String) {
     };
 
     // 2. lazy 打开持久化 run（无 store / 失败 → None = 本会话不落库）。
+    // had_run：本条是否是该 run 的首条消息（此前无 run）——只有首条
+    // 才值得花一次 title 模型调用生成标题。
+    let had_run = {
+        let inner = state.core.lock();
+        inner.session_run.is_some()
+    };
     let session_run = open_session_run(state, Some(title_hint.as_str())).await;
 
     // 3. 用户消息落库（引擎侧逐条追加走同一 recorder，seq 连续）。
     if let Some(run) = &session_run {
         if let Err(e) = run.recorder.write_message(&user_message).await {
             tracing::warn!("failed to persist user message: {e}");
+        }
+    }
+
+    // 3.5 首条消息 → 异步 LLM 标题（capability=title）。占位标题（prompt
+    // 截断）此刻已在库，生成失败/别名缺失即保留占位；成功则替换并广播
+    // RunTitle（历史列表原位更新）。与主回合并行，不阻塞首 token。
+    if !had_run {
+        if let Some(run) = &session_run {
+            let task_state = Arc::clone(state);
+            let task_run_id = run.run_id.0.clone();
+            let first_prompt = user_message.content.clone();
+            tokio::spawn(async move {
+                generate_session_title(&task_state, task_run_id, first_prompt).await;
+            });
         }
     }
 
@@ -352,6 +372,63 @@ async fn open_session_run(
             None
         }
     }
+}
+
+/// 首条消息后的异步 LLM 标题生成（capability=title）。
+///
+/// 计划构建（capability → 代号 → provider）任一步失败 → 静默返回：
+/// run 开始时的 prompt 截断占位标题已在库，这与 compact 的机械兜底
+/// 同语义（降级可用，永不报错）。成功路径：替换 run.title 落库 →
+/// 广播 `RunTitle`（历史列表原位更新）。usage 计入会话累计（同
+/// compact：不进 run 行）。
+async fn generate_session_title(state: &Arc<AppState>, run_id: String, first_prompt: String) {
+    use openslate_core::model_config::{capability_alias, resolve_model, CAP_TITLE};
+
+    let (factory, config, store) = {
+        let inner = state.core.lock();
+        (
+            state.provider_factory.clone(),
+            inner.config.clone(),
+            inner.store.clone(),
+        )
+    };
+    let alias = capability_alias(&config, CAP_TITLE);
+    let Some(resolved) = resolve_model(&config, &alias).ok() else {
+        tracing::debug!("title alias '{alias}' unresolvable; keep mechanical title");
+        return;
+    };
+    let Ok(provider) = factory(&config, &alias) else {
+        tracing::debug!("title provider build failed; keep mechanical title");
+        return;
+    };
+    let pricing = resolved.cost_spec();
+
+    let (title, usage) =
+        crate::engine::generate_title(provider.as_ref(), &resolved.model_id, &first_prompt).await;
+
+    if let Some(usage) = usage {
+        let mut inner = state.core.lock();
+        inner.stats.total_input_tokens += usage.input_tokens as u64;
+        inner.stats.total_output_tokens += usage.output_tokens as u64;
+        inner.stats.total_cost_usd += pricing.cost_of(&usage);
+    }
+
+    let Some(title) = title else {
+        return;
+    };
+    let Some(store) = store else {
+        return;
+    };
+    // run 可能已被删（生成期间用户长按删除）：UPDATE 影响零行也成功
+    // 返回，此时广播无意义——保守起见仍统一广播（客户端按 run_id
+    // 原位更新，目标不存在即自然丢弃）。
+    if let Err(e) = store.update_run_title(&run_id, &title).await {
+        tracing::warn!("failed to persist generated title: {e}");
+        return;
+    }
+    state
+        .sink
+        .broadcast(ServerMsg::RunTitle { run_id, title });
 }
 
 fn new_session_id() -> String {

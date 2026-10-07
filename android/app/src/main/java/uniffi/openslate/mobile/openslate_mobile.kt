@@ -703,9 +703,21 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_delete_session(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_list_provider_models(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_list_sessions(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_lookup_model_meta(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_open_session(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_registry_schedule_auto_update(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_registry_search(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_registry_sources(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_registry_update_source(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_resolve_host_call(
     ): Int
@@ -754,10 +766,22 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_delete_session(`ptr`: Long,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_list_provider_models(`ptr`: Long,`provider`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_list_sessions(`ptr`: Long,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_lookup_model_meta(`ptr`: Long,`modelId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_open_session(`ptr`: Long,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_registry_schedule_auto_update(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_registry_search(`ptr`: Long,`sourceId`: RustBuffer.ByValue,`query`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_registry_sources(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_registry_update_source(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_resolve_host_call(`ptr`: Long,`id`: Long,`ok`: Byte,`payload`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_send(`ptr`: Long,`msg`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -902,10 +926,28 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_delete_session() and 0xFFFF) != 15461) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_list_provider_models() and 0xFFFF) != 55302) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_list_sessions() and 0xFFFF) != 29641) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_lookup_model_meta() and 0xFFFF) != 53564) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_open_session() and 0xFFFF) != 805) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_registry_schedule_auto_update() and 0xFFFF) != 37748) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_registry_search() and 0xFFFF) != 20619) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_registry_sources() and 0xFFFF) != 61320) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_registry_update_source() and 0xFFFF) != 64046) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_resolve_host_call() and 0xFFFF) != 23599) {
@@ -1146,6 +1188,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterULong: FfiConverter<ULong, Long> {
     override fun lift(value: Long): ULong {
         return value.toULong()
@@ -1361,15 +1426,55 @@ public interface OpenSlateRuntimeInterface {
     fun `deleteSession`(`runId`: kotlin.String): kotlin.Boolean
     
     /**
+     * 拉取 provider 的可用模型清单（设置页 Provider 域"自动检测"）。
+     * 返回 `{"ok":true,"models":[...]}` 或 `{"ok":false,"error":"..."}`
+     * （密钥未配置 / 网络 / 协议错误）。含 10s 超时，宿主须在 IO 线程调用。
+     */
+    fun `listProviderModels`(`provider`: kotlin.String): kotlin.String
+    
+    /**
      * 历史会话列表（JSON 数组：id/title/status/started_ms/cost_usd）。
      * 分页：每页 50 条，offset 递增（0、50、100…；首页传 0）。
      */
     fun `listSessions`(`offset`: kotlin.UInt): kotlin.String
     
     /**
+     * 模型元数据查询（本地优先，miss 时在线兜底；IO 线程调用）。
+     */
+    fun `lookupModelMeta`(`modelId`: kotlin.String): kotlin.String
+    
+    /**
      * 切换到指定历史会话（成功后回推新 snapshot 事件）。
      */
     fun `openSession`(`runId`: kotlin.String)
+    
+    /**
+     * 启动时按需自动更新（后台执行；本地缺失或过期才拉取）。
+     */
+    fun `registryScheduleAutoUpdate`()
+    
+    /**
+     * 本地条目搜索 / 浏览（数据源页面「查看条目 / 跨源搜索」）。纯
+     * 本地（首次会读盘解压，宿主建议 IO 线程调用）。`source_id` 空 =
+     * 跨全部已缓存源搜索；`query` 空 = 浏览模式（前 limit 条，键字
+     * 典序）；`limit <= 0` 按 50 处理。返回
+     * `{"total":N,"results":[{source,sourceId,id,ctx,out,vision,reasoning,tool,priceIn,priceOut}]}`：
+     * `total` = 匹配总数（分页计数），`results` 截断到 limit；`id`
+     * 为源 JSON 原始键（保留 provider 前缀）；数值 / 能力 / 计价字段
+     * 源没给为 null。未知 source_id → `{"total":0,"results":[]}`。
+     */
+    fun `registrySearch`(`sourceId`: kotlin.String, `query`: kotlin.String, `limit`: kotlin.Int): kotlin.String
+    
+    /**
+     * 数据源列表 + 各源本地状态（条目数 / 更新时间 / 体积）。
+     */
+    fun `registrySources`(): kotlin.String
+    
+    /**
+     * 手动更新一个数据源（阻塞，最长 120s；IO 线程调用）。
+     * 返回 `{"ok":true,"entries":N}` 或 `{"ok":false,"error":"..."}`。
+     */
+    fun `registryUpdateSource`(`id`: kotlin.String): kotlin.String
     
     /**
      * 应答 host call。`ok=true` → payload 为结果 JSON；`ok=false` →
@@ -1550,6 +1655,25 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 
     
     /**
+     * 拉取 provider 的可用模型清单（设置页 Provider 域"自动检测"）。
+     * 返回 `{"ok":true,"models":[...]}` 或 `{"ok":false,"error":"..."}`
+     * （密钥未配置 / 网络 / 协议错误）。含 10s 超时，宿主须在 IO 线程调用。
+     */override fun `listProviderModels`(`provider`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_list_provider_models(
+        it,
+        
+        FfiConverterString.lower(`provider`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * 历史会话列表（JSON 数组：id/title/status/started_ms/cost_usd）。
      * 分页：每页 50 条，offset 递增（0、50、100…；首页传 0）。
      */override fun `listSessions`(`offset`: kotlin.UInt): kotlin.String {
@@ -1560,6 +1684,23 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
         it,
         
         FfiConverterUInt.lower(`offset`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 模型元数据查询（本地优先，miss 时在线兜底；IO 线程调用）。
+     */override fun `lookupModelMeta`(`modelId`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_lookup_model_meta(
+        it,
+        
+        FfiConverterString.lower(`modelId`),_status)
 }
     }
     )
@@ -1581,6 +1722,81 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 }
     }
     
+    
+
+    
+    /**
+     * 启动时按需自动更新（后台执行；本地缺失或过期才拉取）。
+     */override fun `registryScheduleAutoUpdate`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_registry_schedule_auto_update(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 本地条目搜索 / 浏览（数据源页面「查看条目 / 跨源搜索」）。纯
+     * 本地（首次会读盘解压，宿主建议 IO 线程调用）。`source_id` 空 =
+     * 跨全部已缓存源搜索；`query` 空 = 浏览模式（前 limit 条，键字
+     * 典序）；`limit <= 0` 按 50 处理。返回
+     * `{"total":N,"results":[{source,sourceId,id,ctx,out,vision,reasoning,tool,priceIn,priceOut}]}`：
+     * `total` = 匹配总数（分页计数），`results` 截断到 limit；`id`
+     * 为源 JSON 原始键（保留 provider 前缀）；数值 / 能力 / 计价字段
+     * 源没给为 null。未知 source_id → `{"total":0,"results":[]}`。
+     */override fun `registrySearch`(`sourceId`: kotlin.String, `query`: kotlin.String, `limit`: kotlin.Int): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_registry_search(
+        it,
+        
+        FfiConverterString.lower(`sourceId`),
+        FfiConverterString.lower(`query`),
+        FfiConverterInt.lower(`limit`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 数据源列表 + 各源本地状态（条目数 / 更新时间 / 体积）。
+     */override fun `registrySources`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_registry_sources(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 手动更新一个数据源（阻塞，最长 120s；IO 线程调用）。
+     * 返回 `{"ok":true,"entries":N}` 或 `{"ok":false,"error":"..."}`。
+     */override fun `registryUpdateSource`(`id`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_registry_update_source(
+        it,
+        
+        FfiConverterString.lower(`id`),_status)
+}
+    }
+    )
+    }
     
 
     

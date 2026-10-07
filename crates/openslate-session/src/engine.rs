@@ -34,6 +34,12 @@ for continued work. Produce a concise summary that preserves: \
 Drop pleasantries and verbose tool output details. Be brief — only what is \
 needed to continue the work effectively.";
 
+/// 标题生成系统提示（capability=title）。模型只回标题本身。
+const TITLE_SYSTEM_PROMPT: &str = "You generate a short session title from the \
+user's first message. Output ONLY the title text: at most 16 characters, \
+no quotes, no label prefix, no trailing punctuation. Write it in the same \
+language as the user's message.";
+
 /// 进度回调 → 转写镜像 + 广播。`&mut self` 方法全部内联锁 core。
 pub struct SessionProgressBridge {
     pub state: Arc<AppState>,
@@ -259,23 +265,27 @@ pub async fn run_auto_compact(state: &Arc<AppState>) {
 
     tracing::info!("session auto-compact: history over context limits, summarizing");
 
-    // fast 模型计划（缺失/构建失败 → None → 机械兜底，core compact 内建）。
+    // 压缩模型计划（capability=compact → 代号；缺失/构建失败 → None →
+    // 机械兜底，core compact 内建）。无 [capabilities] 节回退 "fast"，
+    // 与历史硬编码行为一致。
     let factory = state.provider_factory.clone();
+    let config = state.core.lock().config.clone();
+    let compact_alias =
+        openslate_core::model_config::capability_alias(&config, openslate_core::model_config::CAP_COMPACT);
     let summary_plan: Option<(String, Box<dyn ModelProvider>, CostSpec)> = {
-        let config = state.core.lock().config.clone();
-        match resolve_model(&config, "fast") {
-            Ok(resolved) => match factory(&config, "fast") {
+        match resolve_model(&config, &compact_alias) {
+            Ok(resolved) => match factory(&config, &compact_alias) {
                 Ok(provider) => {
                     let pricing = resolved.cost_spec();
                     Some((resolved.model_id, provider, pricing))
                 }
                 Err(e) => {
-                    tracing::debug!("no provider for 'fast' — mechanical fallback: {e}");
+                    tracing::debug!("no provider for '{compact_alias}' — mechanical fallback: {e}");
                     None
                 }
             },
             Err(e) => {
-                tracing::debug!("no 'fast' alias — mechanical fallback: {e}");
+                tracing::debug!("no '{compact_alias}' alias — mechanical fallback: {e}");
                 None
             }
         }
@@ -361,6 +371,70 @@ async fn generate_summary(
     }
 }
 
+// ── 会话标题生成（capability=title）────────────────────────────────────
+
+/// 首条用户消息喂给标题模型的截断长度（字符，CJK 安全）——标题只需要
+///主题，不需要全文。
+const TITLE_INPUT_MAX_CHARS: usize = 400;
+
+/// 标题清洗后的最大长度（字符）。模型提示要求 ≤16 字符，这里留裕量
+/// 兜住啰嗦模型；超出按字符截断（与 prompt 截断同款 CJK 安全语义）。
+const TITLE_MAX_CHARS: usize = 24;
+
+/// 标题模型调用（capability=title）。失败/空白 → None（调用方保留
+/// run 开始时已落库的 prompt 截断占位标题——机械兜底已就位，此处
+/// 无需再降级）。`pub(crate)` 供 session.rs 异步任务复用。
+pub(crate) async fn generate_title(
+    provider: &dyn ModelProvider,
+    model_id: &str,
+    first_prompt: &str,
+) -> (Option<String>, Option<Usage>) {
+    let trimmed_input: String = first_prompt.chars().take(TITLE_INPUT_MAX_CHARS).collect();
+    let request = GenerateRequest {
+        model_id: model_id.to_owned(),
+        system_prompt: Some(TITLE_SYSTEM_PROMPT.to_owned()),
+        messages: vec![Message {
+            role: MessageRole::User,
+            content: trimmed_input,
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }],
+        tools: Vec::new(),
+        max_tokens: Some(48),
+        temperature: None,
+    };
+    match provider.generate(request).await {
+        Ok(response) => {
+            let usage = response.usage;
+            (sanitize_title(response.content.as_deref()), usage)
+        }
+        Err(e) => {
+            tracing::debug!("title generation failed ({e}); keep mechanical title");
+            (None, None)
+        }
+    }
+}
+
+/// 标题清洗：首行 → 去包裹引号/书名号/反引号 → 按字符截断。空/纯
+/// 标点结果 → None（保留占位标题）。`pub(crate)` 供单测。
+pub(crate) fn sanitize_title(raw: Option<&str>) -> Option<String> {
+    let first_line = raw?.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let stripped = first_line
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '“' | '”' | '「' | '」' | '『' | '』' | '《' | '》'))
+        .trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let title: String = stripped.chars().take(TITLE_MAX_CHARS).collect();
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
 /// 供单元测试：usage Meta 行格式。
 #[cfg(test)]
 pub(crate) fn meta_line_for_test(usage: &Usage) -> String {
@@ -370,6 +444,66 @@ pub(crate) fn meta_line_for_test(usage: &Usage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_title_takes_first_line_strips_quotes_and_caps() {
+        assert_eq!(
+            sanitize_title(Some("  调试构建失败  \n第二行")),
+            Some("调试构建失败".into())
+        );
+        assert_eq!(
+            sanitize_title(Some("\"fix login bug\"")),
+            Some("fix login bug".into())
+        );
+        assert_eq!(
+            sanitize_title(Some("「重构压缩逻辑」")),
+            Some("重构压缩逻辑".into())
+        );
+        // 啰嗦模型：按字符截断到 TITLE_MAX_CHARS（24），CJK 安全。
+        let long = "一".repeat(60);
+        assert_eq!(
+            sanitize_title(Some(&long)).map(|t| t.chars().count()),
+            Some(TITLE_MAX_CHARS)
+        );
+        // 空白 / 纯引号 → None（保留机械占位标题）。
+        assert_eq!(sanitize_title(Some("   ")), None);
+        assert_eq!(sanitize_title(Some("\"\"")), None);
+        assert_eq!(sanitize_title(None), None);
+    }
+
+    #[tokio::test]
+    async fn generate_title_caps_input_and_sanitizes_output() {
+        // 桩 provider：验证输入截断 + 小请求限额 + 输出清洗链路。
+        use openslate_core::error::ProviderError;
+        use openslate_core::provider::{GenerateRequest, ModelProvider};
+        use openslate_core::types::ModelResponse;
+        struct TitleStub;
+        #[async_trait::async_trait]
+        impl ModelProvider for TitleStub {
+            async fn generate(&self, req: GenerateRequest) -> Result<ModelResponse, ProviderError> {
+                let input = &req.messages[0].content;
+                assert!(
+                    input.chars().count() <= TITLE_INPUT_MAX_CHARS,
+                    "input must be truncated"
+                );
+                assert_eq!(req.max_tokens, Some(48), "title gen is a tiny request");
+                Ok(ModelResponse {
+                    content: Some("  \"修复登录超时\" \n多余行".into()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    finish_reason: None,
+                })
+            }
+
+            fn provider_name(&self) -> &str {
+                "title-stub"
+            }
+        }
+        let long_prompt = "x".repeat(1_000);
+        let (title, _usage) = generate_title(&TitleStub, "m", &long_prompt).await;
+        assert_eq!(title.as_deref(), Some("修复登录超时"));
+    }
 
     #[test]
     fn usage_meta_line_formats() {

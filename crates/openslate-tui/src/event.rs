@@ -346,6 +346,7 @@ mod tests {
             providers: Default::default(),
             models: Default::default(),
             levels: Default::default(),
+            capabilities: Default::default(),
             limits: openslate_protocol::LimitsDto {
                 max_steps: 8,
                 max_depth: 4,

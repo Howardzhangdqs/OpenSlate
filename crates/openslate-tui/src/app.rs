@@ -3074,6 +3074,7 @@ max_output_bytes = 10_000
                 .map(|(k, v)| (k.clone(), ModelDto::from(v)))
                 .collect(),
             levels: config.levels.clone().into_iter().collect(),
+            capabilities: Default::default(),
             limits: LimitsDto {
                 max_steps: limits.map(|l| l.max_steps).unwrap_or(8),
                 max_depth: limits.map(|l| l.max_depth).unwrap_or(4),

@@ -9,6 +9,53 @@ use std::collections::HashMap;
 use crate::config::{OpenSlateConfig, ProviderConfig};
 use crate::error::ConfigError;
 
+// ── Capabilities（功能 → 代号）───────────────────────────────────────────
+//
+// `[capabilities]` 把"功能"（谁在用模型）与"代号"（用哪个模型档位）
+// 解耦：代号是用户自由命名的 `[levels]` key（fast / main / vision …，
+// 想配几个配几个），功能是固定 id。默认映射让无该节的旧配置行为
+// 完全不变（compact 历史上硬编码 "fast"，main 沿用 "main"）。
+
+/// 功能 id：主对话（正常 API 请求）。
+pub const CAP_MAIN: &str = "main";
+/// 功能 id：上下文压缩（auto-compact 摘要）。
+pub const CAP_COMPACT: &str = "compact";
+/// 功能 id：会话标题生成。
+pub const CAP_TITLE: &str = "title";
+
+/// 全部功能 id（展示顺序即 UI 默认顺序）。
+pub const CAPABILITIES: &[&str] = &[CAP_MAIN, CAP_COMPACT, CAP_TITLE];
+
+/// 功能的中文名（UI 展示 / 事件文案）。
+pub fn capability_title(cap: &str) -> &'static str {
+    match cap {
+        CAP_MAIN => "主对话",
+        CAP_COMPACT => "上下文压缩",
+        CAP_TITLE => "标题生成",
+        _ => "未知功能",
+    }
+}
+
+/// 功能 → 代号（含缺省回退）。
+///
+/// `[capabilities]` 有值用值；没有该节/该 key 的旧配置回退到历史
+/// 默认（`main`→"main"、`compact`/`title`→"fast"），与引入本节之前
+/// 的行为逐字节一致。返回的代号交给 [`resolve_model`] 解析；解析
+/// 失败由调用方按各功能自己的兜底策略处理（compact → 机械拼接、
+/// title → prompt 截断）。
+pub fn capability_alias(config: &OpenSlateConfig, cap: &str) -> String {
+    let fallback = match cap {
+        CAP_MAIN => "main",
+        CAP_COMPACT | CAP_TITLE => "fast",
+        _ => "fast",
+    };
+    config
+        .capabilities
+        .get(cap)
+        .cloned()
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 /// A fully resolved model configuration ready for use.
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
@@ -194,6 +241,67 @@ fast = "small"
         let fast = resolve_model(&config, "fast").unwrap();
         assert_eq!(fast.alias, "fast");
         assert_eq!(fast.model_id, "glm-4-flash");
+    }
+
+    #[test]
+    fn capability_alias_defaults_without_section() {
+        // 无 [capabilities]：回退历史默认（main→"main"，compact/title→"fast"），
+        // 与引入该节之前的硬编码行为一致。
+        let toml = r#"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "K"
+
+[models.main]
+provider = "p"
+model = "m1"
+
+[models.fast]
+provider = "p"
+model = "m2"
+"#;
+        let config = crate::config::parse_openslate_toml(toml).unwrap();
+        assert_eq!(capability_alias(&config, CAP_MAIN), "main");
+        assert_eq!(capability_alias(&config, CAP_COMPACT), "fast");
+        assert_eq!(capability_alias(&config, CAP_TITLE), "fast");
+    }
+
+    #[test]
+    fn capability_alias_override_and_resolve() {
+        // 显式 [capabilities] 覆盖默认；代号可自由命名（vision）。
+        let toml = r#"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "K"
+
+[models.big]
+provider = "p"
+model = "big-m"
+
+[models.small]
+provider = "p"
+model = "small-m"
+
+[levels]
+main = "big"
+fast = "small"
+vision = "big"
+
+[capabilities]
+main = "vision"
+compact = "fast"
+title = "fast"
+"#;
+        let config = crate::config::parse_openslate_toml(toml).unwrap();
+        assert_eq!(capability_alias(&config, CAP_MAIN), "vision");
+        let resolved = resolve_model(&config, &capability_alias(&config, CAP_MAIN)).unwrap();
+        assert_eq!(resolved.model_id, "big-m", "capability main → vision → big");
+        assert_eq!(
+            resolve_model(&config, &capability_alias(&config, CAP_COMPACT))
+                .unwrap()
+                .model_id,
+            "small-m"
+        );
     }
 
     #[test]

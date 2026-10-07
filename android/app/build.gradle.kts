@@ -29,6 +29,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // 本地测试用：debug keystore 签 release，可与 debug 包互相覆盖安装
+            // （免卸载、不丢本地数据）。正式发布前换成正式签名。
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

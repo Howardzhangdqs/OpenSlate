@@ -2,12 +2,10 @@ package dev.openslate.mobile.ui
 
 import android.os.Build
 import android.util.Log
-import androidx.compose.animation.togetherWith
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -15,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -29,10 +28,12 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.Psychology
@@ -47,11 +48,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -90,6 +88,8 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
 import kotlin.math.roundToInt
@@ -115,13 +115,19 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
         .find { it.entry == state.modelAlias }?.supportsReasoning == true
     val showThinking = state.running && state.awaitingFirstToken && thinkEligible
 
-    // 磨砂玻璃：背景捕获层 + 全屏模糊副本（各玻璃面板共用一份，性能考虑），
-    // rootCoords 用于把模糊副本平移到每个玻璃面板自身位置。
-    val glass = rememberGlassLayers()
+    // 磨砂玻璃：共享的内容捕获层（source）+ 模糊参数；每个玻璃面板在各自
+    // draw 阶段录制「自身区域 + 模糊半径出血带」的小模糊层（见 GlassPanel）。
+    // rootCoords 用于把内容捕获层平移到面板自身位置。
+    val glass = rememberGlass()
     var rootCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
-    val blurPx = with(LocalDensity.current) { 20.dp.toPx() }
-    val blurEffect = remember(blurPx) {
-        BlurEffect(radiusX = blurPx, radiusY = blurPx, edgeTreatment = TileMode.Clamp)
+    // 工具详情弹窗：点击工具条目打开（完整命令 + 输出，可选中复制）。
+    // 保存的是打开瞬间的快照副本；渲染前按 name+fullArgs 回查 entries 取
+    // 最新状态（执行中的工具完成时输出能实时刷新进来）。
+    var detailTool by remember { mutableStateOf<UiEntry.ToolCall?>(null) }
+    val detailLive = detailTool?.let { d ->
+        state.entries.filterIsInstance<UiEntry.ToolCall>()
+            .firstOrNull { it.name == d.name && it.fullArgs == d.fullArgs }
+            ?: d
     }
 
     LaunchedEffect(state.entries.size, showThinking) {
@@ -171,7 +177,7 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                                 contentDescription = "模型配置",
                             )
                         }
-                        TextButton(onClick = { RuntimeBridge.newSession() }) { Text("新会话") }
+                        SoftButton(onClick = { RuntimeBridge.newSession() }) { Text("新会话") }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = Color.Transparent,
@@ -206,8 +212,9 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                 .padding(bottom = padding.calculateBottomPadding())
                 .imePadding(),
         ) {
-            // 背景捕获层：把列表内容录制进 GraphicsLayer，再录制一份全屏模糊副本；
-            // 顶栏与输入胶囊共用同一份模糊层（每个玻璃区域各自全屏模糊会拖垮 GPU）。
+            // 背景捕获层：把列表内容录制进共享 GraphicsLayer；屏显也经由该层
+            // 绘制（录制与显示共用一份 displaylist）。各玻璃面板在自身 draw
+            // 阶段引用此层录制带出血带的小模糊层（见 GlassPanel）。
             // GraphicsLayer.renderEffect 依赖 RenderEffect，Android 12+ 才生效。
             Box(
                 Modifier
@@ -219,12 +226,6 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                         )
                         glass.source.record(size = layerSize) {
                             this@drawWithContent.drawContent()
-                        }
-                        glass.blurred.record(size = layerSize) {
-                            drawLayer(glass.source)
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            glass.blurred.renderEffect = blurEffect
                         }
                         drawLayer(glass.source)
                     },
@@ -259,8 +260,12 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                                     item.entry,
                                     // 会话进行中且是最后一条 → 思考中态（实时秒数 + 贴底跟随）。
                                     activeLast = state.running && idx == renderItems.lastIndex,
+                                    onOpenTool = { detailTool = it },
                                 )
-                                is RenderItem.ToolGroup -> ToolGroupCard(item.parts)
+                                is RenderItem.ToolGroup -> ToolGroupCard(
+                                    item.parts,
+                                    onOpenTool = { detailTool = it },
+                                )
                             }
                         }
                         // TTFT 等待期（request_start → 首个 token）的"思考中"提示，
@@ -311,6 +316,11 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                 },
                 onCancel = { RuntimeBridge.cancel() },
             )
+
+            // 工具详情弹窗（Dialog 自身是独立 window，不参与列表布局）。
+            detailLive?.let { tc ->
+                ToolDetailDialog(tc, onDismiss = { detailTool = null })
+            }
         }
     }
 }
@@ -353,7 +363,7 @@ private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {
 }
 
 @Composable
-private fun EntryRow(entry: UiEntry, activeLast: Boolean = false) {
+private fun EntryRow(entry: UiEntry, activeLast: Boolean = false, onOpenTool: (UiEntry.ToolCall) -> Unit = {}) {
     when (entry) {
         is UiEntry.User -> Bubble(entry.text, mine = true)
         is UiEntry.Assistant -> MarkdownBubble(entry.text)
@@ -365,7 +375,7 @@ private fun EntryRow(entry: UiEntry, activeLast: Boolean = false) {
             modifier = Modifier.padding(horizontal = 8.dp),
         )
         // 分组投影后正常不会到达；保留兜底（sealed when 完整性）。
-        is UiEntry.ToolCall -> ToolGroupCard(listOf(entry))
+        is UiEntry.ToolCall -> ToolGroupCard(listOf(entry), onOpenTool)
         is UiEntry.Delegate -> Text(
             (if (entry.done) "↳ agent " else "↻ agent ") + entry.agent,
             style = MaterialTheme.typography.labelMedium,
@@ -384,12 +394,12 @@ private fun EntryRow(entry: UiEntry, activeLast: Boolean = false) {
  * 工具组容器：无外框，相邻工具条目紧贴堆叠、中间只留一条缝；
  * 首条目显示上方圆角、末条目显示下方圆角、中间方角，体现一体感。
  * 夹在工具调用之间的 Meta/StepBreak 行在组内原样渲染。
- * 单个条目点击就地展开（命令 + 输出），展开后仍与上下条目紧贴。
+ * 单个条目点击弹出详情弹窗（完整命令 + 输出）。
  */
 private val TOOL_GROUP_RADIUS = 12.dp
 
 @Composable
-private fun ToolGroupCard(parts: List<UiEntry>) {
+private fun ToolGroupCard(parts: List<UiEntry>, onOpenTool: (UiEntry.ToolCall) -> Unit = {}) {
     val tools = parts.filterIsInstance<UiEntry.ToolCall>()
     // 整组共用一条边框：外框按组形状绘制（四角 12dp），条目本身不带 border。
     val groupShape = RoundedCornerShape(TOOL_GROUP_RADIUS)
@@ -407,14 +417,14 @@ private fun ToolGroupCard(parts: List<UiEntry>) {
                 is UiEntry.ToolCall -> {
                     val idx = tools.indexOf(part)
                     // 组内相邻工具之间保留一条分隔线（首个工具上方不需要），
-                    // 展开后也能直观看出每个工具调用的边界。
+                    // 弹窗打开时也能直观看出每个工具调用的边界。
                     if (idx > 0) {
                         HorizontalDivider(
                             thickness = 0.5.dp,
                             color = groupBorder,
                         )
                     }
-                    // 条目自身的圆角规则：首条目上圆、末条目下圆（展开与否均保持）。
+                    // 条目自身的圆角规则：首条目上圆、末条目下圆。
                     val bottomR = if (idx == tools.lastIndex) TOOL_GROUP_RADIUS else 0.dp
                     val shape = RoundedCornerShape(
                         topStart = if (idx == 0) TOOL_GROUP_RADIUS else 0.dp,
@@ -422,7 +432,7 @@ private fun ToolGroupCard(parts: List<UiEntry>) {
                         bottomEnd = bottomR,
                         bottomStart = bottomR,
                     )
-                    ToolChipRow(part, shape)
+                    ToolChipRow(part, shape, onOpenTool)
                 }
                 is UiEntry.Meta -> Text(
                     part.text,
@@ -437,130 +447,87 @@ private fun ToolGroupCard(parts: List<UiEntry>) {
     }
 }
 
-/** 单个工具条目：状态图标 + 名称 + 参数摘要，点击就地展开。 */
+/** 单个工具条目：状态图标 + 名称 + 参数摘要，点击弹出详情弹窗（完整命令 + 输出）。 */
 @Composable
-private fun ToolChipRow(tc: UiEntry.ToolCall, shape: RoundedCornerShape) {
+private fun ToolChipRow(
+    tc: UiEntry.ToolCall,
+    shape: RoundedCornerShape,
+    onOpen: (UiEntry.ToolCall) -> Unit,
+) {
     // 不用 Surface(onClick)：M3 会强制 48dp 最小触摸目标，把条目撑高、组内出现大空隙。
     // 改用 foundation 组合（clip+background+clickable）精确控制尺寸；
     // 边框由 ToolGroupCard 统一绘制，条目只负责底色。
-    // 状态着色：成功淡绿、失败淡红、执行中保持中性紫。
-    // （主题的 secondaryContainer 是淡紫，绿色用固定色值表达。）
+    // 状态着色：成功淡绿、失败淡红、执行中保持中性紫（均跟随深浅色主题；
+    // 绿色经 StatusColors 适配深色模式，此前写死浅绿在深色下刺眼）。
     // tool_end 事件不带失败状态，native 工具的失败以非 0 exit_code 表达，
     // 直接从输出里识别。
     val exitFail = Regex("""exit_code: (?:[1-9]\d*)""").containsMatchIn(tc.output.orEmpty())
     val ok = tc.status == "done" && !exitFail
     val failed = tc.status == "failed" || exitFail
     val statusTint = when {
-        ok -> androidx.compose.ui.graphics.Color(0xFF1E8A44)
+        ok -> successGreen()
         failed -> MaterialTheme.colorScheme.error
         else -> MaterialTheme.colorScheme.secondary
     }
     val chipColor = when {
-        ok -> androidx.compose.ui.graphics.Color(0xFFDDF3DE)
+        ok -> successGreenContainer()
         failed -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
         else -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
     }
-    Column(Modifier.animateContentSize()) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(shape)
-                .background(chipColor)
-                .clickable { RuntimeBridge.toggleToolExpanded(tc) }
-                .padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-        ) {
-            when (tc.status) {
-                "running" -> CircularProgressIndicator(
-                    strokeWidth = 1.5.dp,
-                    modifier = Modifier.size(13.dp),
-                )
-                "failed" -> Icon(
-                    Icons.Filled.Close,
-                    contentDescription = null,
-                    modifier = Modifier.size(14.dp),
-                    tint = MaterialTheme.colorScheme.error,
-                )
-                else -> Icon(
-                    Icons.Filled.Check,
-                    contentDescription = null,
-                    modifier = Modifier.size(14.dp),
-                    tint = MaterialTheme.colorScheme.secondary,
-                )
-            }
-            Spacer(Modifier.widthIn(min = 6.dp))
-            Text(
-                tc.name,
-                style = MaterialTheme.typography.labelMedium,
-                color = statusTint,
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(chipColor)
+            .clickable { onOpen(tc) }
+            .padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+    ) {
+        when (tc.status) {
+            "running" -> CircularProgressIndicator(
+                strokeWidth = 1.5.dp,
+                modifier = Modifier.size(13.dp),
             )
-            Spacer(Modifier.widthIn(min = 6.dp))
-            Text(
-                tc.argsPreview,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-                maxLines = 1,
-                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
+            "failed" -> Icon(
+                Icons.Filled.Close,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.error,
             )
-            Icon(
-                if (tc.expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                contentDescription = if (tc.expanded) "收起" else "展开",
-                modifier = Modifier.size(16.dp),
+            else -> Icon(
+                Icons.Filled.Check,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
                 tint = MaterialTheme.colorScheme.secondary,
             )
         }
-        if (tc.expanded) {
-            Column(Modifier.padding(start = 10.dp, end = 4.dp, top = 2.dp, bottom = 6.dp)) {
-                Text(
-                    "命令",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                Text(
-                    tc.fullArgs.ifBlank { "（无参数）" },
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                    ),
-                )
-                if (tc.status == "running") {
-                    Text(
-                        "结果（执行中…）",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                } else {
-                    ToolResultView(tc.output.orEmpty(), tc.status)
-                }
-            }
-        }
+        Spacer(Modifier.widthIn(min = 6.dp))
+        Text(
+            tc.name,
+            style = MaterialTheme.typography.labelMedium,
+            color = statusTint,
+        )
+        Spacer(Modifier.widthIn(min = 6.dp))
+        Text(
+            tc.argsPreview,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.outline,
+            maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 
+/** 工具输出的结构化拆解（与后端 format_output 的分段约定一致）。 */
+private class ToolOutParts(val exitCode: String?, val stdout: String, val stderr: String)
+
 /**
- * 展开后的结果区：`结果` 标签行右侧显示 exit_code（native 工具的输出带）；
- * stdout / stderr 按 tab 切换，stderr 为空时不显示 stderr tab。
- * 非格式化输出（如 termux 回传的合并文本）整体按 stdout 处理。
+ * 拆解工具输出：`--- stdout ---` / `--- stderr ---` 分段（native bash）；
+ * 非格式化输出（如 termux 回传的合并文本）整体按 stdout 处理；
+ * exit_code 行（"exit_code: N"）提取为独立字段。
  */
-@Composable
-private fun ToolResultView(raw: String, status: String = "done") {
-    if (raw.isBlank()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "结果",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                "（无输出）",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-        }
-        return
-    }
-    val exitCode = Regex("""exit_code: (-?\d+)""").find(raw)?.groupValues?.get(1)
+private fun parseToolOut(raw: String): ToolOutParts {
     val hasSections = raw.contains("--- stdout ---")
     val stdout = if (hasSections) {
         raw.substringAfter("--- stdout ---").substringBefore("--- stderr ---").trim()
@@ -573,182 +540,213 @@ private fun ToolResultView(raw: String, status: String = "done") {
     } else {
         ""
     }
-    var tab by remember(raw) { mutableStateOf(0) }
+    val exitCode = Regex("""exit_code: (-?\d+)""").find(raw)?.groupValues?.get(1)
+    return ToolOutParts(exitCode, stdout, stderr)
+}
 
-    // 标签行：结果 [stdout][stderr chip] …… [exit chip]
-    // stdout/stderr 用 chip 做切换（选中高亮）；exit chip 略小一号。
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
+/**
+ * 工具详情弹窗：完整命令 + 完整输出（stdout/stderr 切换，无行数上限、
+ * 可滚动），文本经 SelectionContainer 长按选择复制；底部提供整段一键复制。
+ * 替代原就地展开视图（maxLines=16 硬限制 + 不可滚动，长输出看不全）。
+ * 执行中的工具打开时显示等待文案，完成输出经 ChatScreen 的实时回查刷新。
+ */
+@Composable
+private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    val scroll = rememberScrollState()
+    val mono = MaterialTheme.typography.bodySmall.copy(
+        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+    )
+    val parts = remember(tc.output) { parseToolOut(tc.output.orEmpty()) }
+    var tab by remember(tc.output) { mutableStateOf(0) }
+    val running = tc.status == "running"
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        Text(
-            "结果",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.primary,
-        )
-        Spacer(Modifier.width(12.dp))
-        if (stderr.isNotEmpty()) {
-            listOf("stdout" to 0, "stderr" to 1).forEach { (label, idx) ->
-                val selected = tab == idx
-                val labelColor = if (selected) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    MaterialTheme.colorScheme.outline
-                }
-                Text(
-                    label,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = labelColor,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(
-                            if (selected) {
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
-                            } else {
-                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                            },
-                        )
-                        .border(
-                            0.5.dp,
-                            labelColor.copy(alpha = 0.4f),
-                            RoundedCornerShape(50),
-                        )
-                        .clickable { tab = idx }
-                        .padding(horizontal = 10.dp, vertical = 3.dp),
-                )
-                Spacer(Modifier.width(6.dp))
-            }
-        }
-        Spacer(Modifier.weight(1f))
-        if (exitCode != null) {
-            val ok = exitCode == "0"
-            // 颜色按状态分级：0 → 绿；非 0 → 红。
-            val tint = if (ok) {
-                androidx.compose.ui.graphics.Color(0xFF1E8A44)
-            } else {
-                MaterialTheme.colorScheme.error
-            }
-            // tooltip 状态机：tipMounted 决定 Popup 是否挂载，tipVisible 驱动
-            // AnimatedVisibility 的进出场动画（挂载首帧先以 false 进入组合，
-            // 再翻转触发入场；退场时 Popup 延迟卸载以播完退出动画）。
-            var tipMounted by remember(exitCode) { mutableStateOf(false) }
-            var tipVisible by remember(exitCode) { mutableStateOf(false) }
-            // 点击：未挂载→挂载（入场动画随后触发）；已显示→仅隐藏（播退场）。
-            val toggleTip = {
-                if (tipMounted) {
-                    tipVisible = false
-                } else {
-                    tipMounted = true
-                }
-                Unit
-            }
-            // 挂载后下一帧再置 visible=true，确保入场动画播放。
-            LaunchedEffect(tipMounted) {
-                if (tipMounted) tipVisible = true
-            }
-            // 显示 2.5s 后自动收起。
-            LaunchedEffect(tipVisible) {
-                if (tipVisible) {
-                    kotlinx.coroutines.delay(2500)
-                    tipVisible = false
-                }
-            }
-            // 退场动画（约 120ms）播完后卸载 Popup。
-            LaunchedEffect(tipMounted, tipVisible) {
-                if (tipMounted && !tipVisible) {
-                    kotlinx.coroutines.delay(160)
-                    tipMounted = false
-                }
-            }
-            Text(
-                exitCode,
-                style = MaterialTheme.typography.labelSmall.copy(
-                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                ),
-                color = tint,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .background(tint.copy(alpha = 0.12f))
-                    .border(0.5.dp, tint.copy(alpha = 0.4f), RoundedCornerShape(50))
-                    .clickable { toggleTip() }
-                    .padding(horizontal = 10.dp, vertical = 3.dp),
-            )
-            if (tipMounted) {
-                androidx.compose.ui.window.Popup(
-                    alignment = androidx.compose.ui.Alignment.TopEnd,
-                    offset = androidx.compose.ui.unit.IntOffset(0, 24),
-                    onDismissRequest = {
-                        tipVisible = false
-                    },
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            modifier = Modifier
+                .fillMaxWidth(0.96f)
+                .fillMaxHeight(0.9f),
+        ) {
+            Column {
+                // 头部：工具名 + exit code 徽标 + 关闭。
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
                 ) {
-                    androidx.compose.animation.AnimatedVisibility(
-                        visible = tipVisible,
-                        enter = androidx.compose.animation.fadeIn(
-                            androidx.compose.animation.core.tween(110),
-                        ) + androidx.compose.animation.scaleIn(
-                            initialScale = 0.85f,
-                            animationSpec = androidx.compose.animation.core.tween(110),
-                            transformOrigin = androidx.compose.ui.graphics.TransformOrigin(
-                                0.9f, 0f,
+                    Text(
+                        tc.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (parts.exitCode != null) {
+                        val ok = parts.exitCode == "0"
+                        val tint = if (ok) {
+                            successGreen()
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        }
+                        Text(
+                            "exit ${parts.exitCode}",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                             ),
-                        ) + androidx.compose.animation.slideInVertically(
-                            initialOffsetY = { -it / 3 },
-                            animationSpec = androidx.compose.animation.core.tween(110),
-                        ),
-                        exit = androidx.compose.animation.fadeOut(
-                            androidx.compose.animation.core.tween(120),
-                        ) + androidx.compose.animation.scaleOut(
-                            targetScale = 0.9f,
-                            animationSpec = androidx.compose.animation.core.tween(120),
-                            transformOrigin = androidx.compose.ui.graphics.TransformOrigin(
-                                0.9f, 0f,
-                            ),
-                        ) + androidx.compose.animation.slideOutVertically(
-                            targetOffsetY = { -it / 4 },
-                            animationSpec = androidx.compose.animation.core.tween(120),
-                        ),
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = MaterialTheme.colorScheme.inverseSurface,
-                            shadowElevation = 2.dp,
-                        ) {
+                            color = tint,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(tint.copy(alpha = 0.12f))
+                                .border(0.5.dp, tint.copy(alpha = 0.4f), RoundedCornerShape(50))
+                                .padding(horizontal = 10.dp, vertical = 3.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Filled.Close, contentDescription = "关闭")
+                    }
+                }
+                HorizontalDivider(
+                    thickness = 0.5.dp,
+                    color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                )
+                // 内容区：命令 + 输出，整体可滚动、可选择。
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .verticalScroll(scroll)
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Text(
+                        "命令",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    SelectionContainer {
+                        Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    // 输出区头：标签 + stdout/stderr 切换 + 字符数提示。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (running) "输出（执行中…）" else "输出",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        if (parts.stderr.isNotEmpty()) {
+                            listOf("stdout" to 0, "stderr" to 1).forEach { (label, idx) ->
+                                val selected = tab == idx
+                                val labelColor = if (selected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.outline
+                                }
+                                Text(
+                                    label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = labelColor,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(
+                                            if (selected) {
+                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                                            },
+                                        )
+                                        .border(0.5.dp, labelColor.copy(alpha = 0.4f), RoundedCornerShape(50))
+                                        .clickable { tab = idx }
+                                        .padding(horizontal = 10.dp, vertical = 3.dp),
+                                )
+                                Spacer(Modifier.width(6.dp))
+                            }
+                        }
+                        Spacer(Modifier.weight(1f))
+                        if (!running) {
+                            val shownLen = if (tab == 1) parts.stderr.length else parts.stdout.length
                             Text(
-                                "Exit Code：命令退出码\n0 = 成功；非 0 = 失败或被信号终止",
+                                "$shownLen 字符",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.inverseOnSurface,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                color = MaterialTheme.colorScheme.outline,
                             )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    if (running) {
+                        Text(
+                            "执行中，完成后自动显示…",
+                            style = mono,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    } else {
+                        SelectionContainer {
+                            Text(
+                                when {
+                                    parts.stderr.isNotEmpty() && tab == 1 ->
+                                        parts.stderr.ifBlank { "（空）" }
+                                    parts.stdout.isNotBlank() -> parts.stdout
+                                    else -> "（无输出）"
+                                },
+                                style = mono,
+                            )
+                        }
+                    }
+                }
+                HorizontalDivider(
+                    thickness = 0.5.dp,
+                    color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                )
+                // 底部动作行：整段一键复制（配合长按手动选择）。
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    SoftButton(
+                        onClick = { clipboard.setText(AnnotatedString(tc.fullArgs)) },
+                        enabled = tc.fullArgs.isNotBlank(),
+                    ) {
+                        Icon(
+                            Icons.Filled.ContentCopy,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("复制命令")
+                    }
+                    SoftButton(
+                        onClick = { clipboard.setText(AnnotatedString(parts.stdout)) },
+                        enabled = !running && parts.stdout.isNotBlank(),
+                    ) {
+                        Icon(
+                            Icons.Filled.ContentCopy,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("复制 stdout")
+                    }
+                    if (parts.stderr.isNotEmpty()) {
+                        SoftButton(
+                            onClick = { clipboard.setText(AnnotatedString(parts.stderr)) },
+                            enabled = !running,
+                        ) {
+                            Icon(
+                                Icons.Filled.ContentCopy,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text("复制 stderr")
                         }
                     }
                 }
             }
         }
-    }
-    // 内容区：切换 stdout/stderr 时按方向左右滑动 + 淡入淡出。
-    androidx.compose.animation.AnimatedContent(
-        targetState = tab,
-        transitionSpec = {
-            val dir = if (targetState > initialState) 1 else -1
-            (androidx.compose.animation.slideInHorizontally { it / 4 * dir } +
-                androidx.compose.animation.fadeIn()) togetherWith
-                (androidx.compose.animation.slideOutHorizontally { -it / 4 * dir } +
-                    androidx.compose.animation.fadeOut())
-        },
-        label = "resultTab",
-    ) { currentTab ->
-        Text(
-            when {
-                stderr.isNotEmpty() && currentTab == 1 ->
-                    stderr.ifBlank { "（空）" }
-                stdout.isNotBlank() -> stdout
-                else -> "（无输出）"
-            },
-            style = MaterialTheme.typography.bodySmall.copy(
-                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-            ),
-            maxLines = 16,
-            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-        )
     }
 }
 
@@ -915,24 +913,45 @@ private fun Bubble(text: String, mine: Boolean) {
     }
 }
 
-/** 一份背景捕获层 + 一份全屏模糊副本；所有玻璃面板共用（避免每块玻璃各自全屏模糊）。 */
-private class GlassLayers(val source: GraphicsLayer, val blurred: GraphicsLayer)
+/** 磨砂玻璃共享状态：内容捕获层 + 模糊参数（effect 为 null 表示不支持真模糊，退化为蒙层）。 */
+private class Glass(
+    val source: GraphicsLayer,
+    val effect: BlurEffect?,
+    val radiusPx: Float,
+    val base: Color,
+)
+
+/** 模糊半径：12dp 轻磨砂（此前 20dp 观感偏重，可按需微调）。 */
+private val GlassBlurRadius = 12.dp
 
 @Composable
-private fun rememberGlassLayers(): GlassLayers {
+private fun rememberGlass(): Glass {
     val source = rememberGraphicsLayer()
-    val blurred = rememberGraphicsLayer()
-    return remember(source, blurred) { GlassLayers(source, blurred) }
+    val radiusPx = with(LocalDensity.current) { GlassBlurRadius.toPx() }
+    val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        remember(radiusPx) {
+            BlurEffect(radiusX = radiusPx, radiusY = radiusPx, edgeTreatment = TileMode.Clamp)
+        }
+    } else {
+        null
+    }
+    val base = MaterialTheme.colorScheme.surface
+    return remember(source, radiusPx, effect, base) { Glass(source, effect, radiusPx, base) }
 }
 
 /**
- * 磨砂玻璃面板（真·背景模糊，参考 Haze 的实现思路、零第三方依赖）：
- * Android 12+ 时把共用的全屏模糊副本平移到自身位置、只露出被 shape 裁剪的一块，
- * 再叠半透明 tint；低版本退化为纯半透明蒙层（renderEffect 依赖 API 31 的 RenderEffect）。
+ * 磨砂玻璃面板（真·背景模糊，参考 Haze 的实现思路、零第三方依赖）。
+ * 每个面板在自身 draw 阶段录制一块「面板区域 + 四周各一个模糊半径出血带」的
+ * 小图层：先铺不透明底色（整层不透明才能盖住底下未模糊的原文，否则细文字处
+ * 模糊 alpha 过薄、透出清晰重影），再平移绘制共享的内容捕获层，套 BlurEffect
+ * 后回绘到自身位置。出血带保证可见区边缘的卷积核也能采到真实内容——没有它，
+ * Clamp 会在面板边缘把贴边像素拉丝抹进玻璃内侧，滚动时贴边内容逐帧变化，
+ * 表现为玻璃上下边缘闪烁。面板级小层也远比"整屏模糊层 × 2 面板"省 GPU。
+ * 低版本（renderEffect 依赖 API 31 的 RenderEffect）退化为纯半透明蒙层。
  */
 @Composable
 private fun GlassPanel(
-    glass: GlassLayers,
+    glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
     tint: Color,
     modifier: Modifier = Modifier,
@@ -941,6 +960,7 @@ private fun GlassPanel(
     content: @Composable BoxScope.() -> Unit,
 ) {
     var offsetInRoot by remember { mutableStateOf(Offset.Zero) }
+    val panelLayer = rememberGraphicsLayer()
     Box(
         modifier = modifier
             .onGloballyPositioned { coordinates ->
@@ -955,9 +975,23 @@ private fun GlassPanel(
                 clip = true
             }
             .drawWithContent {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    translate(left = -offsetInRoot.x, top = -offsetInRoot.y) {
-                        drawLayer(glass.blurred)
+                if (glass.effect != null) {
+                    val o = glass.radiusPx
+                    val bleed = IntSize(
+                        width = (size.width + 2 * o).roundToInt(),
+                        height = (size.height + 2 * o).roundToInt(),
+                    )
+                    panelLayer.record(size = bleed) {
+                        // 不透明底 + 平移的内容捕获层：模糊输入整体不透明。
+                        drawRect(glass.base)
+                        translate(left = o - offsetInRoot.x, top = o - offsetInRoot.y) {
+                            drawLayer(glass.source)
+                        }
+                    }
+                    panelLayer.renderEffect = glass.effect
+                    // 回绘时内缩一个出血带：可见区恰好对应面板自身区域。
+                    translate(left = -o, top = -o) {
+                        drawLayer(panelLayer)
                     }
                 }
                 drawRect(tint)
@@ -985,7 +1019,7 @@ private fun GlassPanel(
  */
 @Composable
 private fun Composer(
-    glass: GlassLayers,
+    glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
     running: Boolean,
     onSend: (String) -> Unit,
@@ -1096,9 +1130,9 @@ private fun ApprovalBanner(
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = { onAnswer(pending.id, "approve_all") }) { Text("全部允许") }
-                TextButton(onClick = { onAnswer(pending.id, "approve") }) { Text("允许") }
-                TextButton(onClick = { onAnswer(pending.id, "deny") }) { Text("拒绝") }
+                SoftButton(onClick = { onAnswer(pending.id, "approve_all") }) { Text("全部允许") }
+                SoftButton(onClick = { onAnswer(pending.id, "approve") }) { Text("允许") }
+                SoftButton(onClick = { onAnswer(pending.id, "deny") }) { Text("拒绝") }
             }
         }
     }

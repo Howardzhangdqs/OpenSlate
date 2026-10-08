@@ -322,6 +322,26 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
         }
     }
 
+    // 19. `[mcp].tool_name_template`（有值时）：必须含 {tool}，且三占位符
+    //     （{prefix}/{server}/{tool}）以外的部分仅 [A-Za-z0-9_.-]。空白视同
+    //     未设置（= 默认 "{prefix}_{server}__{tool}"），不算错——persist 的
+    //     清空语义写的就是空串。错误是致命级（bad template 会让全部 MCP
+    //     工具注册名异常），但只有显式写了非法值才会触发，运行时写路径
+    //     （FFI set）先经同一校验，正常操作到不了这里。
+    if let Some(template) = config
+        .mcp
+        .as_ref()
+        .and_then(|m| m.tool_name_template.as_deref())
+        .filter(|s| !s.trim().is_empty())
+    {
+        if let Err(message) = validate_mcp_tool_name_template(template) {
+            errors.push(ValidationError {
+                field: "mcp.tool_name_template".into(),
+                message,
+            });
+        }
+    }
+
     errors
 }
 
@@ -481,6 +501,95 @@ pub fn validate_config_full(config: &OpenSlateConfig, agents: &AgentsConfig) -> 
     warnings.extend(dangling_capability_warnings(config));
 
     ValidationResult { errors, warnings }
+}
+
+/// Validate an `[mcp].tool_name_template` value (rule 19's core).
+///
+/// `pub` so the mobile FFI write path (`set_mcp_tool_name_template`) runs the
+/// exact same rules as startup validation — two divergent copies would let an
+/// FFI-accepted value brick the next startup. Blank values are NOT handled
+/// here: callers treat blank as "unset → default" before calling.
+///
+/// Rules:
+/// - must contain the `{tool}` placeholder (a template without it collapses
+///   every tool of a server onto one registered name);
+/// - after replacing every `{prefix}`/`{server}`/`{tool}` with nothing, the
+///   remainder must match `[A-Za-z0-9_.-]*` (an unknown `{...}` placeholder
+///   leaves its braces behind and is rejected by the same check).
+///
+/// Literal `__` is ALLOWED (the default template itself contains one): the
+/// Kotlin side strips/extracts display names by matching the configured
+/// template as a pattern, so `__` no longer needs to be a reserved boundary
+/// in the registered name.
+pub fn validate_mcp_tool_name_template(template: &str) -> Result<(), String> {
+    if !template.contains("{tool}") {
+        return Err(format!(
+            "tool name template '{template}' is invalid: it must contain the {{tool}} \
+             placeholder (legal examples: '{{tool}}', '{{server}}__{{tool}}', \
+             '{{prefix}}_{{server}}__{{tool}}')"
+        ));
+    }
+    let remainder = template
+        .replace("{prefix}", "")
+        .replace("{server}", "")
+        .replace("{tool}", "");
+    if !remainder
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(format!(
+            "tool name template '{template}' is invalid: outside the {{prefix}}/{{server}}/\
+             {{tool}} placeholders only [A-Za-z0-9_.-] are allowed (unknown {{...}} \
+             placeholders are rejected the same way; legal examples: '{{prefix}}.{{server}}.\
+             {{tool}}', '{{server}}__{{tool}}')"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a mobile aggregated-host MCP server name — under the current
+/// placeholder model this is the `{prefix}` expansion value (a
+/// `[mcp.servers]` key, controlled by the App's "service name / prefix"
+/// setting). Rules:
+/// - non-empty;
+/// - only `[A-Za-z0-9_.-]` (same literal set as the template rule);
+/// - no `__` substring — RETAINED even though the template rule dropped its
+///   `__` ban: a prefix containing `__` still leaks into the legacy path
+///   (`{prefix}_{upstream}` for `__`-less desktop-style names) and into
+///   UI/display heuristics that treat `__` as a segment boundary, so the
+///   key itself stays `__`-free.
+///
+/// `pub` for the same reason as [`validate_mcp_tool_name_template`]: the FFI
+/// write path must run the exact rules the name will live under. Deliberately
+/// NOT wired into `validate_config` — this is a mobile aggregated-scenario
+/// naming constraint; desktop configs may legitimately hand-write other key
+/// styles, and wiring it in would brick existing setups.
+pub fn validate_mcp_server_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(
+            "MCP server name (the {prefix} expansion value) must not be empty (legal \
+             examples: termux, phone, dev.1)"
+                .into(),
+        );
+    }
+    if name.contains("__") {
+        return Err(format!(
+            "MCP server name '{name}' (the {{prefix}} expansion value) must not contain a \
+             double underscore (__): a `__` in the prefix leaks into the legacy \
+             `prefix_upstream` path and display heuristics that treat `__` as a segment \
+             boundary (legal examples: termux, phone, dev.1)"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(format!(
+            "MCP server name '{name}' (the {{prefix}} expansion value) allows only \
+             [A-Za-z0-9_.-] and no `__` (legal examples: termux, phone, dev.1)"
+        ));
+    }
+    Ok(())
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -978,6 +1087,184 @@ deep = "ghost"
                 .iter()
                 .any(|w| w.field == "capabilities.compact" && w.message.contains("unknown alias")),
             "strict warnings carry the dangling capability: {warnings:?}"
+        );
+    }
+
+    // ── Rule 19: [mcp].tool_name_template ───────────────────────────────
+
+    #[test]
+    fn mcp_tool_name_template_legal_examples_pass() {
+        for t in [
+            "{tool}",
+            "{server}_{tool}",
+            "{server}.{tool}",
+            "{server}{tool}",
+            "mcp.{server}-{tool}.v2",
+            "dev_{server}_{tool}",
+            // 字面 `__` 合法：Kotlin 侧按模板正则提取，`__` 不再是保留
+            // 分界——默认模板本身就含一个。
+            "{server}__{tool}",
+            "{prefix}_{server}__{tool}",
+            "{prefix}.{server}.{tool}",
+            "{prefix}_{tool}",
+        ] {
+            assert!(
+                validate_mcp_tool_name_template(t).is_ok(),
+                "template '{t}' should be legal"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tool_name_template_missing_tool_rejected() {
+        let err = validate_mcp_tool_name_template("{server}").expect_err("no {tool}");
+        assert!(err.contains("{tool}"), "message names the placeholder: {err}");
+        assert!(
+            err.contains("{prefix}_{server}__{tool}"),
+            "message shows examples: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_name_template_unknown_placeholder_rejected() {
+        // 未知占位符替换后残留 '{'/'}' → 被字符白名单拦下。注意必须带上
+        // {tool}：缺 {tool} 会先命中「必须含 {tool}」分支（该分支另有用例）。
+        let err =
+            validate_mcp_tool_name_template("{server}_{tool}_{foo}").expect_err("unknown {foo}");
+        assert!(err.contains("[A-Za-z0-9_.-]"), "message states the charset: {err}");
+    }
+
+    #[test]
+    fn mcp_tool_name_template_illegal_characters_rejected() {
+        for t in [
+            "{server} {tool}",
+            "{server}:{tool}",
+            "名_{tool}",
+            "{prefix}·{tool}",
+        ] {
+            assert!(
+                validate_mcp_tool_name_template(t).is_err(),
+                "template '{t}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tool_name_template_double_underscore_allowed() {
+        // 字面 `__` 现已合法（默认模板自身含 `__`）：Kotlin 剥离改为按
+        // 模板正则提取，不再依赖 `__` 边界——校验不得拒绝。
+        assert!(validate_mcp_tool_name_template("{server}__{tool}").is_ok());
+        // 默认模板必须过校验（FFI 把它作为缺省回显/写入值）。
+        assert!(validate_mcp_tool_name_template(crate::mcp::DEFAULT_TOOL_NAME_TEMPLATE).is_ok());
+    }
+
+    #[test]
+    fn validate_config_flags_illegal_template() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp]
+tool_name_template = "{server} {tool}"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors.iter().any(|e| e.field == "mcp.tool_name_template"),
+            "illegal template is a validation error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_blank_template_is_default_not_error() {
+        // 空白 = 未设置（默认 {prefix}_{server}__{tool}），不是校验错误——
+        // persist 的清空语义写的就是空串，报错会让"清空→重启"变砖。
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp]
+tool_name_template = ""
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.field != "mcp.tool_name_template"),
+            "blank template means default, not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_legal_template_passes() {
+        let mut config = valid_config();
+        config.mcp = Some(crate::config::McpConfig {
+            // 默认模板本体：启动校验必须放行（FFI 缺省值也是它）。
+            tool_name_template: Some(crate::mcp::DEFAULT_TOOL_NAME_TEMPLATE.into()),
+            ..Default::default()
+        });
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.field != "mcp.tool_name_template"),
+            "legal template must not error: {errors:?}"
+        );
+    }
+
+    // ── MCP server 名（mobile 聚合场景；不接入 validate_config）─────────
+
+    #[test]
+    fn mcp_server_name_legal_examples_pass() {
+        for n in ["termux", "phone", "x", "a-b.c_", "dev.1", "Termux_2"] {
+            assert!(
+                validate_mcp_server_name(n).is_ok(),
+                "server name '{n}' should be legal"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_server_name_illegal_rejected() {
+        // 空 / 中文 / 空格 / `__` / 非法标点。
+        for n in ["", "手机", "has space", "a__b", "__", "a:b", "名"] {
+            assert!(
+                validate_mcp_server_name(n).is_err(),
+                "server name '{n}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_server_name_double_underscore_message_explains_boundary() {
+        // prefix（[mcp.servers] 键名）带 `__` 的禁令保留：模板侧虽已放开
+        // `__`，但键名会泄入 legacy `prefix_upstream` 路径与按 `__` 分段
+        // 的 UI 启发式——错误文案必须点到这一点并给出合法示例。
+        let err = validate_mcp_server_name("my__srv").expect_err("literal __");
+        assert!(err.contains("__"), "message names the separator: {err}");
+        assert!(err.contains("termux"), "message shows legal examples: {err}");
+        assert!(
+            err.contains("{prefix}"),
+            "message frames the value as the prefix: {err}"
         );
     }
 

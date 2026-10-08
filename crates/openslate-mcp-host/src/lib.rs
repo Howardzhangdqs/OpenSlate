@@ -17,8 +17,9 @@
 //!   `json_response=true`，rmcp 服务端会在 handler 发出通知时自动 fallback
 //!   SSE，progress 不丢）；
 //! - 下游懒连接 + 失效重连（调用出错即弃置连接，下次调用重连）；
-//! - 工具名 `alias__tool` 双下划线分隔，与 OpenSlate 侧 `{server}_{tool}`
-//!   前缀在视觉上分层；
+//! - 工具名 `alias__tool` 双下划线分隔；OpenSlate 侧默认展开为
+//!   `{prefix}_{server}__{tool}`（本 host 的 `alias__tool` 即其中
+//!   `{server}__{tool}` 段），模板可自定义组合；
 //! - 只绑 loopback；token 未配置时自动生成并写 `<config>.token` 旁车文件
 //!   （App 侧可经 RUN_COMMAND `cat` 取回）。
 

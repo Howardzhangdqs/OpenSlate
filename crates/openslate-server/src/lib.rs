@@ -84,11 +84,17 @@ pub async fn build_state(opts: &ServeOptions) -> Result<Arc<AppState>> {
         agent_tree,
         mut manager,
         skills,
-        mcp_connections,
+        mut mcp_connections,
+        mcp_external,
+        mcp_tool_names: _,
         config_path,
         global_config_path,
         agents_path: _,
     } = ctx;
+    // server 无热重载缝：外部/builtin 两个 guard 合一保活（与拆分前的
+    // 行为一致——全部连接活到 AppState drop；否则外部 MCP 连接会在装配
+    // 结束时被立刻 drop，工具全部失效）。
+    mcp_connections.append(mcp_external);
 
     let hub = Arc::new(ConnectionHub::new());
     let approval_bridge = Arc::new(SessionApprovalBridge::new(hub.clone()));

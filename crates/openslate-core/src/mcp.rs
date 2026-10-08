@@ -4,8 +4,11 @@
 //!
 //! - **External** servers declared in `openslate.toml` (`[mcp.servers.*]`),
 //!   connected at startup over stdio (subprocess) or Streamable HTTP. Every
-//!   tool they expose is wrapped as an [`McpTool`] namespaced as
-//!   `{server}_{tool}`.
+//!   tool they expose is wrapped as an [`McpTool`] whose registered name is
+//!   the `[mcp].tool_name_template` expansion (default
+//!   `{prefix}_{server}__{tool}`, byte-identical to the historical
+//!   `{prefix}_{upstream}` — registration name only, routing/PTC semantics
+//!   unchanged).
 //! - **Builtin** in-process servers ([`connect_builtin_servers`]): the
 //!   workspace-sandboxed `read_file` / `write_file`, `shell` and `edit_file`
 //!   tools from `openslate-mcp-builtin`, served over an in-process tuple
@@ -84,7 +87,62 @@ fn mcp_auth_override() -> Option<String> {
     cell.read().ok().and_then(|guard| guard.clone())
 }
 
-// ── pure helpers (kept module-private + unit-testable) ──────────────────────
+// ── pure helpers (unit-testable; the template pair is `pub` for reuse) ──────
+
+/// The default `[mcp].tool_name_template` (historical registration shape).
+/// `pub` so callers that need to report/compare the effective template
+/// (mobile FFI getter, docs) don't hardcode a second copy of the literal.
+/// Expands byte-identically to the pre-template `{prefix}_{upstream}` behavior
+/// for both aggregated (`slug__tool`) and plain upstream names.
+pub const DEFAULT_TOOL_NAME_TEMPLATE: &str = "{prefix}_{server}__{tool}";
+
+/// Placeholder model (aligned with how users think about the aggregated host):
+/// - `{prefix}`: the `[mcp.servers]` key in `openslate.toml` (mobile's
+///   "service name / prefix" setting; default `termux`);
+/// - `{server}`: the MCP server's own name — the `{slug}` segment of an
+///   aggregated upstream name (e.g. `Server_Memory`);
+/// - `{tool}`: the concrete tool name WITHOUT the server prefix
+///   (e.g. `create_entities`).
+///
+/// Expand a tool-registration name from `template`. `upstream` is the raw
+/// upstream tool name: when it contains `__` (aggregated-host form
+/// `slug__tool`; the slug is sanitized upstream so the FIRST `__` is the
+/// boundary), it is split into `server`/`tool` and the three placeholders are
+/// expanded — single-pass, values are never re-expanded, unknown placeholders
+/// keep their braces verbatim (a validated template never contains any).
+///
+/// When `upstream` contains NO `__` (desktop direct-connect form), the
+/// template is IGNORED and the result is always `{prefix}_{upstream}` —
+/// the historical behavior, kept byte-identical so desktop setups see zero
+/// change from the template feature (their tool names carry no slug segment
+/// to expose via `{server}`/`{tool}` anyway).
+pub fn format_tool_name(template: &str, prefix: &str, upstream: &str) -> String {
+    let Some((server, tool)) = upstream.split_once("__") else {
+        // 无 `__`（桌面直连形态）→ legacy：模板不适用，保持历史行为。
+        return format!("{prefix}_{upstream}");
+    };
+    let mut out = String::with_capacity(template.len() + prefix.len() + upstream.len());
+    let mut rest = template;
+    while let Some(pos) = rest.find('{') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        if let Some(remaining) = tail.strip_prefix("{prefix}") {
+            out.push_str(prefix);
+            rest = remaining;
+        } else if let Some(remaining) = tail.strip_prefix("{server}") {
+            out.push_str(server);
+            rest = remaining;
+        } else if let Some(remaining) = tail.strip_prefix("{tool}") {
+            out.push_str(tool);
+            rest = remaining;
+        } else {
+            out.push('{');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Convert the agent's tool-call arguments (`serde_json::Value`) into the
 /// `JsonObject` (`Map<String, Value>`) shape MCP's `call_tool` expects.
@@ -141,7 +199,9 @@ fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> String {
 
 /// A [`Tool`] backed by a remote MCP server tool.
 ///
-/// `exposed_name` is what the LLM sees (namespaced as `{server}_{tool}`);
+/// `exposed_name` is what the LLM sees (the `[mcp].tool_name_template`
+/// expansion — default `{prefix}_{server}__{tool}`, byte-identical to the
+/// historical `{prefix}_{upstream}` for both aggregated and plain names);
 /// `definition_name` is the original MCP tool name sent back in `tools/call`.
 pub struct McpTool {
     exposed_name: String,
@@ -159,18 +219,40 @@ pub struct McpTool {
 impl McpTool {
     /// Wrap an `rmcp::model::Tool` discovered on `client`.
     ///
-    /// `server_name` namespaces the exposed name as `{server_name}_{tool_name}`
-    /// (the original name is kept for `call_tool`), so tools from different MCP
-    /// servers never collide. `None` keeps the bare definition name — used for
-    /// the builtin in-process servers whose tools are OpenSlate's own.
+    /// `server_name` is the `[mcp.servers]` key — the `{prefix}` placeholder
+    /// value — and namespaces the exposed name (the original name is kept
+    /// for `call_tool`), so tools from different MCP servers never collide.
+    /// `None` keeps the bare definition name — used for the builtin
+    /// in-process servers whose tools are OpenSlate's own.
+    ///
+    /// `template` (see [`format_tool_name`]) only applies on the external
+    /// path (`server_name = Some`); a `None` template means the default
+    /// [`DEFAULT_TOOL_NAME_TEMPLATE`], whose expansion is byte-identical to
+    /// the no-template legacy form, so both funnel through the same code.
+    /// Upstream names without `__` (desktop direct-connect form) ignore the
+    /// template entirely inside `format_tool_name`. The builtin path passes
+    /// `None` for both and is unaffected by templates. Either way only the
+    /// registered name changes — `definition_name` (tools/call routing) and
+    /// the PTC namespace (`server_alias`) keep their original semantics.
     pub(crate) fn from_definition(
         def: RmcpTool,
         client: ServerSink,
         server_name: Option<&str>,
+        template: Option<&str>,
     ) -> Self {
         let definition_name = def.name.to_string();
         let exposed_name = match server_name {
-            Some(prefix) => format!("{prefix}_{definition_name}"),
+            // 外部路径：prefix = [mcp.servers] 键名；模板缺省 = 默认模板
+            // （二者展开逐字节一致，统一走 format_tool_name，避免两份
+            // legacy 拼接逻辑漂移）。无 `__` 的上游在其内部回落 legacy
+            // `prefix_upstream`——桌面直连形态零影响。
+            Some(prefix) => format_tool_name(
+                template.unwrap_or(DEFAULT_TOOL_NAME_TEMPLATE),
+                prefix,
+                &definition_name,
+            ),
+            // builtin 路径：模板不参与，维持裸名（参数设计允许
+            // template=Some + server=None 的组合，但按约定不这么传）。
             None => definition_name.clone(),
         };
         let description = def.description.as_deref().unwrap_or("").to_owned();
@@ -294,6 +376,16 @@ impl McpConnectionGuard {
         self.services.push(svc);
     }
 
+    /// Move every connection from `other` into `self`.
+    ///
+    /// Hot-reload seam: `AppContext` now carries the builtin and external
+    /// MCP guards separately (the mobile runtime swaps the external one at
+    /// runtime); callers without a reload seam (CLI/server) reunify both
+    /// halves into a single keep-alive via this. `other` is left empty.
+    pub fn append(&mut self, mut other: Self) {
+        self.services.append(&mut other.services);
+    }
+
     /// Gracefully cancel every connection (sends shutdown; kills subprocesses).
     /// Best-effort: per-service errors are logged, not propagated.
     pub async fn graceful_shutdown(mut self) {
@@ -351,13 +443,19 @@ pub enum McpConnectError {
 }
 
 /// Connect to one MCP server, complete the handshake, list its tools, and build
-/// `McpTool` wrappers (exposed names auto-namespaced as `{server_name}_*`).
+/// `McpTool` wrappers (registered names = the `template` expansion, default
+/// [`DEFAULT_TOOL_NAME_TEMPLATE`]).
 ///
 /// Returns the tools plus the live `RunningService` (which the caller must keep
 /// alive for the tools to keep working — see [`McpConnectionGuard`]).
+///
+/// `template` is the caller-resolved `[mcp].tool_name_template` (already
+/// blank-filtered; `None` = default). It only shapes the registered names —
+/// `definition_name` and the PTC namespace are untouched.
 pub async fn connect_mcp_server(
     server_name: &str,
     config: &McpServerConfig,
+    template: Option<&str>,
 ) -> Result<(Vec<McpTool>, RunningService<RoleClient, ClientConfig>), McpConnectError> {
     let client_info = ClientConfig::new(
         ClientCapabilities::default(),
@@ -476,7 +574,7 @@ pub async fn connect_mcp_server(
 
     let mcp_tools = tools
         .into_iter()
-        .map(|t| McpTool::from_definition(t, service.peer().clone(), Some(server_name)))
+        .map(|t| McpTool::from_definition(t, service.peer().clone(), Some(server_name), template))
         .collect();
 
     Ok((mcp_tools, service))
@@ -536,7 +634,9 @@ where
 
     let tools = defs
         .into_iter()
-        .map(|def| McpTool::from_definition(def, client.peer().clone(), None))
+        // builtin 工具不参与 [mcp].tool_name_template：它们是 OpenSlate
+        // 自有工具，裸名即约定（模板只作用于外部 server 的注册名）。
+        .map(|def| McpTool::from_definition(def, client.peer().clone(), None, None))
         .collect();
 
     Ok((tools, client))
@@ -558,7 +658,7 @@ impl From<&crate::skills::Skill> for SkillInfo {
 }
 
 /// Connect the in-process builtin tool servers and return their tools under
-/// **bare** names (no `{server}_` prefix), ready to be registered into the
+/// **bare** names (no `{prefix}_` prefix), ready to be registered into the
 /// `ToolRegistry` by the caller.
 ///
 /// Servers are constructed only as needed per `cfg`:
@@ -950,7 +1050,7 @@ mod tests {
             .find(|d| d.name.as_ref() == "read_file")
             .expect("fs server exposes read_file");
 
-        let tool = McpTool::from_definition(read_def.clone(), service.peer().clone(), Some("srv"));
+        let tool = McpTool::from_definition(read_def.clone(), service.peer().clone(), Some("srv"), None);
         // The LLM sees the namespaced form; call_tool keeps the original name.
         assert_eq!(tool.exposed_name(), "srv_read_file");
         assert_eq!(tool.definition_name, "read_file");
@@ -975,10 +1075,179 @@ mod tests {
             .find(|d| d.name.as_ref() == "read_file")
             .expect("fs server exposes read_file");
 
-        let tool = McpTool::from_definition(read_def, service.peer().clone(), None);
+        let tool = McpTool::from_definition(read_def, service.peer().clone(), None, None);
         assert_eq!(tool.exposed_name(), "read_file");
         assert_eq!(tool.definition_name, "read_file");
         // Builtin tools stay flat in the PTC sandbox (no namespace).
+        assert_eq!(tool.namespace(), None);
+    }
+
+    // ── format_tool_name (pure expansion) ────────────────────────────────
+
+    #[test]
+    fn format_tool_name_table() {
+        // (template, prefix, upstream, expected) — 覆盖：默认模板双形态、
+        // 三占位符各形态、双 {server}、不含 {prefix}、不含 {server}、
+        // 字面 `__` 合法、多个 `__` 上游取首段、无占位符混排。
+        let cases = [
+            // 默认模板：聚合形态 = prefix_server__tool，与 legacy
+            // `prefix_upstream` 逐字节一致；无 `__` 上游走 legacy。
+            (
+                "{prefix}_{server}__{tool}",
+                "termux",
+                "Server_Memory__create_entities",
+                "termux_Server_Memory__create_entities",
+            ),
+            (
+                "{prefix}_{server}__{tool}",
+                "termux",
+                "plain_tool",
+                "termux_plain_tool",
+            ),
+            // 三占位符各形态。
+            ("{tool}", "termux", "S__t", "t"),
+            ("{server}__{tool}", "termux", "S__t", "S__t"),
+            ("{prefix}_{tool}", "termux", "S__t", "termux_t"),
+            ("{prefix}.{server}.{tool}", "termux", "S__t", "termux.S.t"),
+            // 双 {server}。
+            ("{server}.dev.{server}_{tool}", "termux", "S__t", "S.dev.S_t"),
+            // 字面 `__` 允许（Kotlin 侧按模板正则提取，`__` 不再保留）。
+            ("{prefix}__{server}__{tool}", "termux", "S__t", "termux__S__t"),
+            // 多个 `__` 的上游：首 `__` 为分界，后段整体归 {tool}。
+            ("{server}/{tool}", "termux", "S__t__x", "S/t__x"),
+            // 无占位符混排（校验拦得住缺 {tool} 的值；纯函数保持全函数性）。
+            ("fixed-name", "termux", "S__t", "fixed-name"),
+            // 空模板：聚合形态 → 空名（校验层拦住；全函数性）。
+            ("", "termux", "S__t", ""),
+        ];
+        for (template, prefix, upstream, expected) in cases {
+            assert_eq!(format_tool_name(template, prefix, upstream), expected);
+        }
+    }
+
+    #[test]
+    fn format_tool_name_legacy_path_ignores_template() {
+        // 无 `__` 上游（桌面直连形态）恒为 prefix_upstream——模板被无视，
+        // 与模板功能上线前的行为逐字节一致（桌面零影响的关键）。
+        assert_eq!(format_tool_name("{tool}", "srv", "read_file"), "srv_read_file");
+        assert_eq!(format_tool_name("", "srv", "read_file"), "srv_read_file");
+        assert_eq!(
+            format_tool_name("{prefix}_{server}__{tool}", "srv", "read_file"),
+            "srv_read_file"
+        );
+        assert_eq!(
+            format_tool_name("{server}.{tool}", "srv", "read_file"),
+            "srv_read_file"
+        );
+    }
+
+    #[test]
+    fn format_tool_name_does_not_reexpand_values() {
+        // 上游拆出的 server 段 / prefix 值本身长得像占位符也不二次展开
+        // （单趟扫描，值直接拼接不再扫描）。
+        assert_eq!(
+            format_tool_name("{server}_{tool}", "srv", "a{tool}b__x"),
+            "a{tool}b_x"
+        );
+        assert_eq!(
+            format_tool_name("{prefix}_{tool}", "p{server}", "S__t"),
+            "p{server}_t"
+        );
+        // 未校验的未知占位符原样保留（不吞 '{'）。
+        assert_eq!(format_tool_name("{prefix}_{foo}", "srv", "S__t"), "srv_{foo}");
+    }
+
+    #[tokio::test]
+    async fn from_definition_with_template_rewrites_exposed_name_only() {
+        // 带 `__` 的上游名（mobile 聚合 host 形态）：模板参与展开。
+        // builtin server 只提供活 sink——def 手工构造（from_definition
+        // 不执行工具，sink 来源无关紧要）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
+            .await
+            .expect("in-process connect should succeed");
+        let def = RmcpTool::new(
+            "Server_Memory__create_entities",
+            "memory tool",
+            serde_json::Map::new(),
+        );
+
+        let tool = McpTool::from_definition(
+            def,
+            service.peer().clone(),
+            Some("termux"),
+            Some("{prefix}.{server}.{tool}"),
+        );
+        // 注册名按模板展开；tools/call 路由与 PTC namespace 语义不变
+        // （namespace 仍是 [mcp.servers] 键，不随模板改）。
+        assert_eq!(tool.exposed_name(), "termux.Server_Memory.create_entities");
+        assert_eq!(tool.name(), "termux.Server_Memory.create_entities");
+        assert_eq!(tool.definition_name, "Server_Memory__create_entities");
+        assert_eq!(tool.namespace().as_deref(), Some("termux"));
+    }
+
+    #[tokio::test]
+    async fn from_definition_default_template_matches_legacy_concat() {
+        // 模板缺省（None）= 默认模板：展开与「prefix_上游全名」逐字节
+        // 一致（含 `__` 与不含 `__` 两种上游）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
+            .await
+            .expect("in-process connect should succeed");
+        let aggregated = RmcpTool::new(
+            "Server_Memory__create_entities",
+            "memory tool",
+            serde_json::Map::new(),
+        );
+        let plain = RmcpTool::new("read_file", "fs tool", serde_json::Map::new());
+
+        let a = McpTool::from_definition(
+            aggregated,
+            service.peer().clone(),
+            Some("termux"),
+            None,
+        );
+        assert_eq!(a.exposed_name(), "termux_Server_Memory__create_entities");
+        let p = McpTool::from_definition(plain, service.peer().clone(), Some("srv"), None);
+        assert_eq!(p.exposed_name(), "srv_read_file");
+    }
+
+    #[tokio::test]
+    async fn from_definition_template_ignored_for_plain_upstream() {
+        // 无 `__` 上游（桌面直连形态）：即便给了模板也走 legacy
+        // `prefix_upstream`（format_tool_name 内部回落）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
+            .await
+            .expect("in-process connect should succeed");
+        let def = RmcpTool::new("read_file", "fs tool", serde_json::Map::new());
+
+        let tool = McpTool::from_definition(
+            def,
+            service.peer().clone(),
+            Some("srv"),
+            Some("{tool}"),
+        );
+        assert_eq!(tool.exposed_name(), "srv_read_file");
+        assert_eq!(tool.definition_name, "read_file");
+    }
+
+    #[tokio::test]
+    async fn from_definition_template_ignored_without_server() {
+        // 参数契约：server=None（builtin 路径）时模板不参与，裸名维持。
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
+            .await
+            .expect("in-process connect should succeed");
+        let def = RmcpTool::new("read_file", "fs tool", serde_json::Map::new());
+
+        let tool = McpTool::from_definition(
+            def,
+            service.peer().clone(),
+            None,
+            Some("{prefix}_{server}__{tool}"),
+        );
+        assert_eq!(tool.exposed_name(), "read_file");
         assert_eq!(tool.namespace(), None);
     }
 

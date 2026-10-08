@@ -43,7 +43,8 @@
 //!    renamed deterministically and surfaced as
 //!    `// renamed from X (collision)` comments in the prelude. Unknown
 //!    namespace members dispatch under their composed registry name
-//!    (`{server}_{tool}`), mirroring how real members are composed, so the
+//!    (template-expanded; default `{prefix}_{server}__{tool}`), mirroring
+//!    how real members are composed, so the
 //!    host allow-list yields the canonical "tool not available" error
 //!    instead of cross-namespace reach.
 //!
@@ -825,7 +826,7 @@ mod tests {
         assert_eq!(outcome.error, None);
         let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
         // Unknown ns members dispatch under their COMPOSED registry name
-        // (`{server}_{tool}`, mirroring McpTool), never the bare member —
+        // (template-expanded, mirroring McpTool), never the bare member —
         // a flat `nope` tool elsewhere must not become reachable.
         assert_eq!(
             result.as_str().unwrap(),

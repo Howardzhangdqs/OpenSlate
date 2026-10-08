@@ -397,6 +397,118 @@ pub fn remove_mcp_server(path: &Path, name: &str) -> Result<()> {
     save_document(path, &doc)
 }
 
+/// Write/clear `[mcp].tool_name_template`: an empty `template` removes the
+/// key (falling back to the built-in `{prefix}_{server}__{tool}`, via
+/// [`remove_sub_key`]
+/// semantics — missing key/section is a silent success and no stray file is
+/// created); a `[mcp]` section that does not exist yet is created on write.
+/// Value validation is the caller's job (core
+/// `validation::validate_mcp_tool_name_template` — the FFI write path runs it
+/// before persisting, and startup validation would catch anything hand-written
+/// into the file). Refuses to step on a non-table `mcp` node (same guard as
+/// [`upsert_mcp_server`]).
+pub fn set_mcp_tool_name_template(path: &Path, template: &str) -> Result<()> {
+    if template.is_empty() {
+        return remove_sub_key(path, "mcp", "tool_name_template");
+    }
+    let mut doc = load_document(path)?;
+    if let Some(item) = doc.as_table().get("mcp") {
+        anyhow::ensure!(
+            item.is_table(),
+            "config entry 'mcp' is not a standard TOML table"
+        );
+    }
+    let mcp = doc
+        .as_table_mut()
+        .entry("mcp")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("[mcp] is not a table")?;
+    mcp.insert("tool_name_template", value(template.to_owned()));
+    save_document(path, &doc)
+}
+
+/// Rename a key inside `[mcp.servers]` (the mobile aggregated-host scenario
+/// has exactly one server, whose key is also the `{prefix}` placeholder's
+/// expansion value). Semantics:
+///
+/// - exactly one key → that key is renamed (the caller's `old` may be stale
+///   and is ignored — single-server is the invariant this targets);
+/// - multiple keys → the key literally named `old` is renamed; missing `old`
+///   is an error (refuse to guess which entry to touch);
+/// - empty (or missing) `[mcp.servers]` → error (upsert first);
+/// - `new ==` resolved source key → silent no-op (idempotent);
+/// - `new` already exists as another key → error (refuse to clobber);
+/// - the entry must be a standard table; anything else is refused.
+///
+/// The move is whole-`Item`: transport/headers values and their decor
+/// (comments, blank lines) travel to the new key untouched — the render
+/// walks the key path, so `[mcp.servers.old]` (and a nested
+/// `[mcp.servers.old.headers]`) automatically come out as `...new...`.
+/// Position note: `insert` appends at the table's end, so among multiple
+/// servers the renamed one moves last — semantically irrelevant (TOML
+/// tables are unordered). Server-name legality is the caller's job (FFI
+/// runs `validation::validate_mcp_server_name` first).
+pub fn rename_mcp_server(path: &Path, old: &str, new: &str) -> Result<()> {
+    let mut doc = load_document(path)?;
+    let Some(mcp) = doc.as_table_mut().get_mut("mcp").and_then(|i| i.as_table_mut()) else {
+        anyhow::bail!(
+            "[mcp] section is missing (or not a table): nothing to rename — \
+             create the server first via upsert_mcp_server"
+        );
+    };
+    let Some(servers) = mcp.get_mut("servers").and_then(|i| i.as_table_mut()) else {
+        anyhow::bail!(
+            "[mcp.servers] section is missing (or not a table): nothing to \
+             rename — create the server first via upsert_mcp_server"
+        );
+    };
+    // 解析要搬移的源键：单键直取（mobile 聚合场景的常态，调用方的
+    // old 可能过期）；多键必须精确命中 old，改错无辜条目不如报错。
+    let source = match servers.len() {
+        0 => anyhow::bail!(
+            "[mcp.servers] is empty: nothing to rename — create the server \
+             first via upsert_mcp_server"
+        ),
+        1 => servers
+            .iter()
+            .next()
+            // Table::iter() 的键即 &str（非 toml_edit::Key），直接 to_owned。
+            .map(|(k, _)| k.to_owned())
+            .expect("len == 1 guarantees a key"),
+        _ => {
+            if !servers.contains_key(old) {
+                anyhow::bail!(
+                    "[mcp.servers] has multiple keys and none is named '{old}': \
+                     refusing to guess which one to rename"
+                );
+            }
+            old.to_owned()
+        }
+    };
+    // 幂等：目标名即源名（含调用方显式 old == new）→ 原样成功，不落盘。
+    if source == new {
+        return Ok(());
+    }
+    // 目标键已被占（多键场景才可能）→ 拒绝覆盖：静默合并会吞掉一个
+    // server 的配置，且无法从改名操作里恢复。
+    if servers.contains_key(new) {
+        anyhow::bail!(
+            "[mcp.servers.{new}] already exists: refusing to overwrite it \
+             while renaming '{source}' (remove one of them first)"
+        );
+    }
+    let item = servers
+        .remove(&source)
+        .expect("source key was just confirmed present");
+    anyhow::ensure!(
+        item.is_table(),
+        "[mcp.servers.{source}] is not a standard TOML table; refusing to move it"
+    );
+    servers.insert(new, item);
+    save_document(path, &doc)
+}
+
 /// Shared removal for `[<section>] <key>`. A missing section or key is a
 /// silent success leaving the file untouched (idempotent, no stray empty
 /// files); a section that is not a standard table is refused.
@@ -776,6 +888,174 @@ mod tests {
         remove_mcp_server(&path, "zz").expect("remove missing ok");
         let (_dir2, path2) = temp_config();
         remove_mcp_server(&path2, "any").expect("no mcp section ok");
+    }
+
+    // ── [mcp].tool_name_template ───────────────────────────────────────
+
+    #[test]
+    fn set_mcp_tool_name_template_roundtrip() {
+        let (_dir, path) = temp_config();
+        // 写入（[mcp] 节不存在则创建）→ 读回。
+        set_mcp_tool_name_template(&path, "{server}.{tool}").expect("write");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["mcp"]["tool_name_template"].as_str(),
+            Some("{server}.{tool}")
+        );
+        // 覆写。
+        set_mcp_tool_name_template(&path, "{tool}").expect("overwrite");
+        let doc = parse_at(&path);
+        assert_eq!(doc["mcp"]["tool_name_template"].as_str(), Some("{tool}"));
+        // 空串 → 键消失（回默认）。
+        set_mcp_tool_name_template(&path, "").expect("clear");
+        let doc = parse_at(&path);
+        let gone = doc["mcp"]
+            .as_table()
+            .map(|t| t.get("tool_name_template").is_none())
+            .unwrap_or(true);
+        assert!(gone, "cleared key must be absent: {}", text_at(&path));
+        // 再清一次（幂等）。
+        set_mcp_tool_name_template(&path, "").expect("clear again ok");
+    }
+
+    #[test]
+    fn set_mcp_tool_name_template_coexists_with_servers() {
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8765/mcp", None).expect("upsert");
+        set_mcp_tool_name_template(&path, "{server}_{tool}").expect("write");
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.termux]"), "{text}");
+        assert!(
+            text.contains(r#"tool_name_template = "{server}_{tool}""#),
+            "{text}"
+        );
+        // 清模板不动 servers；写出的文件仍可解析回同样的 server 条目。
+        set_mcp_tool_name_template(&path, "").expect("clear");
+        let text = text_at(&path);
+        assert!(!text.contains("tool_name_template"), "{text}");
+        assert!(text.contains("[mcp.servers.termux]"), "{text}");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["mcp"]["servers"]["termux"]["url"].as_str(),
+            Some("http://127.0.0.1:8765/mcp")
+        );
+    }
+
+    #[test]
+    fn set_mcp_tool_name_template_clear_missing_is_ok() {
+        // 无 [mcp] 节的文件上清空 → 静默成功，不创建文件。
+        let (_dir, path) = temp_config();
+        set_mcp_tool_name_template(&path, "").expect("clear on empty doc ok");
+        assert!(!path.exists(), "no file should be created on no-op clear");
+    }
+
+    // ── rename_mcp_server ──────────────────────────────────────────────
+
+    #[test]
+    fn rename_mcp_server_roundtrip() {
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8765/mcp", None).expect("upsert");
+        rename_mcp_server(&path, "termux", "phone").expect("rename");
+
+        // 展开头随键路径变为 [mcp.servers.phone]，旧头消失，值原样。
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.phone]"), "{text}");
+        assert!(!text.contains("[mcp.servers.termux]"), "{text}");
+        assert!(text.contains(r#"transport = "http""#), "{text}");
+        assert!(text.contains("127.0.0.1:8765"), "{text}");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["mcp"]["servers"]["phone"]["url"].as_str(),
+            Some("http://127.0.0.1:8765/mcp")
+        );
+    }
+
+    #[test]
+    fn rename_mcp_server_moves_headers_subtable() {
+        // headers 子表随整个 Item 搬移：渲染为 [mcp.servers.<new>.headers]，
+        // Authorization 条目原样保留。
+        let (_dir, path) = temp_config();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok-1".to_string());
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8765/mcp", Some(&headers))
+            .expect("upsert");
+        rename_mcp_server(&path, "termux", "phone").expect("rename");
+
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.phone.headers]"), "{text}");
+        assert!(text.contains("Authorization = \"Bearer tok-1\""), "{text}");
+        assert!(!text.contains("[mcp.servers.termux"), "{text}");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["mcp"]["servers"]["phone"]["headers"]["Authorization"].as_str(),
+            Some("Bearer tok-1")
+        );
+    }
+
+    #[test]
+    fn rename_mcp_server_coexists_with_tool_name_template() {
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8765/mcp", None).expect("upsert");
+        set_mcp_tool_name_template(&path, "{server}.{tool}").expect("template");
+        rename_mcp_server(&path, "termux", "phone").expect("rename");
+
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.phone]"), "{text}");
+        assert!(
+            text.contains(r#"tool_name_template = "{server}.{tool}""#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn rename_mcp_server_same_name_is_idempotent() {
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8765/mcp", None).expect("upsert");
+        // 显式 old == new → ok，键不动。
+        rename_mcp_server(&path, "termux", "termux").expect("old == new ok");
+        assert!(text_at(&path).contains("[mcp.servers.termux]"));
+        // 单键场景下 old 过期、new 即现名 → 同样幂等 ok。
+        rename_mcp_server(&path, "stale", "termux").expect("stale old, new == current ok");
+        assert!(text_at(&path).contains("[mcp.servers.termux]"));
+    }
+
+    #[test]
+    fn rename_mcp_server_multi_key_targets_old() {
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "a", "http://x/mcp", None).expect("upsert a");
+        upsert_mcp_server(&path, "b", "http://y/mcp", None).expect("upsert b");
+        rename_mcp_server(&path, "a", "c").expect("rename a -> c");
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.c]"), "{text}");
+        assert!(text.contains("[mcp.servers.b]"), "{text}");
+        assert!(!text.contains("[mcp.servers.a]"), "{text}");
+        let doc = parse_at(&path);
+        assert_eq!(doc["mcp"]["servers"]["c"]["url"].as_str(), Some("http://x/mcp"));
+        assert_eq!(doc["mcp"]["servers"]["b"]["url"].as_str(), Some("http://y/mcp"));
+
+        // 多键但 old 不存在 → 报错，不动文件。
+        let (_dir2, path2) = temp_config();
+        upsert_mcp_server(&path2, "a", "http://x/mcp", None).expect("upsert a");
+        upsert_mcp_server(&path2, "b", "http://y/mcp", None).expect("upsert b");
+        assert!(rename_mcp_server(&path2, "zz", "c").is_err());
+        assert!(text_at(&path2).contains("[mcp.servers.a]"));
+
+        // 目标键已被另一 server 占用 → 拒绝覆盖。
+        assert!(rename_mcp_server(&path2, "a", "b").is_err());
+        assert!(text_at(&path2).contains("[mcp.servers.a]"));
+        assert!(text_at(&path2).contains("[mcp.servers.b]"));
+    }
+
+    #[test]
+    fn rename_mcp_server_empty_or_missing_errors() {
+        // 无 [mcp] 节 → 报错。
+        let (_dir, path) = temp_config();
+        assert!(rename_mcp_server(&path, "termux", "phone").is_err());
+        assert!(!path.exists(), "failed rename must not create a file");
+        // [mcp.servers] 存在但为空表 → 同样报错。
+        let (_dir2, path2) = temp_config();
+        fs::write(&path2, "[mcp.servers]\n").expect("write empty servers");
+        assert!(rename_mcp_server(&path2, "termux", "phone").is_err());
     }
 
     fn upsert_provider_creates_new_file() {

@@ -1424,6 +1424,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -1453,6 +1455,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -1482,6 +1486,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
 
         ReplSession::new(ctx, "default".into(), true).unwrap()
@@ -1522,6 +1528,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
     }
@@ -1540,6 +1548,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
         ReplSession::new(ctx, profile.into(), false).unwrap()
     }
@@ -1558,6 +1568,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
         ReplSession::new(ctx, "default".into(), false).unwrap()
     }
@@ -2144,6 +2156,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
 
         let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();
@@ -2181,6 +2195,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
 
         let mut session = ReplSession::new(ctx, "default".into(), true).unwrap();
@@ -2226,6 +2242,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
         ReplSession::new(ctx, "default".into(), true).unwrap()
     }
@@ -2558,6 +2576,8 @@ max_tool_calls = 20
             global_config_path: None,
             agents_path: tmp.path().join(".openslate/agents"),
             mcp_connections: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_external: openslate_core::mcp::McpConnectionGuard::default(),
+            mcp_tool_names: Vec::new(),
         };
         ReplSession::new(ctx, "default".into(), true).unwrap()
     }

@@ -270,13 +270,27 @@ impl Default for TraceConfig {
 pub struct McpConfig {
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
+    /// 工具注册名模板：占位符 {prefix}（[mcp.servers] 键名，App 侧
+    /// 「服务名/前缀」设置）、{server}（上游 MCP 服务器名 = 聚合名的
+    /// `{slug}` 段，如 Server_Memory）与 {tool}（不带前缀的工具名）。
+    /// 缺省 = "{prefix}_{server}__{tool}"（与历史 `前缀_上游全名` 展开
+    /// 逐字节一致）；None/空白同缺省。除占位符外仅允许 [A-Za-z0-9_.-]
+    /// （校验见 validation.rs）。仅作用于含 `__` 的聚合上游名——无
+    /// `__`（桌面直连形态）恒走 legacy `前缀_上游全名`，模板不参与。
+    /// 只影响注册名：tools/call 路由（definition_name）与 PTC namespace
+    /// 语义不变。保持 `Deserialize`-only：写回由 persist.rs 手拼 TOML
+    /// （模块头约定）。
+    #[serde(default)]
+    pub tool_name_template: Option<String>,
 }
 
 /// A single MCP server connection.
 ///
-/// `enabled` defaults to `true`. Each tool this server exposes is automatically
-/// namespaced as `{server_name}_{tool_name}` when registered, so collisions
-/// across servers (and with builtins) are avoided without any per-server config.
+/// `enabled` defaults to `true`. Each tool this server exposes is registered
+/// under the `[mcp].tool_name_template` expansion (default:
+/// `{prefix}_{server}__{tool}`, where `{prefix}` is this server's key in
+/// `[mcp.servers]`), so collisions across servers (and with builtins) are
+/// avoided without any per-server config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
     #[serde(default = "default_true")]

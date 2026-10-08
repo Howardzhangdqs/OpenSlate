@@ -19,7 +19,7 @@ use openslate_core::approval::{
 use openslate_core::config::merge::merge_configs;
 use openslate_core::config::validation::validate_config;
 use openslate_core::config::{
-    parse_agents_dir, parse_openslate_toml, AgentsConfig, OpenSlateConfig,
+    parse_agents_dir, parse_openslate_toml, AgentsConfig, McpConfig, OpenSlateConfig,
 };
 use openslate_core::paths::{resolve_paths, OpenSlatePaths};
 use openslate_core::run_manager::RunManager;
@@ -45,6 +45,17 @@ pub struct AppContext {
     /// the connections themselves are cancelled — avoiding any window where a
     /// tool could outlive its transport.
     pub mcp_connections: openslate_core::mcp::McpConnectionGuard,
+    /// Live EXTERNAL MCP server connections (the `[mcp.servers]` half, split
+    /// out of `mcp_connections`). The mobile runtime swaps this guard
+    /// wholesale when hot-reloading MCP servers, while the builtin half
+    /// (`mcp_connections`) stays put. CLI/server paths have no reload seam
+    /// and reunify both guards into a single keep-alive. Same drop-order rule
+    /// as `mcp_connections` (declared after `manager`).
+    pub mcp_external: openslate_core::mcp::McpConnectionGuard,
+    /// Names of the tools registered from external MCP servers — exactly the
+    /// set the mobile runtime unregisters before swapping in a fresh batch
+    /// on hot-reload.
+    pub mcp_tool_names: Vec<String>,
     /// Resolved config file path (for diagnostics).
     pub config_path: std::path::PathBuf,
     /// User-global config file that was merged underneath the active one
@@ -440,6 +451,141 @@ fn load_dotenv(dir: Option<&Path>) {
     }
 }
 
+/// 按配置连接全部 enabled 的外部 MCP server，并把工具注册进 `registry`。
+///
+/// 从装配期步骤 7.5 抽出（mobile 运行期热重载共用，见 mobile
+/// `MobileRuntime::reload_mcp`）。语义与原装配期完全一致：
+/// - 每 server 一个并发连接任务，经 mpsc 按完成顺序送达并当场注册
+///   （纯内存 HashMap 插入，trivially fast）；
+/// - 单 server 连接失败 warn+skip（一个坏 server 不阻断其余）；
+/// - 工具名冲突 hard error（`anyhow::bail!`）；
+/// - 工具注册名按 `[mcp].tool_name_template` 展开（空白/缺省 =
+///   `{prefix}_{server}__{tool}`，与历史 `前缀_上游全名` 逐字节一致；
+///   无 `__` 的上游恒走 legacy `前缀_上游全名`）；模板不含 `{server}`
+///   时的跨 server 撞名同样走上面的 hard error 兜底。
+///
+/// 返回 `(外部连接 guard, 各成功 server 的工具数, 注册的工具名全集,
+/// 失败 server 名单)`。guard 由调用方持有（连接保活）；热重载调用方可
+/// 传一个 scratch `ToolRegistry` 先做批内冲突检查/暂存，再决定迁移到
+/// 真实注册表——真实注册表在此之前不被触碰。
+pub async fn connect_external_mcp(
+    mcp_cfg: &McpConfig,
+    registry: &ToolRegistry,
+) -> anyhow::Result<(
+    openslate_core::mcp::McpConnectionGuard,
+    std::collections::BTreeMap<String, usize>,
+    Vec<String>,
+    Vec<String>,
+)> {
+    use tokio::sync::mpsc;
+
+    // 工具名模板：空白视同未设置（回落默认 {prefix}_{server}__{tool}），
+    // 与 config/validation 的空白语义一致；装配期与热重载共用本入口，
+    // 两边读到的都是同一份落盘值。owned：spawn 任务要求 'static，
+    // 从 mcp_cfg 借用的 &str 逃不出函数体（E0521）。
+    let tool_name_template = mcp_cfg
+        .tool_name_template
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_owned());
+
+    let mut mcp_connections = openslate_core::mcp::McpConnectionGuard::new();
+    let mut server_tool_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut failed_servers: Vec<String> = Vec::new();
+
+    // Disabled servers: log and skip (no subprocess spawned).
+    for (name, server_cfg) in &mcp_cfg.servers {
+        if !server_cfg.enabled {
+            tracing::info!(target: "openslate_mcp", "MCP server '{name}' disabled, skipping");
+        }
+    }
+
+    // Spawn one task per enabled server to connect concurrently, and log +
+    // register each one THE MOMENT it finishes (delivered in completion order
+    // via the channel) — instead of waiting for all connects before logging.
+    // Registration still happens on this task (&mut registry, sequential),
+    // but it's pure in-memory HashMap inserts, trivially fast.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut pending = 0usize;
+    for (name, cfg) in &mcp_cfg.servers {
+        if !cfg.enabled {
+            continue;
+        }
+        let name = name.clone();
+        let cfg = cfg.clone();
+        let template = tool_name_template.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result =
+                openslate_core::mcp::connect_mcp_server(&name, &cfg, template.as_deref()).await;
+            // `elapsed` is captured here, at this server's connect completion
+            // — independent of when sibling servers (or the registry loop) run.
+            let _ = tx.send((name, start.elapsed(), result));
+        });
+        pending += 1;
+    }
+    drop(tx);
+
+    for _ in 0..pending {
+        let (name, elapsed, result) = match rx.recv().await {
+            Some(msg) => msg,
+            None => break, // all senders dropped unexpectedly (e.g. a task panicked)
+        };
+        match result {
+            Ok((tools, service)) => {
+                let mut names = Vec::with_capacity(tools.len());
+                for tool in tools {
+                    names.push(tool.exposed_name().to_owned());
+                    match registry.try_register(tool) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            anyhow::bail!(
+                                "MCP tool name conflict: tool '{}' from server '{}' collides \
+                                 with an existing tool (MCP tools are auto-namespaced as \
+                                 '{name}_*'; a collision means two servers share a name)",
+                                e.0,
+                                name
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    target: "openslate_mcp",
+                    "MCP server '{name}': {} tools registered in {:.2}s",
+                    names.len(),
+                    elapsed.as_secs_f32()
+                );
+                tracing::debug!(
+                    target: "openslate_mcp",
+                    "MCP server '{name}' tool list: [{}]",
+                    names.join(", ")
+                );
+                server_tool_counts.insert(name.clone(), names.len());
+                tool_names.extend(names);
+                mcp_connections.push(service);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "openslate_mcp",
+                    "MCP server '{name}' failed to connect after {:.2}s, skipped: {e}",
+                    elapsed.as_secs_f32()
+                );
+                failed_servers.push(name);
+            }
+        }
+    }
+
+    Ok((
+        mcp_connections,
+        server_tool_counts,
+        tool_names,
+        failed_servers,
+    ))
+}
+
 /// Build the full application context from CLI parameters.
 pub async fn build_app_context(config_flag: Option<&str>) -> Result<AppContext> {
     build_app_context_with(config_flag, Vec::new()).await
@@ -546,86 +692,15 @@ pub async fn build_app_context_with(
     //     Static config errors were already caught by validate_config; here we
     //     handle runtime failures (spawn/handshake/list) with warn+skip so one
     //     bad server cannot abort startup. Name collisions are a hard error.
+    //     （抽成 connect_external_mcp 与 mobile 热重载共用，装配期语义不变。
+    //      builtin 句柄仍进 mcp_connections；外部句柄进独立的 mcp_external
+    //      ——mobile 热重载整体替换外部半边、builtin 不动。）
+    let mut mcp_external = openslate_core::mcp::McpConnectionGuard::new();
+    let mut mcp_tool_names: Vec<String> = Vec::new();
     if let Some(mcp) = &config.mcp {
-        use tokio::sync::mpsc;
-
-        // Disabled servers: log and skip (no subprocess spawned).
-        for (name, server_cfg) in &mcp.servers {
-            if !server_cfg.enabled {
-                tracing::info!(target: "openslate_mcp", "MCP server '{name}' disabled, skipping");
-            }
-        }
-
-        // Spawn one task per enabled server to connect concurrently, and log +
-        // register each one THE MOMENT it finishes (delivered in completion order
-        // via the channel) — instead of waiting for all connects before logging.
-        // Registration still happens on this task (&mut registry, sequential),
-        // but it's pure in-memory HashMap inserts, trivially fast.
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut pending = 0usize;
-        for (name, cfg) in &mcp.servers {
-            if !cfg.enabled {
-                continue;
-            }
-            let name = name.clone();
-            let cfg = cfg.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let start = std::time::Instant::now();
-                let result = openslate_core::mcp::connect_mcp_server(&name, &cfg).await;
-                // `elapsed` is captured here, at this server's connect completion
-                // — independent of when sibling servers (or the registry loop) run.
-                let _ = tx.send((name, start.elapsed(), result));
-            });
-            pending += 1;
-        }
-        drop(tx);
-
-        for _ in 0..pending {
-            let (name, elapsed, result) = match rx.recv().await {
-                Some(msg) => msg,
-                None => break, // all senders dropped unexpectedly (e.g. a task panicked)
-            };
-            match result {
-                Ok((tools, service)) => {
-                    let mut names = Vec::with_capacity(tools.len());
-                    for tool in tools {
-                        names.push(tool.exposed_name().to_owned());
-                        match registry.try_register(tool) {
-                            Ok(()) => {}
-                            Err(e) => {
-                                anyhow::bail!(
-                                    "MCP tool name conflict: tool '{}' from server '{}' collides \
-                                     with an existing tool (MCP tools are auto-namespaced as \
-                                     '{name}_*'; a collision means two servers share a name)",
-                                    e.0,
-                                    name
-                                );
-                            }
-                        }
-                    }
-                    tracing::info!(
-                        target: "openslate_mcp",
-                        "MCP server '{name}': {} tools registered in {:.2}s",
-                        names.len(),
-                        elapsed.as_secs_f32()
-                    );
-                    tracing::debug!(
-                        target: "openslate_mcp",
-                        "MCP server '{name}' tool list: [{}]",
-                        names.join(", ")
-                    );
-                    mcp_connections.push(service);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "openslate_mcp",
-                        "MCP server '{name}' failed to connect after {:.2}s, skipped: {e}",
-                        elapsed.as_secs_f32()
-                    );
-                }
-            }
-        }
+        let (guard, _counts, names, _failed) = connect_external_mcp(mcp, &registry).await?;
+        mcp_external = guard;
+        mcp_tool_names = names;
     }
 
     // 7.6 PTC diagnostics: exact-name `[ptc.tool_modes]` entries that match
@@ -687,6 +762,8 @@ pub async fn build_app_context_with(
         manager,
         skills,
         mcp_connections,
+        mcp_external,
+        mcp_tool_names,
         config_path,
         global_config_path,
         agents_path,

@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.openslate.mobile.EventCallback
 import uniffi.openslate.mobile.MobilePathsDto
@@ -88,6 +89,32 @@ data class ConfigUi(
     /** 功能 → 代号（server 侧已并入缺省回退的生效值）。 */
     val capabilities: Map<String, String> = emptyMap(),
     val activeConfig: String = "",
+)
+
+/** 工具参数（input_schema.properties 条目的投影）。 */
+data class ToolParamUi(
+    val name: String,
+    val type: String,
+    val required: Boolean,
+    val description: String,
+    /** 嵌套深度：0 = 顶层参数；>0 = 嵌套 schema 展开的子字段（UI 缩进展示）。 */
+    val depth: Int = 0,
+)
+
+/** 工具清单条目（listTools FFI JSON 数组的元素投影）。 */
+data class ToolInfoUi(
+    val name: String,
+    val description: String,
+    /** input_schema 提取的参数（schema 缺失/空 → 空表）。 */
+    val params: List<ToolParamUi> = emptyList(),
+)
+
+/** 工具可见性快照（getAgentToolVisibility FFI JSON 的投影）。
+ *  语义：工具可见 = (tools 为空 || tools 含该名) && hiddenTools 不含该名。
+ *  列表可能含 globs（如 "mcp.*"）等非精确条目，回写时须原样保留。 */
+data class ToolVisibilityUi(
+    val tools: List<String> = emptyList(),
+    val hiddenTools: List<String> = emptyList(),
 )
 
 data class RuntimeUiState(
@@ -360,6 +387,97 @@ object RuntimeBridge {
         Log.i(TAG, "start: restored exec backends = $backends")
     }
 
+    // ── Agent 工具可见性（工具管理页：清单 + 对 agent 可见/隐藏开关）──
+
+    /** 全部可用工具清单（FFI JSON 数组 → 已按 name 排序）；
+     *  null = 运行时未就绪，空表 = 无工具。 */
+    fun listTools(): List<ToolInfoUi>? {
+        val json = runtimeRef.get()?.listTools() ?: return null
+        val arr = runCatching { JSONArray(json) }.getOrNull() ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val obj = arr.optJSONObject(i) ?: return@mapNotNull null
+            val name = obj.optString("name")
+            if (name.isEmpty()) {
+                null
+            } else {
+                ToolInfoUi(name, obj.optString("description"), parseToolParams(obj))
+            }
+        }
+    }
+
+    /** input_schema → 参数列表：properties 的每个键 = 参数名（值为
+     *  {type, description}），required 数组 = 必填名单；schema 缺失或
+     *  无 properties → 空表。嵌套结构（object 的 properties / array 的
+     *  items.properties）递归展开为缩进子参数——MCP 工具的字段描述大多
+     *  藏在嵌套层（如 server-memory 的 entities.items.properties），
+     *  深度上限 3 层防病态 schema。 */
+    private fun parseToolParams(obj: JSONObject): List<ToolParamUi> {
+        val schema = obj.optJSONObject("input_schema") ?: return emptyList()
+        return parseSchemaParams(schema, depth = 0)
+    }
+
+    private fun parseSchemaParams(schema: JSONObject, depth: Int): List<ToolParamUi> {
+        if (depth > 3) return emptyList()
+        val props = schema.optJSONObject("properties") ?: return emptyList()
+        val required = buildSet {
+            val a = schema.optJSONArray("required") ?: return@buildSet
+            for (i in 0 until a.length()) add(a.optString(i))
+        }
+        val out = mutableListOf<ToolParamUi>()
+        for (key in props.keys()) {
+            val p = props.optJSONObject(key) ?: continue
+            out.add(
+                ToolParamUi(
+                    name = key,
+                    type = p.optString("type"),
+                    required = key in required,
+                    description = p.optString("description"),
+                    depth = depth,
+                )
+            )
+            // 嵌套展开：object → 自身 properties；array → items.properties
+            //（server-memory 的 entities 即后者）。required 同理取自本级
+            // 或 items.required（JSON Schema 的对象内必填语义）。
+            val itemObj = p.optJSONObject("items")
+            val nestedProps = p.optJSONObject("properties")
+                ?: itemObj?.optJSONObject("properties") ?: continue
+            val nestedReq = p.optJSONArray("required") ?: itemObj?.optJSONArray("required")
+            val sub = JSONObject().put("properties", nestedProps)
+            if (nestedReq != null) sub.put("required", nestedReq)
+            out.addAll(parseSchemaParams(sub, depth + 1))
+        }
+        return out
+    }
+
+    /** 当前工具可见性快照；null = 运行时未就绪。 */
+    fun getAgentToolVisibility(): ToolVisibilityUi? {
+        val json = runtimeRef.get()?.getAgentToolVisibility() ?: return null
+        val obj = runCatching { JSONObject(json) }.getOrNull() ?: return ToolVisibilityUi()
+        fun strings(key: String): List<String> {
+            val a = obj.optJSONArray(key) ?: return emptyList()
+            return (0 until a.length()).mapNotNull { i ->
+                a.optString(i).takeIf { it.isNotEmpty() }
+            }
+        }
+        return ToolVisibilityUi(strings("tools"), strings("hidden_tools"))
+    }
+
+    /** 全量覆写工具可见性并热生效（FFI 侧为唯一真相源，无本地 prefs）。
+     *  调用方须把快照里无法识别的条目（globs 等）原样带回。
+     *  false = 运行时未就绪（未写入）。 */
+    fun setAgentToolVisibility(tools: List<String>, hiddenTools: List<String>): Boolean {
+        val runtime = runtimeRef.get() ?: return false
+        val result = runtime.setAgentToolVisibility(tools, hiddenTools)
+        // FFI 返回 {"ok":true} / {"ok":false,"error":…}，落盘失败须反馈给 UI。
+        val ok = runCatching { JSONObject(result).optBoolean("ok", false) }.getOrDefault(false)
+        if (ok) {
+            Log.i(TAG, "agent tool visibility set: tools=${tools.size}, hidden=${hiddenTools.size}")
+        } else {
+            Log.w(TAG, "setAgentToolVisibility failed: $result")
+        }
+        return ok
+    }
+
     // ── 模型选择（持久化已迁移到 [capabilities].main：设置页改绑即
     //    落盘 openslate.toml 并热切换；不再本地 SharedPreferences 重放，
     //    双真相源会互相覆盖）。会话内即时切换用下方 setModelAlias()
@@ -475,9 +593,9 @@ object RuntimeBridge {
         JSONObject().put("type", "set_model").put("alias", alias).toString()
     )
 
-    /** 注册/更新 MCP server（http 条目；重启会话后生效——MCP 无热更设计）。
-     *  Authorization 不经此传入：token 由 start() 在 create 前经
-     *  setMcpHostToken() 运行时注入（SecretStore 加密持久化，不落 toml）。 */
+    /** 注册/更新 MCP server（http 条目）。Authorization 不经此传入：
+     *  token 由 start() 在 create 前经 setMcpHostToken() 运行时注入
+     *  （SecretStore 加密持久化，不落 toml）。 */
     fun upsertMcpServer(name: String, url: String) = sendJson(
         JSONObject()
             .put("type", "upsert_mcp_server")
@@ -485,6 +603,236 @@ object RuntimeBridge {
             .put("url", url)
             .toString()
     )
+
+    /** 热重载外部 MCP server（设置页保存清单后调用，新工具免重启生效）。
+     *  FFI 阻塞至全部 server 连接完成（各 server 有内部连接超时），故挂
+     *  IO 线程执行；null = 运行时未就绪。返回 FFI 原始 JSON：
+     *  {"ok":bool,"tools":N,"servers":{…},"failed":[…],"error":"…"}。 */
+    suspend fun reloadMcpServers(): String? = withContext(Dispatchers.IO) {
+        runtimeRef.get()?.reloadMcpServers()
+    }
+
+    // ── MCP 服务名（[mcp.servers] 单键名；校验/改名落盘在 Rust）────
+
+    /** 服务名缓存：get / set 成功后刷新；初值 = Rust 缺省（改名前与
+     *  存量配置一致）。@Volatile：UI 线程读（[MCP_SERVER_NAMES] 计算
+     *  属性）、IO 线程写（get/set/refreshMcpNaming）。 */
+    @Volatile
+    private var mcpServerNameCache: String = "termux"
+
+    /** 配置里的 MCP server 名单（openslate.toml `[mcp.servers]` 键名，
+     *  可经设置页改名，默认 termux）。计算属性直读缓存——注册表工具名
+     *  解析与工具管理页聚合共用，调用方零改动自动跟随改名。
+     *  （SettingsScreen 的同名私有副本同为计算属性，透传到这里。） */
+    val MCP_SERVER_NAMES: List<String> get() = listOf(mcpServerNameCache)
+
+    /**
+     * 当前服务名（IO）。null = runtime 未就绪；FFI 返回空串时兜底
+     * Rust 缺省名 "termux"（Rust 侧对空/失败本就回退，此处双保险）。
+     * 每次调用刷新缓存。
+     */
+    suspend fun getMcpServerName(): String? = withContext(Dispatchers.IO) {
+        val runtime = runtimeRef.get() ?: return@withContext null
+        (runtime.getMcpServerName().takeIf { it.isNotBlank() } ?: "termux")
+            .also { mcpServerNameCache = it }
+    }
+
+    /**
+     * 校验 + 改服务名（IO）。Rust 侧规则：非空、`[A-Za-z0-9_.-]`、不含
+     * `__`；改名只换 `[mcp.servers]` 键、保留 transport 配置；幂等。
+     * 返回 FFI 信封 JSON（{"ok":bool,"error"?}）或 null（runtime 未就绪）。
+     * **不自动 reload**：调用方随后自行 [reloadMcpServers] 热生效。仅
+     * 信封 ok 时刷新缓存（剥离/聚合立即可用新名）。
+     */
+    suspend fun setMcpServerName(name: String): String? = withContext(Dispatchers.IO) {
+        val runtime = runtimeRef.get() ?: return@withContext null
+        val envelope = runtime.setMcpServerName(name)
+        if (runCatching { JSONObject(envelope).optBoolean("ok", false) }.getOrDefault(false)) {
+            mcpServerNameCache = name.trim()
+        }
+        envelope
+    }
+
+    /**
+     * 命名缓存统一刷新点（服务名 + 工具名模板）：注册表聚合等后台路径
+     * 的前置，两个轻量 FFI 读收敛到一个入口，防调用方漏刷其一导致
+     * 剥离用旧名/旧模板。runtime 未就绪时各自不动缓存。
+     */
+    private suspend fun refreshMcpNaming() {
+        getMcpServerName()
+        getMcpToolNameTemplate()
+    }
+
+    // ── MCP 工具名模板（[mcp].tool_name_template；校验/落盘在 Rust）──
+
+    /** Rust 侧 [mcp] 缺省模板的字面（配置未设置 / 保存输入留空时的生效值）。
+     *  三占位符模型：{prefix}=服务名设置值（[mcp.servers] 键名）、
+     *  {server}=MCP 服务器名（注册名的 slug 段）、{tool}=工具名（不带
+     *  服务器名前缀）。默认展开与旧 `{server}_{tool}` 逐字节一致。 */
+    private const val DEFAULT_MCP_NAME_TEMPLATE = "{prefix}_{server}__{tool}"
+
+    /** 生效模板缓存：每次 get / set 成功后刷新；null = 尚未从 runtime
+     *  读到（此时剥离按默认字面，与 Rust 缺省一致）。@Volatile：UI 线程
+     *  读（工具管理页聚合）、IO 线程写（get/set/reload 前置刷新）。 */
+    @Volatile
+    private var mcpNameTemplate: String? = null
+
+    /**
+     * 生效的工具名模板（IO）。null = runtime 未就绪；FFI 空值回退默认
+     * 字面。每次调用都刷新缓存——设置页预填与 [mcpServerSlugOf] 剥离
+     * 共用同源，防漂移。
+     */
+    suspend fun getMcpToolNameTemplate(): String? = withContext(Dispatchers.IO) {
+        val runtime = runtimeRef.get() ?: return@withContext null
+        (runtime.getMcpToolNameTemplate().takeIf { it.isNotBlank() } ?: DEFAULT_MCP_NAME_TEMPLATE)
+            .also { mcpNameTemplate = it }
+    }
+
+    /**
+     * 校验 + 落盘工具名模板（IO）。返回 FFI 信封 JSON
+     * （{"ok":bool,"error"?}）或 null（runtime 未就绪）。**不自动
+     * reload**：调用方随后自行 [reloadMcpServers] 热生效。仅信封 ok 时
+     * 按「留空 = 默认」语义刷新本地缓存（剥离逻辑立即可用新值）。
+     */
+    suspend fun setMcpToolNameTemplate(template: String): String? = withContext(Dispatchers.IO) {
+        val runtime = runtimeRef.get() ?: return@withContext null
+        val envelope = runtime.setMcpToolNameTemplate(template)
+        if (runCatching { JSONObject(envelope).optBoolean("ok", false) }.getOrDefault(false)) {
+            mcpNameTemplate = template.trim().takeIf { it.isNotEmpty() } ?: DEFAULT_MCP_NAME_TEMPLATE
+        }
+        envelope
+    }
+
+    /** 模板编译产物：正则 + {server}/{tool} 的捕获组号（模板缺某占位符
+     *  则对应组号 null；组号按占位符出现顺序编号）。 */
+    private class TemplateRegex(
+        val regex: Regex,
+        val serverGroup: Int?,
+        val toolGroup: Int?,
+    )
+
+    /**
+     * 模板 → 正则（三占位符模型）：字面段逐字符 [Regex.escape]（防
+     * `.`/`__` 等当元字符），`{prefix}` → 候选前缀值（字面 escape）、
+     * `{server}` → lazy 捕获组 `(.+?)`（slug 可含 `_`，lazy 让正则优先
+     * 在最近的分隔符处截断）、`{tool}` → greedy 捕获组 `(.+)`（吞到
+     * 结尾，工具名含 `__` 也不怕）。配 matchEntire 全名匹配。
+     */
+    private fun buildTemplateRegex(template: String, prefix: String): TemplateRegex {
+        val sb = StringBuilder()
+        var serverGroup: Int? = null
+        var toolGroup: Int? = null
+        var groupCount = 0
+        var i = 0
+        while (i < template.length) {
+            when {
+                template.startsWith("{prefix}", i) -> {
+                    sb.append(Regex.escape(prefix)); i += "{prefix}".length
+                }
+                template.startsWith("{server}", i) -> {
+                    groupCount += 1; serverGroup = groupCount; sb.append("(.+?)")
+                    i += "{server}".length
+                }
+                template.startsWith("{tool}", i) -> {
+                    groupCount += 1; toolGroup = groupCount; sb.append("(.+)")
+                    i += "{tool}".length
+                }
+                else -> {
+                    sb.append(Regex.escape(template[i].toString())); i += 1
+                }
+            }
+        }
+        return TemplateRegex(Regex(sb.toString()), serverGroup, toolGroup)
+    }
+
+    /**
+     * 工具名 → 所属 MCP server 的 slug（模板 {server} 捕获组的提取值）。
+     * 主路径：对每个候选前缀编译模板正则（[buildTemplateRegex]）后
+     * matchEntire 全名匹配，{server} 组值即 slug。不匹配任何候选前缀 →
+     * null（非 MCP 名，含恰好同前缀的本地工具如 termux_bash）。
+     * 分组退化：模板缺 {server}（注册名不含服务器身份，如
+     * `{prefix}_{tool}`）→ slug 不可从模板提取，落 [legacySlugOf] 兜底。
+     * 工具管理页的 MCP 聚合与 [mcpRegistryToolsByPrefix] 共用此判定，
+     * 防两处逻辑漂移。
+     */
+    fun mcpServerSlugOf(toolName: String, serverNames: List<String>): String? {
+        val template = mcpNameTemplate ?: DEFAULT_MCP_NAME_TEMPLATE
+        for (prefix in serverNames) {
+            val tr = buildTemplateRegex(template, prefix)
+            val m = tr.regex.matchEntire(toolName) ?: continue
+            if (tr.serverGroup != null) return m.groups[tr.serverGroup]?.value
+            break // 前缀已匹配但模板无 {server}：正则给不出 slug，走兜底
+        }
+        return legacySlugOf(toolName, serverNames)
+    }
+
+    /**
+     * 旧版 `prefix_` 剥离 + 首个 `__` 取前段启发式：模板未加载（缓存
+     * null 理论不可达——get 兜底缺省字面）、模板缺 {server}、或注册表
+     * 残留旧命名等异常形态的兜底（非主路径：默认模板下正则恒先命中）。
+     * 剥 `候选前缀_` 后含 `__` → 前段即 slug；不含 `__` → null，同旧版。
+     */
+    private fun legacySlugOf(toolName: String, serverNames: List<String>): String? {
+        for (prefix in serverNames) {
+            val ns = "$prefix" + "_"
+            if (!toolName.startsWith(ns)) continue
+            val rest = toolName.substring(ns.length)
+            if (!rest.contains("__")) return null
+            return rest.substringBefore("__")
+        }
+        return null
+    }
+
+    /**
+     * 注册表全名 → {tool} 段（与 [mcpServerSlugOf] 同一模板正则的工具
+     * 组提取，{prefix}/{server} 段一并剥掉）。null = 非模板名（正则不
+     * 匹配；模板缺 {tool} 理论不可达——Rust 校验必含，缺组同样返回
+     * null）。工具管理页的短名展示用；调用方自行决定兜底（现有调用
+     * 回退 `__` 启发式）。
+     */
+    fun mcpToolBareName(fullName: String): String? {
+        val template = mcpNameTemplate ?: DEFAULT_MCP_NAME_TEMPLATE
+        for (prefix in MCP_SERVER_NAMES) {
+            val tr = buildTemplateRegex(template, prefix)
+            val m = tr.regex.matchEntire(fullName) ?: continue
+            return tr.toolGroup?.let { m.groups[it]?.value }
+        }
+        return null
+    }
+
+    /**
+     * 工具管理页前缀说明：模板 {tool} 之前的部分，{prefix} 用当前前缀
+     * 缓存值、{server} 用传入 slug 替换（缺省模板 + slug=memory →
+     * `termux_memory__`）。{tool} 前无内容（如模板就是 `{tool}`）→
+     * 空串（UI 隐藏说明行）。
+     */
+    fun mcpAgentPrefixNote(slug: String): String {
+        val template = mcpNameTemplate ?: DEFAULT_MCP_NAME_TEMPLATE
+        if (!template.contains("{tool}")) return ""
+        return template.substringBefore("{tool}")
+            .replace("{prefix}", mcpServerNameCache)
+            .replace("{server}", slug)
+    }
+
+    /** 注册表内外部 MCP 工具按 host 前缀（alias）分组计数。
+     *  slug 判定复用 [mcpServerSlugOf]（工具管理页聚合同源，模板正则
+     *  提取）。
+     *  先经 [refreshMcpNaming] 刷新命名缓存（服务名+模板）——后台路径
+     *  也会走到这里，用户没开过设置页时缓存可能仍是缺省值而配置已改；
+     *  runtime 未就绪则沿用缓存。null = 运行时未就绪。
+     *  serverNames：配置里的 MCP server 名单（经 [MCP_SERVER_NAMES] 取，
+     *  随改名动态），做成参数防将来多 server。 */
+    suspend fun mcpRegistryToolsByPrefix(serverNames: List<String>): Map<String, Int>? =
+        withContext(Dispatchers.IO) {
+            refreshMcpNaming()
+            val tools = listTools() ?: return@withContext null
+            val counts = linkedMapOf<String, Int>()
+            for (t in tools) {
+                val prefix = mcpServerSlugOf(t.name, serverNames) ?: continue
+                counts[prefix] = (counts[prefix] ?: 0) + 1
+            }
+            counts
+        }
 
     /** 审批应答（choice: approve / deny / approve_all）。 */
     fun answerApproval(id: Long, choice: String) = sendJson(

@@ -77,14 +77,19 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.async
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import dev.openslate.mobile.bridge.LogExporter
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.ModelUi
@@ -98,6 +103,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import dev.openslate.mobile.bridge.ProviderUi
 import dev.openslate.mobile.bridge.RuntimeBridge
+import dev.openslate.mobile.bridge.TermuxDiagnostics
 
 /**
  * 模型配置页：Provider / 模型条目 / 级别绑定 / API key。
@@ -195,7 +201,7 @@ fun SettingsScreen(
             // ── 工具域二级 Tab：吸顶固定（在滚动容器外），紧贴主 Tab ──
             if (tab == 2) {
                 androidx.compose.material3.TabRow(selectedTabIndex = toolTab) {
-                    for ((label, idx) in listOf("MCP" to 0, "命令行" to 1)) {
+                    for ((label, idx) in listOf("MCP" to 0, "命令行" to 1, "工具管理" to 2)) {
                         androidx.compose.material3.Tab(
                             selected = toolTab == idx,
                             onClick = { toolTab = idx },
@@ -439,11 +445,15 @@ fun SettingsScreen(
                         }
                     }
                     2 -> {
-                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 命令行 ──
-                        if (toolTab == 0) {
-                            McpSection()
-                            LogSection()
-                        } else ExecBackendSection()
+                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 命令行 / 工具管理 ──
+                        when (toolTab) {
+                            0 -> {
+                                McpSection()
+                                LogSection()
+                            }
+                            1 -> ExecBackendSection()
+                            else -> ToolManagementSection()
+                        }
                     }
                 }
             }
@@ -1041,16 +1051,28 @@ private fun ProviderModelsDialog(
 }@Composable
 private fun Section(
     title: String,
+    subtitle: String? = null,
     action: (@Composable () -> Unit)? = null,
     content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                title,
-                style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.weight(1f),
-            )
+            // 标题块整体居左（weight 占满），action 居右；subtitle 非空时
+            // 主副标题紧凑成组，按钮对标题块垂直居中（双行时视觉平衡）。
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+            }
             action?.invoke()
         }
         content()
@@ -1648,9 +1670,16 @@ private fun Toggle(label: String, value: Boolean, onToggle: () -> Unit) {
     }
 }
 
-/** 方形复选框行（多选场景；Checkbox 圆形默认改为方角以区分单选语义）。 */
+/** 方形复选框行（多选场景；Checkbox 圆形默认改为方角以区分单选语义）。
+ *  subtitle 非空时在标题下加灰色小字说明行（labelSmall + outline，与
+ *  区块内其他说明小字同款）。 */
 @Composable
-private fun CheckboxRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun CheckboxRow(
+    label: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+    subtitle: String? = null,
+) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -1661,7 +1690,18 @@ private fun CheckboxRow(label: String, checked: Boolean, onChange: (Boolean) -> 
             checked = checked,
             onCheckedChange = onChange,
         )
-        Text(label, style = MaterialTheme.typography.bodyMedium)
+        if (subtitle == null) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+        } else {
+            Column(Modifier.weight(1f)) {
+                Text(label, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
     }
 }
 
@@ -1774,12 +1814,14 @@ private fun ExecBackendSection() {
             Text("加载中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
         } else {
             CheckboxRow(
-                label = "native — Android 自带系统 shell（toybox 子集，零依赖零授权）",
+                label = "Native",
+                subtitle = "Android 自带系统 shell（toybox 子集，零依赖零授权）",
                 checked = isEnabled("native"),
                 onChange = { setEnabled("native", it) },
             )
             CheckboxRow(
-                label = "termux — Termux 完整 Linux 环境（apt/python/…）",
+                label = "Termux",
+                subtitle = "Termux 完整 Linux 环境（apt/python/…）",
                 checked = isEnabled("termux"),
                 onChange = { setEnabled("termux", it) },
             )
@@ -1827,6 +1869,18 @@ private fun ExecBackendSection() {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
+                // 部分 ROM（MIUI/HyperOS 等）在 Termux 从未启动时无法完成
+                // 授予：提示先打开一次 Termux（PackageManager 查询轻量，同步调用）。
+                if (!hasPerm && installed &&
+                    dev.openslate.mobile.bridge.TermuxDiagnostics.isTermuxStopped(context)
+                ) {
+                    Text(
+                        "Termux 尚未启动过（或被强制停止）。部分系统此状态下无法授予该权限：" +
+                            "先打开一次 Termux，返回后再点「申请权限」；或直接用 Shizuku 一键授权。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (!hasPerm) {
                         CompactButton(text = "申请权限", onClick = {
@@ -1872,10 +1926,54 @@ private data class McpStatus(
     val probing: Boolean = true,
     val termuxInstalled: Boolean = false,
     val termuxPerm: Boolean = false,
+    /** = channel is TermuxDiagnostics.ChannelResult.Ok。 */
     val termuxAllowed: Boolean = false,
+    /** RUN_COMMAND 通道精确诊断结果（probing / 未探测短路时为 null）。 */
+    val channel: dev.openslate.mobile.bridge.TermuxDiagnostics.ChannelResult? = null,
     val hostInstalled: Boolean = false,
     val hostAlive: Boolean = false,
+    /** Termux 中不存在的 server 启动命令首 token；探测失败/通道未放行为
+     *  空集（= 不警示，避免探测间隙行内警示闪烁）。 */
+    val missingCommands: Set<String> = emptySet(),
+    /** 注册表内外部 MCP 工具按 host 前缀（slug）分组的计数（每服务器
+     *  运行态的判定依据：agent 真实可见，比 host 侧探针更诚实）：
+     *  null = runtime 未就绪/未获取（状态未知），空 map / 缺某 slug =
+     *  该 server 的工具未注册（未起来，或起来但没注册 → 差异自愈会
+     *  尝试重连一次）。 */
+    val hostTools: Map<String, Int>? = null,
 )
+
+/**
+ * MCP 状态的进程级快照：全量重检完成后写入，进页/切回先用快照渲染
+ * （无快照才显示「检测中」），配合门控探测避免每次进页都全量重检。
+ * 只缓存 [McpStatus]；servers 清单从 prefs 本地读零成本，不进缓存。
+ */
+private object McpStatusCache {
+    @Volatile var snapshot: McpStatus? = null
+    /** 快照完成时刻（门控翻转时用于日志展示快照保持了多久）。 */
+    @Volatile var savedAtMs: Long = 0L
+
+    fun update(s: McpStatus) {
+        snapshot = s
+        savedAtMs = System.currentTimeMillis()
+    }
+}
+
+/** App 写入 openslate.toml 的 MCP server 名单：单键名，可经设置页改名
+ *  （默认 termux）。计算属性透传 RuntimeBridge 缓存——改名保存后状态页
+ *  聚合即时跟随，无快照滞后。 */
+// 单一事实源在 RuntimeBridge（ToolManagementSection 聚合与状态页共用）。
+private val MCP_SERVER_NAMES: List<String> get() = RuntimeBridge.MCP_SERVER_NAMES
+
+/**
+ * 差异自愈的防抖（进程级）：reload 在途 + 上次完成时刻（30s 内不重复
+ * 触发）。inFlight 在 finally 里清除——页面离开取消协程也不会把自愈
+ * 卡死在「在途」态。
+ */
+private object McpSelfHealGate {
+    @Volatile var inFlight: Boolean = false
+    @Volatile var lastDoneAtMs: Long = 0L
+}
 
 /**
  * MCP 域：Termux 侧 mcp-host 安装/清单/状态。
@@ -1884,7 +1982,8 @@ private data class McpStatus(
  *   TCP 装进 Termux，写清单、启动、并把 [mcp.servers.termux] 写入
  *   openslate.toml；
  * - server 清单：App 侧管理，变更即推送清单并重启 host；
- *   工具名前缀 `alias__`，模型看到 `termux_fs__list_directory`。
+ *   工具名前缀 `slug__`（slug 由显示名或用户指定代号派生，
+ *   见 McpHostManager.entrySlug），模型看到 `termux_fs__list_directory`。
  */
 @Composable
 /** 日志导出：复制本应用 logcat（三档时间范围），反馈问题时直接粘贴。 */
@@ -1943,7 +2042,14 @@ private fun LogSection() {
 private fun McpSection() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
-    var status by remember { mutableStateOf(McpStatus()) }
+    // MCP 按钮主题色（primary 12% 底 + primary 文字）：与「必填」徽标/
+    // SoftButton 同款惯例，轻量不压卡片内容；disabled 态由 M3 按钮的
+    // 默认弱化色承载（buttonColors 只覆盖 enabled 色），可读。
+    val mcpBtnContainer = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+    val mcpBtnContent = MaterialTheme.colorScheme.primary
+    // 进页先渲染进程级快照（如有）：配合门控避免每次进页都从「检测中」
+    // 全量重来；无快照（冷启动首次）才从 probing 态开始。
+    var status by remember { mutableStateOf(McpStatusCache.snapshot ?: McpStatus()) }
     // server 清单（prefs JSON）预取到 IO 线程，避免组合期主线程读盘。
     var servers by remember { mutableStateOf<List<McpHostManager.McpServerEntry>>(emptyList()) }
     LaunchedEffect(Unit) {
@@ -1977,10 +2083,79 @@ private fun McpSection() {
         }
     }
     var busy by remember { mutableStateOf(false) }
-    var editServer by remember { mutableStateOf<Pair<String, String>?>(null) } // alias to command
+    // 全量重检的在途 Job：新触发取消旧在途（最新优先，不排队堆积）。
+    // 手动刷新/applyServers 收尾/门控触发的重检都经它收敛——「取消顶替」
+    // 而非「在途忽略」是刻意的：applyServers 的收尾重检必须保证能起一轮
+    // 新的（配置刚变过），纯「在途忽略」会把它吞掉。
+    var refreshJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    // 添加/编辑对话框状态：first = 条目在 servers 中的索引（-1 = 添加模式），
+    // second = 预填的 (name, slug, command)。编辑保存按索引定位替换——不用
+    // 条目相等性查找，避免同内容条目（data class 相等）误替换到另一个。
+    var editServer by remember { mutableStateOf<Pair<Int, Triple<String, String?, String>>?>(null) }
 
-    fun refresh() {
-        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+    /**
+     * 单发差异自愈（替代旧的定时重试轮询——用户否了周期性全量刷新：
+     * 运行链路本就有 core↔host 持久会话与热重载，轮询是状态面板自己
+     * 开的平行通道）。host 在跑、server 启动命令在 Termux 存在（缺失
+     * 是终态，重连无意义），但注册表里没有该 server 的工具（agent 看
+     * 不见）→ 调一次 reloadMcpServers 重连；成功后从注册表重读 slug 级
+     * 计数刷新状态 + 快照。失败只记一行——不重试、不循环：瞬时态
+     * （host 掉线）由门控翻转检测覆盖，重连失败靠下次门控/手动刷新
+     * 自然再试（30s 防抖防连发）。
+     */
+    suspend fun maybeSelfHeal() {
+        if (McpSelfHealGate.inFlight) return
+        if (System.currentTimeMillis() - McpSelfHealGate.lastDoneAtMs < 30_000) return
+        val s = status
+        if (s.probing || !s.hostAlive || !s.hostInstalled) return
+        // 现读注册表而非用快照（快照可能滞后于刚完成的重连/刷新）；
+        // runtime 未就绪 → 无法判定，不动。
+        val reg = RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES) ?: return
+        val missing = McpHostManager.serversSlugMap(servers).mapNotNull { (entry, slug) ->
+            val cmdToken = entry.command.trim().split(Regex("\\s+")).first()
+            when {
+                cmdToken in s.missingCommands -> null // 终态不自愈（行内已有警示指引）
+                slug !in reg -> slug
+                else -> null
+            }
+        }
+        if (missing.isEmpty()) return
+        McpSelfHealGate.inFlight = true
+        log("检测到 ${missing.joinToString("、")} 工具未注册，自动重连…")
+        try {
+            val result = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
+            val obj = result?.let { runCatching { JSONObject(it) }.getOrNull() }
+            if (obj != null && obj.optBoolean("ok", false)) {
+                // reload 响应的 servers 计数按配置 server 名聚合（键是
+                // "termux"，不是 slug），hostTools 必须从注册表重读。
+                val reg2 = RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES)
+                val updated = status.copy(hostTools = reg2)
+                status = updated
+                McpStatusCache.update(updated)
+                val n = obj.optInt("tools", -1).takeIf { it >= 0 }
+                    ?: reg2?.values?.sum()
+                    ?: 0
+                log("重连成功：$n 个工具")
+            } else {
+                val err = obj?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
+                    ?: result?.take(120)
+                    ?: "runtime 未就绪"
+                log("自动重连失败：$err")
+            }
+        } finally {
+            McpSelfHealGate.inFlight = false
+            McpSelfHealGate.lastDoneAtMs = System.currentTimeMillis()
+        }
+    }
+
+    /**
+     * 全量重检：只在用户想看全貌的时机跑（手动刷新 / 首载 / 门控翻转 /
+     * applyServers 收尾）；自动路径只有门控的毫秒级探测与差异检查，不
+     * 产生任何轮询。返回本轮 Job（在途判定用）。
+     */
+    fun refresh(): kotlinx.coroutines.Job {
+        refreshJob?.cancel() // 最新触发优先：取消在途轮而非排队
+        val job = scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val t0 = System.currentTimeMillis()
             log("── 状态检查开始 ──")
             step("检查 Termux / 权限")
@@ -1989,31 +2164,36 @@ private fun McpSection() {
                 termuxPerm = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context),
                 termuxAllowed = false, hostInstalled = false, hostAlive = false)
             log("Termux 已安装：${s.termuxInstalled}；RUN_COMMAND 权限：${s.termuxPerm}")
+            ensureActive() // 被更新的触发取消 → 立即退出，不写状态
             // 快检查立即写回：慢通道（RUN_COMMAND 往返最长 12s）探测期间，
             // 按钮状态（如「打开 Termux」）就该正确亮起，不能等整轮结束。
             status = s.copy(probing = true)
             var full = s
             var alive = false
+            var missing = emptySet<String>()
+            var tools: Map<String, Int>? = null
             if (s.termuxInstalled && s.termuxPerm) {
                 kotlinx.coroutines.coroutineScope {
                     // 端口探活走独立 HTTP 通道，先并行发出（不占 Termux 通道）。
                     val aliveD = async { McpHostManager.hostAliveDetail(context) }
 
-                    // ── 步骤 1：RUN_COMMAND 通道（echo ok 单次往返）──
+                    // ── 步骤 1：RUN_COMMAND 通道（echo ok 往返 + 精确诊断）──
                     // 独立成步：卡在这即通道问题（Termux 冷启动 / 被冻结解冻 / 放行未开）。
                     step("检测 RUN_COMMAND 通道（echo ok）")
                     val watcher = launch {
-                        kotlinx.coroutines.delay(4000)
+                        kotlinx.coroutines.delay(5000)
                         log("仍在等待 RUN_COMMAND 应答…（Termux 冷启动或被系统冻结后首次命令较慢；" +
                             "常开 Termux 通知常驻 + Wakelock 并对其关闭电池优化可避免）")
                     }
-                    // 状态检查 12s 上限：不陪跑 TermuxExec 的 90s 兜底。
-                    // 超时 = 通道死（Termux 未运行/被冻结），给出明确动作指引。
-                    val (allowed, rdetail) = kotlinx.coroutines.withTimeoutOrNull(12_000) {
-                        McpHostManager.checkRunCommandAllowed(context)
-                    } ?: (false to "12s 无应答（Termux 可能未运行或被系统冻结）")
+                    val chan = TermuxDiagnostics.ensureTermuxUp(context, log = { log(it) })
                     watcher.cancel()
-                    log("RUN_COMMAND 通道：${if (allowed) "通过（$rdetail）" else "未通过：$rdetail —— 可点「打开 Termux」拉起后重试，并检查 ~/.termux/termux.properties 的 allow-external-apps=true"}")
+                    log("RUN_COMMAND 通道最终结果：${TermuxDiagnostics.describe(chan)}")
+                    val allowed = chan is TermuxDiagnostics.ChannelResult.Ok
+                    // 前台拉起可能让部分 ROM（MIUI 等）补全 RUN_COMMAND 授权：复查一次。
+                    val permNow = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context)
+                    if (!s.termuxPerm && permNow) {
+                        log("Termux 启动后权限检查结果已更新：未授予 → 已授予")
+                    }
 
                     // ── 步骤 2：host 安装（通道已热，秒回）──
                     val inst = if (allowed) {
@@ -2022,12 +2202,61 @@ private fun McpSection() {
                     } else false
                     log("host 已安装：$inst")
 
+                    // ── 步骤 2.5：server 启动命令探测（通道放行才有意义）──
+                    // 首 token 在 Termux 缺失（如未装 npx）的 server 必然无法
+                    // 启动，行内直接警示 + 安装指引；通道未放行不探测（五灯
+                    // 状态已引导修通道，不叠加命令级警示），探测失败返回空集
+                    // 不误报。切分逻辑与 manifestToml 一致（首 token = 可执行名）。
+                    if (allowed && servers.isNotEmpty()) {
+                        step("探测 server 命令可用性")
+                        val firstTokens = servers.map { it.command.trim().split(Regex("\\s+")).first() }
+                        missing = McpHostManager.probeCommandAvailable(context, firstTokens)
+                        if (missing.isNotEmpty()) {
+                            log("Termux 缺少命令：${missing.joinToString("、")}（对应服务器无法启动，见行内提示）")
+                        }
+                    }
+
                     // ── 步骤 3：端口探活（并行已发出，此时收结果）──
                     step("探活服务端口")
                     val (a, adetail) = aliveD.await()
                     alive = a
                     log("探活 ${McpHostManager.HOST_URL}：${if (a) "应答正常（$adetail）" else "无应答（$adetail）"}")
-                    full = s.copy(termuxAllowed = allowed, hostInstalled = inst)
+
+                    // ── 步骤 4：host 已装但未运行 → 自动拉起（无需点重装）──
+                    if (allowed && inst && !alive && !busy) {
+                        step("自动拉起 MCP 服务")
+                        log("服务未运行，自动拉起（停止旧进程 → nohup 后台启动）…")
+                        runCatching { McpHostManager.restartHost(context) { log(it) } }
+                            .onSuccess {
+                                val (a2, d2) = McpHostManager.hostAliveDetail(context)
+                                alive = a2
+                                log(
+                                    if (a2) "服务已自动恢复（$d2），无需重装"
+                                    else "自动拉起后仍未应答（$d2）——可点「自动化操作（重新安装）」修复",
+                                )
+                            }
+                            .onFailure {
+                                log("自动拉起失败：${it.message?.take(160)}——可点「自动化操作（重新安装）」修复")
+                            }
+                    }
+                    // ── 步骤 5：工具可见性。状态行的判定源 = 注册表计数
+                    // （agent 真实可见，比 host 侧探针更诚实）；host 侧 HTTP
+                    // 探针（hostToolsByPrefix）降级为深度诊断——区分「server
+                    // 没起来」vs「host 有但未注册」，只在手动全量时跑一次。
+                    if (alive) {
+                        step("获取 host 工具列表")
+                        val reg = RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES)
+                        tools = reg
+                        log("注册表工具：" + (reg?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
+                            ?: "runtime 未就绪（状态未知）"))
+                        val hostSide = McpHostManager.hostToolsByPrefix(context)
+                        log("host 侧探针：" + (hostSide?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
+                            ?: "获取失败"))
+                    }
+                    full = s.copy(
+                        termuxAllowed = allowed, channel = chan, hostInstalled = inst,
+                        termuxPerm = permNow, missingCommands = missing, hostTools = tools,
+                    )
                 }
             } else {
                 step("探活服务端口")
@@ -2035,12 +2264,77 @@ private fun McpSection() {
                 alive = a
                 log("探活 ${McpHostManager.HOST_URL}：${if (a) "应答正常（$adetail）" else "无应答（$adetail）"}")
             }
-            status = full.copy(hostAlive = alive)
+            ensureActive() // 取消轮不落地：不覆盖更新一轮已写的新状态/快照
+            val final = full.copy(hostAlive = alive)
+            status = final
+            McpStatusCache.update(final)
             step(null)
             log("── 状态检查完成（总耗时 ${System.currentTimeMillis() - t0}ms）──")
+            // 收尾差异自愈：注册表缺工具时单发重连（30s 防抖，不循环）。
+            maybeSelfHeal()
+        }
+        refreshJob = job
+        return job
+    }
+    /**
+     * 进页 / ON_RESUME 的智能门控：有快照时只做廉价变化探测——本机回环
+     * HTTP（~ms 级，不碰 Termux 通道），与快照 hostAlive 比对：
+     * - 一致 → 只做无感差异检查（注册表缺工具才单发自愈，健康时零日志
+     *   零动作——用户：「其他时候不要乱动」）；
+     * - 翻转（绿→红或红→绿）→ 全量重检（收尾自带差异检查）；
+     * - 无快照（首次进页）→ 全量重检。
+     * 门控全程不置 probing：快照继续渲染，不闪「探测状态…」。
+     */
+    fun gateRefresh() {
+        val snap = McpStatusCache.snapshot
+        if (snap == null) {
+            refresh()
+            return
+        }
+        // 有操作/重检在途 → 它的结果本来就更新，门控不叠加。
+        if (busy || refreshJob?.isActive == true) return
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val (alive, _) = McpHostManager.hostAliveDetail(context)
+            // 探测期间可能已有操作/重检启动（applyServers、手动刷新等）：
+            // 它们的结果本来就更新，这次的翻转判定作废，不叠加。
+            if (busy || refreshJob?.isActive == true) return@launch
+            if (alive == snap.hostAlive) {
+                // 一致 → 只做无感差异检查：注册表缺工具才单发自愈，健康时
+                // 零日志零动作（不产生任何「获取 host 工具列表」类轮询）。
+                maybeSelfHeal()
+                return@launch
+            }
+            val ageSec = (System.currentTimeMillis() - McpStatusCache.savedAtMs) / 1000
+            log(
+                "服务状态变化（快照保持了 ${ageSec}s）：${if (snap.hostAlive) "运行中 → 未应答" else "未运行 → 已应答"}，自动重检…"
+            )
+            refresh()
         }
     }
-    androidx.compose.runtime.LaunchedEffect(Unit) { refresh() }
+
+    androidx.compose.runtime.LaunchedEffect(Unit) { gateRefresh() }
+
+    // 五灯全绿（折叠/摘要行用，原语义：只看基础设施）。旧的「不健康
+    // 定时重试循环」已移除——周期性全量刷新等于状态面板自开的轮询通道
+    // （用户否了）：host 掉线这类瞬时态由门控翻转检测覆盖，工具未注册
+    // 由 maybeSelfHeal 单发差异自愈处理，不再有任何后台定时器。
+    val allGreen = !status.probing && status.termuxInstalled && status.termuxPerm &&
+        status.termuxAllowed && status.hostInstalled && status.hostAlive
+
+    // 用户按指引手动打开 Termux 唤醒后，回到本页（ON_RESUME）触发智能
+    // 门控（仿 ExecBackendSection 的 ON_RESUME 模式）：无快照/状态翻转
+    // 才全量重检，其余情况不动（gateRefresh 内部自会处理）。
+    @Suppress("DEPRECATION") // 非 deprecated 替代在 lifecycle-runtime-compose（非本项目依赖），与 L1765 现有用法一致
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                gateRefresh()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
 
     fun applyServers(next: List<McpHostManager.McpServerEntry>) {
         servers = next
@@ -2054,9 +2348,41 @@ private fun McpSection() {
                     McpHostManager.pushManifest(context)
                     McpHostManager.restartHost(context) { log(it) }
                 }
-                RuntimeBridge.upsertMcpServer("termux", McpHostManager.HOST_URL)
+                // 服务名可改（设置页）：upsert 必须用当前生效名——继续
+                // 用死字面量 "termux" 会把旧键建回来，[mcp.servers] 变成
+                // 双 server（transport 重复、工具重复注册）。
+                val srvName = RuntimeBridge.getMcpServerName() ?: "termux"
+                RuntimeBridge.upsertMcpServer(srvName, McpHostManager.HOST_URL)
             }.fold(
-                onSuccess = { log("已更新（新工具重启会话后生效）") },
+                onSuccess = {
+                    // 配置已变 → 热重连 MCP 工具（免重启生效）。未装 host 时
+                    // 也调——清单变了就该重连（直连型 server 不依赖 host）。
+                    // runtime 未就绪（null）时退回旧语义：重启会话后生效。
+                    val result = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
+                    if (result == null) {
+                        log("已更新（新工具重启会话后生效）")
+                    } else {
+                        val obj = runCatching { JSONObject(result) }.getOrNull()
+                        if (obj != null && obj.optBoolean("ok", false)) {
+                            val tools = obj.optInt("tools", -1)
+                            val serversObj = obj.optJSONObject("servers")
+                            val serversSummary = serversObj?.keys()?.asSequence()
+                                ?.joinToString("、") { "${it}(${serversObj.optInt(it)}个)" }
+                                .orEmpty()
+                            log(
+                                if (tools >= 0 && serversSummary.isNotEmpty()) {
+                                    "已更新（工具已热重连生效：$tools 个工具,服务器: $serversSummary）"
+                                } else {
+                                    "已更新（工具已热重连生效）"
+                                },
+                            )
+                        } else {
+                            val err = obj?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
+                                ?: result.take(120)
+                            log("清单已更新，但工具热重连失败（$err）——重启应用后生效")
+                        }
+                    }
+                },
                 onFailure = { log("失败：${it.message}") },
             )
             step(null)
@@ -2065,19 +2391,135 @@ private fun McpSection() {
         }
     }
 
-    Section(title = "MCP 服务（在 Termux 中运行）") {
+    /**
+     * 单服务器「重启」= 智能修复。host 没有单服务器重启接口，此按钮
+     * 先探测自愈：reloadMcpServers 热重连常能救回「进程其实活着/已自愈」
+     * 的常见情况（不惊动其他服务器）；快路径未就绪才升级整 host 重启——
+     * 对 1-3 个服务器的典型场景等价于单服务器重启（副作用是同 host 的
+     * 其他服务器进程随之重启，触发日志已明示）。
+     */
+    fun restartServer(slug: String, name: String) {
+        busy = true
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                // 快路径：热重连 + 注册表复核。reload 失败/runtime 未就绪
+                // → counts 为 null → 直接走升级路径。
+                val result = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
+                val obj = result?.let { runCatching { JSONObject(it) }.getOrNull() }
+                val counts = if (obj != null && obj.optBoolean("ok", false)) {
+                    RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES)
+                } else null
+                if (counts != null && slug in counts) {
+                    log("$name：工具已就绪（${counts[slug]} 个），无需重启")
+                    // 顺手把注册表计数写回状态与快照：状态行立即转绿，
+                    // 不必等一轮全量（与 maybeSelfHeal 的刷新范式一致）。
+                    val updated = status.copy(hostTools = counts)
+                    status = updated
+                    McpStatusCache.update(updated)
+                    return@launch
+                }
+                // 升级路径：整 host 重启（全部服务器进程随之重启）。
+                log("$name：工具未就绪，重启 MCP 服务（全部服务器进程随之重启）…")
+                McpHostManager.restartHost(context) { log(it) }
+                val r2 = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
+                val o2 = r2?.let { runCatching { JSONObject(it) }.getOrNull() }
+                if (o2 != null && o2.optBoolean("ok", false)) {
+                    log("$name：已就绪（${o2.optInt("tools", -1)} 个工具）")
+                } else {
+                    val err = o2?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
+                        ?: r2?.take(120)
+                        ?: "runtime 未就绪"
+                    log("$name：重启后仍未就绪（$err）")
+                }
+            } catch (e: Throwable) {
+                log("$name：重启失败：${e.message?.take(160) ?: e.javaClass.simpleName}")
+            } finally {
+                busy = false
+            }
+            // 升级路径收尾全量重检（快路径已提前 return，不重检）。
+            refresh()
+        }
+    }
+
+    Section(
+        title = "MCP 服务",
+        subtitle = "在 Termux 中运行",
+        // 手动刷新/重启入口改文字按钮（用户反馈 icon 不直观）：用户主动
+        // 要求的重检/重启永远允许，无条件执行（与在途轮互斥由 refresh
+        // 内部收敛）。
+        action = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CompactButton(
+                    text = "刷新",
+                    enabled = !status.probing,
+                    container = mcpBtnContainer,
+                    content = mcpBtnContent,
+                ) {
+                    status = McpStatus(probing = true); refresh()
+                }
+                // 重启 host 进程：比「刷新」重（杀旧进程 → nohup 重启 → 端口
+                // 就绪），给 host 假死/状态错乱时一个不进 Termux 的手动出口。
+                CompactButton(
+                    text = "重启",
+                    enabled = !busy && !status.probing,
+                    container = mcpBtnContainer,
+                    content = mcpBtnContent,
+                ) {
+                    busy = true
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        try {
+                            // restartHost 自带全部步骤日志（杀旧/nohup/轮询
+                            // 端口），失败抛异常并带 Termux 侧证据。
+                            McpHostManager.restartHost(context) { log(it) }
+                            log("MCP 服务已重启，重连工具…")
+                            // host 进程换了 → core↔host 持久会话需重建，
+                            // reload 不能省；注册工具随新 host 重新聚合一轮。
+                            val result = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
+                            val obj = result?.let { runCatching { JSONObject(it) }.getOrNull() }
+                            if (obj != null && obj.optBoolean("ok", false)) {
+                                log("重连成功：${obj.optInt("tools", -1)} 个工具")
+                            } else {
+                                val err = obj?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
+                                    ?: result?.take(120)
+                                    ?: "runtime 未就绪"
+                                log("工具重连失败：$err")
+                            }
+                        } catch (e: Throwable) {
+                            log("MCP 服务重启失败：${e.message?.take(160) ?: e.javaClass.simpleName}")
+                        } finally {
+                            busy = false
+                        }
+                        // 最后全量重检：tools/list 会触发下游懒 spawn（npx
+                        // 冷启动可达数秒，由既有 15s 读超时覆盖），工具与
+                        // 状态随新 host 重新聚合；重启失败也重检——让状态
+                        // 行如实反映（服务未运行），自动拉起仍有机会兜底。
+                        refresh()
+                    }
+                }
+            }
+        },
+    ) {
         // ── 折叠逻辑：五灯全绿自动收起（一行摘要）；异常自动展开 ──
-        val allGreen = !status.probing && status.termuxInstalled && status.termuxPerm &&
-            status.termuxAllowed && status.hostInstalled && status.hostAlive
+        //（allGreen 在 McpSection 顶层计算）
         var expanded by androidx.compose.runtime.saveable.rememberSaveable {
             mutableStateOf(false)
+        }
+        // 诊断日志折叠态：一切就绪自动收起，点击标题行重新打开。
+        var logOpen by androidx.compose.runtime.saveable.rememberSaveable {
+            mutableStateOf(true)
         }
         var prevGreen by androidx.compose.runtime.saveable.rememberSaveable {
             mutableStateOf(false)
         }
         androidx.compose.runtime.LaunchedEffect(allGreen) {
-            if (allGreen && !prevGreen) expanded = false // 变绿瞬间收起
-            if (!allGreen) expanded = true // 有异常自动展开
+            if (allGreen && !prevGreen) { // 变绿瞬间收起
+                expanded = false
+                logOpen = false // 一切就绪：诊断日志一并折叠
+            }
+            if (!allGreen) { // 有异常自动展开
+                expanded = true
+                logOpen = true
+            }
             prevGreen = allGreen
         }
         // 摘要行（始终显示；点击切换）。
@@ -2109,25 +2551,78 @@ private fun McpSection() {
         if (expanded && !status.probing) {
             McpStatusLine(status.termuxInstalled, "Termux 已安装")
             McpStatusLine(status.termuxPerm, "RUN_COMMAND 权限")
-            McpStatusLine(status.termuxAllowed, "外部应用放行（allow-external-apps）")
-            // ── 未放行时给一键指引：复制命令到 Termux 执行 ──────
-            if (!status.termuxAllowed) {
+            McpStatusLine(status.termuxAllowed, "RUN_COMMAND 通道")
+            status.channel?.let {
                 Text(
-                    "在 Termux 中粘贴执行下面这条命令即可放行（命令前后已带换行，不破坏原配置；执行后点「刷新」）：",
+                    TermuxDiagnostics.describe(it),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
-                // 代码块样式：点击整块直接复制。
-                CodeBlock(TERMUX_ALLOW_EXTERNAL_CMD)
-                if (status.termuxInstalled) {
-                    // 复制后一键跳到 Termux 粘贴执行。
-                    CompactButton(text = "打开 Termux", onClick = {
-                        context.packageManager.getLaunchIntentForPackage("com.termux")?.let { intent ->
-                            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                            context.startActivity(intent)
-                        }
-                    })
+            }
+            // ── 通道未通过时按因给指引 ──────────────────────────
+            val chan = status.channel
+            when (chan) {
+                is TermuxDiagnostics.ChannelResult.PolicyRejected -> {
+                    Text(
+                        "在 Termux 中粘贴执行下面这条命令即可放行（命令前后已带换行，不破坏原配置；执行后点「刷新」）：",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                    // 代码块样式：点击整块直接复制。
+                    CodeBlock(TERMUX_ALLOW_EXTERNAL_CMD)
+                    if (status.termuxInstalled) {
+                        // 复制后一键跳到 Termux 粘贴执行。
+                        CompactButton(text = "打开 Termux", onClick = {
+                            context.packageManager.getLaunchIntentForPackage("com.termux")?.let { intent ->
+                                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                context.startActivity(intent)
+                            }
+                        })
+                    }
+                    Text(
+                        "若 Termux 刚安装尚未打开过：先打开一次完成初始化，再粘贴执行上面命令。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
                 }
+                is TermuxDiagnostics.ChannelResult.NoResponse -> {
+                    if (chan.stopped) {
+                        Text(
+                            "Termux 处于停止状态（安装后从未打开、被强制停止或被系统清理）。系统限制下无法后台直接拉起，只能打开一次 Termux 唤醒——点下方「打开 Termux」，打开后请手动回到 OpenSlate，返回时会自动重新检测。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    } else {
+                        Text(
+                            "Termux 无应答：进程可能被系统冻结或后台受限。建议在 Termux 中执行 termux-wake-lock 开启常驻通知，并在系统设置中关闭 Termux 的电池优化。也可点下方「打开 Termux」手动唤醒——打开后请手动回到 OpenSlate，返回时会自动重新检测。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
+                    // 按钮紧贴指引文案（原文案「点下方」即指此处），不放远处按钮排。
+                    CompactButton(text = "打开 Termux", enabled = !busy) {
+                        log("打开 Termux（请手动返回 OpenSlate，返回后自动重新检测）…")
+                        if (!McpHostManager.startTermuxApp(context)) {
+                            log("拉起失败：找不到 Termux 启动入口（未安装？）")
+                        }
+                    }
+                }
+                is TermuxDiagnostics.ChannelResult.Rejected -> {
+                    Text(
+                        "Termux 拒绝了命令：${chan.errmsg.take(160)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
+                is TermuxDiagnostics.ChannelResult.DispatchError -> {
+                    Text(
+                        "命令派发失败：${chan.error.take(160)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
+                // Ok / null（未探测短路，如未安装/无权限）：不显示指引块。
+                is TermuxDiagnostics.ChannelResult.Ok, null -> {}
             }
             if (!status.termuxPerm) {
                 CompactButton(text = "申请 RUN_COMMAND 权限", onClick = {
@@ -2162,7 +2657,10 @@ private fun McpSection() {
                         }
                             .onSuccess { msg ->
                                 log(msg)
-                                RuntimeBridge.upsertMcpServer("termux", McpHostManager.HOST_URL)
+                                // 服务名可改：同 applyServers——upsert 用当前
+                                // 生效名，防止把旧键 "termux" 建成双 server。
+                                val srvName = RuntimeBridge.getMcpServerName() ?: "termux"
+                                RuntimeBridge.upsertMcpServer(srvName, McpHostManager.HOST_URL)
                             }
                             .onFailure { log("失败：${it.message}") }
                         busy = false
@@ -2170,15 +2668,8 @@ private fun McpSection() {
                     }
                 }
             }
-            CompactButton(text = "打开 Termux", enabled = !busy && status.termuxInstalled) {
-                log("拉起 Termux 应用（前台）…")
-                if (!McpHostManager.startTermuxApp(context)) {
-                    log("拉起失败：找不到 Termux 启动入口（未安装？）")
-                }
-            }
-            CompactButton(text = "刷新", enabled = !status.probing) {
-                status = McpStatus(probing = true); refresh()
-            }
+            // 手动「刷新」入口已移到 Section 标题行（IconButton）——正文
+            // 不再放重复入口。
         }
         // 当前步骤 + 已进行时长（每秒刷新；卡住时能看出停在哪一步、停了多久）。
         currentStep?.let { name ->
@@ -2195,7 +2686,13 @@ private fun McpSection() {
             }
         }
         if (logLines.isNotEmpty()) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // 标题行可点击：一切就绪自动折叠后，点这里重新打开（或再次收起）。
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { logOpen = !logOpen },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(
                     "诊断日志（${logLines.size} 条）",
                     style = MaterialTheme.typography.labelMedium,
@@ -2204,41 +2701,180 @@ private fun McpSection() {
                 )
                 CompactButton(text = "清空", onClick = { logLines = emptyList() })
             }
-            val listState = rememberLazyListState()
-            androidx.compose.runtime.LaunchedEffect(logLines.size) {
-                if (logLines.isNotEmpty()) listState.animateScrollToItem(logLines.size - 1)
-            }
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 220.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .padding(8.dp),
-            ) {
-                items(logLines) { line ->
-                    Text(
-                        line,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
-                        color = MaterialTheme.colorScheme.outline,
-                    )
+            if (logOpen) {
+                val listState = rememberLazyListState()
+                androidx.compose.runtime.LaunchedEffect(logLines.size) {
+                    if (logLines.isNotEmpty()) listState.animateScrollToItem(logLines.size - 1)
+                }
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 220.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(8.dp),
+                ) {
+                    items(logLines) { line ->
+                        Text(
+                            line,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
                 }
             }
         }
         Text(
             "一键安装并启动 MCP 服务，之后重启会话即可使用。MCP 服务器在 " +
-                "Termux 中运行（添加时填 npx 命令即可，首次使用会自动下载）。",
+                "Termux 中运行；命令用 npx 时需先在 Termux 安装 Node.js（pkg install nodejs），" +
+                "npm 包首次运行会自动下载。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline,
         )
+
+        // ── 工具名模板（[mcp].tool_name_template）：保存 = Rust 校验+落盘
+        // → reload 热生效（FFI 不自动 reload，此处串起两步）→ 重检。
+        // {prefix} 占位符的展开值恒为配置键名（默认 termux，无独立设置行）。
+        // 模板状态用 TextFieldValue：占位符插入按钮需要 selection（光标/选区）。
+        var templateValue by remember { mutableStateOf(TextFieldValue("")) }
+        // 模板输入框当前是否聚焦：未聚焦时插入 = 追加到文本末尾（Compose
+        // 的 selection 恒有值，从未聚焦时是 TextRange(0)——不加此标志会
+        // 误插到文本开头）。
+        var templateFocused by remember { mutableStateOf(false) }
+        // 生效值（null = 进页 IO 读取未完成，保存禁用防把缺省值误存）。
+        var effectiveTemplate by remember { mutableStateOf<String?>(null) }
+        // 进页 IO 读当前生效模板做预填。
+        LaunchedEffect(Unit) {
+            val cur = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                RuntimeBridge.getMcpToolNameTemplate()
+            }
+            effectiveTemplate = cur
+            templateValue = TextFieldValue(cur ?: "")
+        }
+        val tpl = templateValue.text.trim()
+        // 插入占位符：聚焦时插入光标处 / 替换选区（光标落在插入内容之后）；
+        // 未聚焦 → 追加到末尾；selection 越界（理论）clamp 到末尾，同追加语义。
+        fun insertPlaceholder(p: String) {
+            val v = templateValue
+            val len = v.text.length
+            val start = (if (templateFocused) v.selection.min else len).coerceIn(0, len)
+            val end = (if (templateFocused) v.selection.max else len).coerceIn(0, len)
+            templateValue = TextFieldValue(
+                text = v.text.substring(0, start) + p + v.text.substring(end),
+                selection = TextRange(start + p.length),
+            )
+        }
+        // 本地校验镜像 Rust 侧规则：必须含 {tool}，移除三占位符后剩余
+        // 字符仅限字母数字 _ . -（`__` 合法——它是缺省模板的分隔字面）；
+        // 留空 = 恢复默认，视为合法。
+        val templateValid = tpl.isEmpty() ||
+            (tpl.contains("{tool}") &&
+                tpl.replace("{prefix}", "").replace("{server}", "").replace("{tool}", "")
+                    .matches(Regex("^[A-Za-z0-9_.-]*$")))
+        // 实时预览：{prefix} 取当前生效前缀（RuntimeBridge 缓存，只读），
+        // {server} 固定示例 memory、{tool} 固定示例 create_entities；空
+        // 模板按默认模板预览。展开为字面替换（替换值不含占位符文本，与
+        // Rust format_tool_name 的单趟扫描等价）。
+        val previewName = tpl.ifEmpty { "{prefix}_{server}__{tool}" }
+            .replace("{prefix}", RuntimeBridge.MCP_SERVER_NAMES.firstOrNull() ?: "termux")
+            .replace("{server}", "memory")
+            .replace("{tool}", "create_entities")
+        // ── 工具名模板行 ─────────────────────────────────────────
+        OutlinedTextField(
+            value = templateValue,
+            onValueChange = { templateValue = it },
+            label = { Text("工具名模板") },
+            placeholder = { Text("{prefix}_{server}__{tool}") },
+            singleLine = true,
+            modifier = Modifier
+                .fillMaxWidth()
+                .onFocusChanged { templateFocused = it.isFocused },
+        )
+        // 占位符快插 chips：等宽字面量，surface 弱化配色（明显轻于主题色
+        // 的「保存」）；clickable 不抢焦点——输入框保持聚焦与键盘，
+        // 插入位置即当前光标/选区。
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (ph in listOf("{prefix}", "{server}", "{tool}")) {
+                Text(
+                    ph,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .clickable { insertPlaceholder(ph) }
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                )
+            }
+        }
+        Text(
+            "占位符：{prefix} = 前缀，{server} = MCP 服务器名，{tool} = 工具名（不带服务器名前缀）；留空保存恢复默认",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+        if (templateValid) {
+            Text(
+                "示例：$previewName",
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        } else {
+            Text(
+                "模板无效：必须含 {tool}，且除占位符外仅限字母数字 _ . -",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        CompactButton(
+            text = "保存",
+            enabled = !busy && effectiveTemplate != null && tpl != effectiveTemplate,
+            container = mcpBtnContainer,
+            content = mcpBtnContent,
+        ) {
+            busy = true
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val envelope = RuntimeBridge.setMcpToolNameTemplate(tpl)
+                    val obj = envelope?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    if (obj != null && obj.optBoolean("ok", false)) {
+                        log("工具名模板已保存，重连生效中…")
+                        // FFI 不自动 reload：手动重连让已注册工具按新模板重挂。
+                        val r = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
+                        val o = r?.let { runCatching { JSONObject(it) }.getOrNull() }
+                        if (o != null && o.optBoolean("ok", false)) {
+                            log("${o.optInt("tools", -1)} 个工具已按新模板注册")
+                        } else {
+                            val err = o?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
+                                ?: r?.take(120) ?: "runtime 未就绪"
+                            log("工具重连失败：$err")
+                        }
+                        // 读回生效值（同时刷新桥层缓存）；与输入一致后保存钮自动禁用。
+                        effectiveTemplate = RuntimeBridge.getMcpToolNameTemplate()
+                    } else {
+                        val err = obj?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
+                            ?: envelope?.take(120) ?: "runtime 未就绪"
+                        log("模板保存失败：$err")
+                    }
+                } catch (e: Throwable) {
+                    log("模板保存失败：${e.message?.take(160) ?: e.javaClass.simpleName}")
+                } finally {
+                    busy = false
+                }
+                // 成败都全量重检：成功让 hostTools 按新模板重新聚合；失败让
+                // 状态行如实反映（与「重启」按钮的收尾惯例一致）。
+                refresh()
+            }
+        }
     }
 
     Section(
         title = "MCP 服务器",
         action = {
-            IconButton(onClick = { editServer = "" to "" }) {
+            IconButton(onClick = { editServer = -1 to Triple("", null, "") }) {
                 Icon(Icons.Filled.Add, contentDescription = "添加 MCP")
             }
         },
@@ -2251,18 +2887,101 @@ private fun McpSection() {
                 color = MaterialTheme.colorScheme.outline,
             )
         }
-        for (s in servers) {
+        // 派生 slug 与清单生成（manifestToml）共用同一实现：行内展示的前缀
+        // 就是 host 实际路由用的前缀，两处绝不能各算各的。
+        val slugMap = remember(servers) { McpHostManager.serversSlugMap(servers) }
+        for ((idx, entry) in slugMap.withIndex()) {
+            val (s, slug) = entry
             Card(Modifier.fillMaxWidth()) {
-                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(s.alias, style = MaterialTheme.typography.titleSmall)
-                        Text(s.command, style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.outline)
-                        Text("工具名前缀：${s.alias}__ · ${if (status.hostAlive) "运行中" else "未运行"}",
-                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                // 纵向布局：信息占满整行宽度，控制按钮单独一行居右——
+                // 不与名称/命令/状态文本抢横向空间。
+                // 底边收紧到 6dp：按钮行贴近卡片底边（视觉重心下沉），
+                // 其余三边不变。
+                Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 6.dp)) {
+                    Text(s.name, style = MaterialTheme.typography.titleSmall)
+                    Text(s.command, style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.outline)
+                    // ── 每服务器运行状态行：按 host 实际工具列表判定，
+                    // 而非只看端口是否应答（端口活着 ≠ server 起来了）。
+                    // 正常态的前缀片段用等宽字体（与对话框预览行同款做法）。
+                    val cmdToken = s.command.trim().split(Regex("\\s+")).first()
+                    val tools = status.hostTools
+                    if (!status.probing && status.hostAlive && tools != null && slug in tools) {
+                        Text(
+                            buildAnnotatedString {
+                                append("正常运行（${tools[slug]} 个工具）· 前缀 ")
+                                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+                                    append("${slug}__")
+                                }
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = successGreen(),
+                        )
+                    } else {
+                        val (statusText, statusColor) = when {
+                            status.probing -> "检测中…" to MaterialTheme.colorScheme.outline
+                            !status.hostAlive -> "服务未运行" to MaterialTheme.colorScheme.outline
+                            tools == null -> "状态未知（工具列表获取失败）" to MaterialTheme.colorScheme.outline
+                            cmdToken in status.missingCommands ->
+                                "无法启动：Termux 缺少 $cmdToken" to MaterialTheme.colorScheme.error
+                            else -> "启动中或启动失败（npx 首次运行需下载依赖，可稍候刷新；" +
+                                "持续失败请查看 Termux 侧 ~/.openslate/host.log）" to MaterialTheme.colorScheme.error
+                        }
+                        Text(statusText, style = MaterialTheme.typography.labelSmall, color = statusColor)
                     }
-                    IconButton(onClick = { applyServers(servers.filter { it != s }) }) {
-                        Icon(Icons.Filled.Delete, contentDescription = "删除")
+                    // 启动命令首 token 在 Termux 缺失 → 行内警示（规格与
+                    // ExecBackendSection 的警告行一致；探测失败不会进
+                    // missingCommands，不误报）。
+                    if (cmdToken in status.missingCommands) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Outlined.Warning,
+                                contentDescription = null, // 语义由文字承载
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.height(14.dp).width(14.dp),
+                            )
+                            Text(
+                                if (cmdToken == "npx") {
+                                    "  Termux 未安装 npx：该服务器无法启动。" +
+                                        "请在 Termux 中执行 pkg install nodejs（npx 随 Node.js 一起安装）。"
+                                } else {
+                                    "  Termux 未安装 $cmdToken：该服务器无法启动。请先在 Termux 中安装对应运行时。"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                    // 控制按钮独立一行、居右；文字按钮（用户反馈 icon
+                    // 不直观，与标题行刷新/重启统一），主题色同全局 MCP 按钮。
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    ) {
+                        CompactButton(
+                            text = "编辑",
+                            enabled = !busy,
+                            container = mcpBtnContainer,
+                            content = mcpBtnContent,
+                        ) {
+                            editServer = idx to Triple(s.name, s.slug, s.command)
+                        }
+                        CompactButton(
+                            text = "重启",
+                            enabled = !busy,
+                            container = mcpBtnContainer,
+                            content = mcpBtnContent,
+                        ) {
+                            restartServer(slug, s.name)
+                        }
+                        CompactButton(
+                            text = "删除",
+                            enabled = !busy,
+                            container = mcpBtnContainer,
+                            content = mcpBtnContent,
+                        ) {
+                            applyServers(servers.filter { it != s })
+                        }
                     }
                 }
             }
@@ -2270,23 +2989,95 @@ private fun McpSection() {
     }
 
     editServer?.let { initial ->
-        var alias by remember(initial) { mutableStateOf(initial.first) }
-        var command by remember(initial) { mutableStateOf(initial.second) }
+        val (editIdx, prefill) = initial
+        val isEdit = editIdx >= 0
+        var name by remember(initial) { mutableStateOf(prefill.first) }
+        var userSlug by remember(initial) { mutableStateOf(prefill.second ?: "") }
+        var command by remember(initial) { mutableStateOf(prefill.third) }
+        // 前缀预览与真实派生同源（entrySlug）：编辑时只把该条目之前的
+        // slug 视为已占用（清单按顺序派生，后条目不影响前条目）；添加时
+        // 全部现有 slug 已占用。保证预览 = 保存后清单里的实际前缀。
+        val takenSlugs = remember(servers, editIdx) {
+            // 编辑：只算该条目之前的（清单顺序派生，后条目不影响前条目）；
+            // 添加：算全部现有条目（否则撞名时预览漏掉 -2 后缀）。
+            val upto = if (editIdx >= 0) editIdx else servers.size
+            McpHostManager.serversSlugMap(servers.take(upto)).map { it.second }
+        }
+        // 名称留空时自动识别显示名（仅对话框建议用，不进清单派生链路）：
+        // suggestServerName 识别不出时回退命令首 token（直接 bin 形态如
+        // mcp-server-memory → 名称就是它）；命令为空时为 ""（确认按钮
+        // 已禁用，placeholder 显示固定的机制提示文案）。
+        val resolvedName = name.trim().ifEmpty {
+            McpHostManager.suggestServerName(command.trim())
+                ?: command.trim().split(Regex("\\s+")).first()
+        }
+        // 最终生效 slug：用户指定的代号优先（同样 sanitize），空则从名称
+        // （名称留空时即自动识别结果）派生。
+        val finalSlug = McpHostManager.entrySlug(resolvedName, userSlug, takenSlugs)
+        val slugSpecified = userSlug.isNotBlank()
         androidx.compose.material3.AlertDialog(
             onDismissRequest = { editServer = null },
-            title = { Text("添加 MCP 服务器") },
+            title = { Text(if (isEdit) "编辑 MCP 服务器" else "添加 MCP 服务器") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(value = alias, onValueChange = { alias = it }, label = { Text("名称") })
+                    // 名称可留空：留空时保存前自动从启动命令识别（保存
+                    // 路径见 resolvedName），落库 name 永远非空。识别值
+                    // 用 placeholder 动态呈现（随命令实时变化），不占
+                    // 预览区行。
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("名称（可留空）") },
+                        placeholder = {
+                            Text(
+                                if (resolvedName.isEmpty()) "留空自动识别 npm/uvx 包名"
+                                else "$resolvedName（自动识别）"
+                            )
+                        },
+                    )
+                    OutlinedTextField(
+                        value = userSlug,
+                        onValueChange = { userSlug = it },
+                        label = { Text("代号（工具名前缀）") },
+                        // 留空 = 自动派生；placeholder 实时给出将派生的值
+                        //（同样基于解析后的名称，与最终前缀预览一致）。
+                        placeholder = { Text("auto: " + McpHostManager.entrySlug(resolvedName, null, takenSlugs)) },
+                    )
                     OutlinedTextField(value = command, onValueChange = { command = it }, label = { Text("启动命令") })
                     Text("完整命令行，如 npx -y @modelcontextprotocol/server-memory", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    Text(
+                        buildAnnotatedString {
+                            append("工具名前缀：")
+                            withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(finalSlug + "__") }
+                            append(if (slugSpecified) "（已指定）" else "（自动派生）")
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
                 }
             },
             confirmButton = {
-                SoftButton(enabled = alias.isNotBlank() && command.isNotBlank() && !busy, onClick = {
+                // 只要求启动命令非空：名称可留空（保存时自动识别兜底）。
+                SoftButton(enabled = command.isNotBlank() && !busy, onClick = {
+                    val entry = McpHostManager.McpServerEntry(
+                        // 落库 name 永远非空：resolvedName = 输入留空时已用
+                        // suggestServerName / 命令首 token 兜底，slug 派生
+                        // 与清单链路无需感知。
+                        resolvedName,
+                        userSlug.trim().takeIf { it.isNotEmpty() }, // 空 = 自动派生，不持久化空串
+                        command.trim(),
+                    )
                     editServer = null
-                    applyServers(servers + McpHostManager.McpServerEntry(alias.trim(), command.trim()))
-                }) { Text("添加") }
+                    // 编辑按索引原位替换（避免 data class 相等性误伤同内容
+                    // 条目）；添加追加到尾部。
+                    applyServers(
+                        if (isEdit) {
+                            servers.toMutableList().also { it[editIdx] = entry }
+                        } else {
+                            servers + entry
+                        }
+                    )
+                }) { Text(if (isEdit) "保存" else "添加") }
             },
             dismissButton = { SoftButton(onClick = { editServer = null }) { Text("取消") } },
         )

@@ -63,9 +63,10 @@ object TermuxExec {
         if (command.isBlank()) return null to "termux.run: empty command"
         if (!hasPermission(context)) {
             return null to
-                "termux.run: missing permission $RUN_COMMAND_PERMISSION. " +
+                "termux.run: RUN_COMMAND permission not granted. " +
                 "Grant it in system Settings → Apps → OpenSlate → Permissions, " +
-                "or via Shizuku in the app's settings page."
+                "or via Shizuku on the settings page. On some ROMs Termux must " +
+                "be opened once before this permission can be granted."
         }
         val deferred = CompletableDeferred<TermuxResult>()
         pending[id] = deferred
@@ -77,7 +78,7 @@ object TermuxExec {
                 context,
                 (id and 0x7FFFFFFF).toInt(),
                 resultIntent,
-                android.app.PendingIntent.FLAG_MUTABLE,
+                android.app.PendingIntent.FLAG_MUTABLE or android.app.PendingIntent.FLAG_ONE_SHOT,
             )
             val intent = Intent(RUN_COMMAND_ACTION)
                 .setClassName(TERMUX_PACKAGE, RUN_COMMAND_SERVICE)
@@ -91,11 +92,15 @@ object TermuxExec {
             val result = withTimeoutOrNull(RESULT_TIMEOUT_MS) { deferred.await() }
             return when {
                 result == null ->
-                    null to "termux.run: no result within ${RESULT_TIMEOUT_MS / 1000}s " +
-                        "(check Termux is running and allow-external-apps=true is set)"
+                    null to "termux.run: no result within ${RESULT_TIMEOUT_MS / 1000}s. " +
+                        "Termux is likely in stopped state (never opened since install / " +
+                        "force-stopped) or frozen by the system. Open Termux once, enable " +
+                        "its wakelock, and disable battery optimization for Termux."
                 result.errmsg != null -> null to "termux.run error: ${result.errmsg}"
                 else -> result.combined() to ""
             }
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            throw c
         } catch (t: Throwable) {
             Log.e(TAG, "termux.run dispatch failed", t)
             return null to "termux.run error: ${t.message}"
@@ -123,6 +128,8 @@ data class TermuxResult(
     val stderr: String? = null,
     val exitCode: Int? = null,
     val errmsg: String? = null,
+    /** Termux 错误码（result Bundle 的整型 "err"，如 allow-external-apps 未开 = 2）。 */
+    val errCode: Int? = null,
 ) {
     fun combined(): String = buildString {
         append(stdout ?: "")
@@ -139,23 +146,26 @@ data class TermuxResult(
 
 /**
  * 结果回传接收者（manifest 注册，exported=false；PendingIntent 临时授权
- * 使 Termux 可达）。解析 Termux 结果 intent 的 "result" Bundle。
+ * 使 Termux 可达）。解析 Termux 结果 intent 的 result Bundle：依次试
+ * "result"、"com.termux.execute.result" 两个 key，都不像则扫描 extras 里
+ * 第一个满足结果 Bundle 形状（含 stdout/stderr/errmsg/err 任一）的值
+ * （不同 Termux 版本/分支的 extra key 有差异）。
  */
 class TermuxResultReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         val id = intent.getLongExtra("openslate_id", -1L)
         if (id < 0) return
-        val bundle: Bundle? = runCatching {
-            intent.getBundleExtra("result")
-                ?: intent.getBundleExtra("com.termux.execute.result")
-        }.getOrNull()
+        val bundle: Bundle? = runCatching { findResultBundle(intent) }.getOrNull()
         val result = if (bundle != null) {
             TermuxResult(
                 stdout = bundle.getString("stdout"),
                 stderr = bundle.getString("stderr"),
                 exitCode = if (bundle.containsKey("exitCode")) bundle.getInt("exitCode") else null,
                 errmsg = bundle.getString("errmsg") ?: bundle.getString("err"),
+                errCode = if (bundle.containsKey("err")) {
+                    runCatching { bundle.getInt("err") }.getOrNull()
+                } else null,
             )
         } else {
             // 无 result Bundle：Termux 直接给出了 resultCode 语义（send 的
@@ -164,5 +174,21 @@ class TermuxResultReceiver : BroadcastReceiver() {
         }
         Log.d("OpenSlateTermux", "result for #$id: err=${result.errmsg} exit=${result.exitCode}")
         TermuxExec.complete(id, result)
+    }
+
+    @Suppress("DEPRECATION") // Bundle.get(String)：扫描 extras 兼容旧 API（33+ 弃用但可用）
+    private fun findResultBundle(intent: Intent): Bundle? {
+        fun looksLikeResult(b: Bundle?): Boolean =
+            b != null && (b.containsKey("stdout") || b.containsKey("stderr") ||
+                b.containsKey("errmsg") || b.containsKey("err"))
+        val extras = intent.extras ?: return null
+        return when {
+            looksLikeResult(extras.getBundle("result")) -> extras.getBundle("result")
+            looksLikeResult(extras.getBundle("com.termux.execute.result")) ->
+                extras.getBundle("com.termux.execute.result")
+            else -> extras.keySet().firstNotNullOfOrNull { k ->
+                (extras.get(k) as? Bundle)?.takeIf { looksLikeResult(it) }
+            }
+        }
     }
 }

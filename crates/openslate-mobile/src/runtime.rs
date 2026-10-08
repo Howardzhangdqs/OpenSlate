@@ -15,10 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use openslate_app::wiring::{apply_approval, build_app_context_with, AppContext};
+use openslate_app::wiring::{
+    apply_approval, build_app_context_with, connect_external_mcp, load_config, AppContext,
+};
 use openslate_core::approval::ApprovalManager;
+use openslate_core::error::ToolError;
+use openslate_core::mcp::McpConnectionGuard;
 use openslate_core::tool::Tool;
-use openslate_core::types::{Message, MessageRole};
+use openslate_core::types::{Message, MessageRole, ToolOutput};
 use openslate_protocol::{
     ClientMsg, EntryDto, NoticeLevel, ServerMsg, ToolStatusDto, PROTOCOL_VERSION,
 };
@@ -74,6 +78,14 @@ pub struct MobileRuntime {
     workspace_dir: PathBuf,
     /// bash 后端多选状态（设置页热切换；bash / termux_bash 命名规则）。
     exec_selection: ExecSelectionCell,
+    /// 外部 MCP server 连接 guard（热重载整体替换；builtin 句柄在
+    /// `AppState._mcp`，不在此列）。声明在 `registry` 之后：drop 时工具
+    /// 先于连接消失。
+    mcp_external: std::sync::Mutex<McpConnectionGuard>,
+    /// 当前已注册的外部 MCP 工具名（热重载时精确反注册的名单）。
+    mcp_tool_names: std::sync::Mutex<Vec<String>>,
+    /// 生效配置路径（热重载读最新落盘的 `[mcp]` 配置）。
+    config_path: PathBuf,
     shutdown_flag: std::sync::atomic::AtomicBool,
 }
 
@@ -138,8 +150,10 @@ impl MobileRuntime {
             .context("创建 tokio runtime 失败")?;
         crate::alog!("create_with: tokio runtime built, assembling state…");
 
-        let state = rt.block_on(assemble_state(
-            config_path,
+        // 外部 MCP 连接 guard + 工具名册随装配交出（热重载整体替换；
+        // builtin 句柄已随 AppState._mcp 保活）。
+        let (state, mcp_external, mcp_tool_names) = rt.block_on(assemble_state(
+            config_path.clone(),
             sink.clone(),
             factory,
             extra_tools,
@@ -165,6 +179,9 @@ impl MobileRuntime {
             model_registry,
             workspace_dir: paths.workspace_dir.clone(),
             exec_selection: exec_selection.clone(),
+            mcp_external: std::sync::Mutex::new(mcp_external),
+            mcp_tool_names: std::sync::Mutex::new(mcp_tool_names),
+            config_path,
             shutdown_flag: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -241,6 +258,387 @@ impl MobileRuntime {
             sel.native,
             sel.termux
         );
+    }
+
+    // ── MCP 外部 server 热重载（设置页增删改后免重启生效）──────────
+
+    /// 热重载外部 MCP：读最新落盘配置 → 连新（工具先进 scratch 注册表，
+    /// 批内名字冲突此时以 Err 体现，真实注册表未动、旧工具仍在）→
+    /// 反注册旧名 → 注册新工具（此时撞名只可能是与非 MCP 工具冲突，
+    /// Err 则回滚：清掉已注册的新名、旧工具原样装回、保留旧 guard）→
+    /// 成功后整体换 guard（旧 guard drop，旧连接自然关闭）。
+    /// 完全失败（配置读不了 / 所有 enabled server 都失败且旧态非空）→
+    /// 保留旧工具，返回错误。返回 JSON：
+    /// `{"ok":bool,"tools":N,"servers":{"name":count,…},"failed":[…],"error":"…"}`。
+    ///
+    /// 锁序红线：全程不碰 `state.core`（配置路径装配期已存字段），无锁
+    /// 跨 await；registry 自带内部锁，注册/反注册均为同步调用。
+    pub fn reload_mcp(&self) -> String {
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let Some(rt) = guard.as_ref() else {
+                return serde_json::json!({
+                    "ok": false, "tools": 0, "servers": {}, "failed": [],
+                    "error": "runtime 已关停",
+                })
+                .to_string();
+            };
+            rt.handle().clone()
+        };
+
+        // 最新配置以落盘为准。mobile 装配 = 显式路径单文件语义，此处
+        // load_config(active) 与装配期 load_effective_config(Some(path))
+        // 等价（无全局库合并参与）。
+        let mcp_cfg = match load_config(&self.config_path) {
+            Ok(cfg) => cfg.mcp.unwrap_or_default(),
+            Err(e) => {
+                let error = format!("读取配置失败: {e:#}");
+                crate::alog!("reload_mcp: {error}");
+                return serde_json::json!({
+                    "ok": false, "tools": 0, "servers": {}, "failed": [], "error": error,
+                })
+                .to_string();
+            }
+        };
+
+        // 1) 连新 + scratch 注册（并发结构/日志与装配期一致；工具暂存
+        //    scratch——真实注册表未动，旧工具/旧连接原样保留）。
+        let scratch = openslate_core::tool::ToolRegistry::new();
+        let (new_guard, counts, new_names, failed) =
+            match handle.block_on(connect_external_mcp(&mcp_cfg, &scratch)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    crate::alog!("reload_mcp: connect failed: {error}");
+                    return serde_json::json!({
+                        "ok": false, "tools": 0, "servers": {}, "failed": [], "error": error,
+                    })
+                    .to_string();
+                }
+            };
+
+        let old_names = self
+            .mcp_tool_names
+            .lock()
+            .expect("mcp_tool_names lock poisoned")
+            .clone();
+        let enabled = mcp_cfg.servers.values().filter(|c| c.enabled).count();
+
+        // 2) 完全失败判定：有 enabled server 且全军覆没、旧态非空 →
+        //    保旧报错（旧工具仍可用；用户可稍后重试或重启）。
+        if enabled > 0 && counts.is_empty() && !old_names.is_empty() {
+            let error = format!(
+                "全部 {enabled} 个 MCP server 连接失败：[{}]",
+                failed.join(", ")
+            );
+            crate::alog!("reload_mcp: {error}");
+            return serde_json::json!({
+                "ok": false, "tools": 0, "servers": {}, "failed": failed, "error": error,
+            })
+            .to_string();
+        }
+
+        // 3) 备份旧工具 Arc（撞名回滚时原样装回；旧 guard 不动，连接
+        //    仍活，回滚后一切照旧）→ 反注册旧名。
+        let old_tools: Vec<(String, Arc<dyn Tool>)> = old_names
+            .iter()
+            .filter_map(|n| self.registry.get(n).map(|t| (n.clone(), t)))
+            .collect();
+        for name in &old_names {
+            self.registry.unregister(name);
+        }
+
+        // 4) 注册新工具（从 scratch 取 Arc 包装迁移；此处撞名只可能是
+        //    与 builtin/host 等非 MCP 工具冲突——装配期同样致命）。
+        let mut registered: Vec<String> = Vec::with_capacity(new_names.len());
+        for name in &new_names {
+            let Some(tool) = scratch.get(name) else { continue };
+            if let Err(e) = self.registry.try_register(SharedTool(tool)) {
+                for n in &registered {
+                    self.registry.unregister(n);
+                }
+                for (_, t) in old_tools {
+                    self.registry.register_boxed(Box::new(SharedTool(t)));
+                }
+                let error = format!(
+                    "MCP 工具名冲突: '{}' 与非 MCP 工具撞名（已回滚，旧工具恢复）",
+                    e.0
+                );
+                crate::alog!("reload_mcp: {error}");
+                return serde_json::json!({
+                    "ok": false, "tools": 0, "servers": {}, "failed": failed, "error": error,
+                })
+                .to_string();
+            }
+            registered.push(name.clone());
+        }
+
+        // 5) 换 guard（旧 guard drop → 旧连接关闭）+ 更新名册。
+        {
+            let mut guard_cell = self.mcp_external.lock().expect("mcp_external lock poisoned");
+            *guard_cell = new_guard;
+        }
+        *self.mcp_tool_names.lock().expect("mcp_tool_names lock poisoned") = new_names;
+
+        let total: usize = counts.values().sum();
+        crate::alog!("reload_mcp: ok tools={total} servers={counts:?} failed={failed:?}");
+        serde_json::json!({
+            "ok": true,
+            "tools": total,
+            "servers": counts,
+            "failed": failed,
+        })
+        .to_string()
+    }
+
+    /// 当前生效的 MCP 工具名模板（设置页回显）。读最新落盘配置——与
+    /// `reload_mcp` 同源（`load_config(active)`），保证回显值 = 下次
+    /// 热重载实际展开的值；未设置 / 空白 → 默认
+    /// `"{prefix}_{server}__{tool}"`（core 常量引用，不写第二份字面）。
+    /// 配置读不了（理论上装配期已挡）也回默认：回显接口不设错误通道，
+    /// 默认值与装配期兜底一致。
+    pub fn get_mcp_tool_name_template(&self) -> String {
+        match load_config(&self.config_path) {
+            Ok(cfg) => cfg
+                .mcp
+                .and_then(|m| m.tool_name_template)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| openslate_core::mcp::DEFAULT_TOOL_NAME_TEMPLATE.to_owned()),
+            Err(e) => {
+                crate::alog!("get_mcp_tool_name_template: 读取配置失败: {e:#}");
+                openslate_core::mcp::DEFAULT_TOOL_NAME_TEMPLATE.to_owned()
+            }
+        }
+    }
+
+    /// 写 MCP 工具名模板并落盘：空白 = 清除（回默认）。校验复用 core
+    /// 的 `validate_mcp_tool_name_template`——与启动校验同一套规则，
+    /// 避免 FFI 收下的值把下次启动变成 validation error。**不自动
+    /// reload**：新模板对已注册工具名的生效由调用方显式走既有
+    /// `reload_mcp`（热重载会按最新落盘配置重连重注册）。返回
+    /// `{"ok":true}` / `{"ok":false,"error":"…"}`。
+    pub fn set_mcp_tool_name_template(&self, template: String) -> String {
+        let blank = template.trim().is_empty();
+        if !blank {
+            if let Err(message) =
+                openslate_core::config::validation::validate_mcp_tool_name_template(&template)
+            {
+                crate::alog!("set_mcp_tool_name_template: 校验失败: {message}");
+                return serde_json::json!({ "ok": false, "error": message }).to_string();
+            }
+        }
+        // 空白归一成空串：persist 的清空语义（删键回默认）。
+        let effective: &str = if blank { "" } else { template.as_str() };
+        match openslate_core::config::persist::set_mcp_tool_name_template(
+            &self.config_path,
+            effective,
+        ) {
+            Ok(()) => {
+                crate::alog!("set_mcp_tool_name_template: 已落盘 {effective:?}");
+                serde_json::json!({ "ok": true }).to_string()
+            }
+            Err(e) => {
+                let error = format!("写入配置失败: {e:#}");
+                crate::alog!("set_mcp_tool_name_template: {error}");
+                serde_json::json!({ "ok": false, "error": error }).to_string()
+            }
+        }
+    }
+
+    /// mobile 聚合 host 在 toml 里的默认 server 键名（App 一键安装 /
+    /// applyServers 经 upsert_mcp_server 写入的名字）。get 的多键回退
+    /// 与 set 的"当前名"都锚定它。占位符模型上它是 `{prefix}` 的值
+    /// （`{server}` 留给上游聚合名里的服务器段）。
+    const DEFAULT_MCP_SERVER_NAME: &str = "termux";
+
+    /// 当前 mobile 聚合 host 的 server 名（`[mcp.servers]` 的键，即
+    /// 模板 `{prefix}` 占位符的展开值；设置页回显）。读最新落盘配置，
+    /// 与 `reload_mcp` 同源：恰好一个键 → 该键；多键 → `termux` 优先、
+    /// 否则任取一个并 alog 一行（多键是异常态：本 FFI 面向单 server
+    /// 聚合场景，多键说明用户手改过 toml）；空 / 读失败 → 默认
+    /// `termux`（回显接口不设错误通道，默认值与 App 一键安装写入的
+    /// 键一致，行为可预期）。
+    pub fn get_mcp_server_name(&self) -> String {
+        let servers = match load_config(&self.config_path) {
+            Ok(cfg) => cfg.mcp.map(|m| m.servers).unwrap_or_default(),
+            Err(e) => {
+                crate::alog!("get_mcp_server_name: 读取配置失败: {e:#}");
+                return Self::DEFAULT_MCP_SERVER_NAME.to_owned();
+            }
+        };
+        match servers.len() {
+            0 => Self::DEFAULT_MCP_SERVER_NAME.to_owned(),
+            1 => servers
+                .keys()
+                .next()
+                .expect("len == 1 guarantees a key")
+                .clone(),
+            n => {
+                // 多键异常态：优先回显 termux（App 管的那个），否则任取
+                // 一个——回显要给出一个确定值，但绝不猜着改名。
+                let fallback = servers
+                    .keys()
+                    .find(|k| k.as_str() == Self::DEFAULT_MCP_SERVER_NAME)
+                    .or_else(|| servers.keys().next())
+                    .expect("len > 0 guarantees a key")
+                    .clone();
+                crate::alog!(
+                    "get_mcp_server_name: [mcp.servers] 有 {n} 个键（异常态，应为单 server 聚合），回显 '{fallback}'"
+                );
+                fallback
+            }
+        }
+    }
+
+    /// 改 mobile 聚合 host 的 server 名（`[mcp.servers]` 键名 = 模板
+    /// `{prefix}` 占位符的展开值；改名后工具注册名前缀、PTC namespace
+    /// 随之变化——经既有 `reload_mcp` 热生效，此处**不自动 reload**，
+    /// 调用方显式调 reloadMcpServers）。三步：
+    /// 1. 校验：复用 core `validate_mcp_server_name`（非空、
+    ///    [A-Za-z0-9_.-]、不含 `__`——键名会泄入 legacy
+    ///    `prefix_upstream` 路径与按 `__` 分段的 UI 启发式，须保持
+    ///    `__`-free）；
+    /// 2. 与当前名相同 → 幂等 `{"ok":true}`（不落盘）；
+    /// 3. `rename_mcp_server` 落盘搬移（transport/headers 原样）。
+    /// 返回 `{"ok":true}` / `{"ok":false,"error":"…"}`（空表/键缺失
+    /// 由 persist 报错上抛：应先经 App 一键安装 upsert 建 server）。
+    pub fn set_mcp_server_name(&self, name: String) -> String {
+        if let Err(message) = openslate_core::config::validation::validate_mcp_server_name(&name) {
+            crate::alog!("set_mcp_server_name: 校验失败: {message}");
+            return serde_json::json!({ "ok": false, "error": message }).to_string();
+        }
+        let current = self.get_mcp_server_name();
+        if current == name {
+            // 幂等：与当前名相同（含首键就是 termux 的默认态）→ 直接
+            // 成功，不动文件、不触发 reload。
+            return serde_json::json!({ "ok": true }).to_string();
+        }
+        match openslate_core::config::persist::rename_mcp_server(
+            &self.config_path,
+            &current,
+            &name,
+        ) {
+            Ok(()) => {
+                crate::alog!("set_mcp_server_name: {current:?} → {name:?} 已落盘");
+                serde_json::json!({ "ok": true }).to_string()
+            }
+            Err(e) => {
+                let error = format!("重命名失败: {e:#}");
+                crate::alog!("set_mcp_server_name: {error}");
+                serde_json::json!({ "ok": false, "error": error }).to_string()
+            }
+        }
+    }
+
+    // ── 工具可见性（工具管理页）──────────────────────────────────────
+
+    /// 全部已注册工具清单（JSON 数组，按 name 排序；宿主渲染工具管理页，
+    /// 展开项展示详细参数）：
+    /// `[{"name":"bash","description":"…","input_schema":{…}}, …]`——
+    /// `input_schema` 为该工具参数的 JSON Schema 对象原样（无 schema 时
+    /// 为 `{}`，键恒存在）。
+    pub fn list_tools_json(&self) -> String {
+        let mut defs = self.registry.definitions();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        serde_json::json!(defs
+            .iter()
+            .map(|d| {
+                // 参数 schema 原样透传（ToolDefinition.parameters，即各工具
+                // parameters_schema() 的 JSON Schema 对象）；工具无 schema
+                // （null）时恒输出空对象，键永远存在。
+                let input_schema = if d.parameters.is_null() {
+                    serde_json::json!({})
+                } else {
+                    d.parameters.clone()
+                };
+                serde_json::json!({
+                    "name": d.name,
+                    "description": d.description,
+                    "input_schema": input_schema,
+                })
+            })
+            .collect::<Vec<_>>())
+        .to_string()
+    }
+
+    /// 当前生效 agent（root）的工具可见性（JSON 对象）：
+    /// `{"tools":[…],"hidden_tools":[…]}`——frontmatter 两份名单原样
+    /// 回读（含 glob 模式，顺序保持落盘顺序）。
+    pub fn get_agent_tool_visibility_json(&self) -> String {
+        let (tools, hidden_tools) = {
+            let inner = self.state.core.lock();
+            let root = inner.agent_tree.get_root();
+            (root.tools.clone(), root.hidden_tools.clone())
+        };
+        serde_json::json!({ "tools": tools, "hidden_tools": hidden_tools }).to_string()
+    }
+
+    /// 全量覆写 root agent 的 `tools:` / `hidden_tools:` 并热生效：
+    /// 外科手术式改写 `agents/<root>.md` frontmatter（其余字段与正文
+    /// 逐字节保留）→ 重装 agent 树 → 热替换（manager 在家就换；回合
+    /// 进行中改 `inner.agent_tree`，引擎回收时自动对齐）。下一对话回
+    /// 合即按新可见性过滤，无需重启 app。
+    /// 返回 `{"ok":true}` 或 `{"ok":false,"error":"…"}`。
+    pub fn set_agent_tool_visibility_json(
+        &self,
+        tools: Vec<String>,
+        hidden_tools: Vec<String>,
+    ) -> String {
+        match self.set_agent_tool_visibility_impl(tools, hidden_tools) {
+            Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+            Err(e) => {
+                crate::alog!("set_agent_tool_visibility failed: {e:#}");
+                serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string()
+            }
+        }
+    }
+
+    fn set_agent_tool_visibility_impl(
+        &self,
+        tools: Vec<String>,
+        hidden_tools: Vec<String>,
+    ) -> Result<()> {
+        // 1) 定位 root agent 的 md（frontmatter `id:` 匹配，`<id>.md`
+        //    文件名兜底）。agents 目录 = 生效配置同级的 `agents/`。
+        let (agents_dir, root_id) = {
+            let inner = self.state.core.lock();
+            let active = inner.paths.active.clone();
+            let root_id = inner.agent_tree.get_root().id.0.clone();
+            (
+                active
+                    .parent()
+                    .context("生效配置路径无父目录")?
+                    .join("agents"),
+                root_id,
+            )
+        };
+        let root_md =
+            find_agent_markdown(&agents_dir, &root_id).context("定位 root agent md 失败")?;
+
+        // 2) 外科手术式落盘。
+        openslate_core::config::persist::set_agent_tool_lists(&root_md, &tools, &hidden_tools)?;
+
+        // 3) 重装 agent 树 + 热替换。重装失败不回滚磁盘（与
+        //    config_ops 落盘语义一致：磁盘已改，运行时保留旧树并报错）。
+        let agents =
+            openslate_core::config::parse_agents_dir(&agents_dir).context("重装 agents 失败")?;
+        let tree = openslate_core::agent_tree::AgentTree::from_configs(&agents.agents)
+            .context("重建 agent 树失败")?;
+        {
+            let mut inner = self.state.core.lock();
+            inner.agents_cfg = agents;
+            inner.agent_tree = tree.clone();
+            if let Some(manager) = inner.manager.as_mut() {
+                manager.agent_tree = tree;
+            }
+        }
+        crate::alog!(
+            "tool visibility updated: tools={:?} hidden={:?} → {}",
+            tools,
+            hidden_tools,
+            root_md.display()
+        );
+        Ok(())
     }
 
     /// 宿主应答 host call。`ok=true` → `payload` 为结果 JSON；
@@ -644,13 +1042,20 @@ impl MobileRuntime {
 /// 状态装配（server `build_state` 的 mobile 变体：origin / 显式路径 /
 /// 注入 factory）。`run_retention` = 启动保留策略（见
 /// [`RuntimeOptions::run_retention`]）。
+/// 返回 `(AppState, 外部 MCP guard, 外部 MCP 工具名)`——后两者由
+/// `MobileRuntime` 接手（热重载整体替换），builtin 句柄留在
+/// `AppState._mcp` 保活。
 async fn assemble_state(
     config_path: std::path::PathBuf,
     sink: Arc<EventSink>,
     provider_factory: ProviderFactory,
     extra_tools: Vec<Box<dyn Tool>>,
     run_retention: i64,
-) -> Result<Arc<AppState>> {
+) -> Result<(
+    Arc<AppState>,
+    McpConnectionGuard,
+    Vec<String>,
+)> {
     let config_flag = config_path.to_str().map(|s| s.to_owned());
     crate::alog!("assemble: build_app_context begin");
     let ctx: AppContext = build_app_context_with(config_flag.as_deref(), extra_tools)
@@ -665,6 +1070,8 @@ async fn assemble_state(
         mut manager,
         skills,
         mcp_connections,
+        mcp_external,
+        mcp_tool_names,
         config_path: active,
         ..
     } = ctx;
@@ -814,15 +1221,80 @@ async fn assemble_state(
         pending_step_meta: None,
     };
 
-    Ok(Arc::new(AppState {
-        core: Arc::new(SessionCore::new(inner)),
-        sink,
-        approval: approval_bridge,
-        auth_token: None,
-        provider_factory,
-        origin: "mobile",
-        _mcp: mcp_connections,
-    }))
+    Ok((
+        Arc::new(AppState {
+            core: Arc::new(SessionCore::new(inner)),
+            sink,
+            approval: approval_bridge,
+            auth_token: None,
+            provider_factory,
+            origin: "mobile",
+            _mcp: mcp_connections,
+        }),
+        mcp_external,
+        mcp_tool_names,
+    ))
+}
+
+/// `Arc<dyn Tool>` 再包装：registry 只收 `impl Tool`，热重载从 scratch
+/// 注册表迁出的新工具 / 撞名回滚时装回的旧工具都是 `Arc`，包一层委派
+/// 实现才能重新注册（工具本体与行为不变，仅多一层引用）。
+struct SharedTool(Arc<dyn Tool>);
+
+#[async_trait::async_trait]
+impl Tool for SharedTool {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn namespace(&self) -> Option<String> {
+        self.0.namespace()
+    }
+
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.0.parameters_schema()
+    }
+
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
+        self.0.execute(args).await
+    }
+}
+
+/// 在 agents 目录中定位 id 匹配的 agent markdown：frontmatter `id:`
+/// 优先（id 与文件名可不同），无 frontmatter id 时文件名派生 id 兜底
+/// （`<id>.md` 存在即可）。两者都无 → Err。
+fn find_agent_markdown(agents_dir: &std::path::Path, id: &str) -> Result<std::path::PathBuf> {
+    let entries = std::fs::read_dir(agents_dir)
+        .with_context(|| format!("读取 agents 目录失败：{}", agents_dir.display()))?;
+    let mut filename_fallback: Option<std::path::PathBuf> = None;
+    for entry in entries {
+        let entry = entry.context("读取 agents 目录条目失败")?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if filename == format!("{id}.md") {
+            filename_fallback = Some(path.clone());
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(cfg) = openslate_core::config::parse_agent_markdown(&content, &filename) {
+            if cfg.id.0 == id {
+                return Ok(path);
+            }
+        }
+    }
+    filename_fallback.with_context(|| format!("agents 目录下无 id 为 {id} 的 agent md"))
 }
 
 /// ModelMeta → FFI JSON（字段缺失为 null；completeness 便于调用方判断）。

@@ -184,7 +184,7 @@ pub fn spawn_engine_turn(
 
 async fn engine_turn(
     state: Arc<AppState>,
-    manager: RunManager,
+    mut manager: RunManager,
     run_id: RunId,
     provider: Box<dyn ModelProvider>,
     history: Vec<Message>,
@@ -211,6 +211,11 @@ async fn engine_turn(
     inner.depth_cur = 0;
     inner.tool_calls_cur = 0;
     inner.agents_running = 0;
+    // 回合期间 agent_tree 可能被热替换（工具可见性页 set_agent_tool_visibility
+    // 只改 inner.agent_tree，碰不到被 take 走的 manager）——回家的 manager
+    // 采用最新树，下一回合即按新可见性过滤（config 的同款陈旧问题不在
+    // 本路径处理，保持既有语义）。
+    manager.agent_tree = inner.agent_tree.clone();
     inner.manager = Some(manager);
     match result {
         Ok(r) => {

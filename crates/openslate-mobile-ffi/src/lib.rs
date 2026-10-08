@@ -8,6 +8,12 @@
 //! - `shutdown()` → host call fail-all + 审批全拒 + runtime 收束
 //! - `list_sessions(offset)` / `open_session` / `delete_session` → 历史会话
 //! - `set_mcp_host_token(token)`（namespace 函数）→ MCP host 鉴权注入
+//! - `reload_mcp_servers()` → 外部 MCP 热重载（重连 + 工具重注册）
+//! - `get/set_mcp_tool_name_template()` → MCP 工具注册名模板读写
+//!   （占位符 `{prefix}`/`{server}`/`{tool}`；落盘，生效走既有
+//!   `reload_mcp_servers()`）
+//! - `get/set_mcp_server_name()` → 聚合 server 键名读写（`{prefix}`
+//!   占位符的展开值；生效同样走 `reload_mcp_servers()`）
 //!
 //! 线程约定：所有方法立即返回（send 内部 spawn；shutdown 有限等待）；
 //! `callback.on_event` 从 Rust 泓线程调用——宿主实现必须线程安全、
@@ -150,6 +156,82 @@ impl OpenSlateRuntime {
     /// `bash`（native）+ `termux_bash`（termux）。
     pub fn set_exec_backends(&self, backends: String) {
         self.inner.set_exec_backends(&backends);
+    }
+
+    /// 热重载外部 MCP server（设置页增删改 server 后调用，新工具清单
+    /// 免重启生效）。读最新落盘配置 → 重连 → 重注册工具；阻塞至全部
+    /// server 连接完成（各 server 有内部连接超时；宿主须在 IO 线程
+    /// 调用）。返回
+    /// `{"ok":true,"tools":N,"servers":{"name":count,…},"failed":[…]}`
+    /// 或 `{"ok":false,"tools":0,"servers":{},"failed":[…],"error":"…"}`
+    /// （失败时旧工具保留，重启后按新配置装配）。
+    pub fn reload_mcp_servers(&self) -> String {
+        openslate_mobile::alog!("ffi: reload_mcp_servers");
+        self.inner.reload_mcp()
+    }
+
+    /// 读取当前生效的 MCP 工具名模板（未设置 / 空白 → 默认
+    /// `"{prefix}_{server}__{tool}"`；读最新落盘配置）。占位符：
+    /// `{prefix}` = 服务名（[mcp.servers] 键）、`{server}` = 上游服务
+    /// 器名（聚合名 slug 段）、`{tool}` = 不带前缀的工具名。
+    pub fn get_mcp_tool_name_template(&self) -> String {
+        openslate_mobile::alog!("ffi: get_mcp_tool_name_template");
+        self.inner.get_mcp_tool_name_template()
+    }
+
+    /// 设置 MCP 工具名模板：校验（与启动校验同一套规则）→ 落盘；
+    /// 空白 = 清除回默认。**不自动热重载**——新模板经既有
+    /// `reload_mcp_servers()` 生效（重连后按新模板重注册工具名）。
+    /// 返回 `{"ok":true}` 或 `{"ok":false,"error":"…"}`。
+    pub fn set_mcp_tool_name_template(&self, template: String) -> String {
+        openslate_mobile::alog!("ffi: set_mcp_tool_name_template({template:?})");
+        self.inner.set_mcp_tool_name_template(template)
+    }
+
+    /// 读取当前聚合 server 名（`[mcp.servers]` 的键，模板 `{prefix}`
+    /// 占位符的展开值）。恰好一个键 → 该键；多键 → termux 优先否则
+    /// 任取；空 / 读失败 → `termux`。
+    pub fn get_mcp_server_name(&self) -> String {
+        openslate_mobile::alog!("ffi: get_mcp_server_name");
+        self.inner.get_mcp_server_name()
+    }
+
+    /// 改聚合 server 名（即 `{prefix}` 值）：校验（非空、
+    /// [A-Za-z0-9_.-]、不含 `__`）→ 落盘重命名（transport/headers
+    /// 原样搬移）；与当前名相同 → 幂等成功。**不自动热重载**——新名
+    /// 经既有 `reload_mcp_servers()` 生效（重连后注册名前缀 /
+    /// namespace 随新键名变化）。返回 `{"ok":true}` 或
+    /// `{"ok":false,"error":"…"}`。
+    pub fn set_mcp_server_name(&self, name: String) -> String {
+        openslate_mobile::alog!("ffi: set_mcp_server_name({name:?})");
+        self.inner.set_mcp_server_name(name)
+    }
+
+    // ── 工具可见性（工具管理页）──────────────────────────────────────
+
+    /// 全部已注册工具清单（JSON 数组，按 name 排序）：
+    /// `[{"name":"bash","description":"…"}, …]`。
+    pub fn list_tools(&self) -> String {
+        openslate_mobile::alog!("ffi: list_tools");
+        self.inner.list_tools_json()
+    }
+
+    /// 当前生效 agent（root）的工具可见性（JSON 对象）：
+    /// `{"tools":[…],"hidden_tools":[…]}`。
+    pub fn get_agent_tool_visibility(&self) -> String {
+        openslate_mobile::alog!("ffi: get_agent_tool_visibility");
+        self.inner.get_agent_tool_visibility_json()
+    }
+
+    /// 全量覆写 root agent 的 `tools:` / `hidden_tools:`（工具对 agent
+    /// 可见/隐藏）。外科手术式改写 `agents/root.md` frontmatter（其余
+    /// 字段与正文不动）并热生效——下一对话回合即按新可见性过滤，无需
+    /// 重启 app。返回 `{"ok":true}` 或 `{"ok":false,"error":"…"}`。
+    pub fn set_agent_tool_visibility(&self, tools: Vec<String>, hidden_tools: Vec<String>) -> String {
+        openslate_mobile::alog!(
+            "ffi: set_agent_tool_visibility(tools={tools:?}, hidden={hidden_tools:?})"
+        );
+        self.inner.set_agent_tool_visibility_json(tools, hidden_tools)
     }
 
     /// 应答 host call。`ok=true` → payload 为结果 JSON；`ok=false` →

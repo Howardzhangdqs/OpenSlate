@@ -303,3 +303,76 @@ fn mobile_runtime_shutdown_rejects_send() {
     runtime.shutdown();
     assert!(runtime.send(r#"{"type":"cancel"}"#).is_err());
 }
+
+#[test]
+fn mobile_runtime_tool_visibility_roundtrip() {
+    let (paths, dir) = temp_paths();
+    let (collector, _rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths, collector, opts).unwrap();
+
+    // list_tools：注册表全部工具，按 name 排序。
+    let tools: serde_json::Value = serde_json::from_str(&runtime.list_tools_json()).unwrap();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"mobile.ping"), "mobile.ping 应注册: {names:?}");
+    // bash 工具按后端探测注册（桌面测试环境可能缺席），只验排序与字段。
+    assert!(names.windows(2).all(|w| w[0] <= w[1]), "按 name 排序: {names:?}");
+    for t in tools.as_array().unwrap() {
+        assert!(t["description"].is_string(), "name+description 字段固定: {t}");
+        // input_schema 键恒存在（无 schema 时为 {}）；且必须是对象。
+        assert!(
+            t["input_schema"].is_object(),
+            "input_schema 应为对象（可空 schema 输出 {{}}）: {t}"
+        );
+    }
+    // 至少一个工具的参数 schema 非空（mobile.ping 恒注册且带完整 schema）。
+    assert!(
+        tools.as_array().unwrap().iter().any(|t| {
+            t["input_schema"].as_object().is_some_and(|o| !o.is_empty())
+        }),
+        "应存在参数 schema 非空的工具: {tools}"
+    );
+
+    // 初始可见性 = bootstrap 默认白名单、无 hidden。
+    let vis: serde_json::Value =
+        serde_json::from_str(&runtime.get_agent_tool_visibility_json()).unwrap();
+    assert_eq!(
+        vis["tools"],
+        serde_json::json!(["mobile.ping", "bash", "termux_bash"])
+    );
+    assert_eq!(vis["hidden_tools"], serde_json::json!([]));
+
+    // 全量覆写：白名单清空（= 暴露全部）+ 隐藏 termux_bash。
+    let ret: serde_json::Value = serde_json::from_str(
+        &runtime.set_agent_tool_visibility_json(vec![], vec!["termux_bash".into()]),
+    )
+    .unwrap();
+    assert_eq!(ret["ok"], serde_json::json!(true), "覆写应成功: {ret}");
+
+    // 回读：运行时树已热替换为新名单。
+    let vis: serde_json::Value =
+        serde_json::from_str(&runtime.get_agent_tool_visibility_json()).unwrap();
+    assert_eq!(vis["tools"], serde_json::json!([]));
+    assert_eq!(vis["hidden_tools"], serde_json::json!(["termux_bash"]));
+
+    // 落盘检查：root.md 外科手术式改写——两个键替换，其余 frontmatter
+    // 与正文保留。
+    let md = std::fs::read_to_string(dir.path().join("config/agents/root.md")).unwrap();
+    assert!(md.contains("id: root\n"));
+    assert!(md.contains("name: OpenSlate\n"));
+    assert!(md.contains("model: main\n"));
+    assert!(md.contains("tools: []\n"));
+    assert!(md.contains("hidden_tools:\n    - termux_bash\n"));
+    assert!(md.contains("You are a helpful AI assistant."));
+
+    runtime.shutdown();
+}

@@ -12,6 +12,9 @@ pub struct AgentNode {
     pub model_alias: String,
     pub children: Vec<AgentId>,
     pub tools: Vec<String>,
+    /// 工具隐藏名单（glob 可）：生效集合 = tools 白名单（空=全部）减去
+    /// 此名单匹配项（同一套 matcher）。
+    pub hidden_tools: Vec<String>,
     pub default_prompt: String,
 }
 
@@ -55,6 +58,7 @@ impl AgentTree {
                     model_alias: agent.model.clone(),
                     children: agent.children.clone(),
                     tools: agent.tools.clone(),
+                    hidden_tools: agent.hidden_tools.clone(),
                     default_prompt: agent.default_prompt.clone(),
                 },
             );
@@ -162,6 +166,7 @@ mod tests {
     fn example_configs() -> Vec<AgentConfig> {
         vec![
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("root".into()),
                 name: "Root Agent".into(),
                 model: "main".into(),
@@ -175,6 +180,7 @@ mod tests {
                 default_prompt: "You are the root coordinator agent.".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("researcher".into()),
                 name: "Researcher".into(),
                 model: "fast".into(),
@@ -183,6 +189,7 @@ mod tests {
                 default_prompt: "You are a research agent.".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("verifier".into()),
                 name: "Verifier".into(),
                 model: "fast".into(),
@@ -191,6 +198,7 @@ mod tests {
                 default_prompt: "You are a verification agent.".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("writer".into()),
                 name: "Writer".into(),
                 model: "fast".into(),
@@ -199,6 +207,7 @@ mod tests {
                 default_prompt: "You are a writing agent.".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("deep-analyst".into()),
                 name: "Deep Analyst".into(),
                 model: "deep-reasoner".into(),
@@ -207,6 +216,7 @@ mod tests {
                 default_prompt: "You are a deep analysis agent.".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("visual-inspector".into()),
                 name: "Visual Inspector".into(),
                 model: "vision".into(),
@@ -260,6 +270,7 @@ mod tests {
         // A→B, B→A — every agent is a child of another, so no root
         let configs = vec![
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("a".into()),
                 name: "A".into(),
                 model: "m".into(),
@@ -268,6 +279,7 @@ mod tests {
                 default_prompt: "".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("b".into()),
                 name: "B".into(),
                 model: "m".into(),
@@ -290,6 +302,7 @@ mod tests {
     #[test]
     fn test_invalid_child_ref() {
         let configs = vec![AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("root".into()),
             name: "Root".into(),
             model: "m".into(),
@@ -315,6 +328,7 @@ mod tests {
         // root → a → b → a  (cycle via a↔b)
         let configs = vec![
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("root".into()),
                 name: "Root".into(),
                 model: "m".into(),
@@ -323,6 +337,7 @@ mod tests {
                 default_prompt: "".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("a".into()),
                 name: "A".into(),
                 model: "m".into(),
@@ -331,6 +346,7 @@ mod tests {
                 default_prompt: "".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("b".into()),
                 name: "B".into(),
                 model: "m".into(),

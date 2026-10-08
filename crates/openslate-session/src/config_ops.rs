@@ -557,6 +557,7 @@ fast = "fast"
         let config = parse_openslate_toml(toml).expect("fixture parses");
         let agents = AgentsConfig {
             agents: vec![AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("root".into()),
                 name: "Root".into(),
                 model: "main".into(),

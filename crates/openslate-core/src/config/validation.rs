@@ -747,6 +747,7 @@ max_output_bytes = 65536
         AgentsConfig {
             agents: vec![
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("root".into()),
                     name: "Root".into(),
                     model: "main".into(),
@@ -755,6 +756,7 @@ max_output_bytes = 65536
                     default_prompt: "root prompt here".into(),
                 },
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("worker".into()),
                     name: "Worker".into(),
                     model: "fast".into(),
@@ -777,6 +779,7 @@ max_output_bytes = 65536
     ) -> AgentsConfig {
         AgentsConfig {
             agents: vec![AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId(id.into()),
                 name: name.into(),
                 model: model.into(),
@@ -1002,6 +1005,7 @@ deep = "ghost"
         let agents = AgentsConfig {
             agents: vec![
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("root".into()),
                     name: "Root".into(),
                     model: "main".into(),
@@ -1010,6 +1014,7 @@ deep = "ghost"
                     default_prompt: "p1".into(),
                 },
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("root".into()),
                     name: "Root Dupe".into(),
                     model: "fast".into(),
@@ -1036,6 +1041,7 @@ deep = "ghost"
         let agents = AgentsConfig {
             agents: vec![
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("a".into()),
                     name: "A".into(),
                     model: "main".into(),
@@ -1044,6 +1050,7 @@ deep = "ghost"
                     default_prompt: "p".into(),
                 },
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("b".into()),
                     name: "B".into(),
                     model: "fast".into(),
@@ -1388,6 +1395,7 @@ model = ""
         let agents = AgentsConfig {
             agents: vec![
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("root".into()),
                     name: "Root".into(),
                     model: "main".into(),
@@ -1396,6 +1404,7 @@ model = ""
                     default_prompt: "prompt here for testing".into(),
                 },
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("loop_a".into()),
                     name: "LoopA".into(),
                     model: "fast".into(),
@@ -1404,6 +1413,7 @@ model = ""
                     default_prompt: "prompt here for testing".into(),
                 },
                 AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: AgentId("loop_b".into()),
                     name: "LoopB".into(),
                     model: "fast".into(),

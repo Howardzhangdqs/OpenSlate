@@ -245,6 +245,7 @@ mod tests {
 
         let configs = vec![
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("root".into()),
                 name: "Root".into(),
                 model: "main".into(),
@@ -253,6 +254,7 @@ mod tests {
                 default_prompt: "".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("child-a".into()),
                 name: "Child A".into(),
                 model: "fast".into(),
@@ -261,6 +263,7 @@ mod tests {
                 default_prompt: "".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("child-b".into()),
                 name: "Child B".into(),
                 model: "fast".into(),

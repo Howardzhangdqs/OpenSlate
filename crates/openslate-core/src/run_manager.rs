@@ -308,6 +308,7 @@ max_output_bytes = 10_000
 
     fn test_agent_tree() -> AgentTree {
         let agents = vec![AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("root".into()),
             name: "Root Agent".into(),
             model: "main".into(),

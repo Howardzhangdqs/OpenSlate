@@ -646,6 +646,7 @@ fn agent_node_dto_from_tree() {
     use openslate_core::agent_tree::AgentTree;
     use openslate_core::types::{AgentConfig, AgentId};
     let cfg = |id: &str, children: Vec<&str>| AgentConfig {
+        hidden_tools: Vec::new(),
         id: AgentId(id.into()),
         name: format!("Agent-{id}"),
         model: "main".into(),

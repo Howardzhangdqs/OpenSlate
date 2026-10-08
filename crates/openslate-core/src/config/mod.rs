@@ -548,6 +548,9 @@ pub struct AgentFrontmatter {
     pub model: String,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// 工具隐藏名单（glob 可）：从生效集合中扣除（见 [`crate::types::AgentConfig::hidden_tools`]）。
+    #[serde(default)]
+    pub hidden_tools: Vec<String>,
     #[serde(default)]
     pub children: Vec<String>,
 }
@@ -620,6 +623,7 @@ pub fn parse_agent_markdown(content: &str, filename: &str) -> Result<AgentConfig
         model: fm.model,
         children,
         tools: fm.tools,
+        hidden_tools: fm.hidden_tools,
         default_prompt,
     })
 }
@@ -1653,7 +1657,16 @@ supports_vision = true
         assert_eq!(agent.model, "main");
         assert_eq!(agent.tools, vec!["bash", "read_file"]);
         assert!(agent.children.is_empty());
+        assert!(agent.hidden_tools.is_empty(), "无 hidden_tools = 空名单（行为不变）");
         assert_eq!(agent.default_prompt, "You are the root agent.");
+    }
+
+    #[test]
+    fn md_parse_hidden_tools() {
+        let md = "---\nname: Root\nmodel: main\ntools: [bash, read_file]\nhidden_tools:\n  - mcp_*\n  - termux_bash\n---\nBody.\n";
+        let agent = parse_agent_markdown(md, "root.md").expect("should parse");
+        assert_eq!(agent.tools, vec!["bash", "read_file"]);
+        assert_eq!(agent.hidden_tools, vec!["mcp_*", "termux_bash"]);
     }
 
     #[test]

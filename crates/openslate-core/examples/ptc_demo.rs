@@ -174,6 +174,7 @@ enabled = true
 
     // --- 单 agent 树 + 两个 mock 工具(一个平铺、一个命名空间) ---
     let agents = vec![AgentConfig {
+        hidden_tools: Vec::new(),
         id: AgentId("root".into()),
         name: "Root".into(),
         model: "main".into(),

@@ -92,6 +92,11 @@ pub struct AgentConfig {
     pub children: Vec<AgentId>,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// 工具隐藏名单（与 `tools` 同一套 glob 匹配：无 `*`/`?` 精确名，
+    /// 否则通配）。生效集合 =（`tools` 为空 → 全部注册工具；否则白名
+    /// 单匹配）减去 `hidden_tools` 匹配项。默认空 = 行为不变。
+    #[serde(default)]
+    pub hidden_tools: Vec<String>,
     pub default_prompt: String,
 }
 
@@ -296,6 +301,7 @@ mod tests {
     #[test]
     fn agent_config_serde_roundtrip() {
         let config = AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId::from("root"),
             name: "Root Agent".into(),
             model: "gpt-4".into(),

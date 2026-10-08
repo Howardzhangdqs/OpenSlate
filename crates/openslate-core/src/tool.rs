@@ -159,6 +159,36 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Get definitions for an agent's *effective* tool set: every registered
+    /// tool when `allow` is empty, else those matching an `allow` pattern —
+    /// minus every tool matching a `hidden` pattern.
+    ///
+    /// Both lists share the [`definitions_for`] matcher semantics (exact name
+    /// unless the pattern contains `*` / `?` glob metacharacters). This is
+    /// the single place where the `tools:` whitelist meets the
+    /// `hidden_tools:` hide-list, so the model-facing list (runner) and any
+    /// derived view cannot drift. Empty `hidden` is a no-op (backward
+    /// compatible). Returned order follows the registry's internal order.
+    ///
+    /// [`definitions_for`]: Self::definitions_for
+    pub fn definitions_visible(
+        &self,
+        allow: &[String],
+        hidden: &[String],
+    ) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(name, _)| {
+                let allowed =
+                    allow.is_empty() || allow.iter().any(|p| tool_name_matches(name, p));
+                allowed && !hidden.iter().any(|p| tool_name_matches(name, p))
+            })
+            .map(|(_, t)| t.to_definition())
+            .collect()
+    }
+
     /// List all registered tool names.
     pub fn tool_names(&self) -> Vec<String> {
         self.tools
@@ -328,6 +358,112 @@ pub fn create_audit_record(
         },
         duration_ms: output.duration_ms,
         truncated: output.status == ToolOutputStatus::Truncated,
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    /// Minimal tool stub: name doubles as description, no-op execute.
+    struct StubTool(&'static str);
+    #[async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            self.0
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
+            unreachable!("visibility tests never execute tools")
+        }
+    }
+
+    fn registry(names: &'static [&'static str]) -> ToolRegistry {
+        let reg = ToolRegistry::new();
+        for &n in names {
+            reg.register(StubTool(n));
+        }
+        reg
+    }
+
+    fn visible_names(reg: &ToolRegistry, allow: &[&str], hidden: &[&str]) -> Vec<String> {
+        let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
+        let hidden: Vec<String> = hidden.iter().map(|s| s.to_string()).collect();
+        let mut names: Vec<String> = reg
+            .definitions_visible(&allow, &hidden)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn empty_hidden_keeps_whitelist_behavior() {
+        let reg = registry(&["bash", "read_file", "list_dir", "mobile.ping"]);
+        // 白名单 + 空 hidden = 与 definitions_for 完全一致。
+        assert_eq!(
+            visible_names(&reg, &["bash", "read_file"], &[]),
+            ["bash", "read_file"]
+        );
+        // 空 allow + 空 hidden = 全部工具（旧行为不变）。
+        assert_eq!(
+            visible_names(&reg, &[], &[]),
+            ["bash", "list_dir", "mobile.ping", "read_file"]
+        );
+    }
+
+    #[test]
+    fn hidden_exact_name_filters() {
+        let reg = registry(&["bash", "read_file", "list_dir"]);
+        assert_eq!(
+            visible_names(&reg, &[], &["bash"]),
+            ["list_dir", "read_file"]
+        );
+    }
+
+    #[test]
+    fn hidden_glob_filters() {
+        let reg = registry(&["fs_read", "fs_write", "fs_list", "bash", "mobile.ping"]);
+        assert_eq!(visible_names(&reg, &[], &["fs_*"]), ["bash", "mobile.ping"]);
+        assert_eq!(
+            visible_names(&reg, &[], &["fs_????"]),
+            // `?` 恰好一个字符：fs_read/fs_list（fs_+4）被隐藏，
+            // fs_write（fs_+5）保留。
+            ["bash", "fs_write", "mobile.ping"]
+        );
+        assert_eq!(
+            visible_names(&reg, &[], &["mobile.?ing", "bash"]),
+            ["fs_list", "fs_read", "fs_write"]
+        );
+    }
+
+    #[test]
+    fn whitelist_plus_hidden_stack() {
+        let reg = registry(&["a_one", "a_two", "b_one", "c_one"]);
+        // 生效 = 白名单匹配 − hidden 匹配（两道过滤器叠加）。
+        assert_eq!(
+            visible_names(&reg, &["a_*", "b_*"], &["*_two", "b_one"]),
+            ["a_one"]
+        );
+    }
+
+    #[test]
+    fn hidden_applies_when_whitelist_empty() {
+        let reg = registry(&["bash", "read_file", "list_dir"]);
+        // tools 为空（= 全部暴露）时 hidden 仍生效。
+        assert_eq!(visible_names(&reg, &[], &["bash", "read_*"]), ["list_dir"]);
+    }
+
+    #[test]
+    fn hidden_all_yields_empty() {
+        let reg = registry(&["bash", "read_file"]);
+        assert!(visible_names(&reg, &[], &["*"]).is_empty());
     }
 }
 

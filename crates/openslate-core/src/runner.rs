@@ -394,9 +394,10 @@ impl<'a> AgentRunner<'a> {
     }
 
     /// Build the tool definitions exposed to a given agent: its `tools:`
-    /// whitelist (or all registered tools when the whitelist is empty) plus,
-    /// when the agent has children, the `call_agent` definitions that let the
-    /// model delegate sub-tasks.
+    /// whitelist (or all registered tools when the whitelist is empty)
+    /// minus its `hidden_tools:` hide-list matches, plus, when the agent
+    /// has children, the `call_agent` definitions that let the model
+    /// delegate sub-tasks.
     ///
     /// With PTC enabled, ptc-only tools are removed from the direct list and
     /// a `run_code` tool is appended when the agent has at least one
@@ -406,11 +407,12 @@ impl<'a> AgentRunner<'a> {
             Some(a) => a,
             None => return vec![],
         };
-        let mut defs = if agent.tools.is_empty() {
-            self.tool_registry.definitions()
-        } else {
-            self.tool_registry.definitions_for(&agent.tools)
-        };
+        // 生效集合 = tools 白名单（空 = 全部）减 hidden_tools（同一套
+        // glob matcher，见 ToolRegistry::definitions_visible）。默认
+        // hidden 为空 → 行为与旧版完全一致。
+        let mut defs = self
+            .tool_registry
+            .definitions_visible(&agent.tools, &agent.hidden_tools);
         if !agent.children.is_empty() {
             defs.extend(child_agent_definitions(&agent.children, self.agent_tree));
         }
@@ -450,7 +452,8 @@ impl<'a> AgentRunner<'a> {
 
     /// Tools the given agent may call from inside `run_code` — the PTC
     /// binding set (PTC_PLAN.md §3, 收口②): its `tools:` whitelist (or every
-    /// registered tool when the whitelist is empty) restricted to
+    /// registered tool when the whitelist is empty) minus its `hidden_tools:`
+    /// matches, restricted to
     /// ptc-callable modes, excluding `run_code` itself and `call_agent` (no
     /// recursive delegation from code; `call_agent` is not a registry tool,
     /// so the registry-derived list would exclude it anyway — the explicit
@@ -465,11 +468,11 @@ impl<'a> AgentRunner<'a> {
             Some(a) => a,
             None => return vec![],
         };
-        let mut defs = if agent.tools.is_empty() {
-            self.tool_registry.definitions()
-        } else {
-            self.tool_registry.definitions_for(&agent.tools)
-        };
+        // 与 tool_definitions_for 同一可见性口径：hidden 的工具不得经
+        // run_code 侧漏给模型（sandbox 绑定集一并扣除）。
+        let mut defs = self
+            .tool_registry
+            .definitions_visible(&agent.tools, &agent.hidden_tools);
         defs.retain(|d| {
             d.name != RUN_CODE_TOOL
                 && d.name != "call_agent"
@@ -1406,6 +1409,7 @@ model = "mock-fast"
 
     fn root_only_tree() -> AgentTree {
         let agents = vec![AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("root".into()),
             name: "Root".into(),
             model: "main".into(),
@@ -1420,6 +1424,7 @@ model = "mock-fast"
     fn root_child_tree() -> AgentTree {
         let agents = vec![
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("root".into()),
                 name: "Root".into(),
                 model: "main".into(),
@@ -1428,6 +1433,7 @@ model = "mock-fast"
                 default_prompt: "root prompt".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("child".into()),
                 name: "Child".into(),
                 model: "fast".into(),
@@ -1926,6 +1932,7 @@ output_price_per_mtok = 1.0
     fn root_child_grandchild_tree() -> AgentTree {
         let agents = vec![
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("root".into()),
                 name: "Root".into(),
                 model: "main".into(),
@@ -1934,6 +1941,7 @@ output_price_per_mtok = 1.0
                 default_prompt: "root".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("child".into()),
                 name: "Child".into(),
                 model: "main".into(),
@@ -1942,6 +1950,7 @@ output_price_per_mtok = 1.0
                 default_prompt: "child".into(),
             },
             AgentConfig {
+                hidden_tools: Vec::new(),
                 id: AgentId("grandchild".into()),
                 name: "Grandchild".into(),
                 model: "main".into(),

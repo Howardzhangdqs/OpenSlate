@@ -75,6 +75,7 @@ max_output_bytes = 10_000
 
 fn test_agent_tree(tools: Vec<String>) -> AgentTree {
     let agents = vec![AgentConfig {
+        hidden_tools: Vec::new(),
         id: AgentId("root".into()),
         name: "Root Agent".into(),
         model: "main".into(),
@@ -641,6 +642,7 @@ async fn integration_model_resolved() {
 fn two_agent_tree() -> AgentTree {
     let agents = vec![
         AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("root".into()),
             name: "Root".into(),
             model: "main".into(),
@@ -649,6 +651,7 @@ fn two_agent_tree() -> AgentTree {
             default_prompt: "You coordinate and delegate.".into(),
         },
         AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("child".into()),
             name: "Child".into(),
             model: "main".into(),

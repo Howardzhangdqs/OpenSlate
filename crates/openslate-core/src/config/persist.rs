@@ -497,6 +497,190 @@ fn write_env_file(env_path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// ── Agent markdown frontmatter（工具可见性页）────────────────────────────────
+
+/// Rewrite ONLY the `tools:` / `hidden_tools:` keys in an agent markdown
+/// file's YAML frontmatter, leaving every other byte — other frontmatter
+/// keys (order, spelling, comments), the closing `---`, and the whole
+/// markdown body — untouched.
+///
+/// - An existing key (whatever shape: dash list, inline `[a, b]`, scalar) is
+///   replaced wholesale by the new serialization: a 4-space-indented dash
+///   list, or `key: []` for an empty list (bootstrap `agents/root.md` style).
+/// - A missing `hidden_tools` key is inserted right after `tools`; a missing
+///   `tools` key is inserted at the top of the frontmatter.
+/// - List items are written unquoted when they match the plain-scalar-safe
+///   tool-name/pattern charset, double-quoted otherwise (a bare `*glob`/`"`
+///   would corrupt the YAML).
+/// - A file without (or with unclosed) frontmatter is an error — this helper
+///   never invents structure, it edits an existing agent file.
+/// - Idempotent: calling it twice with the same arguments yields the same
+///   file.
+///
+/// Callers own the reference-integrity questions (unknown tool names are
+/// persisted as-is; the runner simply matches nothing for them).
+pub fn set_agent_tool_lists(path: &Path, tools: &[String], hidden_tools: &[String]) -> Result<()> {
+    for (kind, list) in [("tools", tools), ("hidden_tools", hidden_tools)] {
+        for item in list {
+            if item.contains('\n') || item.contains('\r') {
+                anyhow::bail!("{kind} entry must be a single line: {item:?}");
+            }
+        }
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read agent file '{}'", path.display()))?;
+
+    // Same frontmatter split as `parse_agent_markdown` (BOM tolerated,
+    // preserved on write-back).
+    let (bom, rest) = match content.strip_prefix('\u{feff}') {
+        Some(r) => ("\u{feff}", r),
+        None => ("", content.as_str()),
+    };
+    let after_open = rest.strip_prefix("---").ok_or_else(|| {
+        anyhow::anyhow!("agent file '{}': no frontmatter delimiter", path.display())
+    })?;
+    let close = after_open.find("\n---").ok_or_else(|| {
+        anyhow::anyhow!("agent file '{}': unclosed frontmatter (missing closing ---)", path.display())
+    })?;
+    let frontmatter = &after_open[..close];
+    let body = &after_open[close + "\n---".len()..];
+
+    let lines: Vec<&str> = frontmatter.split_inclusive('\n').collect();
+    // Locate each top-level key block: the key line plus every following
+    // indented / blank line (nested list items, nested tables). A column-0
+    // comment stops the block so comments above the next key survive.
+    let mut blocks: Vec<(&str, usize, usize)> = Vec::new(); // (key, start, end_exclusive)
+    let mut i = 0usize;
+    while i < lines.len() {
+        if let Some(key) = top_level_key(lines[i]) {
+            let start = i;
+            i += 1;
+            while i < lines.len() {
+                let line = lines[i].trim_end_matches(['\n', '\r']);
+                if line.starts_with(' ')
+                    || line.starts_with('\t')
+                    || line.is_empty()
+                    || line.starts_with("- ")
+                    || line == "-"
+                {
+                    // 缩进续行 / 空行 / 列 0 序列项（YAML 允许列表与父键同
+                    // 缩进——`tools:\n- a\n- b`）。列 0 注释不属于块（保留
+                    // 在原位，通常是下一个键的说明）。
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push((key, start, i));
+        } else {
+            i += 1;
+        }
+    }
+
+    let tools_block = yaml_key_block("tools", tools);
+    let hidden_block = yaml_key_block("hidden_tools", hidden_tools);
+
+    // Ranges to drop = the old tools/hidden blocks; the fresh pair is written
+    // at the start of the first dropped block so `hidden_tools` always ends
+    // up right after `tools`. Lines outside every block (leading blank line,
+    // column-0 comments between keys) are copied verbatim.
+    let drop_ranges: Vec<(usize, usize)> = blocks
+        .iter()
+        .filter(|(k, ..)| *k == "tools" || *k == "hidden_tools")
+        .map(|(_, s, e)| (*s, *e))
+        .collect();
+    let insert_at = drop_ranges.first().map(|(s, _)| *s).or_else(|| {
+        // Neither key existed: anchor at the first recognized key (keeping
+        // any leading blank/comment lines in place), or the very top when
+        // the frontmatter holds no keys at all.
+        blocks.first().map(|(_, s, _)| *s)
+    });
+
+    let mut out =
+        String::with_capacity(frontmatter.len() + tools_block.len() + hidden_block.len());
+    for (i, line) in lines.iter().enumerate() {
+        if insert_at == Some(i) {
+            out.push_str(&tools_block);
+            out.push_str(&hidden_block);
+        }
+        if !drop_ranges.iter().any(|(s, e)| *s <= i && i < *e) {
+            out.push_str(line);
+        }
+    }
+    if insert_at.is_none() {
+        // Keyless frontmatter: the pair becomes its whole content.
+        out.push_str(&tools_block);
+        out.push_str(&hidden_block);
+    }
+
+    let mut file = String::with_capacity(bom.len() + 4 + out.len() + 4 + body.len());
+    file.push_str(bom);
+    file.push_str("---");
+    file.push_str(&out);
+    file.push_str("\n---");
+    file.push_str(body);
+    fs::write(path, file)
+        .with_context(|| format!("Failed to write agent file '{}'", path.display()))
+}
+
+/// Top-level YAML key of a frontmatter line (`name: …`), or `None` for
+/// indented continuation lines, comments, blank lines, and anything that is
+/// not a `key:` at column 0.
+fn top_level_key(line: &str) -> Option<&str> {
+    let bare = line.trim_end_matches(['\n', '\r']);
+    let first = bare.chars().next()?;
+    if first.is_whitespace() || first == '#' || first == '-' {
+        return None;
+    }
+    let colon = bare.find(':')?;
+    let key = &bare[..colon];
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(key)
+}
+
+/// Serialize one frontmatter key as a dash list (`key:\n    - item`) or an
+/// empty inline list (`key: []`), bootstrap-`root.md` style.
+fn yaml_key_block(key: &str, items: &[String]) -> String {
+    if items.is_empty() {
+        return format!("{key}: []\n");
+    }
+    let mut out = format!("{key}:\n");
+    for item in items {
+        out.push_str("    - ");
+        out.push_str(&yaml_scalar(item));
+        out.push('\n');
+    }
+    out
+}
+
+/// Plain scalar when the value is unambiguous YAML in a list-item position
+/// (tool names and most globs), double-quoted otherwise — a bare `*alias`,
+/// `?`, `"` etc. would corrupt the document.
+fn yaml_scalar(value: &str) -> String {
+    let plain_safe = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '?' | '*' | '/');
+    let first_ok = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    if first_ok && !value.is_empty() && value.chars().all(plain_safe) {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1042,5 +1226,155 @@ mod tests {
         assert!(upsert_env_key(dir.path(), "", "v").is_err());
         assert!(upsert_env_key(dir.path(), "A=B", "v").is_err());
         assert!(upsert_env_key(dir.path(), "A", "line1\nline2").is_err());
+    }
+
+    // ── set_agent_tool_lists（agent md frontmatter 外科手术）───────────
+
+    // 注意：字符串续行（`\`+换行）会吞掉下一行前导空格，列表缩进必须
+    // 用原始字符串字面量保真。
+    const ROOT_MD: &str = r#"---
+id: root
+name: OpenSlate
+# 主对话模型
+model: main
+tools:
+    - mobile.ping
+    - bash
+children: []
+---
+You are a helpful AI assistant.
+"#;
+
+    fn agent_file() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("root.md");
+        fs::write(&path, ROOT_MD).expect("seed agent md");
+        (dir, path)
+    }
+
+    #[test]
+    fn set_agent_tool_lists_rewrites_only_the_two_keys() {
+        let (dir, path) = agent_file();
+        set_agent_tool_lists(
+            &path,
+            &["mobile.ping".into(), "bash".into()],
+            &["termux_bash".into()],
+        )
+        .expect("rewrite");
+
+        let content = text_at(&path);
+        // 其余 frontmatter 键（含注释）与正文逐字节保留。
+        assert!(content.contains("id: root\n"));
+        assert!(content.contains("# 主对话模型\nmodel: main\n"));
+        assert!(content.contains("children: []\n"));
+        assert!(content.ends_with("---\nYou are a helpful AI assistant.\n"));
+        // 两个键按新值重写，hidden_tools 紧随 tools。
+        assert!(content.contains("tools:\n    - mobile.ping\n    - bash\n"));
+        assert!(content.contains("hidden_tools:\n    - termux_bash\n"));
+        assert_eq!(content.matches("tools:").count(), 2); // tools + hidden_tools
+
+        // 回读语义正确（markdown 解析器视角）。
+        let agent = super::super::parse_agent_markdown(&content, "root.md").expect("reparse");
+        assert_eq!(agent.tools, ["mobile.ping", "bash"]);
+        assert_eq!(agent.hidden_tools, ["termux_bash"]);
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_tool_lists_is_idempotent() {
+        let (dir, path) = agent_file();
+        set_agent_tool_lists(&path, &["bash".into()], &["mcp_*".into()]).expect("first");
+        let once = text_at(&path);
+        set_agent_tool_lists(&path, &["bash".into()], &["mcp_*".into()]).expect("second");
+        assert_eq!(once, text_at(&path), "second call must not change the file");
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_tool_lists_empty_list_writes_inline_empty() {
+        let (dir, path) = agent_file();
+        set_agent_tool_lists(&path, &[], &[]).expect("rewrite");
+        let content = text_at(&path);
+        assert!(content.contains("tools: []\n"));
+        assert!(content.contains("hidden_tools: []\n"));
+        let agent = super::super::parse_agent_markdown(&content, "root.md").expect("reparse");
+        assert!(agent.tools.is_empty());
+        assert!(agent.hidden_tools.is_empty());
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_tool_lists_quotes_glob_only_patterns() {
+        let (dir, path) = agent_file();
+        // 前导 `*` 的裸模式在 YAML 里是 alias 语法，必须引号包裹。
+        set_agent_tool_lists(&path, &["*".into(), "fs_*".into()], &["*_echo".into()])
+            .expect("rewrite");
+        let content = text_at(&path);
+        assert!(content.contains("    - \"*\"\n"));
+        assert!(content.contains("    - fs_*\n"));
+        assert!(content.contains("    - \"*_echo\"\n"));
+        let agent = super::super::parse_agent_markdown(&content, "root.md").expect("reparse");
+        assert_eq!(agent.tools, ["*", "fs_*"]);
+        assert_eq!(agent.hidden_tools, ["*_echo"]);
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_tool_lists_relocates_stray_hidden_tools() {
+        // hidden_tools 在文件别处（甚至 tools 之前）也会被收编到 tools 之后。
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("root.md");
+        fs::write(
+            &path,
+            "---\nhidden_tools:\n    - old\nname: OpenSlate\nmodel: main\ntools: [bash]\n---\nbody\n",
+        )
+        .expect("seed");
+
+        set_agent_tool_lists(&path, &["read_file".into()], &[]).expect("rewrite");
+
+        let content = text_at(&path);
+        let tools_at = content.find("tools:\n    - read_file\n").expect("fresh tools");
+        let hidden_at = content
+            .find("hidden_tools: []\n")
+            .expect("fresh hidden follows tools");
+        assert!(hidden_at > tools_at);
+        assert_eq!(content.matches("hidden_tools").count(), 1);
+        assert!(content.ends_with("---\nbody\n"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_tool_lists_inserts_into_file_without_the_keys() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("child.md");
+        fs::write(&path, "---\nname: Child\nmodel: fast\n---\nDo things.\n").expect("seed");
+
+        set_agent_tool_lists(&path, &["bash".into()], &["mcp_fs_*".into()]).expect("rewrite");
+
+        let agent =
+            super::super::parse_agent_markdown(&text_at(&path), "child.md").expect("reparse");
+        assert_eq!(agent.tools, ["bash"]);
+        assert_eq!(agent.hidden_tools, ["mcp_fs_*"]);
+        assert!(text_at(&path).ends_with("---\nDo things.\n"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_tool_lists_rejects_bad_input() {
+        let (dir, path) = agent_file();
+        // 无 frontmatter / 未闭合 frontmatter → 报错不动文件。
+        let bare = dir.path().join("bare.md");
+        fs::write(&bare, "no frontmatter here\n").expect("seed");
+        assert!(set_agent_tool_lists(&bare, &[], &[]).is_err());
+
+        let unclosed = dir.path().join("unclosed.md");
+        fs::write(&unclosed, "---\nname: X\n").expect("seed");
+        assert!(set_agent_tool_lists(&unclosed, &[], &[]).is_err());
+
+        // 多行条目 → 拒绝（会破坏 YAML 结构）。
+        assert!(set_agent_tool_lists(&path, &["a\nb".into()], &[]).is_err());
+
+        // 不存在的文件 → 报错。
+        assert!(set_agent_tool_lists(&dir.path().join("nope.md"), &[], &[]).is_err());
     }
 }

@@ -1195,6 +1195,7 @@ path = "{}"
             let config = parse_openslate_toml(toml).expect("parse");
             let agents = AgentsConfig {
                 agents: vec![openslate_core::types::AgentConfig {
+                    hidden_tools: Vec::new(),
                     id: openslate_core::types::AgentId("root".into()),
                     name: "Root".into(),
                     model: "main".into(),

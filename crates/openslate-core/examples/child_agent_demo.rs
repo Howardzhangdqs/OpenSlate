@@ -110,6 +110,7 @@ model = "fast-model"
     // --- 静态 agent 树:root → researcher → verifier ---
     let agents = vec![
         AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("root".into()),
             name: "Root 协调者".into(),
             model: "main".into(),
@@ -118,6 +119,7 @@ model = "fast-model"
             default_prompt: "你是根协调者,把任务委派给 researcher".into(),
         },
         AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("researcher".into()),
             name: "Researcher 研究员".into(),
             model: "fast".into(),
@@ -126,6 +128,7 @@ model = "fast-model"
             default_prompt: "你是研究员,委托 verifier 验证后汇总".into(),
         },
         AgentConfig {
+            hidden_tools: Vec::new(),
             id: AgentId("verifier".into()),
             name: "Verifier 验证员".into(),
             model: "fast".into(),

@@ -1012,6 +1012,7 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, haz
             hazeState = hazeState,
             items = items,
             labelFontFamily = MonoFont,
+            alignEnd = true,
             onSelect = { RuntimeBridge.setCapability(cap, it.value) },
         )
     }

@@ -100,14 +100,22 @@ private val GlassMenuBlurRadius = 18.dp
  * 锚点定位：横向左缘对齐锚点并夹取到窗口内；纵向优先展开在锚点下方，
  * 放不下翻转到上方（composer 贴屏幕底部 → 自动向上开），再夹取兜底。
  */
-private class AnchorFlipPositionProvider(private val marginPx: Int) : PopupPositionProvider {
+private class AnchorFlipPositionProvider(
+    private val marginPx: Int,
+    private val alignEnd: Boolean = false,
+) : PopupPositionProvider {
     override fun calculatePosition(
         anchorBounds: IntRect,
         windowSize: IntSize,
         layoutDirection: LayoutDirection,
         popupContentSize: IntSize,
     ): IntOffset {
-        val x = anchorBounds.left.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
+        // alignEnd：弹层右缘对锚点右缘（值控件贴行右缘时弹层从右侧展开）；
+        // 默认 Start：弹层左缘对锚点左缘。超窗宽一律收进窗口内。
+        val x = (
+            if (alignEnd) anchorBounds.right - popupContentSize.width
+            else anchorBounds.left
+            ).coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
         val yBelow = anchorBounds.bottom + marginPx
         val fitsBelow = yBelow + popupContentSize.height <= windowSize.height - marginPx
         val y = if (fitsBelow) yBelow else anchorBounds.top - marginPx - popupContentSize.height
@@ -154,6 +162,7 @@ internal fun GlassDropdownMenu(
     shape: Shape = RoundedCornerShape(16.dp),
     maxHeight: Dp = GlassMenuMaxHeight,
     labelFontFamily: FontFamily? = null,
+    alignEnd: Boolean = false,
     onSelect: (GlassDropdownItem) -> Unit,
 ) {
     // 退场动画期间保持 Popup 组合（currentState 在退场结束前仍为 true）。
@@ -170,7 +179,7 @@ internal fun GlassDropdownMenu(
                 dismissOnBackPress = true,
                 dismissOnClickOutside = true,
             ),
-            popupPositionProvider = AnchorFlipPositionProvider(marginPx),
+            popupPositionProvider = AnchorFlipPositionProvider(marginPx, alignEnd),
         ) {
             Box(
                 modifier = modifier

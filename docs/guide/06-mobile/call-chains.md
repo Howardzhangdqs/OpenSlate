@@ -50,20 +50,22 @@ ChatScreen Composer
 
 ## 3. host call 往返（模型调 Android 能力）
 
-以模型调用 `termux_bash` 工具为例：
+以模型调用 `termux_bash` 工具为例（**HostTool 兜底路径**；MCP 接管路径见 §3.1）：
 
 ```text
 模型 tool call
   → 引擎在注册表命中 HostTool（termux_bash / mobile.ping / …）
-  → HostTool::execute (hostcall.rs:176)
-  → HostCallRouter::call("termux_bash", args) (hostcall.rs:71)
+  → HostTool::execute (hostcall.rs)
+  → HostCallRouter::call("termux_bash", args) (hostcall.rs)
       next_id.fetch_add（AtomicU64，从 1 起）
       pending.insert(id, oneshot::Sender)
       emit {"type":"host_call_requested","id":42,"tool":"termux_bash","args":{"command":"…"}}
   → （经 §2 下行链路送达 Kotlin）
   → RuntimeBridge.handleEvent → handleHostCall
       ├ "mobile.ping"            → 自动应答 resolveHostCall(id, true, '{"pong":true,…}')
-      └ "termux.run"/"termux_bash" → TermuxExec.termux(ctx, command)
+      └ "termux.run"/"termux_bash"/"bash" → TermuxExec.termux(ctx, command)
+            （"bash" = 仅选 termux 后端时 HostTool 顶替名；输出按实际
+              注册名配对 tool_end）
             Intent(com.termux.RUN_COMMAND) → Termux RunCommandService（background runner）
             + RUN_COMMAND_PENDING_INTENT → PendingIntent.getBroadcast(FLAG_MUTABLE)
               → 本 App TermuxResultReceiver
@@ -77,11 +79,52 @@ ChatScreen Composer
 
 | 层 | 上限 | 行为 |
 |----|------|------|
-| Rust `HOST_CALL_TIMEOUT`（hostcall.rs:48） | **120s** | 超时移除 pending，工具报错（回合可继续，不是 runtime 失败） |
+| Rust `HOST_CALL_TIMEOUT`（hostcall.rs） | **120s** | 超时移除 pending，工具报错（回合可继续，不是 runtime 失败） |
 | Kotlin Termux 结果（TermuxExec RESULT_TIMEOUT_MS） | **90s** | deferred 超时 → resolveHostCall(false, "timeout…") |
 | `shutdown()` | — | `fail_all("runtime shutting down")`：全部在途立刻失败 + 审批全拒 |
 
 重复/迟到应答：`resolve` 对不在途的 id 返回 false（超时已清/已答/关停），幂等安全。同回合同名工具多次调用的输出经 Kotlin `pendingToolOutputs`（工具名 → deque）按序配对。
+
+### 3.1 termux bash 双路径（MCP 接管 + HostTool 兜底）
+
+`termux_bash` 的执行路径由**降级阶梯**决定（MCP 优先，RUN_COMMAND 兜底）：
+
+```text
+主路径（MCP 接管，host 在线时）
+  模型 tool call termux_bash
+  → 注册表命中 McpTool（openslate-core mcp.rs；host 内置 BashServer
+    经聚合 host 以裸名 bash 列出，App 侧按 [mcp].builtin_tool_name_template
+    （默认 {prefix}_{tool}）展开注册为 termux_bash）
+  → MCP over HTTP（127.0.0.1:8765，Authorization: Bearer token）
+  → host 路由裸名 → BashServer 在 Termux 内执行（$PREFIX/bin/bash）
+  → CallToolResult → ToolOutput（连接失败 = ExecutionError 带工具名，
+    回合可继续；运行期 host 死亡不做工具热切换——工具列表已进上下文，
+    修复入口 = 设置页「重载 MCP」/ 健康态门控自动触发 reloadMcpServers）
+
+兜底路径（HostTool 壳，host 缺席时）
+  即 §3 的 host call 往返（RUN_COMMAND Intent 逐命令桥接）
+```
+
+**接管/兜底的交接只在三个选择点发生**（统一判定谓词
+`exec::mcp_owned_bash_names`：MCP 名册 ∩ builtin 模板展开名，另加
+名册 ∩ bash 历史名的防误杀防线；见 openslate-mobile.md §7）：
+
+| 选择点 | 位置 | 语义 |
+|--------|------|------|
+| 装配期 | `create_with`（runtime.rs） | assemble_state 注册外部 MCP 后重算：MCP 已接管的名字 HostTool/native 让位（不注册、不清理） |
+| `reload_mcp` | runtime.rs | **先让位再 swap**：新名册含 bash 域名而 host bash 工具正占着 → 先卸载让位再 try_register（修掉撞名整体回滚死锁）；swap 成功后重算（接管保持 / MCP 缺席回装兜底）；回滚/全败路径让位的工具原样装回 |
+| `set_exec_backends` | runtime.rs | 切后端前重算：MCP 已接管的名字不被 unregister/顶替（修误杀） |
+
+白名单兼容：bootstrap 默认 root.md 的 `tools:` 白名单（`mobile.ping` /
+`bash` / `termux_bash`）**零变动**——两条路径共用这两个名字，历史
+配置免迁移；host 新增的其余裸名工具（read_file / write_file /
+edit_file）对模型是 opt-in（root.md 不含即不可见）。
+
+**展示 delta（纯展示级，可接受）**：HostTool 兜底形态的 `termux_bash`
+名与 MCP 接管形态同名，Kotlin 侧 builtin 模板正则无法区分归属——
+工具管理页/状态页把它分组为 MCP（`termux` 组）；PTC namespace 上 MCP
+接管后从顶层工具变为 `tools.termux.bash` 组（server_alias = 前缀
+termux），HostTool 兜底形态保持顶层。
 
 ## 4. 生命周期
 

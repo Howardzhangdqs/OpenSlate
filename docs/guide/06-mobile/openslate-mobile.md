@@ -29,7 +29,7 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/bootstrap.rs` | 396 | `MobilePaths` | 宿主注入的 4 个路径；首启目录脚手架 + 默认配置；DB 路径归位 |
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
 | `src/hostcall.rs` | 310 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底 |
-| `src/exec.rs` | 605 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`register_bash_tools` | bash 工具后端多选（native / termux）+ 进程内 shell 工具 |
+| `src/exec.rs` | 857 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具 + MCP 接管判定（见 §7.1） |
 | `src/provider.rs` | 88 | `mobile_provider_factory`、`MobileSecrets` | provider 工厂：内存 key 注入 + env 兜底 |
 | `src/registry.rs` | 541 | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
@@ -72,7 +72,7 @@ pub fn set_mcp_host_token(token: &str) {
 8. `RegistryStore::new(&paths.config_dir)`；
 9. 构建 tokio runtime：**multi_thread、worker_threads=2、线程名 `openslate-mobile`**（runtime.rs:133-138）；
 10. `rt.block_on(assemble_state(...))`（见 §3.6）；
-11. 从 state 取出运行期 `ToolRegistry` → `register_bash_tools(默认 native-only)`；
+11. 从 state 取出运行期 `ToolRegistry` → **重算 MCP bash 接管**（统一谓词，MCP 已接管的名字 HostTool/native 让位）→ `register_bash_tools(默认 native-only, mcp_owned)`；
 12. `emit_snapshot()` —— **create 即握手**：进程内单客户端（`MOBILE_CONN_ID=1`），创建即推首份 snapshot。
 
 ### 3.3 各方法语义（含行号）
@@ -84,7 +84,7 @@ pub fn set_mcp_host_token(token: &str) {
   - `Hello`（runtime.rs:199-210）：`proto != PROTOCOL_VERSION` → 广播 `proto_mismatch` 错误；匹配则补发 snapshot；
   - 其余消息：从 `Mutex<Option<Runtime>>` 借 `handle()` clone 后 `spawn`（不移动 runtime 本体），`session_dispatch::dispatch(&state, MOBILE_CONN_ID, msg).await`。
 - **`set_api_key(provider, value)`**（runtime.rs:228-230）：`MobileSecrets.set`（内存 map）。
-- **`set_exec_backends(backends_csv)`**（runtime.rs:235-244）：`ExecSelection::parse_csv().normalized()` → 存 `ExecSelectionCell` → `register_bash_tools` 热重注册。
+- **`set_exec_backends(backends_csv)`**（runtime.rs）：`ExecSelection::parse_csv().normalized()` → 存 `ExecSelectionCell` → 重算 MCP bash 接管（统一谓词）→ `register_bash_tools` 热重注册（MCP 已接管的名字让位，见 §7.1）。
 - **`list_tools_json()`**（runtime.rs:253-275）：全部已注册工具，按 name 排序的 JSON 数组；`input_schema` 原样透传（无 schema 恒为 `{}`，键恒存在）。
 - **`get_agent_tool_visibility_json()`**（runtime.rs:280-287）：读 root agent frontmatter 的 `{"tools":[…],"hidden_tools":[…]}`（含 glob，保持落盘顺序）。
 - **`set_agent_tool_visibility_json(tools, hidden)`**（runtime.rs:295-355）：①定位 root md（frontmatter `id:` 优先，`<id>.md` 文件名兜底，`find_agent_markdown` runtime.rs:942-970）→ ②外科手术式改写 frontmatter（`openslate_core::config::persist::set_agent_tool_lists`，其余字段与正文逐字节保留）→ ③重装 agent 树 + 热替换（manager 在家就换；回合进行中改 `inner.agent_tree`，引擎回收时自动对齐）。重装失败不回滚磁盘。下一回合即按新可见性过滤，无需重启。
@@ -213,9 +213,9 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 - `fail_all(reason)`（hostcall.rs:126-134）：关停兜底，drain 全部 pending 立刻失败（引擎解栈）。
 - `HostTool`（hostcall.rs:139-196）：由宿主执行的 `Tool` 壳——name/description/schema 进注册表，execute 转发 router；Err 也返回 `Ok(ToolOutput{status: Error})`（工具失败，不炸回合）。
 
-## 7. `exec.rs` 详解（bash 后端多选）
+## 7. `exec.rs` 详解（bash 后端多选 × MCP 接管）
 
-命名固定、变化的是注册与否（未选中的名字直接从注册表注销，模型不可见；运行中途切换时旧名字调用得到 NotFound，模型可自纠）：
+**host 侧命名矩阵**（固定、变化的是注册与否；未选中的名字直接从注册表注销，模型不可见；运行中途切换时旧名字调用得到 NotFound，模型可自纠）：
 
 | 多选 | `bash` | `termux_bash` |
 |------|--------|---------------|
@@ -224,10 +224,32 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 | 双选 | native | termux（HostTool 壳） |
 | 全不选 | 不注册 | 不注册（bash 能力整体下线，`normalized()` 恒等、**不自动回退**） |
 
-- 常量（exec.rs:29-42）：`DEFAULT_TIMEOUT_MS = 30_000`、`MAX_TIMEOUT_MS = 120_000`（调用方可指定，超出 clamp）、`MAX_OUTPUT_BYTES = 64KiB`（超限截断保头尾）、`KEEP_BYTES = 24KiB`；`BASH_TOOL="bash"`、`TERMUX_BASH_TOOL="termux_bash"`；`ALL_BASH_NAMES` 还含历史名 `"shell.run"` / `"termux.run"`（切换时统一清理）。
+- 常量（exec.rs）：`DEFAULT_TIMEOUT_MS = 30_000`、`MAX_TIMEOUT_MS = 120_000`（调用方可指定，超出 clamp）、`MAX_OUTPUT_BYTES = 64KiB`（超限截断保头尾）、`KEEP_BYTES = 24KiB`；`BASH_TOOL="bash"`、`TERMUX_BASH_TOOL="termux_bash"`；`ALL_BASH_NAMES`（pub）还含历史名 `"shell.run"` / `"termux.run"`（切换时统一清理；reload 的让位判定按它界定「bash 工具域」）。
 - `ExecSelection`（位标志 struct）+ `parse_csv`（未知值忽略，全未知 = 空）+ `ExecSelectionCell`（`Arc<AtomicU8>` 存 bits，FFI `set_exec_backends` 热更新）。
-- `register_bash_tools(registry, sel, workspace, router)`（exec.rs:106-143）：先 unregister 全部旧名字，再按需注册——native 注册 `NativeShellTool`；termux 注册 `HostTool`（描述里告知模型 Termux 有完整 coreutils/apt/python，输出超 ~8KB 截断）。
-- `NativeShellTool`（exec.rs:150-304）：进程内 shell，cwd 固定 workspace_dir；**Android 上必须用绝对路径 `/system/bin/sh`**（App 进程 PATH 不含它，exec.rs:307-314；desktop 测试回退 `/bin/sh`）；`kill_on_drop(true)`；stdout/stderr **并发读管道 + wait**（子进程输出超管道缓冲不并发即死锁）；超时杀进程后还有 **200ms 宽限**收敛已缓冲输出；环境变量**脱敏继承**——`SENSITIVE_ENV_MARKERS`（API_KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/PRIVATE_KEY，子串匹配大写）命中的变量 `env_remove`（模型可经 `env` 读到继承变量，绝不下发敏感命名）；输出格式 `exit_code: N\n\n--- stdout ---\n…\n--- stderr ---\n…`（与桌面 builtin shell 一致），截断按 UTF-8 字符边界切。
+- `register_bash_tools(registry, sel, workspace, router, mcp_owned)`：先清理全部旧名字（**MCP 已接管的名字除外**），再按需注册——native 注册 `NativeShellTool`；termux 注册 `HostTool`（描述里告知模型 Termux 有完整 coreutils/apt/python，输出超 ~8KB 截断）。`mcp_owned` 见下。
+- `NativeShellTool`（exec.rs）：进程内 shell，cwd 固定 workspace_dir；**Android 上必须用绝对路径 `/system/bin/sh`**（App 进程 PATH 不含它；desktop 测试回退 `/bin/sh`）；`kill_on_drop(true)`；stdout/stderr **并发读管道 + wait**（子进程输出超管道缓冲不并发即死锁）；超时杀进程后还有 **200ms 宽限**收敛已缓冲输出；环境变量**脱敏继承**——`SENSITIVE_ENV_MARKERS`（API_KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/PRIVATE_KEY，子串匹配大写）命中的变量 `env_remove`（模型可经 `env` 读到继承变量，绝不下发敏感命名）；输出格式 `exit_code: N\n\n--- stdout ---\n…\n--- stderr ---\n…`（与桌面 builtin shell 一致），截断按 UTF-8 字符边界切。
+
+### 7.1 MCP 接管（termux bash 降级阶梯的 host 侧半边）
+
+MCP 聚合 host 在线时，其内置 BashServer 以裸名 `bash` 列工具，经
+`[mcp].builtin_tool_name_template`（默认 `{prefix}_{tool}`，core
+`McpConfig::builtin_template_or_default()` 接缝）展开注册（默认 →
+`termux_bash`）。统一判定谓词（exec.rs，pub）：
+
+- `mcp_bash_expanded_names(&McpConfig)`：builtin 模板按各 server 键展开裸名 `bash` 的候选名（**不硬编码 `termux_bash` 字面**——用户改小模板后展开名随之变化）。
+- `mcp_owned_bash_names(roster, &McpConfig)`：MCP 名册 ∩ 展开名，**并上**名册 ∩ `ALL_BASH_NAMES`（防「模板已改、名册还是旧模板注册的」不一致窗口误杀）。非空 = MCP 接管：HostTool/native 对这些名字让位（`register_bash_tools` 不清理、不注册）；为空 = HostTool/native 兜底。
+
+三个选择点（runtime.rs）都先经谓词重算：
+
+| 选择点 | 行为 |
+|--------|------|
+| 装配期（`create_with`） | assemble_state 注册外部 MCP 后重算 → `register_bash_tools(…, mcp_owned)` 让位 |
+| `reload_mcp` | **先让位再 swap**：新名册含 bash 域名且注册表正被 host bash 工具占着 → 备份 Arc 后先卸载，再 try_register（修掉撞名整体回滚死锁——否则 MCP 永远接管不了）；swap 成功后重算（接管保持 / MCP 缺席 HostTool 回装兜底）；撞真冲突（bash 域外，如 `mobile.ping`）回滚时让位的工具原样装回；全败保旧路径注册表不动 → 兜底天然在场 |
+| `set_exec_backends` | 切后端前重算（名册 = `mcp_tool_names` 快照，模板读最新落盘）——修掉旧实现「切后端 = 无条件 unregister 全部 bash 名」对 MCP bash 工具的误杀 |
+
+运行期 host 死亡**不做工具热切换**（模型工具列表已进上下文）：`McpTool::execute` 失败语义 = `ExecutionError` 带工具名（回合可继续），修复入口是显式 `reload_mcp`。接管/兜底的交接只在上述三个选择点发生。
+
+termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`（RUN_COMMAND 兜底），MCP 注册名 = builtin 模板展开（默认 `termux_bash`、自定义如 `{prefix}.{tool}` → `termux.bash`）——白名单 `bash` / `termux_bash` 两者在默认模板下都有实体，历史配置零变动。
 
 ## 8. `provider.rs` 详解（secret 注入）
 
@@ -242,7 +264,8 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 ## 10. 测试
 
 - 集成测试 `crates/openslate-mobile/tests/runtime_flow.rs`（desktop 可跑，无 Android 依赖）：`mobile_runtime_closed_loop_streaming`（scripted provider 流式回包闭环）、`mobile_runtime_host_call_roundtrip`（信封往返 + resolve）、`mobile_runtime_hello_version_check`（版本不匹配报错）、`mobile_runtime_shutdown_rejects_send`、`mobile_runtime_tool_visibility_roundtrip`。harness：`ScriptedProvider`（脚本化 `ModelStreamEvent` 流）+ `Collector`（事件采集 + `wait_for_count` 按类型计数等待）。
-- 单元测试在各模块 `#[cfg(test)] mod tests`：runtime 生命周期 / 安全守卫（触达私有状态；DB 校验经独立 scratch 连接）、hostcall 四条路径（roundtrip/error/timeout/fail_all）、exec（注册矩阵 / 热切换 / native 执行 / 截断 / 脱敏）、bootstrap（幂等 / realign 四场景）、provider（set/get 往返）。
+- 单元测试在各模块 `#[cfg(test)] mod tests`：runtime 生命周期 / 安全守卫（触达私有状态；DB 校验经独立 scratch 连接）、hostcall 四条路径（roundtrip/error/timeout/fail_all）、exec（注册矩阵 / 热切换 / native 执行 / 截断 / 脱敏 / MCP 接管判定与让位）、bootstrap（幂等 / realign 四场景）、provider（set/get 往返）。
+- 降级阶梯（runtime tests，手写 std::net MCP HTTP 挡板同 app wiring 集成测试模式）：`set_exec_backends` 热切换不误杀 MCP bash 工具、HostTool 在场 reload 升级接管（不撞名回滚）、reload 全败兜底在场、reload 真冲突回滚装回让位工具、termux-only 命名矩阵（默认 / 自定义 builtin 模板，证明不硬编码）、builtin 模板 setter（校验 + 落盘 + 空串删键）。
 - 跑法：`cargo test -p openslate-mobile`。
 
 ## 11. 接手检查清单

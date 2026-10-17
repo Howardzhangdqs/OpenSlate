@@ -12,8 +12,15 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Termux RUN_COMMAND 通道精确诊断 + 自动拉起。
  *
+ * termux bash 降级阶梯中的**兜底路径**：MCP 聚合 host（在线时 bash 经
+ * MCP over HTTP 执行，见 McpHostManager / Rust 侧 builtin 小模板展开）
+ * 是主路径；host 未安装/未拉起/探活失败时，RUN_COMMAND 可用即视为
+ * bash 可用（本类的通道诊断负责判定）。host 恢复在线后经
+ * RuntimeBridge.reloadMcpServers() 热重载让 MCP 接管（设置页「MCP
+ * 服务」的健康态门控变化时已自动触发；手动入口 = 该页「刷新/重启」）。
+ *
  * 一次 `echo ok` 往返的结局可精确分类（依据 RunCommandService 行为）：
- * - Ok：正常往返；
+ * - Ok：正常往返（此态下 bash 经 RUN_COMMAND 兜底可用）；
  * - PolicyRejected：Termux 快速回调（RESULT_OK + err=2、errmsg 含
  *   allow-external-apps）——allow-external-apps 未开启或 Termux 未初始化；
  * - Rejected：其他明确拒绝；
@@ -119,7 +126,8 @@ object TermuxDiagnostics {
         }
     }
 
-    /** 一行中文摘要（不带时间戳；时间戳由调用方日志加）。 */
+    /** 一行中文摘要（不带时间戳；时间戳由调用方日志加）。Ok = RUN_COMMAND
+     *  兜底路径可用（host 在线时 bash 实际走 MCP，主路径不经过本类）。 */
     fun describe(r: ChannelResult): String = when (r) {
         is ChannelResult.Ok -> "通过（${r.ms}ms）"
         is ChannelResult.PolicyRejected ->

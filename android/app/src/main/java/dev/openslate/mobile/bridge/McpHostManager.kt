@@ -577,7 +577,14 @@ object McpHostManager {
     private fun stripScope(pkg: String): String? =
         pkg.split('/').last().takeIf { it.isNotEmpty() }
 
-    /** 生成当前清单（token + 全部 server 条目）。 */
+    /** 生成当前清单（token + 全部 server 条目）。
+     *
+     * **永不写 `[builtin]` 段（版本偏斜防线，勿改）**：新 App 可能携带
+     * 认识 `[builtin]` 的旧 host 二进制——host 的 HostConfig 是
+     * `deny_unknown_fields`，清单里出现它不认识的键会解析失败、host
+     * 直接起不来。builtin server 的启停由 host 侧默认值决定（默认全
+     * 开），App 不越权配置；只有升级 Termux 侧 host 二进制后该段才有
+     * 意义，届时再评估是否下发。 */
     fun manifestToml(ctx: Context): String {
         val sb = StringBuilder()
         sb.append("bind = \"127.0.0.1:$HOST_PORT\"\n")

@@ -50,6 +50,8 @@ JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**�
 | `setAgentToolVisibility(tools, hiddenTools): String` | 175-180 | 全量覆写 + 热生效；返回 ok 信封 |
 | `reloadMcpServers(): String` | — | 热重载外部 MCP：按最新落盘配置重连 `[mcp.servers]` 并重注册工具（scratch registry 先做批内冲突检查，撞名完整回滚）；返回 `{"ok","tools","servers":{name:count},"failed":[…],"error"?}`；设置页保存 MCP 清单后调用 |
 | `getMcpToolNameTemplate(): String` | — | 读当前生效工具名模板（落盘 `[mcp].tool_name_template`，缺省返回字面 `{prefix}_{server}__{tool}`；三占位符：prefix=前缀/服务键名、server=MCP 服务器名、tool=裸工具名） |
+| `getMcpBuiltinToolNameTemplate(): String` | — | 读当前生效 builtin（裸名）工具名模板（落盘 `[mcp].builtin_tool_name_template`，缺省/空白返回字面 `{prefix}_{tool}`；占位符仅 prefix/tool，禁 `{server}` 与字面 `__`）。作用于不含 `__` 的裸上游名——host-builtin 裸名与桌面直连裸名同一条展开分支；解析经 core `McpConfig::builtin_template_or_default()`（接缝契约）。Phase C Kotlin 侧（判断 MCP 名册中的 bash 名）经它读取 |
+| `setMcpBuiltinToolNameTemplate(template: String): String` | — | 校验（复用 core `validate_mcp_builtin_tool_name_template`：必须含 `{tool}`、占位符仅 `{prefix}`/`{tool}`、拒 `{server}`、禁字面 `__`——防 FFI 收下坏值致启动 fatal）+ 落盘（空串删键回默认）；返回 ok 信封；**不自动 reload**——调用方显式走 `reloadMcpServers` 热生效（reload 按新模板展开名交接 HostTool 让位/兜底，见 openslate-mobile.md §7.1） |
 | `setMcpToolNameTemplate(template: String): String` | — | 校验（复用 core `validate_mcp_tool_name_template`，防 FFI 收下坏值致启动 fatal）+ 落盘（空串删键回默认）；返回 ok 信封；**不自动 reload**——调用方显式走 `reloadMcpServers` 热生效 |
 | `getMcpServerName(): String` | — | 读 `[mcp.servers]` 单键名（多键回退 termux，空/失败回退 termux）——**`{prefix}` 占位符的展开值** |
 | `setMcpServerName(name: String): String` | — | 校验（`validate_mcp_server_name`：非空、`[A-Za-z0-9_.-]`、不含 `__`）+ `rename_mcp_server` 整子表搬移（transport/headers 随迁，旧键消失）；幂等；返回 ok 信封；不自动 reload |

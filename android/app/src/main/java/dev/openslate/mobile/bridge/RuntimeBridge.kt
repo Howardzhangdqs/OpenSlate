@@ -239,6 +239,12 @@ object RuntimeBridge {
         java.util.concurrent.ConcurrentHashMap.newKeySet()
     private val termuxStallMutex = Mutex()
 
+    /** reloadMcpServers 串行化：设置页保存、诊断自愈、工具页刷新等多个
+     *  调用点可能并发触发热重载；Rust 侧 reload（让位→swap→重算）非
+     *  原子，交错会让 HostTool 交接序列短暂纠缠（下次 reload 可自愈，
+     *  此处串行化消除放大）。 */
+    private val reloadMcpMutex = Mutex()
+
     private fun recordToolOutput(name: String, output: String) {
         pendingToolOutputs.getOrPut(name) { java.util.concurrent.ConcurrentLinkedDeque() }.add(output)
     }
@@ -617,9 +623,13 @@ object RuntimeBridge {
     /** 热重载外部 MCP server（设置页保存清单后调用，新工具免重启生效）。
      *  FFI 阻塞至全部 server 连接完成（各 server 有内部连接超时），故挂
      *  IO 线程执行；null = 运行时未就绪。返回 FFI 原始 JSON：
-     *  {"ok":bool,"tools":N,"servers":{…},"failed":[…],"error":"…"}。 */
+     *  {"ok":bool,"tools":N,"servers":{…},"failed":[…],"error":"…"}。
+     *  经 [reloadMcpMutex] 串行：reload 含 HostTool 让位/兜底交接，
+     *  并发交错会纠缠交接序列（见字段注释）。 */
     suspend fun reloadMcpServers(): String? = withContext(Dispatchers.IO) {
-        runtimeRef.get()?.reloadMcpServers()
+        reloadMcpMutex.withLock {
+            runtimeRef.get()?.reloadMcpServers()
+        }
     }
 
     // ── MCP 服务名（[mcp.servers] 单键名；校验/改名落盘在 Rust）────
@@ -664,13 +674,14 @@ object RuntimeBridge {
     }
 
     /**
-     * 命名缓存统一刷新点（服务名 + 工具名模板）：注册表聚合等后台路径
-     * 的前置，两个轻量 FFI 读收敛到一个入口，防调用方漏刷其一导致
+     * 命名缓存统一刷新点（服务名 + 两个工具名模板）：注册表聚合等后台
+     * 路径的前置，三个轻量 FFI 读收敛到一个入口，防调用方漏刷其一导致
      * 剥离用旧名/旧模板。runtime 未就绪时各自不动缓存。
      */
     private suspend fun refreshMcpNaming() {
         getMcpServerName()
         getMcpToolNameTemplate()
+        getMcpBuiltinToolNameTemplate()
     }
 
     // ── MCP 工具名模板（[mcp].tool_name_template；校验/落盘在 Rust）──
@@ -712,6 +723,55 @@ object RuntimeBridge {
         }
         envelope
     }
+
+    // ── MCP builtin 工具名模板（[mcp].builtin_tool_name_template）────
+    // 作用于不含 `__` 的裸上游名：聚合 host 内置 server 的裸名（bash /
+    // read_file…）与桌面直连裸名共用同一条展开分支（Rust 侧
+    // format_tool_name 的裸名分支）。termux bash 降级阶梯：host 在线
+    // → MCP 以该模板展开名接管（默认 termux_bash）；离线 → HostTool
+    // RUN_COMMAND 兜底（同名的展示形态一致）。
+
+    /** Rust 侧 builtin 小模板缺省的字面镜像（与 [DEFAULT_MCP_NAME_TEMPLATE]
+     *  同款模式：Rust 是唯一事实源，此处仅 FFI 未就绪/配置未设置时的
+     *  回退字面）。两占位符模型：{prefix}=服务名、{tool}=裸工具名；无
+     *  {server}（裸名没有 server slug 段）。默认展开 termux_bash 与旧
+     *  拼接逐字节一致。 */
+    private const val DEFAULT_MCP_BUILTIN_NAME_TEMPLATE = "{prefix}_{tool}"
+
+    /** 生效 builtin 模板缓存（语义同 [mcpNameTemplate]）。 */
+    @Volatile
+    private var mcpBuiltinNameTemplate: String? = null
+
+    /**
+     * 生效的 builtin 工具名模板（IO）。null = runtime 未就绪；FFI 空值
+     * 回退默认字面。每次调用都刷新缓存——设置页预填与
+     * [mcpServerSlugOf]/[mcpToolBareName] 的裸名剥离共用同源，防漂移。
+     */
+    suspend fun getMcpBuiltinToolNameTemplate(): String? = withContext(Dispatchers.IO) {
+        val runtime = runtimeRef.get() ?: return@withContext null
+        (runtime.getMcpBuiltinToolNameTemplate().takeIf { it.isNotBlank() }
+            ?: DEFAULT_MCP_BUILTIN_NAME_TEMPLATE)
+            .also { mcpBuiltinNameTemplate = it }
+    }
+
+    /**
+     * 校验 + 落盘 builtin 工具名模板（IO）。Rust 侧规则：必须含
+     * `{tool}`、占位符仅 `{prefix}`/`{tool}`（拒 `{server}`）、除占位
+     * 符外仅 [A-Za-z0-9_.-] 且禁字面 `__`。返回 FFI 信封 JSON 或 null
+     * （runtime 未就绪）。**不自动 reload**：调用方随后自行
+     * [reloadMcpServers] 热生效（reload 按新模板展开名交接 HostTool
+     * 让位/兜底）。仅信封 ok 时按「留空 = 默认」语义刷新缓存。
+     */
+    suspend fun setMcpBuiltinToolNameTemplate(template: String): String? =
+        withContext(Dispatchers.IO) {
+            val runtime = runtimeRef.get() ?: return@withContext null
+            val envelope = runtime.setMcpBuiltinToolNameTemplate(template)
+            if (runCatching { JSONObject(envelope).optBoolean("ok", false) }.getOrDefault(false)) {
+                mcpBuiltinNameTemplate = template.trim().takeIf { it.isNotEmpty() }
+                    ?: DEFAULT_MCP_BUILTIN_NAME_TEMPLATE
+            }
+            envelope
+        }
 
     /** 模板编译产物：正则 + {server}/{tool} 的捕获组号（模板缺某占位符
      *  则对应组号 null；组号按占位符出现顺序编号）。 */
@@ -762,16 +822,31 @@ object RuntimeBridge {
      * null（非 MCP 名，含恰好同前缀的本地工具如 termux_bash）。
      * 分组退化：模板缺 {server}（注册名不含服务器身份，如
      * `{prefix}_{tool}`）→ slug 不可从模板提取，落 [legacySlugOf] 兜底。
-     * 工具管理页的 MCP 聚合与 [mcpRegistryToolsByPrefix] 共用此判定，
-     * 防两处逻辑漂移。
+     * builtin 小模板形态（host 裸名注册，默认 termux_bash /
+     * termux_read_file）：大模板不匹配且大模板本身也没命中时，用
+     * builtin 模板再试一轮——命中 = MCP 域名，slug 退化为前缀本身
+     * （这些工具属于聚合 host，没有下游 server 段）。注意 HostTool
+     * 兜底形态的 termux_bash 同样命中（名侧无法区分归属，纯展示级
+     * 分组，可接受）。工具管理页的 MCP 聚合与 [mcpRegistryToolsByPrefix]
+     * 共用此判定，防两处逻辑漂移。
      */
     fun mcpServerSlugOf(toolName: String, serverNames: List<String>): String? {
         val template = mcpNameTemplate ?: DEFAULT_MCP_NAME_TEMPLATE
+        var bigMatchedWithoutServer = false
         for (prefix in serverNames) {
             val tr = buildTemplateRegex(template, prefix)
             val m = tr.regex.matchEntire(toolName) ?: continue
             if (tr.serverGroup != null) return m.groups[tr.serverGroup]?.value
+            bigMatchedWithoutServer = true
             break // 前缀已匹配但模板无 {server}：正则给不出 slug，走兜底
+        }
+        if (!bigMatchedWithoutServer) {
+            // builtin 小模板（两占位符，无 {server}）：命中 → slug = 前缀。
+            val builtin = mcpBuiltinNameTemplate ?: DEFAULT_MCP_BUILTIN_NAME_TEMPLATE
+            for (prefix in serverNames) {
+                val tr = buildTemplateRegex(builtin, prefix)
+                if (tr.regex.matchEntire(toolName) != null) return prefix
+            }
         }
         return legacySlugOf(toolName, serverNames)
     }
@@ -797,13 +872,21 @@ object RuntimeBridge {
      * 注册表全名 → {tool} 段（与 [mcpServerSlugOf] 同一模板正则的工具
      * 组提取，{prefix}/{server} 段一并剥掉）。null = 非模板名（正则不
      * 匹配；模板缺 {tool} 理论不可达——Rust 校验必含，缺组同样返回
-     * null）。工具管理页的短名展示用；调用方自行决定兜底（现有调用
-     * 回退 `__` 启发式）。
+     * null）。大模板不匹配时再用 builtin 小模板试一轮（host 裸名注册
+     * 形态，如 termux_bash → bash；HostTool 兜底形态同样命中 → 展示
+     * 裸名一致）。工具管理页的短名展示用；调用方自行决定兜底（现有
+     * 调用回退 `__` 启发式）。
      */
     fun mcpToolBareName(fullName: String): String? {
         val template = mcpNameTemplate ?: DEFAULT_MCP_NAME_TEMPLATE
         for (prefix in MCP_SERVER_NAMES) {
             val tr = buildTemplateRegex(template, prefix)
+            val m = tr.regex.matchEntire(fullName) ?: continue
+            return tr.toolGroup?.let { m.groups[it]?.value }
+        }
+        val builtin = mcpBuiltinNameTemplate ?: DEFAULT_MCP_BUILTIN_NAME_TEMPLATE
+        for (prefix in MCP_SERVER_NAMES) {
+            val tr = buildTemplateRegex(builtin, prefix)
             val m = tr.regex.matchEntire(fullName) ?: continue
             return tr.toolGroup?.let { m.groups[it]?.value }
         }
@@ -813,10 +896,17 @@ object RuntimeBridge {
     /**
      * 工具管理页前缀说明：模板 {tool} 之前的部分，{prefix} 用当前前缀
      * 缓存值、{server} 用传入 slug 替换（缺省模板 + slug=memory →
-     * `termux_memory__`）。{tool} 前无内容（如模板就是 `{tool}`）→
-     * 空串（UI 隐藏说明行）。
+     * `termux_memory__`）。slug = 前缀本身（builtin 组：host 裸名走
+     * builtin 小模板，缺省 → `termux_`）。{tool} 前无内容（如模板就是
+     * `{tool}`）→ 空串（UI 隐藏说明行）。
      */
     fun mcpAgentPrefixNote(slug: String): String {
+        if (slug == mcpServerNameCache) {
+            // builtin 组（[mcpServerSlugOf] 的裸名分支返回前缀本身）。
+            val builtin = mcpBuiltinNameTemplate ?: DEFAULT_MCP_BUILTIN_NAME_TEMPLATE
+            if (!builtin.contains("{tool}")) return ""
+            return builtin.substringBefore("{tool}").replace("{prefix}", mcpServerNameCache)
+        }
         val template = mcpNameTemplate ?: DEFAULT_MCP_NAME_TEMPLATE
         if (!template.contains("{tool}")) return ""
         return template.substringBefore("{tool}")
@@ -1173,8 +1263,11 @@ object RuntimeBridge {
     }
 
     /**
-     * host call 处理：mobile.ping 直答；termux.run 经 RUN_COMMAND intent 在
-     * Termux 执行、共享存储文件回传输出（阶段五预演）；其余显式 unsupported。
+     * host call 处理：mobile.ping 直答；termux 后端工具（HostTool 兜底
+     * 壳）经 RUN_COMMAND intent 在 Termux 执行、结果 PendingIntent 回传。
+     * 工具名三种形态：termux.run（历史）/ termux_bash（双选）/ bash
+     * （仅选 termux 时 HostTool 顶替名——MCP 接管后同名工具走 MCP
+     * 路径，不会到这）。其余显式 unsupported。
      */
     private fun handleHostCall(obj: JSONObject) {
         val id = obj.optLong("id")
@@ -1188,9 +1281,8 @@ object RuntimeBridge {
                     """{"pong":true,"runtime":"rust","host":"android"}""",
                 )
             }
-            // termux 后端工具名随设置可为 termux.run（旧）或 termux_bash（现）。
-            "termux.run", "termux_bash" ->
-                runInTermux(runtime, id, obj.optJSONObject("args")?.optString("command") ?: "")
+            "termux.run", "termux_bash", "bash" ->
+                runInTermux(runtime, id, tool, obj.optJSONObject("args")?.optString("command") ?: "")
             else -> runtime.resolveHostCall(
                 id.toULong(), false,
                 "host tool '$tool' not implemented in Phase 1",
@@ -1199,10 +1291,12 @@ object RuntimeBridge {
     }
 
     /**
-     * termux.run：TermuxExec（RUN_COMMAND + 结果 PendingIntent 本机直传）。
-     * 无 PC、无 adb、无局域网中继；失败原因随错误返回供模型自纠。
+     * termux bash（HostTool 兜底形态）：TermuxExec（RUN_COMMAND + 结果
+     * PendingIntent 本机直传）。无 PC、无 adb、无局域网中继；失败原因随
+     * 错误返回供模型自纠。`toolName` 用于输出配对（tool_end 事件按注册
+     * 名取数——仅选 termux 时注册名是 bash 而非 termux_bash）。
      */
-    private fun runInTermux(runtime: OpenSlateRuntime, id: Long, command: String) {
+    private fun runInTermux(runtime: OpenSlateRuntime, id: Long, toolName: String, command: String) {
         val ctx = appContext
         if (ctx == null) {
             runtime.resolveHostCall(id.toULong(), false, "termux.run: no app context")
@@ -1228,13 +1322,13 @@ object RuntimeBridge {
             try {
                 val (output, error) = TermuxExec.run(ctx, id, command)
                 if (output != null) {
-                    recordToolOutput("termux_bash", output)
+                    recordToolOutput(toolName, output)
                     runtime.resolveHostCall(
                         id.toULong(), true,
                         JSONObject().put("output", output).put("command", command).toString(),
                     )
                 } else {
-                    recordToolOutput("termux_bash", error)
+                    recordToolOutput(toolName, error)
                     runtime.resolveHostCall(id.toULong(), false, error)
                 }
             } finally {

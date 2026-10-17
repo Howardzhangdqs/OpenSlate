@@ -43,7 +43,10 @@
 //!    renamed deterministically and surfaced as
 //!    `// renamed from X (collision)` comments in the prelude. Unknown
 //!    namespace members dispatch under their composed registry name
-//!    (template-expanded; default `{prefix}_{server}__{tool}`), mirroring
+//!    (template-expanded — the dual-template expansion of `McpTool`:
+//!    `[mcp].tool_name_template` for aggregated `slug__tool` names,
+//!    default `{prefix}_{server}__{tool}`; `[mcp].builtin_tool_name_template`
+//!    for bare names, default `{prefix}_{tool}`), mirroring
 //!    how real members are composed, so the
 //!    host allow-list yields the canonical "tool not available" error
 //!    instead of cross-namespace reach.
@@ -72,8 +75,9 @@ use crate::{
 /// `__call_tool_raw` and turns error envelopes into JS exceptions (the
 /// errors-as-data protocol); `__mkNs(entries, nsDisplay, nsPrefix)` builds
 /// a namespace object whose unknown members fall through to the bridge
-/// under their *composed* registry name `nsPrefix + "_" + member` (how
-/// `McpTool` composes real members), so unlisted tools get the canonical
+/// under their *composed* registry name `nsPrefix + "_" + member` (the
+/// bare-name composition shape — mirrors `McpTool`'s builtin template
+/// default `{prefix}_{tool}`), so unlisted tools get the canonical
 /// "not available" envelope instead of dispatching a same-named flat tool.
 const PRELUDE_HEAD: &str = r#"
 globalThis.__logs = [];
@@ -826,8 +830,9 @@ mod tests {
         assert_eq!(outcome.error, None);
         let result: serde_json::Value = serde_json::from_str(&outcome.result.unwrap()).unwrap();
         // Unknown ns members dispatch under their COMPOSED registry name
-        // (template-expanded, mirroring McpTool), never the bare member —
-        // a flat `nope` tool elsewhere must not become reachable.
+        // (template-expanded, mirroring McpTool — bare-name shape via the
+        // builtin template, default `{prefix}_{tool}`), never the bare
+        // member — a flat `nope` tool elsewhere must not become reachable.
         assert_eq!(
             result.as_str().unwrap(),
             "tool github.nope failed: tool not available in code mode: github_nope"

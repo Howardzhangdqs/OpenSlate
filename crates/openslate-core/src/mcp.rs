@@ -5,9 +5,11 @@
 //! - **External** servers declared in `openslate.toml` (`[mcp.servers.*]`),
 //!   connected at startup over stdio (subprocess) or Streamable HTTP. Every
 //!   tool they expose is wrapped as an [`McpTool`] whose registered name is
-//!   the `[mcp].tool_name_template` expansion (default
-//!   `{prefix}_{server}__{tool}`, byte-identical to the historical
-//!   `{prefix}_{upstream}` — registration name only, routing/PTC semantics
+//!   the template-pair expansion (`[mcp].tool_name_template` for aggregated
+//!   `slug__tool` upstream names, default `{prefix}_{server}__{tool}`;
+//!   `[mcp].builtin_tool_name_template` for bare upstream names, default
+//!   `{prefix}_{tool}` — both byte-identical to the historical
+//!   `{prefix}_{upstream}`; registration name only, routing/PTC semantics
 //!   unchanged).
 //! - **Builtin** in-process servers ([`connect_builtin_servers`]): the
 //!   workspace-sandboxed `read_file` / `write_file`, `shell` and `edit_file`
@@ -96,6 +98,17 @@ fn mcp_auth_override() -> Option<String> {
 /// for both aggregated (`slug__tool`) and plain upstream names.
 pub const DEFAULT_TOOL_NAME_TEMPLATE: &str = "{prefix}_{server}__{tool}";
 
+/// The default `[mcp].builtin_tool_name_template` — the SMALL template for
+/// upstream names WITHOUT `__` (bare names). `pub` for the same reason as
+/// [`DEFAULT_TOOL_NAME_TEMPLATE`]: one literal, reused everywhere (mobile FFI
+/// getter, validation tests) instead of a second hand-copied string.
+///
+/// 双模板模型：`tool_name_template`（三占位符）只作用于含 `__` 的聚合上游
+/// 名；不含 `__` 的裸名走本模板（占位符仅 `{prefix}`/`{tool}`——裸名没有
+/// server slug 段可暴露）。默认 `{prefix}_{tool}` 的展开与模板功能上线前的
+/// legacy `{prefix}_{upstream}` 逐字节一致，所以默认配置下注册名零变化。
+pub const DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE: &str = "{prefix}_{tool}";
+
 /// Placeholder model (aligned with how users think about the aggregated host):
 /// - `{prefix}`: the `[mcp.servers]` key in `openslate.toml` (mobile's
 ///   "service name / prefix" setting; default `termux`);
@@ -104,24 +117,51 @@ pub const DEFAULT_TOOL_NAME_TEMPLATE: &str = "{prefix}_{server}__{tool}";
 /// - `{tool}`: the concrete tool name WITHOUT the server prefix
 ///   (e.g. `create_entities`).
 ///
-/// Expand a tool-registration name from `template`. `upstream` is the raw
-/// upstream tool name: when it contains `__` (aggregated-host form
-/// `slug__tool`; the slug is sanitized upstream so the FIRST `__` is the
-/// boundary), it is split into `server`/`tool` and the three placeholders are
-/// expanded — single-pass, values are never re-expanded, unknown placeholders
-/// keep their braces verbatim (a validated template never contains any).
+/// Expand a tool-registration name from the TEMPLATE PAIR. `upstream` is the
+/// raw upstream tool name; which template applies is decided by its shape:
 ///
-/// When `upstream` contains NO `__` (desktop direct-connect form), the
-/// template is IGNORED and the result is always `{prefix}_{upstream}` —
-/// the historical behavior, kept byte-identical so desktop setups see zero
-/// change from the template feature (their tool names carry no slug segment
-/// to expose via `{server}`/`{tool}` anyway).
-pub fn format_tool_name(template: &str, prefix: &str, upstream: &str) -> String {
-    let Some((server, tool)) = upstream.split_once("__") else {
-        // 无 `__`（桌面直连形态）→ legacy：模板不适用，保持历史行为。
-        return format!("{prefix}_{upstream}");
+/// - **contains `__`** (aggregated-host form `slug__tool`; the slug is
+///   sanitized upstream so the FIRST `__` is the boundary): split into
+///   `server`/`tool`, expand `template` (three placeholders) — single-pass,
+///   values are never re-expanded, unknown placeholders keep their braces
+///   verbatim (a validated template never contains any).
+/// - **contains NO `__`** (bare name — the aggregated host's builtin tools,
+///   or a desktop direct-connect server): expand `builtin_template` with
+///   `{prefix}`/`{tool}` only (`{server}` has no value here; a validated
+///   builtin template never contains it, and as an unknown placeholder its
+///   braces would survive verbatim). Historically this path hardcoded
+///   `{prefix}_{upstream}`; [`DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE`] is that
+///   same shape, so defaults expand byte-identically and desktop/direct
+///   setups see zero change. 用户改 `[mcp].builtin_tool_name_template`
+///   会同时影响 host-builtin 裸名与桌面直连裸名两条路（同一条展开分支）。
+///
+/// Both templates are the caller-resolved effective values (blank already
+/// filtered; see [`crate::config::McpConfig::builtin_template_or_default`]).
+pub fn format_tool_name(
+    template: &str,
+    builtin_template: &str,
+    prefix: &str,
+    upstream: &str,
+) -> String {
+    let (server, tool) = match upstream.split_once("__") {
+        Some((server, tool)) => (Some(server), tool),
+        // 无 `__`（裸名：host-builtin / 桌面直连）→ builtin 小模板：
+        // 占位符仅 {prefix}/{tool}（默认值展开与 legacy `prefix_upstream`
+        // 逐字节一致）。
+        None => {
+            return expand_template(builtin_template, prefix, None, upstream);
+        }
     };
-    let mut out = String::with_capacity(template.len() + prefix.len() + upstream.len());
+    expand_template(template, prefix, server, tool)
+}
+
+/// Single expansion engine for both templates (never a second copy):
+/// scan once, splice placeholder values verbatim (no re-expansion), leave
+/// `{` of unknown placeholders in place. `server = None` means the
+/// `{server}` placeholder has no value on this path (bare-name builtin
+/// branch) — it then behaves like any unknown placeholder.
+fn expand_template(template: &str, prefix: &str, server: Option<&str>, tool: &str) -> String {
+    let mut out = String::with_capacity(template.len() + prefix.len() + tool.len());
     let mut rest = template;
     while let Some(pos) = rest.find('{') {
         out.push_str(&rest[..pos]);
@@ -130,8 +170,19 @@ pub fn format_tool_name(template: &str, prefix: &str, upstream: &str) -> String 
             out.push_str(prefix);
             rest = remaining;
         } else if let Some(remaining) = tail.strip_prefix("{server}") {
-            out.push_str(server);
-            rest = remaining;
+            // let-chains 需 2024 edition（workspace 尚在 2021），嵌套展开。
+            match server {
+                Some(server) => {
+                    out.push_str(server);
+                    rest = remaining;
+                }
+                // 裸名分支：{server} 无值，按未知占位符保留花括号原样
+                // （校验层本就拒收含 {server} 的 builtin 模板）。
+                None => {
+                    out.push('{');
+                    rest = &tail[1..];
+                }
+            }
         } else if let Some(remaining) = tail.strip_prefix("{tool}") {
             out.push_str(tool);
             rest = remaining;
@@ -199,8 +250,9 @@ fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> String {
 
 /// A [`Tool`] backed by a remote MCP server tool.
 ///
-/// `exposed_name` is what the LLM sees (the `[mcp].tool_name_template`
-/// expansion — default `{prefix}_{server}__{tool}`, byte-identical to the
+/// `exposed_name` is what the LLM sees (the `[mcp].tool_name_template` /
+/// `[mcp].builtin_tool_name_template` expansion — defaults
+/// `{prefix}_{server}__{tool}` / `{prefix}_{tool}`, byte-identical to the
 /// historical `{prefix}_{upstream}` for both aggregated and plain names);
 /// `definition_name` is the original MCP tool name sent back in `tools/call`.
 pub struct McpTool {
@@ -225,34 +277,39 @@ impl McpTool {
     /// `None` keeps the bare definition name — used for the builtin
     /// in-process servers whose tools are OpenSlate's own.
     ///
-    /// `template` (see [`format_tool_name`]) only applies on the external
-    /// path (`server_name = Some`); a `None` template means the default
-    /// [`DEFAULT_TOOL_NAME_TEMPLATE`], whose expansion is byte-identical to
-    /// the no-template legacy form, so both funnel through the same code.
-    /// Upstream names without `__` (desktop direct-connect form) ignore the
-    /// template entirely inside `format_tool_name`. The builtin path passes
-    /// `None` for both and is unaffected by templates. Either way only the
-    /// registered name changes — `definition_name` (tools/call routing) and
-    /// the PTC namespace (`server_alias`) keep their original semantics.
+    /// `template` / `builtin_template` (see [`format_tool_name`]) only apply
+    /// on the external path (`server_name = Some`): which of the two wins is
+    /// decided by the upstream name's shape (含/不含 `__`)。A `None` template
+    /// means the respective default ([`DEFAULT_TOOL_NAME_TEMPLATE`] /
+    /// [`DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE`]), whose expansion is
+    /// byte-identical to the no-template legacy form, so all three funnel
+    /// through the same code with zero default drift. The builtin path
+    /// (server = None) passes `None` for both and is unaffected by templates.
+    /// Either way only the registered name changes — `definition_name`
+    /// (tools/call routing) and the PTC namespace (`server_alias`) keep their
+    /// original semantics.
     pub(crate) fn from_definition(
         def: RmcpTool,
         client: ServerSink,
         server_name: Option<&str>,
         template: Option<&str>,
+        builtin_template: Option<&str>,
     ) -> Self {
         let definition_name = def.name.to_string();
         let exposed_name = match server_name {
-            // 外部路径：prefix = [mcp.servers] 键名；模板缺省 = 默认模板
-            // （二者展开逐字节一致，统一走 format_tool_name，避免两份
-            // legacy 拼接逻辑漂移）。无 `__` 的上游在其内部回落 legacy
-            // `prefix_upstream`——桌面直连形态零影响。
+            // 外部路径：prefix = [mcp.servers] 键名；两模板缺省各自回默认
+            // （默认展开与 legacy 拼接逐字节一致，统一走 format_tool_name，
+            // 避免第二份拼接逻辑漂移）。含 `__` 的聚合名走三占位符模板，
+            // 裸名（host-builtin / 桌面直连）走 builtin 小模板。
             Some(prefix) => format_tool_name(
                 template.unwrap_or(DEFAULT_TOOL_NAME_TEMPLATE),
+                builtin_template.unwrap_or(DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE),
                 prefix,
                 &definition_name,
             ),
-            // builtin 路径：模板不参与，维持裸名（参数设计允许
-            // template=Some + server=None 的组合，但按约定不这么传）。
+            // builtin 路径（app 内置 in-process server）：模板不参与，维持
+            // 裸名（参数设计允许模板 Some + server=None 的组合，但按约定
+            // 不这么传——别与「外部上游的裸名」混淆，后者仍走小模板）。
             None => definition_name.clone(),
         };
         let description = def.description.as_deref().unwrap_or("").to_owned();
@@ -443,19 +500,24 @@ pub enum McpConnectError {
 }
 
 /// Connect to one MCP server, complete the handshake, list its tools, and build
-/// `McpTool` wrappers (registered names = the `template` expansion, default
-/// [`DEFAULT_TOOL_NAME_TEMPLATE`]).
+/// `McpTool` wrappers (registered names = the `template`/`builtin_template`
+/// expansion; see [`format_tool_name`] for which one applies — defaults
+/// [`DEFAULT_TOOL_NAME_TEMPLATE`] / [`DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE`]).
 ///
 /// Returns the tools plus the live `RunningService` (which the caller must keep
 /// alive for the tools to keep working — see [`McpConnectionGuard`]).
 ///
-/// `template` is the caller-resolved `[mcp].tool_name_template` (already
-/// blank-filtered; `None` = default). It only shapes the registered names —
-/// `definition_name` and the PTC namespace are untouched.
+/// `template` / `builtin_template` are the caller-resolved
+/// `[mcp].tool_name_template` / `[mcp].builtin_tool_name_template` (already
+/// blank-filtered; `None` = the respective default — see
+/// [`crate::config::McpConfig::builtin_template_or_default`]). They only
+/// shape the registered names — `definition_name` and the PTC namespace are
+/// untouched.
 pub async fn connect_mcp_server(
     server_name: &str,
     config: &McpServerConfig,
     template: Option<&str>,
+    builtin_template: Option<&str>,
 ) -> Result<(Vec<McpTool>, RunningService<RoleClient, ClientConfig>), McpConnectError> {
     let client_info = ClientConfig::new(
         ClientCapabilities::default(),
@@ -574,7 +636,13 @@ pub async fn connect_mcp_server(
 
     let mcp_tools = tools
         .into_iter()
-        .map(|t| McpTool::from_definition(t, service.peer().clone(), Some(server_name), template))
+        .map(|t| McpTool::from_definition(
+            t,
+            service.peer().clone(),
+            Some(server_name),
+            template,
+            builtin_template,
+        ))
         .collect();
 
     Ok((mcp_tools, service))
@@ -634,9 +702,10 @@ where
 
     let tools = defs
         .into_iter()
-        // builtin 工具不参与 [mcp].tool_name_template：它们是 OpenSlate
-        // 自有工具，裸名即约定（模板只作用于外部 server 的注册名）。
-        .map(|def| McpTool::from_definition(def, client.peer().clone(), None, None))
+        // builtin 工具（app 内置 in-process server）不参与两个工具名模板：
+        // 它们是 OpenSlate 自有工具，裸名即约定（模板只作用于外部 server
+        // 的注册名——注意与「外部上游列出的裸名」区分，后者走小模板）。
+        .map(|def| McpTool::from_definition(def, client.peer().clone(), None, None, None))
         .collect();
 
     Ok((tools, client))
@@ -1050,7 +1119,7 @@ mod tests {
             .find(|d| d.name.as_ref() == "read_file")
             .expect("fs server exposes read_file");
 
-        let tool = McpTool::from_definition(read_def.clone(), service.peer().clone(), Some("srv"), None);
+        let tool = McpTool::from_definition(read_def.clone(), service.peer().clone(), Some("srv"), None, None);
         // The LLM sees the namespaced form; call_tool keeps the original name.
         assert_eq!(tool.exposed_name(), "srv_read_file");
         assert_eq!(tool.definition_name, "read_file");
@@ -1075,7 +1144,7 @@ mod tests {
             .find(|d| d.name.as_ref() == "read_file")
             .expect("fs server exposes read_file");
 
-        let tool = McpTool::from_definition(read_def, service.peer().clone(), None, None);
+        let tool = McpTool::from_definition(read_def, service.peer().clone(), None, None, None);
         assert_eq!(tool.exposed_name(), "read_file");
         assert_eq!(tool.definition_name, "read_file");
         // Builtin tools stay flat in the PTC sandbox (no namespace).
@@ -1086,58 +1155,93 @@ mod tests {
 
     #[test]
     fn format_tool_name_table() {
-        // (template, prefix, upstream, expected) — 覆盖：默认模板双形态、
-        // 三占位符各形态、双 {server}、不含 {prefix}、不含 {server}、
-        // 字面 `__` 合法、多个 `__` 上游取首段、无占位符混排。
+        // (template, builtin_template, prefix, upstream, expected) — 覆盖：
+        // 默认模板双形态、三占位符各形态、双 {server}、不含 {prefix}、
+        // 不含 {server}、字面 `__` 合法、多个 `__` 上游取首段、无占位符
+        // 混排、builtin 小模板展开/缺省等价/不参与 `__` 分支。
         let cases = [
             // 默认模板：聚合形态 = prefix_server__tool，与 legacy
-            // `prefix_upstream` 逐字节一致；无 `__` 上游走 legacy。
+            // `prefix_upstream` 逐字节一致；无 `__` 上游走 builtin 模板
+            // （默认下同为 legacy 形）。
             (
                 "{prefix}_{server}__{tool}",
+                "{prefix}_{tool}",
                 "termux",
                 "Server_Memory__create_entities",
                 "termux_Server_Memory__create_entities",
             ),
             (
                 "{prefix}_{server}__{tool}",
+                "{prefix}_{tool}",
                 "termux",
                 "plain_tool",
                 "termux_plain_tool",
             ),
-            // 三占位符各形态。
-            ("{tool}", "termux", "S__t", "t"),
-            ("{server}__{tool}", "termux", "S__t", "S__t"),
-            ("{prefix}_{tool}", "termux", "S__t", "termux_t"),
-            ("{prefix}.{server}.{tool}", "termux", "S__t", "termux.S.t"),
+            // 三占位符各形态（`__` 分支；builtin 模板不参与）。
+            ("{tool}", "{prefix}_{tool}", "termux", "S__t", "t"),
+            ("{server}__{tool}", "{prefix}_{tool}", "termux", "S__t", "S__t"),
+            ("{prefix}_{tool}", "{prefix}_{tool}", "termux", "S__t", "termux_t"),
+            ("{prefix}.{server}.{tool}", "{prefix}.{tool}", "termux", "S__t", "termux.S.t"),
             // 双 {server}。
-            ("{server}.dev.{server}_{tool}", "termux", "S__t", "S.dev.S_t"),
+            ("{server}.dev.{server}_{tool}", "{prefix}_{tool}", "termux", "S__t", "S.dev.S_t"),
             // 字面 `__` 允许（Kotlin 侧按模板正则提取，`__` 不再保留）。
-            ("{prefix}__{server}__{tool}", "termux", "S__t", "termux__S__t"),
+            ("{prefix}__{server}__{tool}", "{prefix}_{tool}", "termux", "S__t", "termux__S__t"),
             // 多个 `__` 的上游：首 `__` 为分界，后段整体归 {tool}。
-            ("{server}/{tool}", "termux", "S__t__x", "S/t__x"),
+            ("{server}/{tool}", "{prefix}_{tool}", "termux", "S__t__x", "S/t__x"),
             // 无占位符混排（校验拦得住缺 {tool} 的值；纯函数保持全函数性）。
-            ("fixed-name", "termux", "S__t", "fixed-name"),
+            ("fixed-name", "{prefix}_{tool}", "termux", "S__t", "fixed-name"),
             // 空模板：聚合形态 → 空名（校验层拦住；全函数性）。
-            ("", "termux", "S__t", ""),
+            ("", "{prefix}_{tool}", "termux", "S__t", ""),
+            // ── builtin 小模板分支（上游无 `__`）──
+            // 自定义小模板：占位符仅 {prefix}/{tool}，正常展开。
+            ("{prefix}_{server}__{tool}", "{prefix}.{tool}", "termux", "bash", "termux.bash"),
+            ("{prefix}_{server}__{tool}", "mcp_{tool}", "termux", "read_file", "mcp_read_file"),
+            ("{prefix}_{server}__{tool}", "{tool}", "termux", "bash", "bash"),
+            // 不含 {prefix}：裸工具名原样（跨 server 撞名由注册层兜底）。
+            ("{prefix}_{server}__{tool}", "host.{tool}.v2", "termux", "bash", "host.bash.v2"),
+            // {server} 在 builtin 模板里无值：未知占位符语义，花括号原样
+            // 保留（校验层本就拒收；全函数性）。
+            ("{prefix}_{server}__{tool}", "{server}_{tool}", "termux", "bash", "{server}_bash"),
+            // 空模板：裸名 → 空名（校验层拦住；全函数性）。
+            ("{prefix}_{server}__{tool}", "", "termux", "bash", ""),
         ];
-        for (template, prefix, upstream, expected) in cases {
-            assert_eq!(format_tool_name(template, prefix, upstream), expected);
+        for (template, builtin_template, prefix, upstream, expected) in cases {
+            assert_eq!(
+                format_tool_name(template, builtin_template, prefix, upstream),
+                expected,
+                "template={template:?} builtin={builtin_template:?} upstream={upstream:?}"
+            );
         }
     }
 
     #[test]
-    fn format_tool_name_legacy_path_ignores_template() {
-        // 无 `__` 上游（桌面直连形态）恒为 prefix_upstream——模板被无视，
-        // 与模板功能上线前的行为逐字节一致（桌面零影响的关键）。
-        assert_eq!(format_tool_name("{tool}", "srv", "read_file"), "srv_read_file");
-        assert_eq!(format_tool_name("", "srv", "read_file"), "srv_read_file");
+    fn format_tool_name_no_dunder_expands_builtin_template() {
+        // 无 `__` 上游（host-builtin 裸名 / 桌面直连形态）展开的是 builtin
+        // 小模板：默认 `{prefix}_{tool}` 与模板功能上线前的 legacy
+        // `prefix_upstream` 逐字节一致（默认零影响的关键回归锚点）；大模板
+        // 在该分支不参与。
+        let legacy_default = DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE;
+        assert_eq!(legacy_default, "{prefix}_{tool}");
         assert_eq!(
-            format_tool_name("{prefix}_{server}__{tool}", "srv", "read_file"),
+            format_tool_name("{tool}", legacy_default, "srv", "read_file"),
             "srv_read_file"
         );
         assert_eq!(
-            format_tool_name("{server}.{tool}", "srv", "read_file"),
+            format_tool_name("", legacy_default, "srv", "read_file"),
             "srv_read_file"
+        );
+        assert_eq!(
+            format_tool_name("{prefix}_{server}__{tool}", legacy_default, "srv", "read_file"),
+            "srv_read_file"
+        );
+        assert_eq!(
+            format_tool_name("{server}.{tool}", legacy_default, "srv", "read_file"),
+            "srv_read_file"
+        );
+        // 自定义 builtin 模板改写裸名注册形状（大模板仍被无视）。
+        assert_eq!(
+            format_tool_name("{tool}", "{prefix}-{tool}", "srv", "read_file"),
+            "srv-read_file"
         );
     }
 
@@ -1146,15 +1250,65 @@ mod tests {
         // 上游拆出的 server 段 / prefix 值本身长得像占位符也不二次展开
         // （单趟扫描，值直接拼接不再扫描）。
         assert_eq!(
-            format_tool_name("{server}_{tool}", "srv", "a{tool}b__x"),
+            format_tool_name("{server}_{tool}", "{prefix}_{tool}", "srv", "a{tool}b__x"),
             "a{tool}b_x"
         );
         assert_eq!(
-            format_tool_name("{prefix}_{tool}", "p{server}", "S__t"),
+            format_tool_name("{prefix}_{tool}", "{prefix}_{tool}", "p{server}", "S__t"),
             "p{server}_t"
         );
         // 未校验的未知占位符原样保留（不吞 '{'）。
-        assert_eq!(format_tool_name("{prefix}_{foo}", "srv", "S__t"), "srv_{foo}");
+        assert_eq!(
+            format_tool_name("{prefix}_{foo}", "{prefix}_{tool}", "srv", "S__t"),
+            "srv_{foo}"
+        );
+        // builtin 分支同理：值长得像占位符也不二次展开。
+        assert_eq!(
+            format_tool_name("{prefix}_{server}__{tool}", "{prefix}_{tool}", "srv", "a{tool}b"),
+            "srv_a{tool}b"
+        );
+    }
+
+    #[test]
+    fn format_tool_name_legal_builtin_templates_never_produce_dunder() {
+        // 性质回归锚点：「builtin 模板过校验 ∧ prefix/裸上游均不含 `__`
+        // 且不以 `_` 界接」⇒ 展开结果永不含 `__`。`__` 是聚合形态
+        // （slug__tool）的保留分界，裸名注册一旦带 `__` 就会被 UI 启发式/
+        // 历史迁移误认成聚合形态。性质由三方共同保证：模板字面量禁 `__`
+        // （本测试的模板集全部过 validate_mcp_builtin_tool_name_template）、
+        // server 键名禁 `__`（validate_mcp_server_name）、含 `__` 的上游名
+        // 根本不进这条分支。
+        //
+        // 界接 `_` 的例外是 legacy 既有行为，模板规则管不到也无需管：
+        // prefix 以 `_` 结尾（如 `a-b.c_`）× 分隔符 `_` 在 legacy
+        // `prefix_upstream` 时代同样会拼出 `__`——那是值侧命名问题，
+        // 不是模板引入的回归，故 fixture 集排除界接组合。
+        let templates = [
+            DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE,
+            "{tool}",
+            "{prefix}_{tool}",
+            "{prefix}.{tool}",
+            "{prefix}-{tool}",
+            "{prefix}{tool}",
+            "mcp.{tool}.v2",
+            "host_{tool}",
+            "{tool}_x",
+        ];
+        let prefixes = ["termux", "phone", "x", "a-b.c", "dev.1", "Termux_2", "srv"];
+        let upstreams = ["bash", "read_file", "Server_Memory", "x_1", "a.b-c", "edit_file"];
+        for t in templates {
+            crate::config::validation::validate_mcp_builtin_tool_name_template(t)
+                .unwrap_or_else(|e| panic!("fixture template {t:?} must be legal: {e}"));
+            for prefix in prefixes {
+                for upstream in upstreams {
+                    let name = format_tool_name(DEFAULT_TOOL_NAME_TEMPLATE, t, prefix, upstream);
+                    assert!(
+                        !name.contains("__"),
+                        "`__`-free expansion violated: template={t:?} prefix={prefix:?} upstream={upstream:?} → {name:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1177,6 +1331,7 @@ mod tests {
             service.peer().clone(),
             Some("termux"),
             Some("{prefix}.{server}.{tool}"),
+            Some(DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE),
         );
         // 注册名按模板展开；tools/call 路由与 PTC namespace 语义不变
         // （namespace 仍是 [mcp.servers] 键，不随模板改）。
@@ -1187,9 +1342,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_definition_default_template_matches_legacy_concat() {
-        // 模板缺省（None）= 默认模板：展开与「prefix_上游全名」逐字节
-        // 一致（含 `__` 与不含 `__` 两种上游）。
+    async fn from_definition_default_templates_match_legacy_concat() {
+        // 两模板缺省（None）= 各自默认：展开与「prefix_上游全名」逐字节
+        // 一致（含 `__` 与不含 `__` 两种上游）——默认配置零影响锚点。
         let dir = tempfile::TempDir::new().unwrap();
         let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
             .await
@@ -1206,35 +1361,50 @@ mod tests {
             service.peer().clone(),
             Some("termux"),
             None,
+            None,
         );
         assert_eq!(a.exposed_name(), "termux_Server_Memory__create_entities");
-        let p = McpTool::from_definition(plain, service.peer().clone(), Some("srv"), None);
+        let p = McpTool::from_definition(plain, service.peer().clone(), Some("srv"), None, None);
         assert_eq!(p.exposed_name(), "srv_read_file");
     }
 
     #[tokio::test]
-    async fn from_definition_template_ignored_for_plain_upstream() {
-        // 无 `__` 上游（桌面直连形态）：即便给了模板也走 legacy
-        // `prefix_upstream`（format_tool_name 内部回落）。
+    async fn from_definition_builtin_template_rewrites_plain_upstream() {
+        // 无 `__` 上游（host-builtin 裸名 / 桌面直连形态）：参与展开的是
+        // builtin 小模板（大模板被无视）；tools/call 路由不变。
         let dir = tempfile::TempDir::new().unwrap();
         let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
             .await
             .expect("in-process connect should succeed");
         let def = RmcpTool::new("read_file", "fs tool", serde_json::Map::new());
 
+        // 默认 builtin 模板 → legacy 形（大模板给了也被无视）。
+        let tool = McpTool::from_definition(
+            def.clone(),
+            service.peer().clone(),
+            Some("srv"),
+            Some("{tool}"),
+            None,
+        );
+        assert_eq!(tool.exposed_name(), "srv_read_file");
+        assert_eq!(tool.definition_name, "read_file");
+
+        // 自定义 builtin 模板 → 裸名注册形状随之改写。
         let tool = McpTool::from_definition(
             def,
             service.peer().clone(),
             Some("srv"),
-            Some("{tool}"),
+            None,
+            Some("{prefix}-mcp-{tool}"),
         );
-        assert_eq!(tool.exposed_name(), "srv_read_file");
+        assert_eq!(tool.exposed_name(), "srv-mcp-read_file");
         assert_eq!(tool.definition_name, "read_file");
     }
 
     #[tokio::test]
     async fn from_definition_template_ignored_without_server() {
-        // 参数契约：server=None（builtin 路径）时模板不参与，裸名维持。
+        // 参数契约：server=None（app 内置 in-process 路径）时两模板都
+        // 不参与，裸名维持。
         let dir = tempfile::TempDir::new().unwrap();
         let (_tools, service) = connect_builtin_server(FsServer::new(dir.path()))
             .await
@@ -1246,6 +1416,7 @@ mod tests {
             service.peer().clone(),
             None,
             Some("{prefix}_{server}__{tool}"),
+            Some("{prefix}_{tool}"),
         );
         assert_eq!(tool.exposed_name(), "read_file");
         assert_eq!(tool.namespace(), None);

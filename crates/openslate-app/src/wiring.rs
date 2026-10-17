@@ -459,10 +459,12 @@ fn load_dotenv(dir: Option<&Path>) {
 ///   （纯内存 HashMap 插入，trivially fast）；
 /// - 单 server 连接失败 warn+skip（一个坏 server 不阻断其余）；
 /// - 工具名冲突 hard error（`anyhow::bail!`）；
-/// - 工具注册名按 `[mcp].tool_name_template` 展开（空白/缺省 =
-///   `{prefix}_{server}__{tool}`，与历史 `前缀_上游全名` 逐字节一致；
-///   无 `__` 的上游恒走 legacy `前缀_上游全名`）；模板不含 `{server}`
-///   时的跨 server 撞名同样走上面的 hard error 兜底。
+/// - 工具注册名按模板对展开（`[mcp].tool_name_template` 作用于含 `__`
+///   的聚合上游名；`[mcp].builtin_tool_name_template` 作用于裸名——
+///   host-builtin 裸名与桌面直连裸名同一条分支。两者缺省/空白 =
+///   `{prefix}_{server}__{tool}` / `{prefix}_{tool}`，与历史
+///   `前缀_上游全名` 逐字节一致）；模板不含 `{server}` 时的跨 server
+///   撞名同样走上面的 hard error 兜底。
 ///
 /// 返回 `(外部连接 guard, 各成功 server 的工具数, 注册的工具名全集,
 /// 失败 server 名单)`。guard 由调用方持有（连接保活）；热重载调用方可
@@ -479,15 +481,17 @@ pub async fn connect_external_mcp(
 )> {
     use tokio::sync::mpsc;
 
-    // 工具名模板：空白视同未设置（回落默认 {prefix}_{server}__{tool}），
-    // 与 config/validation 的空白语义一致；装配期与热重载共用本入口，
-    // 两边读到的都是同一份落盘值。owned：spawn 任务要求 'static，
-    // 从 mcp_cfg 借用的 &str 逃不出函数体（E0521）。
+    // 工具名模板对：空白视同未设置（各自回落默认），与 config/validation
+    // 的空白语义一致；装配期与热重载共用本入口，两边读到的都是同一份
+    // 落盘值。owned：spawn 任务要求 'static，从 mcp_cfg 借用的 &str 逃不
+    // 出函数体（E0521）。builtin 半边统一经 McpConfig::builtin_template_
+    // or_default() 解析（跨 crate 接缝契约），此处不自写 blank-filter。
     let tool_name_template = mcp_cfg
         .tool_name_template
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_owned());
+    let builtin_tool_name_template = mcp_cfg.builtin_template_or_default().to_owned();
 
     let mut mcp_connections = openslate_core::mcp::McpConnectionGuard::new();
     let mut server_tool_counts: std::collections::BTreeMap<String, usize> =
@@ -516,11 +520,17 @@ pub async fn connect_external_mcp(
         let name = name.clone();
         let cfg = cfg.clone();
         let template = tool_name_template.clone();
+        let builtin_template = builtin_tool_name_template.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
-            let result =
-                openslate_core::mcp::connect_mcp_server(&name, &cfg, template.as_deref()).await;
+            let result = openslate_core::mcp::connect_mcp_server(
+                &name,
+                &cfg,
+                template.as_deref(),
+                Some(builtin_template.as_str()),
+            )
+            .await;
             // `elapsed` is captured here, at this server's connect completion
             // — independent of when sibling servers (or the registry loop) run.
             let _ = tx.send((name, start.elapsed(), result));
@@ -1451,5 +1461,255 @@ model = "m1"
         let ctx = build_app_context(config_path.to_str()).await.expect("ctx");
         assert!(ctx.global_config_path.is_none());
         assert_eq!(ctx.config_path, config_path);
+    }
+
+    // ── connect_external_mcp × 裸名上游（host-builtin 形态）集成快照 ────
+    //
+    // 模拟聚合 host 的内置 server 列「裸名」工具（bash / read_file），经
+    // connect_external_mcp 装配，锚定「默认配置下注册名逐字节 =
+    // termux_bash / termux_read_file，且 app 内置裸名工具不受影响」。
+    //
+    // 挡板是手写的最小 MCP Streamable HTTP server（std::net + 独立线程，
+    // 每连接阻塞循环）：只实现装配所需的 legacy `initialize` 握手 +
+    // `tools/list`，响应恒为 application/json（rmcp 客户端原生支持，
+    // 见 streamable_http_client 的 StreamableHttpPostResponse::Json），
+    // 通知回 202。不引 axum/rmcp dev-dep——app crate 保持零新增依赖。
+
+    /// 起 mock host（后台线程常驻），返回其 /mcp URL。
+    /// `tools`: (name, description) 清单，原样进 tools/list。
+    fn spawn_bare_tool_http_host(tools: &[(&str, &str)]) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        fn serve_connection(stream: TcpStream, tools: Vec<(String, String)>) {
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut stream = stream;
+            loop {
+                // 请求行 + 头部（keep-alive：reqwest 连接池复用连接）。
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    return; // 连接关闭
+                }
+                let http_method = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    // let-chains 需 2024 edition（workspace 尚在 2021）。
+                    if let Some((k, v)) = header.split_once(':') {
+                        if k.eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 && reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+
+                // 非 POST（客户端探测性 GET SSE 流 / 会话清理 DELETE）：
+                // 405，rmcp 客户端按「不支持」优雅降级。
+                if http_method != "POST" {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                    continue;
+                }
+
+                let msg: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let rpc_method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = msg.get("id").cloned();
+                let is_request = id.is_some();
+
+                let response: Option<serde_json::Value> = match (rpc_method, is_request) {
+                    // legacy initialize：回显客户端请求的协议版本。
+                    ("initialize", true) => Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": msg["params"]["protocolVersion"]
+                                .as_str()
+                                .unwrap_or("2025-11-25"),
+                            "capabilities": { "tools": { "listChanged": false } },
+                            "serverInfo": { "name": "bare-mock-host", "version": "0.0.0" }
+                        }
+                    })),
+                    ("tools/list", true) => Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": tools.iter().map(|(name, desc)| serde_json::json!({
+                                "name": name,
+                                "description": desc,
+                                "inputSchema": {
+                                    "type": "object", "properties": {}, "required": []
+                                }
+                            })).collect::<Vec<_>>()
+                        }
+                    })),
+                    ("ping", true) => {
+                        Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                    }
+                    _ => None,
+                };
+
+                match response {
+                    Some(payload) => {
+                        let bytes = payload.to_string().into_bytes();
+                        let _ = write!(stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            bytes.len());
+                        let _ = stream.write_all(&bytes);
+                    }
+                    // 通知（notifications/initialized 等）→ 202 Accepted。
+                    None if !is_request => {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    // 未知请求 → JSON-RPC method-not-found（200 + JSON body）。
+                    None => {
+                        let bytes = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": "method not found" }
+                        })
+                        .to_string()
+                        .into_bytes();
+                        let _ = write!(stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            bytes.len());
+                        let _ = stream.write_all(&bytes);
+                    }
+                }
+                let _ = stream.flush();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local addr");
+        let tools: Vec<(String, String)> = tools
+            .iter()
+            .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+            .collect();
+        std::thread::spawn(move || {
+            // 测试挡板线程：随测试进程退出回收，不设关闭协议。
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let tools = tools.clone();
+                std::thread::spawn(move || serve_connection(stream, tools));
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    fn mcp_cfg_pointing_at(url: String) -> McpConfig {
+        use openslate_core::config::{McpServerConfig, TransportConfig};
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "termux".to_string(),
+            McpServerConfig {
+                enabled: true,
+                transport: TransportConfig::Http {
+                    url,
+                    headers: None,
+                },
+            },
+        );
+        McpConfig {
+            servers,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_external_mcp_bare_names_default_templates_snapshot() {
+        // 默认配置（两模板均缺省）+ host 列裸名 bash/read_file：
+        // 注册名逐字节 = termux_bash / termux_read_file（legacy
+        // `prefix_upstream` 形态），app 内置裸名工具不受影响。
+        let url = spawn_bare_tool_http_host(&[
+            ("bash", "run a bash command"),
+            ("read_file", "read a file"),
+        ]);
+
+        // 先注册 app 内置 in-process 工具（裸名 read_file 等），模拟
+        // build_app_context 步骤 7.2 的注册序。
+        let dir = tempfile::TempDir::new().expect("tmp");
+        let (builtin_tools, _builtin_services) = openslate_core::mcp::connect_builtin_servers(
+            dir.path(),
+            &Default::default(),
+            Vec::new(),
+        )
+        .await
+        .expect("builtin servers");
+        let registry = ToolRegistry::new();
+        for tool in builtin_tools {
+            registry
+                .register_boxed(Box::new(tool))
+        }
+        let builtin_read_file_before = registry.get("read_file").expect("builtin read_file");
+
+        let cfg = mcp_cfg_pointing_at(url);
+        let (_guard, counts, names, failed) =
+            connect_external_mcp(&cfg, &registry).await.expect("connect");
+        assert!(failed.is_empty(), "mock host must connect: {failed:?}");
+        assert_eq!(counts.get("termux"), Some(&2), "counts: {counts:?}");
+
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["termux_bash", "termux_read_file"]);
+
+        // 注册表：前缀名可查；裸名未被 MCP 注册（bash 原本不存在）。
+        assert!(registry.get("termux_bash").is_some());
+        assert!(registry.get("termux_read_file").is_some());
+        assert!(registry.get("bash").is_none());
+        // app 内置 read_file 不受影响（同 Arc，未被顶替）。
+        let builtin_read_file_after = registry.get("read_file").expect("bare read_file kept");
+        assert!(
+            std::sync::Arc::ptr_eq(&builtin_read_file_before, &builtin_read_file_after),
+            "builtin bare read_file must not be replaced by the MCP registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_external_mcp_bare_names_custom_builtin_template() {
+        // 自定义 builtin 小模板：裸名注册形状随之改写（同时证明 wiring
+        // 把 McpConfig::builtin_template_or_default 的解析结果传到了
+        // format_tool_name）；含 `__` 的聚合上游不受小模板影响不在此测
+        // （mcp.rs 表测试已覆盖）。
+        let url = spawn_bare_tool_http_host(&[
+            ("bash", "run a bash command"),
+            ("read_file", "read a file"),
+        ]);
+        let registry = ToolRegistry::new();
+        let mut cfg = mcp_cfg_pointing_at(url);
+        cfg.builtin_tool_name_template = Some("{prefix}.mcp.{tool}".to_string());
+
+        let (_guard, _counts, names, failed) =
+            connect_external_mcp(&cfg, &registry).await.expect("connect");
+        assert!(failed.is_empty(), "mock host must connect: {failed:?}");
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["termux.mcp.bash", "termux.mcp.read_file"]);
+        assert!(registry.get("termux.mcp.bash").is_some());
+
+        // 空白 = 未设置 = 默认（helper 契约，装配路径同一份解析）。
+        let mut cfg_blank = cfg;
+        cfg_blank.builtin_tool_name_template = Some("   ".to_string());
+        assert_eq!(
+            cfg_blank.builtin_template_or_default(),
+            openslate_core::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE
+        );
     }
 }

@@ -428,6 +428,35 @@ pub fn set_mcp_tool_name_template(path: &Path, template: &str) -> Result<()> {
     save_document(path, &doc)
 }
 
+/// Write/clear `[mcp].builtin_tool_name_template`（rule 19b 的落盘半边）：
+/// an empty `template` removes the key (falling back to the built-in
+/// `{prefix}_{tool}` via [`remove_sub_key`] semantics); a `[mcp]` section
+/// that does not exist yet is created on write. Value validation is the
+/// caller's job (core `validation::validate_mcp_builtin_tool_name_template`
+/// — the FFI write path runs it before persisting, and startup validation
+/// would catch anything hand-written into the file). Same non-table guard as
+/// [`set_mcp_tool_name_template`].
+pub fn set_mcp_builtin_tool_name_template(path: &Path, template: &str) -> Result<()> {
+    if template.is_empty() {
+        return remove_sub_key(path, "mcp", "builtin_tool_name_template");
+    }
+    let mut doc = load_document(path)?;
+    if let Some(item) = doc.as_table().get("mcp") {
+        anyhow::ensure!(
+            item.is_table(),
+            "config entry 'mcp' is not a standard TOML table"
+        );
+    }
+    let mcp = doc
+        .as_table_mut()
+        .entry("mcp")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .context("[mcp] is not a table")?;
+    mcp.insert("builtin_tool_name_template", value(template.to_owned()));
+    save_document(path, &doc)
+}
+
 /// Rename a key inside `[mcp.servers]` (the mobile aggregated-host scenario
 /// has exactly one server, whose key is also the `{prefix}` placeholder's
 /// expansion value). Semantics:
@@ -946,6 +975,69 @@ mod tests {
         // 无 [mcp] 节的文件上清空 → 静默成功，不创建文件。
         let (_dir, path) = temp_config();
         set_mcp_tool_name_template(&path, "").expect("clear on empty doc ok");
+        assert!(!path.exists(), "no file should be created on no-op clear");
+    }
+
+    // ── [mcp].builtin_tool_name_template ──────────────────────────────
+
+    #[test]
+    fn set_mcp_builtin_tool_name_template_roundtrip() {
+        let (_dir, path) = temp_config();
+        // 写入（[mcp] 节不存在则创建）→ 读回。
+        set_mcp_builtin_tool_name_template(&path, "{prefix}.{tool}").expect("write");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["mcp"]["builtin_tool_name_template"].as_str(),
+            Some("{prefix}.{tool}")
+        );
+        // 覆写。
+        set_mcp_builtin_tool_name_template(&path, "{tool}").expect("overwrite");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["mcp"]["builtin_tool_name_template"].as_str(),
+            Some("{tool}")
+        );
+        // 空串 → 键消失（回默认）。
+        set_mcp_builtin_tool_name_template(&path, "").expect("clear");
+        let doc = parse_at(&path);
+        let gone = doc["mcp"]
+            .as_table()
+            .map(|t| t.get("builtin_tool_name_template").is_none())
+            .unwrap_or(true);
+        assert!(gone, "cleared key must be absent: {}", text_at(&path));
+        // 再清一次（幂等）。
+        set_mcp_builtin_tool_name_template(&path, "").expect("clear again ok");
+    }
+
+    #[test]
+    fn set_mcp_builtin_tool_name_template_coexists_with_servers() {
+        // 小模板与大模板/servers 同居 [mcp]：互不干扰。
+        let (_dir, path) = temp_config();
+        upsert_mcp_server(&path, "termux", "http://127.0.0.1:8765/mcp", None).expect("upsert");
+        set_mcp_tool_name_template(&path, "{server}_{tool}").expect("big template");
+        set_mcp_builtin_tool_name_template(&path, "{prefix}-{tool}").expect("builtin template");
+        let text = text_at(&path);
+        assert!(text.contains("[mcp.servers.termux]"), "{text}");
+        assert!(
+            text.contains(r#"builtin_tool_name_template = "{prefix}-{tool}""#),
+            "{text}"
+        );
+        // 清小模板不动 servers 与大模板。
+        set_mcp_builtin_tool_name_template(&path, "").expect("clear");
+        let text = text_at(&path);
+        assert!(!text.contains("builtin_tool_name_template"), "{text}");
+        assert!(
+            text.contains(r#"tool_name_template = "{server}_{tool}""#),
+            "{text}"
+        );
+        assert!(text.contains("[mcp.servers.termux]"), "{text}");
+    }
+
+    #[test]
+    fn set_mcp_builtin_tool_name_template_clear_missing_is_ok() {
+        // 无 [mcp] 节的文件上清空 → 静默成功，不创建文件。
+        let (_dir, path) = temp_config();
+        set_mcp_builtin_tool_name_template(&path, "").expect("clear on empty doc ok");
         assert!(!path.exists(), "no file should be created on no-op clear");
     }
 

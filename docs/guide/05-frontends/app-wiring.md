@@ -93,8 +93,11 @@ pub struct AppContext {
   注册本身仍在装配 task 上串行做纯内存 insert）。失败 warn+skip（一个坏 server 不拖垮
   启动）；撞名 bail。服务句柄进独立的 `mcp_external` guard。**mobile 热重载共用此函数**
   （先注册进 scratch registry 做批内冲突检查，再迁移到真实注册表，见 06-mobile）。
-  工具注册名按 `[mcp].tool_name_template` 展开（模板解析为 owned String 传入各 spawn
-  任务——`&str` 借用逃不出 `'static` 任务，E0521；空白视同未设置回默认）。
+  工具注册名按**模板对**展开（`[mcp].tool_name_template` 作用于含 `__` 的聚合上游名、
+  `[mcp].builtin_tool_name_template` 作用于裸名；builtin 半边经
+  `McpConfig::builtin_template_or_default()` 解析——空白回落默认 `{prefix}_{tool}` 的
+  接缝契约，不自写 blank-filter。模板解析为 owned String 传入各 spawn 任务——`&str`
+  借用逃不出 `'static` 任务，E0521）。默认两值均与历史 `前缀_上游全名` 逐字节一致。
 - 连接超时矩阵见 `04-tools/mcp-builtin.md` / core `mcp.rs`（握手/清单 30s，调用 300s）。
 
 ## 4. 审批策略推导（wiring.rs:293-370）

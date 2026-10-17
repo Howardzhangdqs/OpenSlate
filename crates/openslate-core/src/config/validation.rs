@@ -342,6 +342,26 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
         }
     }
 
+    // 19b. `[mcp].builtin_tool_name_template`（rule 19 的姊妹条，独立校验
+    //     函数——两条规则刻意不同，勿合并）：小模板作用于不含 `__` 的裸
+    //     上游名，占位符仅 {prefix}/{tool}（禁 {server}：裸名没有 slug 段
+    //     可暴露），且 strip 占位符后禁字面 `__`、限 [A-Za-z0-9_.-]——裸名
+    //     注册一旦带 `__` 就会被 UI 启发式误认成聚合形态 slug__tool。空白
+    //     同 rule 19 视同未设置（= 默认 "{prefix}_{tool}"）。
+    if let Some(template) = config
+        .mcp
+        .as_ref()
+        .and_then(|m| m.builtin_tool_name_template.as_deref())
+        .filter(|s| !s.trim().is_empty())
+    {
+        if let Err(message) = validate_mcp_builtin_tool_name_template(template) {
+            errors.push(ValidationError {
+                field: "mcp.builtin_tool_name_template".into(),
+                message,
+            });
+        }
+    }
+
     errors
 }
 
@@ -542,6 +562,73 @@ pub fn validate_mcp_tool_name_template(template: &str) -> Result<(), String> {
              {{tool}} placeholders only [A-Za-z0-9_.-] are allowed (unknown {{...}} \
              placeholders are rejected the same way; legal examples: '{{prefix}}.{{server}}.\
              {{tool}}', '{{server}}__{{tool}}')"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an `[mcp].builtin_tool_name_template` value (rule 19b's core).
+///
+/// **独立函数，不复用也不改参 [`validate_mcp_tool_name_template`]**：两条
+/// 规则存在有意差异——外部大模板允许字面 `__`（默认模板自身含一个，且
+/// Kotlin 侧按模板正则提取后 `__` 不再是保留边界），而 builtin 小模板
+/// **禁 `__`**（见下）。`pub` 同样是为了让 FFI 写路径与启动校验共用同一
+/// 套规则。Blank 不在此处理：调用方先按「空白 = 未设置 = 默认」归一。
+///
+/// Rules（小模板作用于不含 `__` 的裸上游名——host-builtin 裸名与桌面直连
+/// 裸名共用同一条展开分支）：
+/// - must contain the `{tool}` placeholder;
+/// - `{server}` is REJECTED: bare upstream names carry no server-slug segment,
+///   so `{server}` has no value to expand (it would leak literal braces into
+///   every registered name);
+/// - after replacing every `{prefix}`/`{tool}` with nothing (same strip
+///   technique as the sibling rule), the remainder must match `[A-Za-z0-9_.-]`
+///   (unknown `{...}` placeholders are rejected by the same check — this runs
+///   BEFORE the `__` ban so brace leftovers get the charset message) AND must
+///   not contain a literal `__` — the no-`__` expansion branch must stay
+///   `__`-free so bare-name registrations remain distinguishable from the
+///   aggregated `slug__tool` form (UI heuristics / history migration treat
+///   `__` as the boundary). The strip-based ban is deliberately conservative:
+///   adjacent separators merge in the remainder (`{prefix}_{tool}_x` strips
+///   to `__x` and is rejected too) — over-rejecting a few exotic-but-harmless
+///   templates is cheaper than a second, cleverer check. This is what makes
+///   the "validated template ⇒ `__`-free expansion" property hold for
+///   boundary-`_`-free prefix/tool values (anchored by the mcp.rs property
+///   test; value-side `_`+`_` boundary merges are a pre-existing legacy quirk
+///   no template rule can guard).
+pub fn validate_mcp_builtin_tool_name_template(template: &str) -> Result<(), String> {
+    if !template.contains("{tool}") {
+        return Err(format!(
+            "builtin tool name template '{template}' is invalid: it must contain the \
+             {{tool}} placeholder (legal examples: '{{tool}}', '{{prefix}}_{{tool}}')"
+        ));
+    }
+    if template.contains("{server}") {
+        return Err(format!(
+            "builtin tool name template '{template}' is invalid: the {{server}} \
+             placeholder is not available here — bare upstream names (host builtin / \
+             desktop direct-connect) carry no server slug segment; use {{prefix}}/{{tool}} \
+             only (legal examples: '{{tool}}', '{{prefix}}_{{tool}}')"
+        ));
+    }
+    let remainder = template.replace("{prefix}", "").replace("{tool}", "");
+    if !remainder
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(format!(
+            "builtin tool name template '{template}' is invalid: outside the \
+             {{prefix}}/{{tool}} placeholders only [A-Za-z0-9_.-] are allowed (unknown \
+             {{...}} placeholders are rejected the same way; legal examples: \
+             '{{prefix}}.{{tool}}', 'mcp_{{tool}}')"
+        ));
+    }
+    if remainder.contains("__") {
+        return Err(format!(
+            "builtin tool name template '{template}' is invalid: a literal double \
+             underscore (__) is not allowed — bare-name registrations must stay \
+             distinguishable from the aggregated `slug__tool` form, whose boundary \
+             is exactly `__` (legal examples: '{{tool}}', '{{prefix}}_{{tool}}')"
         ));
     }
     Ok(())
@@ -1228,6 +1315,168 @@ tool_name_template = ""
                 .iter()
                 .all(|e| e.field != "mcp.tool_name_template"),
             "legal template must not error: {errors:?}"
+        );
+    }
+
+    // ── Rule 19b: [mcp].builtin_tool_name_template ─────────────────────
+
+    #[test]
+    fn mcp_builtin_tool_name_template_legal_examples_pass() {
+        for t in [
+            "{tool}",
+            "{prefix}_{tool}",
+            "{prefix}.{tool}",
+            "{prefix}{tool}",
+            "mcp.{tool}.v2",
+            "host_{tool}",
+            "{prefix}-mcp-{tool}",
+            // 单个 `_` 合法（默认模板本身就带一个）；禁的只是 `__`。
+            "{tool}_x",
+            // 注意 `{prefix}_{tool}_x` 被有意拒收：strip 后相邻分隔符合并
+            // 成 `__x`（保守过拒，见校验函数 doc）。
+        ] {
+            assert!(
+                validate_mcp_builtin_tool_name_template(t).is_ok(),
+                "builtin template '{t}' should be legal"
+            );
+        }
+        // 默认 builtin 模板必须过校验（FFI 缺省回显值 / 常量本体）。
+        assert!(validate_mcp_builtin_tool_name_template(
+            crate::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn mcp_builtin_tool_name_template_missing_tool_rejected() {
+        let err = validate_mcp_builtin_tool_name_template("{prefix}")
+            .expect_err("no {tool}");
+        assert!(err.contains("{tool}"), "message names the placeholder: {err}");
+        assert!(
+            err.contains("{prefix}_{tool}"),
+            "message shows examples: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_builtin_tool_name_template_server_placeholder_rejected() {
+        // {server} 在小模板里无值可展开（裸上游名没有 slug 段），必须
+        // 拒收——独立于字符白名单的显式分支，错误信息直说原因。
+        let err = validate_mcp_builtin_tool_name_template("{server}_{tool}")
+            .expect_err("{server} rejected");
+        assert!(
+            err.contains("{server}"),
+            "message names the placeholder: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_builtin_tool_name_template_double_underscore_rejected() {
+        // 禁字面 `__`（与 rule 19 的有意差异）：裸名注册带 `__` 会被误认
+        // 成聚合形态 slug__tool。注意必须带 {tool}，否则先命中缺 {tool}
+        // 分支（该分支另有用例）。
+        for t in ["{prefix}__{tool}", "__{tool}", "{tool}__", "a__b_{tool}"] {
+            let err = validate_mcp_builtin_tool_name_template(t)
+                .expect_err(format!("template '{t}' must be rejected").as_str());
+            assert!(
+                err.contains("double underscore") || err.contains("__"),
+                "message explains the `__` ban: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_builtin_tool_name_template_unknown_placeholder_rejected() {
+        // 未知占位符 strip 后残留 '{'/'}' → 字符白名单拦下。
+        let err = validate_mcp_builtin_tool_name_template("{prefix}_{tool}_{foo}")
+            .expect_err("unknown {foo}");
+        assert!(err.contains("[A-Za-z0-9_.-]"), "message states the charset: {err}");
+    }
+
+    #[test]
+    fn mcp_builtin_tool_name_template_illegal_characters_rejected() {
+        for t in ["{prefix} {tool}", "{prefix}:{tool}", "名_{tool}", "{prefix}·{tool}"] {
+            assert!(
+                validate_mcp_builtin_tool_name_template(t).is_err(),
+                "builtin template '{t}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_config_flags_illegal_builtin_template() {
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp]
+builtin_tool_name_template = "{prefix}__{tool}"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "mcp.builtin_tool_name_template"),
+            "illegal builtin template is a validation error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_blank_builtin_template_is_default_not_error() {
+        // 空白 = 未设置（默认 {prefix}_{tool}），不是校验错误——persist
+        // 的清空语义写的就是空串（与 rule 19 同口径）。
+        let toml = r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.main]
+provider = "zhipu"
+model = "m1"
+
+[models.fast]
+provider = "zhipu"
+model = "m2"
+
+[mcp]
+builtin_tool_name_template = ""
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.field != "mcp.builtin_tool_name_template"),
+            "blank builtin template means default, not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_config_legal_builtin_template_passes() {
+        let mut config = valid_config();
+        config.mcp = Some(crate::config::McpConfig {
+            // 默认小模板本体：启动校验必须放行。
+            builtin_tool_name_template: Some(
+                crate::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE.into(),
+            ),
+            ..Default::default()
+        });
+        let errors = validate_config(&config, &valid_agents());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.field != "mcp.builtin_tool_name_template"),
+            "legal builtin template must not error: {errors:?}"
         );
     }
 

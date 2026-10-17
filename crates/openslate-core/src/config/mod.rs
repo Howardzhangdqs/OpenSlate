@@ -270,27 +270,56 @@ impl Default for TraceConfig {
 pub struct McpConfig {
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
-    /// 工具注册名模板：占位符 {prefix}（[mcp.servers] 键名，App 侧
-    /// 「服务名/前缀」设置）、{server}（上游 MCP 服务器名 = 聚合名的
-    /// `{slug}` 段，如 Server_Memory）与 {tool}（不带前缀的工具名）。
-    /// 缺省 = "{prefix}_{server}__{tool}"（与历史 `前缀_上游全名` 展开
-    /// 逐字节一致）；None/空白同缺省。除占位符外仅允许 [A-Za-z0-9_.-]
-    /// （校验见 validation.rs）。仅作用于含 `__` 的聚合上游名——无
-    /// `__`（桌面直连形态）恒走 legacy `前缀_上游全名`，模板不参与。
-    /// 只影响注册名：tools/call 路由（definition_name）与 PTC namespace
-    /// 语义不变。保持 `Deserialize`-only：写回由 persist.rs 手拼 TOML
-    /// （模块头约定）。
+    /// 工具注册名模板（大模板，三占位符）：占位符 {prefix}（[mcp.servers]
+    /// 键名，App 侧「服务名/前缀」设置）、{server}（上游 MCP 服务器名 =
+    /// 聚合名的 `{slug}` 段，如 Server_Memory）与 {tool}（不带前缀的
+    /// 工具名）。缺省 = "{prefix}_{server}__{tool}"（与历史
+    /// `前缀_上游全名` 展开逐字节一致）；None/空白同缺省。除占位符外仅
+    /// 允许 [A-Za-z0-9_.-]（校验见 validation.rs）。**仅作用于含 `__` 的
+    /// 聚合上游名**——裸名上游（host-builtin / 桌面直连）走
+    /// [`Self::builtin_tool_name_template`] 小模板。只影响注册名：
+    /// tools/call 路由（definition_name）与 PTC namespace 语义不变。保持
+    /// `Deserialize`-only：写回由 persist.rs 手拼 TOML（模块头约定）。
     #[serde(default)]
     pub tool_name_template: Option<String>,
+    /// builtin 工具名模板（小模板，双模板模型的另一半）：作用于**不含
+    /// `__` 的裸上游名**——聚合 host 内置 server 列出的裸名（bash /
+    /// read_file…）与桌面直连 server 的裸名共用同一条展开分支，改这一
+    /// 个字段同时影响两者。占位符仅 {prefix}/{tool}（裸名没有 server
+    /// slug 段，`{server}` 不允许出现）；缺省 = "{prefix}_{tool}"（与
+    /// legacy `前缀_上游全名` 逐字节一致，None/空白同缺省）；除占位符外
+    /// 仅 [A-Za-z0-9_.-] 且**禁字面 `__`**——裸名注册必须与聚合形态
+    /// `slug__tool` 保持可区分（校验见 validation.rs）。生效值统一经
+    /// [`Self::builtin_template_or_default`] 解析（空白回落默认），装配 /
+    /// 热重载 / FFI 共用，勿各处自写 blank-filter。写回由 persist.rs
+    /// `set_mcp_builtin_tool_name_template`（空串删键回默认）。
+    #[serde(default)]
+    pub builtin_tool_name_template: Option<String>,
+}
+
+impl McpConfig {
+    /// 生效的 builtin 工具名模板（跨 crate 接缝契约）：None/空白视同
+    /// 未设置，回落 [`crate::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE`]
+    /// （`{prefix}_{tool}`）。装配期（wiring）、mobile 热重载、FFI 回显
+    /// 统一走这里解析——空白语义只此一份，避免各处自写 blank-filter 后
+    /// 对「空串 = 默认」的口径漂移。
+    pub fn builtin_template_or_default(&self) -> &str {
+        self.builtin_tool_name_template
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(crate::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE)
+    }
 }
 
 /// A single MCP server connection.
 ///
 /// `enabled` defaults to `true`. Each tool this server exposes is registered
-/// under the `[mcp].tool_name_template` expansion (default:
-/// `{prefix}_{server}__{tool}`, where `{prefix}` is this server's key in
-/// `[mcp.servers]`), so collisions across servers (and with builtins) are
-/// avoided without any per-server config.
+/// under the template-pair expansion (`[mcp].tool_name_template` for
+/// aggregated `slug__tool` names, `[mcp].builtin_tool_name_template` for
+/// bare names; defaults `{prefix}_{server}__{tool}` / `{prefix}_{tool}`,
+/// where `{prefix}` is this server's key in `[mcp.servers]`), so collisions
+/// across servers (and with builtins) are avoided without any per-server
+/// config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerConfig {
     #[serde(default = "default_true")]

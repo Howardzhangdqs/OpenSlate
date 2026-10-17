@@ -115,7 +115,9 @@ pub fn envelope_error(msg) -> String;                     // {"error": "…"}
    - `__mkTool(display, registry)`：`(input) => …` 包装器，调 `__call_tool_raw(registry,
      JSON.stringify(input ?? {}))`，error envelope → `throw new Error("tool X failed: …")`；
    - `__mkNs(entries, nsDisplay, nsPrefix)`：Proxy 命名空间对象，**未知成员**落 bridge
-     派发组合名 `nsPrefix + "_" + member`（与 McpTool 组合真成员的方式一致）——得到规范的
+     派发组合名 `nsPrefix + "_" + member`（与 McpTool 组合真成员的方式一致——即裸名
+     形状；McpTool 注册名实为双模板展开：含 `__` 聚合名走 `[mcp].tool_name_template`、
+     裸名走 `[mcp].builtin_tool_name_template`，见 02-core）——得到规范的
      "tool not available" envelope，而不是跨命名空间够到同名平铺工具；
    - 顶层 `tools` Proxy：未知成员同样走 bridge（宿主 allow-list 产出规范错误）；
    - `list_tools` / `describe_tool` 同时暴露为顶层函数和 `tools.list_tools` /

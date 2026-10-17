@@ -2318,13 +2318,18 @@ private fun McpSection() {
         return job
     }
     /**
-     * 进页 / ON_RESUME 的智能门控：有快照时只做廉价变化探测——本机回环
-     * HTTP（~ms 级，不碰 Termux 通道），与快照 hostAlive 比对：
-     * - 一致 → 只做无感差异检查（注册表缺工具才单发自愈，健康时零日志
-     *   零动作——用户：「其他时候不要乱动」）；
-     * - 翻转（绿→红或红→绿）→ 全量重检（收尾自带差异检查）；
-     * - 无快照（首次进页）→ 全量重检。
-     * 门控全程不置 probing：快照继续渲染，不闪「探测状态…」。
+     * 进页 / ON_RESUME 的智能门控：
+     * - 无快照（首次进页）→ 全量重检；
+     * - 快照非全绿（上次有未通过项）→ 直接全量重检：典型场景是用户按
+     *   指引打开 Termux 后返回——Termux 刚复活时 host 端口必然仍无应答
+     *   （host 还没人重启），host-only 廉价比对看不见「Termux 已活」这个
+     *   变化，会误判无变化而跳过重检、逼用户手动刷新；全量重检的步骤 4
+     *   会顺带把 host 自动拉起，一步到位；
+     * - 全绿快照 → 只做廉价变化探测——本机回环 HTTP（~ms 级，不碰
+     *   Termux 通道），与快照 hostAlive 比对：一致 → 无感差异检查
+     *   （注册表缺工具才单发自愈，健康时零日志零动作）；翻转 → 全量重检。
+     * 廉价路径全程不置 probing（快照继续渲染）；全量路径由 refresh 自带的
+     * 渐进提交接管（检测中 · 已完成 n/5）。
      */
     fun gateRefresh() {
         val snap = McpStatusCache.snapshot
@@ -2334,6 +2339,13 @@ private fun McpSection() {
         }
         // 有操作/重检在途 → 它的结果本来就更新，门控不叠加。
         if (busy || refreshJob?.isActive == true) return
+        val snapGreen = snap.termuxInstalled && snap.termuxPerm &&
+            snap.termuxAllowed && snap.hostInstalled && snap.hostAlive
+        if (!snapGreen) {
+            log("上次检测有未通过项（如刚从 Termux 返回），自动全量重检…")
+            refresh()
+            return
+        }
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val (alive, _) = McpHostManager.hostAliveDetail(context)
             // 探测期间可能已有操作/重检启动（applyServers、手动刷新等）：

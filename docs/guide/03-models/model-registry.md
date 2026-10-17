@@ -13,7 +13,7 @@
 |------|------|
 | `crates/openslate-core/src/model_registry.rs`（573 行） | **纯逻辑，无 IO 状态**：数据源定义（`SOURCES`，L56）、两种格式解析（`SourceFormat::{ModelsDev, LiteLLM}`，L30）、id 归一化与匹配（`norm_id` L92 / `id_candidates` L102）、按源优先级合并（`merge_metas` L218）、CloudPrice 在线单查（`probe_cloudprice_by_id` L383）、`http_get_json`（L336，Android TLS + 代理） |
 | `crates/openslate-mobile/src/registry.rs`（541 行） | **存储与更新**：`RegistryStore`（L46）——本地 ZSTD 持久化、手动/自动更新、三源合并查询、搜索/浏览 |
-| 设置页「模型数据源」（mobile，内嵌子页） | UI：provider 聚合浏览/跨源搜索 + 条目详情弹层；每源独立「更新」按钮在页顶「数据源管理」区（常开直接可见） |
+| 设置页「模型数据源」（mobile，内嵌子页） | UI：**按源下钻**（用户拍板 2026-10：首屏 = 源管理卡片区常开置顶 + 提示行，无跨源合并列表、无跨源搜索；点源卡进该源独占视图——内嵌页头返回 + 该源条目 provider 分组浏览 + 源内搜索）+ 条目详情弹层；每源独立「更新」按钮在首屏「数据源管理」区（卡片点按与「更新」事件隔离） |
 
 ## 2. 数据源（`SOURCES` 常量，L56-83；声明序 = 优先级序）
 
@@ -174,13 +174,17 @@ pub struct ModelMeta {
 - `raw`（L55）：解码后的**原始 JSON**（`Arc<Value>`，`raw_value` L220 懒加载——搜索/浏览
   要原始键含 provider 前缀与天然键序，索引 map 已折叠丢失。Arc 共享，查询方零整树克隆）。
 
-### 6.3 `search_json`（数据源子页「provider 聚合浏览 / 跨源搜索」）
+### 6.3 `search_json`（数据源子页「按源浏览 / 源内搜索」）
 
 纯本地（磁盘 ZSTD + 内存 raw 缓存）、同步执行。返回
 `{"total":N,"results":[{source,sourceId,id,ctx,out,vision,reasoning,tool,priceIn,priceOut}]}`。
 
 - `source_id` 空 = 跨全部**本地已缓存**源搜索（无 zst 数据的源跳过，不误报）；
-  非空 = 只搜该源；未知 id → `{"total":0,"results":[]}`（契约）。
+  非空 = 只搜该源；未知 id → `{"total":0,"results":[]}`（契约）。**UI 侧 2026-10
+  起只按源调用**（数据源子页已改按源下钻、不合并展示：浏览传
+  `registrySearch(sourceId, "", 100_000)`，源内搜索传 `registrySearch(sourceId,
+  q, 100_000)`）；空 `source_id` 的跨源通道保留为 FFI 契约（Rust 单测覆盖），
+  UI 不再用。
 - `query` 空（或归一化后为空，如纯符号）= **浏览模式**：按 JSON 键天然顺序
   （serde_json 默认 BTreeMap 字典序，确定性）取前 `limit` 条；非空 = 双侧归一化子串匹配
   `norm_id(原始键).contains(&norm_id(query))`（键含 provider 前缀，尾段子串天然覆盖）。

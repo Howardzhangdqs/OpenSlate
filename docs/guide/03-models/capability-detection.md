@@ -62,13 +62,28 @@ pub async fn list_remote_models(
   内存 secrets map，`env(api_key_env)` 兜底；ollama 等本地端点允许无 key。
 - **desktop 暂无入口**（cli/tui/server 未接线；要加的话走 core 这个函数，别再复制一份矩阵）。
 
-## 6. 检测之后：能力字段哪里来
+## 6. mobile 建条目的 entry 键命名（`providerId/modelId`）
+
+- UI 勾选/手动添加入库（SettingsScreen `genModelEntryId`）生成的 `[models.<entry>]`
+  键为 **`providerId/modelId`**（两段原样、仅 trim），与 models.dev 注册表键
+  （`zhipuai/glm-4.7`）同形。toml 中含 `/` 的键由 toml_edit 自动加引号
+  （`[models."zhipuai/glm-4.7"]`），合法且无碍；键冲突时追加 `-` + 4 位 hex 后缀。
+- **存量 `provider__model` slug 键**（旧生成器：小写 + 非 `[a-z0-9-]` 折叠 `-`，
+  冲突加 hex 后缀）由 mobile 端启动迁移统一改写（RuntimeBridge
+  `migrateModelEntrySlash`：精确公式匹配判定自动生成条目 → upsert 新键 →
+  levels/capabilities 引用同步改指 → 删旧键；SharedPreferences 标记
+  `migrated_model_entry_slash_v1` 防重跑）。手写 entry 与 levels KEY 不动。
+- Rust 全链路（resolve_model/persist/registry/session）把 entry 当**不透明串**，
+  键格式仅是 mobile 侧约定；UI 显示层经 `RuntimeBridge.modelAliasDisplay` 把
+  条目键换「Provider显示名/modelId」，entry 裸串不直出。
+
+## 7. 检测之后：能力字段哪里来
 
 `list_remote_models` 只给 id。`[models.X]` 条目的 `supports_tool_call / supports_vision /
 supports_reasoning` 及限额 / 计价来自：手动配置 > mobile 端「从 registry 补全」
 （`lookup_with_online_fallback`，见 `model-registry.md` §7）。
 
-## 7. 改动检查清单
+## 8. 改动检查清单
 
 - 新增 adapter 端点形态 → 矩阵 + 解析都要动；错误文案保持带响应片段的习惯。
 - 动 TLS / 代理 → 与 model-genai、model_registry 三处同款，一起改。

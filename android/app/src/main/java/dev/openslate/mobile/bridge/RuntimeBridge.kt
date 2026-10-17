@@ -609,6 +609,27 @@ object RuntimeBridge {
         JSONObject().put("type", "set_model").put("alias", alias).toString()
     )
 
+    // ── 模型别名显示（共享助手；entry 内部键不直出 UI）──────────────
+
+    /**
+     * 别名 → UI 显示串。命中 [ConfigUi.models] 条目（直绑形态）→
+     * 「Provider显示名/modelId」——provider 显示名与 Provider 页/选择
+     * 器同源（title 优先、回退内部 name，见 [ProviderUi.displayName]）；
+     * levels 代号（用户自命名，不转换）与未命中 → 原样返回；空串原样
+     * （「未设置」等占位由调用方处理）。内部 entry 键（`zhipuai/glm-4.7`，
+     * 历史 `zhipu__glm-4-7`）经此转换后不出现在任何 UI 文本——顶栏副
+     * 标题（ChatScreen）、模型选择器（ComposerPanel）、功能模型分段控
+     * 件（SettingsScreen）三处共用。纯函数读传入 config，无额外缓存，
+     * config_changed 刷新 state 后自动跟随。
+     */
+    fun modelAliasDisplay(alias: String, config: ConfigUi): String {
+        if (alias.isEmpty()) return alias
+        val m = config.models.firstOrNull { it.entry == alias } ?: return alias
+        val provider = config.providers.firstOrNull { it.name == m.provider }
+            ?.displayName ?: m.provider
+        return "$provider/${m.modelId}"
+    }
+
     /** 注册/更新 MCP server（http 条目）。Authorization 不经此传入：
      *  token 由 start() 在 create 前经 setMcpHostToken() 运行时注入
      *  （SecretStore 加密持久化，不落 toml）。 */
@@ -1171,6 +1192,117 @@ object RuntimeBridge {
         mutate { copy(config = parseConfig(c)) }
     }
 
+    // ── 模型条目键一次性迁移（legacy `p__m` slug → `p/m`）──────────
+
+    /** 迁移防重跑标记（FILE_MAIN；置位后永不再跑）。 */
+    private const val PREF_MIGRATED_MODEL_ENTRY_SLASH = "migrated_model_entry_slash_v1"
+
+    /** 进程内单发闸：snapshot 可能多次到达（重开会话等），防重复挂协程。 */
+    @Volatile
+    private var modelEntryMigrationLaunched = false
+
+    /**
+     * 首个 snapshot（runtime 就绪 + config 已入 state）后挂一次性迁移
+     * （IO 后台，不阻塞事件泵）。prefs 标记已置位则只闸不跑。整体异常
+     * 不置标记 → 下次启动重试；操作幂等（upsert 同键覆写；legacy 公式
+     * 对已改斜杠的条目不命中），重跑无副作用。
+     */
+    private fun maybeMigrateModelEntrySlash() {
+        if (modelEntryMigrationLaunched) return
+        val ctx = appContext ?: return
+        modelEntryMigrationLaunched = true
+        val prefs = ctx.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, false)) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                migrateModelEntrySlash(_state.value.config)
+                prefs.edit().putBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, true).apply()
+                Log.i(TAG, "model-entry migration: marked done ($PREF_MIGRATED_MODEL_ENTRY_SLASH)")
+            } catch (t: Throwable) {
+                Log.e(TAG, "model-entry migration: aborted, will retry next launch", t)
+            }
+        }
+    }
+
+    /** 旧生成器（SettingsScreen.genModelEntryId 的 `__` 版本）slug 公式的镜像。 */
+    private fun legacyEntrySlug(s: String): String =
+        s.lowercase().replace(Regex("[^a-z0-9-]+"), "-").trim('-').ifEmpty { "m" }
+
+    /**
+     * 自动生成判定（精确公式匹配，零误伤）：entry == `<slug(P)>__<slug(M)>`
+     * 或再带 4 位 hex 冲突后缀——旧生成器唯一两种产出。用户手写 entry
+     * 不匹配公式，一律不动；levels 的 KEY（用户命名空间）同样不动。
+     */
+    private fun isLegacyAutoEntry(entry: String, provider: String, modelId: String): Boolean {
+        val base = Regex.escape("${legacyEntrySlug(provider)}__${legacyEntrySlug(modelId)}")
+        return Regex("^$base(-[0-9a-f]{4})?$").matches(entry)
+    }
+
+    /**
+     * 逐条迁移（单条失败跳过并日志，不中断整体）。每条顺序（防悬空）：
+     * upsert 新键（完整复制原字段）→ `[levels]` value 改指新键（KEY
+     * 不变）→ `[capabilities]` 直绑值同理 → 会话别名仍指旧键则热切
+     * （set_model，防删除后内存别名悬空）→ deleteModel 旧键；levels/
+     * capabilities 改指任一失败则保留旧键不删（服务端也可能拒删被引
+     * 用条目，双保险）。全部经现有协议操作（persist 落盘 + config_
+     * changed 回刷），**无新 FFI**。目标键被其他 entry 占用则跳过该条。
+     */
+    private fun migrateModelEntrySlash(config: ConfigUi) {
+        val occupied = config.models.map { it.entry }.toMutableSet()
+        var migrated = 0
+        var skipped = 0
+        val userAuthored = config.models.count {
+            !isLegacyAutoEntry(it.entry, it.provider, it.modelId)
+        }
+        for (m in config.models) {
+            if (!isLegacyAutoEntry(m.entry, m.provider, m.modelId)) continue
+            val target = "${m.provider.trim()}/${m.modelId.trim()}"
+            if (target != m.entry && target in occupied) {
+                skipped++
+                Log.w(TAG, "model-entry migration: skip '${m.entry}' -> '$target' (target occupied)")
+                continue
+            }
+            try {
+                if (!upsertModel(m.copy(entry = target))) {
+                    skipped++
+                    Log.w(TAG, "model-entry migration: skip '${m.entry}' (upsert send failed)")
+                    continue
+                }
+                var repointOk = true
+                for ((level, e) in config.levels) {
+                    if (e == m.entry && !setLevel(level, target)) repointOk = false
+                }
+                for ((cap, alias) in config.capabilities) {
+                    if (alias == m.entry && !setCapability(cap, target)) repointOk = false
+                }
+                if (_state.value.modelAlias == m.entry) setModelAlias(target)
+                if (repointOk) {
+                    if (!deleteModel(m.entry)) {
+                        Log.w(TAG, "model-entry migration: '${m.entry}' copied but old key kept (delete failed)")
+                    }
+                } else {
+                    Log.w(
+                        TAG,
+                        "model-entry migration: '${m.entry}' copied but old key kept " +
+                            "(level/capability repoint failed; refs still on old key)",
+                    )
+                }
+                occupied.remove(m.entry)
+                occupied.add(target)
+                migrated++
+                Log.i(TAG, "model-entry migration: '${m.entry}' -> '$target' ok")
+            } catch (t: Throwable) {
+                skipped++
+                Log.e(TAG, "model-entry migration: '${m.entry}' failed, skipped", t)
+            }
+        }
+        Log.i(
+            TAG,
+            "model-entry migration: pass done (total=${config.models.size}, " +
+                "migrated=$migrated, skipped=$skipped, userAuthored=$userAuthored)",
+        )
+    }
+
     private fun applySnapshot(session: JSONObject?) {
         if (session == null) return
         val transcript = session.optJSONArray("transcript") ?: return
@@ -1227,6 +1359,9 @@ object RuntimeBridge {
         )
         // 本地 transcript（含思维链/⚡meta）若存在则整体覆盖镜像版。
         tryRestoreLocalTranscript()
+        // 模型条目键一次性迁移（legacy `p__m` slug → `p/m`；prefs 防重跑，
+        // 挂载点选在此处 = runtime 就绪且 config 已入 state 的最早时刻）。
+        maybeMigrateModelEntrySlash()
     }
 
     /** 增量并入最后一条同类条目（或新起一条）。 */

@@ -272,12 +272,19 @@ internal fun ComposerFocusPanel(
     }
 }
 
-/** 「本次对话模型」选项：别名 + 解析出的展示副标题（null = 代号未绑定到模型条目）。 */
-private data class ComposerModelOption(val alias: String, val subtitle: String?)
+/** 「本次对话模型」选项：别名（原始值，选中/回传语义）+ 显示主文字
+ *  （models 直绑条目经共享助手换「Provider/modelId」，levels 代号原样）
+ *  + 解析出的展示副标题（null = 代号未绑定到模型条目）。 */
+private data class ComposerModelOption(
+    val alias: String,
+    val label: String,
+    val subtitle: String?,
+)
 
 /**
  * 可选别名全集 = levels 键 + capabilities 值 + models 条目键（三者都是
  * set_model 的合法别名——resolve_model 先查 levels 再直查 models）。
+ * 主文字 = [RuntimeBridge.modelAliasDisplay]（条目键不直出 UI）；
  * 副标题 = (levels[alias] ?: alias) 对应模型条目的「Provider · modelId」，
  * 解析顺序与 Rust resolve_model 逐字一致。
  */
@@ -290,6 +297,7 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> {
         val model = config.models.firstOrNull { it.entry == entryName }
         ComposerModelOption(
             alias = alias,
+            label = RuntimeBridge.modelAliasDisplay(alias, config),
             subtitle = model?.let { m ->
                 val provider = config.providers.firstOrNull { it.name == m.provider }
                     ?.displayName ?: m.provider
@@ -303,7 +311,9 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> {
  * 「本次对话模型」行：整行点击弹 DropdownMenu（菜单贴底自动向上展开），
  * 选中项带 Check 图标（ui.md 基线），副标题展示解析到的具体模型；切换走
  * onSelectModel（RuntimeBridge.setModelAlias）→ model_changed 回填
- * state.modelAlias，行内显示与实际生效恒同源。
+ * state.modelAlias，行内显示与实际生效恒同源。选项主文字与行内当前值
+ * 都经 modelAliasDisplay（条目键 → 「Provider/modelId」；levels 代号
+ * 原样）——内部 entry 键不直出 UI，选中比对/回传仍用原始别名。
  */
 @Composable
 private fun ModelPickerRow(
@@ -343,7 +353,7 @@ private fun ModelPickerRow(
                 when {
                     options.isEmpty() -> "未配置模型"
                     modelAlias.isEmpty() -> "未设置"
-                    else -> modelAlias
+                    else -> RuntimeBridge.modelAliasDisplay(modelAlias, config)
                 },
                 style = MaterialTheme.typography.labelLarge,
                 color = if (options.isEmpty()) {
@@ -368,7 +378,7 @@ private fun ModelPickerRow(
                 DropdownMenuItem(
                     text = {
                         Column {
-                            Text(opt.alias, style = MaterialTheme.typography.bodyMedium)
+                            Text(opt.label, style = MaterialTheme.typography.bodyMedium)
                             if (opt.subtitle != null) {
                                 Text(
                                     opt.subtitle,

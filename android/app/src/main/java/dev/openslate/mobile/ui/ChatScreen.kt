@@ -188,11 +188,16 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                         Column {
                             Text("OpenSlate", style = MaterialTheme.typography.titleLarge)
                             Text(
+                                // 直绑条目键经共享显示助手换「Provider/modelId」，
+                                // 内部 entry 不直出；levels 代号原样。
                                 text = when {
                                     !state.ready -> "runtime 启动中…"
                                     state.running ->
-                                        "${state.modelAlias} · Step ${state.step} · 工具 ${state.toolCalls}"
-                                    else -> state.modelAlias.ifEmpty { "就绪" }
+                                        "${RuntimeBridge.modelAliasDisplay(state.modelAlias, state.config)}" +
+                                            " · Step ${state.step} · 工具 ${state.toolCalls}"
+                                    else -> RuntimeBridge
+                                        .modelAliasDisplay(state.modelAlias, state.config)
+                                        .ifEmpty { "就绪" }
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                             )

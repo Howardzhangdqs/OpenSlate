@@ -275,6 +275,10 @@ fun SettingsScreen(
                                         options = aliases,
                                         selected = config.capabilities[cap] ?: dft,
                                         onSelect = { RuntimeBridge.setCapability(cap, it) },
+                                        // 选项值可含 models 直绑条目键 → 经共享
+                                        // 显示助手换「Provider/modelId」，条目
+                                        // 键不直出；levels 代号原样。
+                                        label = { RuntimeBridge.modelAliasDisplay(it, config) },
                                     )
                                 }
                             }
@@ -517,7 +521,7 @@ fun SettingsScreen(
                 editModelLock = null
             },
             onSave = { ui ->
-                // Provider 页新建且未填条目 ID → 自动生成（provider__model slug）。
+                // Provider 页新建且未填条目 ID → 自动生成（providerId/modelId）。
                 val final = if (ui.entry.isBlank()) {
                     ui.copy(
                         entry = genModelEntryId(
@@ -529,7 +533,7 @@ fun SettingsScreen(
                 } else {
                     ui
                 }
-                // 查重：同 Provider 下不允许重复的模型 ID（否则 slug 冲突
+                // 查重：同 Provider 下不允许重复的模型 ID（否则键冲突
                 // 会生成随机后缀新条目，列表出现重复模型）；同 entry 覆盖
                 // 更新不受影响。服务端 upsert_model 守卫同款兜底。
                 val dup = config.models.find {
@@ -685,18 +689,20 @@ private fun InfoRow(label: String, value: String) {
     }
 }
 
-/** 模型条目内部 ID：`<provider>__<model>` slug 化（TOML 键安全：
- * 非 [a-z0-9-] 折成 `-`），冲突时追加随机后缀。仅在 Provider 页自动
- * 检测/手动添加时生成；改名入口不存在，引用稳定。 */
+/** 模型条目内部 ID：`<providerId>/<modelId>`（两段原样、仅 trim——与
+ * models.dev 注册表键 `zhipuai/glm-4.7` 同形；toml 中含 `/` 的键由
+ * toml_edit 自动加引号，合法且无碍）。键冲突（同键已被手写占用）时
+ * 追加随机 hex 后缀。仅在 Provider 页自动检测/手动添加时生成；改名
+ * 入口不存在，引用稳定。存量 `provider__model` slug 键由 RuntimeBridge
+ * 启动迁移（migrateModelEntrySlash）统一改写，此处不再生成。 */
 private fun genModelEntryId(providerId: String, modelId: String, existing: Set<String>): String {
-    fun slug(s: String) = s.lowercase().replace(Regex("[^a-z0-9-]+"), "-")
-        .trim('-').ifEmpty { "m" }
-    var id = "${slug(providerId)}__${slug(modelId)}"
+    val p = providerId.trim()
+    val m = modelId.trim()
+    var id = "$p/$m"
     if (id !in existing) return id
     val chars = ('a'..'f') + ('0'..'9')
     while (id in existing) {
-        id = "${slug(providerId)}__${slug(modelId)}-" +
-            List(4) { chars.random() }.joinToString("")
+        id = "$p/$m-" + List(4) { chars.random() }.joinToString("")
     }
     return id
 }
@@ -1088,6 +1094,9 @@ private const val TERMUX_ALLOW_EXTERNAL_CMD =
 /**
  * 滑动药丸分段选择器：所有选项平铺在一个圆角容器里，选中项背后是一块
  * 半透明着色区域；切换时色块以动画平滑滑动到目标位置。
+ *
+ * [label] 仅换显示文字（默认恒等）：选项的**值语义**（selected 匹配、
+ * onSelect 回传）始终用原始 option，供调用方把内部键映射为显示串。
  */
 @Composable
 private fun SlidingSegmentedControl(
@@ -1095,6 +1104,7 @@ private fun SlidingSegmentedControl(
     selected: String,
     onSelect: (String) -> Unit,
     modifier: Modifier = Modifier,
+    label: (String) -> String = { it },
 ) {
     val selectedIndex = options.indexOf(selected).coerceAtLeast(0)
     // 色块位置用「选中索引」的浮点动画驱动，index 连续变化 → 色块连续滑动。
@@ -1135,7 +1145,7 @@ private fun SlidingSegmentedControl(
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            opt,
+                            label(opt),
                             style = MaterialTheme.typography.titleSmall,
                             color = if (isSel) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant,

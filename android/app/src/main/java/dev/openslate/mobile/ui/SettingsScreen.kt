@@ -1034,46 +1034,59 @@ private const val TERMUX_ALLOW_EXTERNAL_CMD =
 @Composable
 private fun AccentSwatchRow(selectedId: String, onSelect: (String) -> Unit) {
     val dark = LocalDarkTheme.current
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        for (palette in ACCENTS) {
-            val selected = palette.id == selectedId
-            val fill = if (dark) palette.dark.primary else palette.light.primary
-            val onFill = if (dark) palette.dark.onPrimary else palette.light.onPrimary
-            Box(
-                Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .clickable(
-                        role = Role.RadioButton,
-                        onClickLabel = "切换到${palette.label}主题色",
-                    ) { onSelect(palette.id) }
-                    .then(
-                        if (selected) {
-                            Modifier.border(2.dp, fill, CircleShape)
-                        } else {
-                            Modifier
-                        },
-                    )
-                    .padding(if (selected) 4.dp else 0.dp)
-                    .clip(CircleShape)
-                    .background(fill),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (selected) {
-                    Icon(
-                        Icons.Filled.Check,
-                        contentDescription = null,
+    // 行内居中（用户拍板）。horizontalScroll 会向子级传无限宽约束，居中对齐
+    // 在其中失效，故按宽度分路径：放得下（≥ 328dp = 7×40 圈 + 6×8 间距）→
+    // 无滚动 + spacedBy 居中对齐；更窄屏 → 横滑兜底（起点对齐，可滚动）。
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val fits = maxWidth >= 328.dp
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .then(
+                    if (fits) Modifier
+                    else Modifier.horizontalScroll(rememberScrollState()),
+                ),
+            horizontalArrangement = if (fits) {
+                Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+            } else {
+                Arrangement.spacedBy(8.dp)
+            },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            for (palette in ACCENTS) {
+                val selected = palette.id == selectedId
+                val fill = if (dark) palette.dark.primary else palette.light.primary
+                val onFill = if (dark) palette.dark.onPrimary else palette.light.onPrimary
+                Box(
+                    Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .clickable(
+                            role = Role.RadioButton,
+                            onClickLabel = "切换到${palette.label}主题色",
+                        ) { onSelect(palette.id) }
+                        .then(
+                            if (selected) {
+                                Modifier.border(2.dp, fill, CircleShape)
+                            } else {
+                                Modifier
+                            },
+                        )
+                        .padding(if (selected) 4.dp else 0.dp)
+                        .clip(CircleShape)
+                        .background(fill),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (selected) {
+                        Icon(
+                            Icons.Filled.Check,
+                            contentDescription = null,
                         tint = onFill,
                         modifier = Modifier.size(18.dp),
                     )
                 }
             }
+        }
         }
     }
 }

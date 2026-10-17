@@ -133,6 +133,7 @@ internal suspend fun loadComposerPanelData(context: Context): ComposerPanelData?
 /**
  * 面板本体。visible 由 ChatScreen 的输入框焦点状态驱动；data 为 null
  * 且 loading = 首次聚焦读取中，data 为 null 且 !loading = 运行时未就绪。
+ * hazeState 透传给「本次对话模型」弹层（Haze 局部模糊内容源）。
  */
 @Composable
 internal fun ComposerFocusPanel(
@@ -144,6 +145,7 @@ internal fun ComposerFocusPanel(
     onSelectModel: (String) -> Unit,
     glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
+    hazeState: dev.chrisbanes.haze.HazeState,
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -261,7 +263,7 @@ internal fun ComposerFocusPanel(
                                 color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                                 modifier = Modifier.padding(vertical = 7.dp),
                             )
-                            ModelPickerRow(modelAlias, config, onSelectModel)
+                            ModelPickerRow(modelAlias, config, onSelectModel, hazeState)
                         }
                     }
                 }
@@ -292,9 +294,9 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> =
 
 /**
  * 「本次对话模型」行：整行点击弹玻璃弹层（[GlassDropdownMenu]，与面板同
- * 族磨砂语言；贴底自动向上展开），选中项带 Check 图标（ui.md 基线）；切换
- * 走 onSelectModel（RuntimeBridge.setModelAlias）→ model_changed 回填
- * state.modelAlias，行内显示与实际生效恒同源。当前值经
+ * 族磨砂语言；Haze 局部模糊聊天内容，贴底自动向上展开），选中项带 Check
+ * 图标（ui.md 基线）；切换走 onSelectModel（RuntimeBridge.setModelAlias）→
+ * model_changed 回填 state.modelAlias，行内显示与实际生效恒同源。当前值经
  * [RuntimeBridge.modelEntryOf] 解析到条目再显示（levels 遗留兜底）——
  * 内部 entry 键不直出 UI，选中比对/回传仍用原始条目键。
  */
@@ -303,6 +305,7 @@ private fun ModelPickerRow(
     modelAlias: String,
     config: ConfigUi,
     onSelectModel: (String) -> Unit,
+    hazeState: dev.chrisbanes.haze.HazeState,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val options = remember(config) { composerModelOptions(config) }
@@ -362,6 +365,7 @@ private fun ModelPickerRow(
         GlassDropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
+            hazeState = hazeState,
             items = options.map { opt ->
                 GlassDropdownItem(value = opt.entry, label = opt.label, selected = opt.entry == currentEntry)
             },

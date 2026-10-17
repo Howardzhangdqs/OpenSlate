@@ -99,6 +99,9 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
@@ -149,6 +152,9 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
     // draw 阶段录制「自身区域 + 模糊半径出血带」的小模糊层（见 GlassPanel）。
     // rootCoords 用于把内容捕获层平移到面板自身位置。
     val glass = rememberGlass()
+    // Haze 内容源：弹层玻璃（GlassDropdownMenu，聚焦面板模型选择器）对聊天
+    // 内容做局部真实模糊；与 GlassPanel 的 GraphicsLayer 捕获体系互不相干。
+    val hazeState = rememberHazeState()
     var rootCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     // 工具详情弹窗：点击工具条目打开（完整命令 + 输出，可选中复制）。
     // 保存的是打开瞬间的快照副本；渲染前按 name+fullArgs 回查 entries 取
@@ -259,9 +265,12 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
             // 绘制（录制与显示共用一份 displaylist）。各玻璃面板在自身 draw
             // 阶段引用此层录制带出血带的小模糊层（见 GlassPanel）。
             // GraphicsLayer.renderEffect 依赖 RenderEffect，Android 12+ 才生效。
+            // 同时标 hazeSource：弹层玻璃（GlassDropdownMenu）对此内容区做
+            // Haze 局部真实模糊——源即弹层背后实际可见的内容区域。
             Box(
                 Modifier
                     .fillMaxSize()
+                    .hazeSource(hazeState)
                     .drawWithContent {
                         val layerSize = IntSize(
                             width = size.width.roundToInt(),
@@ -372,6 +381,7 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                     onSelectModel = { RuntimeBridge.setModelAlias(it) },
                     glass = glass,
                     rootCoords = { rootCoords },
+                    hazeState = hazeState,
                 )
                 Composer(
                     glass = glass,

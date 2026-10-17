@@ -82,6 +82,10 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
     implementation(libs.coil.svg)
+
+    // Haze：弹层局部真实背景模糊（hazeSource / hazeBlur），Apache-2.0。
+    implementation(libs.haze)
+    implementation(libs.haze.blur)
     // UniFFI 生成的 Kotlin 绑定依赖 JNA（com.sun.jna.*）。
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     // Shizuku（设置页一键授权 Termux RUN_COMMAND；仅一次性 pm grant 用）。

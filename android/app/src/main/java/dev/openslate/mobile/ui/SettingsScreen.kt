@@ -93,6 +93,9 @@ import dev.openslate.mobile.bridge.LogExporter
 import dev.openslate.mobile.bridge.ConfigUi
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.ModelUi
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
@@ -122,6 +125,9 @@ fun SettingsScreen(
     val state by RuntimeBridge.state.collectAsState()
     val config = state.config
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+    // Haze 内容源：会话页功能模型弹层（GlassDropdownMenu）对本页内容做局部
+    // 真实模糊；挂在下方承载各域内容的内容列上（即弹层背后可见区域）。
+    val hazeState = rememberHazeState()
 
     var editProvider by remember { mutableStateOf<ProviderUi?>(null) }
     var editProviderIsNew by remember { mutableStateOf(false) }
@@ -210,9 +216,11 @@ fun SettingsScreen(
             }
 
             // ── 域内容（各自独立滚动）───────────────────────────
+            // hazeSource：本内容列即弹层背后实际可见的内容区域（含键盘上方）。
             Column(
                 Modifier
                     .fillMaxSize()
+                    .hazeSource(hazeState)
                     .verticalScroll(rememberScrollState())
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -262,7 +270,7 @@ fun SettingsScreen(
                                 "title" to "会话标题生成",
                             )
                             for ((cap, label) in capRows) {
-                                CapabilityModelRow(cap, label, config)
+                                CapabilityModelRow(cap, label, config, hazeState)
                             }
                         }
                     }
@@ -888,7 +896,7 @@ private fun Section(
  * （悬空代号 / 条目已删）显示「未设置」——重选条目即自愈。
  */
 @Composable
-private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi) {
+private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, hazeState: HazeState) {
     var expanded by remember { mutableStateOf(false) }
     val stored = config.capabilities[cap]
     val fallback = if (cap == "main") "main" else "fast"
@@ -948,6 +956,7 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi) {
         GlassDropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
+            hazeState = hazeState,
             items = items,
             onSelect = { RuntimeBridge.setCapability(cap, it.value) },
         )

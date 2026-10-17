@@ -13,7 +13,7 @@
 |------|------|
 | `crates/openslate-core/src/model_registry.rs`（573 行） | **纯逻辑，无 IO 状态**：数据源定义（`SOURCES`，L56）、两种格式解析（`SourceFormat::{ModelsDev, LiteLLM}`，L30）、id 归一化与匹配（`norm_id` L92 / `id_candidates` L102）、按源优先级合并（`merge_metas` L218）、CloudPrice 在线单查（`probe_cloudprice_by_id` L383）、`http_get_json`（L336，Android TLS + 代理） |
 | `crates/openslate-mobile/src/registry.rs`（541 行） | **存储与更新**：`RegistryStore`（L46）——本地 ZSTD 持久化、手动/自动更新、三源合并查询、搜索/浏览 |
-| 设置页「模型数据源」 | UI 入口（mobile），每源独立「更新」按钮 + 条目搜索 |
+| 设置页「模型数据源」（mobile，内嵌子页） | UI：provider 聚合浏览/跨源搜索 + 条目详情弹层；每源独立「更新」按钮在页顶「数据源管理」区（常开直接可见） |
 
 ## 2. 数据源（`SOURCES` 常量，L56-83；声明序 = 优先级序）
 
@@ -159,7 +159,7 @@ pub struct ModelMeta {
 
 | 方法 | 行号 | 语义 |
 |------|------|------|
-| `update_source(id) -> Result<usize>` | L131 | 拉取 → `parse_source_map` 计数 → ZSTD 压缩 → tmp+rename 原子写 `<id>.json.zst` → 更新 meta → **失效两层内存缓存**（parsed + raw）。返回条目数。数据源页面「更新」按钮的后端 |
+| `update_source(id) -> Result<usize>` | L131 | 拉取 → `parse_source_map` 计数 → ZSTD 压缩 → tmp+rename 原子写 `<id>.json.zst` → 更新 meta → **失效两层内存缓存**（parsed + raw）。返回条目数。数据源子页「数据源管理」小节「更新」按钮的后端 |
 | `auto_update_if_stale()` | L176 | 启动时对缺失 / 超过 `stale_after` 的源**串行**刷新（for 循环逐个 await，避免移动网络带宽尖峰）；失败静默（alog，下次启动再试），本地旧数据继续用 |
 | `lookup_local(model_id) -> ModelMeta` | L240 | 按 `SOURCES` 序遍历本地索引（`parsed_map` 懒加载磁盘 zst），非空命中收进 vec，`merge_metas` 合并；全 miss → 空 `ModelMeta` |
 | `lookup_with_online_fallback(model_id)` | L256 | `lookup_local` 非空即返回；空 → `probe_cloudprice_by_id` 兜底，仍 None → default |
@@ -174,7 +174,7 @@ pub struct ModelMeta {
 - `raw`（L55）：解码后的**原始 JSON**（`Arc<Value>`，`raw_value` L220 懒加载——搜索/浏览
   要原始键含 provider 前缀与天然键序，索引 map 已折叠丢失。Arc 共享，查询方零整树克隆）。
 
-### 6.3 `search_json`（数据源页面「查看条目 / 跨源搜索」）
+### 6.3 `search_json`（数据源子页「provider 聚合浏览 / 跨源搜索」）
 
 纯本地（磁盘 ZSTD + 内存 raw 缓存）、同步执行。返回
 `{"total":N,"results":[{source,sourceId,id,ctx,out,vision,reasoning,tool,priceIn,priceOut}]}`。
@@ -184,7 +184,8 @@ pub struct ModelMeta {
 - `query` 空（或归一化后为空，如纯符号）= **浏览模式**：按 JSON 键天然顺序
   （serde_json 默认 BTreeMap 字典序，确定性）取前 `limit` 条；非空 = 双侧归一化子串匹配
   `norm_id(原始键).contains(&norm_id(query))`（键含 provider 前缀，尾段子串天然覆盖）。
-- `limit <= 0` 按 50；`total` = 匹配总数（分页「共 N 条」），`results` 截断到 `limit`。
+- `limit <= 0` 按 50；`total` = 匹配总数，`results` 截断到 `limit`（mobile 数据源子页
+  不用分页：浏览与搜索都传大 limit（100_000）一次拉全量，客户端按 provider 前缀分组）。
 - `id` = 源 JSON 的**原始键**（保留 provider 前缀）；数值 / 能力 / 计价字段源没给就为
   null（不硬造）。LiteLLM 非模型条目按 `is_model_entry` 跳过。
 - 测试：`search_browse_mode_and_field_mapping` / `search_limit_truncation_keeps_total` /

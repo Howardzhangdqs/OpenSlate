@@ -119,7 +119,6 @@ import dev.openslate.mobile.bridge.TermuxDiagnostics
 fun SettingsScreen(
     onBack: () -> Unit,
     onOpenKeys: () -> Unit,
-    onOpenRegistry: () -> Unit,
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     onThemeModeChange: (ThemeMode) -> Unit = {},
 ) {
@@ -190,10 +189,10 @@ fun SettingsScreen(
                 }
             }
 
-            // ── 模型域二级 Tab：会话 / 模型 / Provider（吸顶，同工具域）──
+            // ── 模型域二级 Tab：会话 / 模型数据源 / Provider（吸顶，同工具域）──
             if (tab == 1) {
                 androidx.compose.material3.TabRow(selectedTabIndex = modelTab) {
-                    for ((label, idx) in listOf("会话" to 0, "模型" to 1, "Provider" to 2)) {
+                    for ((label, idx) in listOf("会话" to 0, "模型数据源" to 1, "Provider" to 2)) {
                         androidx.compose.material3.Tab(
                             selected = modelTab == idx,
                             onClick = { modelTab = idx },
@@ -216,7 +215,16 @@ fun SettingsScreen(
                 }
             }
 
-            // ── 域内容（各自独立滚动）───────────────────────────
+            // ── 域内容 ─────────────────────────────────────────
+            // 「模型 > 模型数据源」子页条目全量达数千条，用自带 LazyColumn
+            // 分组虚拟化、自管滚动，不能嵌进下方共享 verticalScroll 列 →
+            // 该组合下在此独立渲染本子页；其余子页布局与 hazeSource 行为
+            // 零变化（会话页玻璃弹层依赖本列的 hazeSource）。
+            if (tab == 1 && modelTab == 1) {
+                Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
+                    ModelRegistrySection()
+                }
+            } else {
             // hazeSource：本内容列即弹层背后实际可见的内容区域（含键盘上方）。
             Column(
                 Modifier
@@ -251,7 +259,8 @@ fun SettingsScreen(
                         }
                     }
                     1 -> {
-                        // ── 模型域：会话 / 模型 / Provider 三个二级 tab ──
+                        // ── 模型域二级 tab：会话 / Provider（「模型数据源」
+                        // 子页已在上方独立渲染，不进本滚动列）──
                         when (modelTab) {
                             0 -> {
                         // ── 会话域：标题生成模型（功能 → 模型条目直绑）──
@@ -269,32 +278,6 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.outline,
                             )
                             CapabilityModelRow("title", "会话标题生成", config, hazeState)
-                        }
-                    }
-                    1 -> {
-                        // ── 模型域：条目管理入口指引 + 元数据数据源 ──────
-                        // levels 代号列表/绑定/创建已随映射层一并移除；模型
-                        // 条目在各 Provider 的「模型」管理里维护，功能绑定
-                        // 在「会话」页完成。
-                        Text(
-                            "模型条目在各 Provider 的「模型」管理里增删改（自动检测 + 手动添加）；" +
-                                "标题生成绑定在「会话」页，主对话模型在对话页输入框面板里直接选。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.outline,
-                        )
-                        // 元数据数据源管理（更新 / 本地缓存状态）。
-                        Card(
-                            modifier = Modifier.fillMaxWidth(),
-                            onClick = onOpenRegistry,
-                        ) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text("模型数据源", style = MaterialTheme.typography.titleSmall)
-                                Text(
-                                    "上下文 / 输出限额 / 视觉 / 思考 / 计价的来源与本地缓存更新",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.outline,
-                                )
-                            }
                         }
                     }
                     2 -> {
@@ -383,6 +366,7 @@ fun SettingsScreen(
                         }
                     }
                 }
+            }
             }
         }
     }
@@ -579,9 +563,10 @@ private fun ModelCapsRow(m: ModelUi) {
     }
 }
 
-/** 详情弹窗的信息行：标签（灰、小字）靠左，值靠右。 */
+/** 详情弹窗的信息行：标签（灰、小字）靠左，值靠右。
+ *  internal：SettingsScreen 与 ModelRegistryScreen（registry 条目详情弹层）共用。 */
 @Composable
-private fun InfoRow(label: String, value: String) {
+internal fun InfoRow(label: String, value: String) {
     Row(Modifier.fillMaxWidth()) {
         Text(
             label,

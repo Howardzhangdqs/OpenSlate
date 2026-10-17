@@ -38,7 +38,6 @@ import dev.openslate.mobile.ui.ThemePrefs
 import dev.openslate.mobile.ui.ChatScreen
 import dev.openslate.mobile.ui.HistoryScreen
 import dev.openslate.mobile.ui.KeysScreen
-import dev.openslate.mobile.ui.ModelRegistryScreen
 import dev.openslate.mobile.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
@@ -90,19 +89,9 @@ private fun AppNavHost(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> U
             SettingsScreen(
                 onBack = { nav.popBackStack() },
                 onOpenKeys = { nav.navigate("keys") { launchSingleTop = true } },
-                onOpenRegistry = { nav.navigate("registry") { launchSingleTop = true } },
                 themeMode = themeMode,
                 onThemeModeChange = onThemeModeChange,
             )
-        }
-        composable(
-            "registry",
-            enterTransition = { slideInHorizontally(tween(280)) { it } + fadeIn(tween(280)) },
-            exitTransition = { slideOutHorizontally(tween(280)) { -it / 4 } + fadeOut(tween(280)) },
-            popEnterTransition = { slideInHorizontally(tween(280)) { -it / 4 } + fadeIn(tween(280)) },
-            popExitTransition = { slideOutHorizontally(tween(280)) { it } + fadeOut(tween(280)) },
-        ) {
-            ModelRegistryScreen(onBack = { nav.popBackStack() })
         }
         composable(
             "keys",
@@ -145,7 +134,7 @@ private fun WarmUpSecondaryScreens() {
     }
     if (warming) {
         Box(Modifier.size(0.dp)) {
-            SettingsScreen(onBack = {}, onOpenKeys = {}, onOpenRegistry = {})
+            SettingsScreen(onBack = {}, onOpenKeys = {})
             KeysScreen(onBack = {})
             HistoryScreen(onBack = {}, onOpened = {})
         }

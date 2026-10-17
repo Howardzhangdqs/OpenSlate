@@ -12,7 +12,7 @@
   - `.service`：前台服务（AgentService）
   - `.ui`：Compose 页面与基础件
   - UniFFI 生成代码：`uniffi.openslate.mobile`
-- **页面文件按 screen 切分**（`ChatScreen` / `SettingsScreen` / `HistoryScreen` / `KeysScreen` / `ModelRegistryScreen`）；可复用基础件（`SoftButton` / `Section` / `DropdownChoice` / `AppDialog` 等）留在 `ui/` 顶层。页面超大（SettingsScreen ~2300 行）是现状，**新增区块优先抽 `XxxSection` 私有 composable**，不再往单文件里堆。
+- **页面文件按 screen 切分**（`ChatScreen` / `SettingsScreen` / `HistoryScreen` / `KeysScreen`；`ModelRegistryScreen.kt` 现 hosting 内嵌设置页的 `ModelRegistrySection` 子页，无独立路由）；可复用基础件（`SoftButton` / `Section` / `DropdownChoice` / `AppDialog` 等）留在 `ui/` 顶层。页面超大（SettingsScreen ~2900 行）是现状，**新增区块优先抽 `XxxSection` 私有 composable**，不再往单文件里堆。
 
 ## 2. 命名约定
 

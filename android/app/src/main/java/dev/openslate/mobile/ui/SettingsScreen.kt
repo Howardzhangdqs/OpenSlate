@@ -76,7 +76,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.layout
@@ -999,7 +999,10 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, haz
                     Icons.Filled.KeyboardArrowDown,
                     contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
                     tint = MaterialTheme.colorScheme.outline,
-                    modifier = Modifier.rotate(arrowAngle),
+                    // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
+                    // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
+                    // 叠加弹层 Haze 模糊时表现为旋转卡顿）。
+                    modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
                 )
             }
         }

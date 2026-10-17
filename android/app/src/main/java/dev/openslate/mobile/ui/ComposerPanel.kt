@@ -38,7 +38,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.text.AnnotatedString
@@ -372,7 +372,8 @@ private fun ModelPickerRow(
                 Icons.Filled.KeyboardArrowDown,
                 contentDescription = if (expanded) "收起模型选择" else "选择本次对话模型",
                 tint = MaterialTheme.colorScheme.outline,
-                modifier = Modifier.rotate(arrowAngle),
+                // 同 SettingsScreen.CapabilityModelRow：绘制相位读取，避免逐帧重组。
+                modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
             )
         }
         GlassDropdownMenu(

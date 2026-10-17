@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
@@ -35,6 +36,8 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.CompositionLocalProvider
 import dev.openslate.mobile.ui.LocalDarkTheme
+import dev.openslate.mobile.ui.AccentPalette
+import dev.openslate.mobile.ui.accentOf
 import dev.openslate.mobile.ui.ThemeMode
 import dev.openslate.mobile.ui.ThemePrefs
 import dev.openslate.mobile.ui.ChatScreen
@@ -54,13 +57,19 @@ class MainActivity : ComponentActivity() {
         setContent {
             val ctx = applicationContext
             var themeMode by remember { mutableStateOf(ThemePrefs.read(ctx)) }
-            OpenSlateTheme(mode = themeMode) {
+            var accentColor by remember { mutableStateOf(ThemePrefs.readAccent(ctx)) }
+            OpenSlateTheme(mode = themeMode, accent = accentColor) {
                 Surface {
                     AppNavHost(
                         themeMode = themeMode,
                         onThemeModeChange = { m ->
                             themeMode = m
                             ThemePrefs.write(ctx, m)
+                        },
+                        accent = accentColor,
+                        onAccentChange = { id ->
+                            accentColor = id
+                            ThemePrefs.writeAccent(ctx, id)
                         },
                     )
                 }
@@ -71,7 +80,12 @@ class MainActivity : ComponentActivity() {
 
 /** 页面导航栈：chat（起点）/ settings / history / registry-source/{sourceId}（模型数据源三级页），回退键沿栈逐级返回。 */
 @Composable
-private fun AppNavHost(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Unit) {
+private fun AppNavHost(
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+    accent: String,
+    onAccentChange: (String) -> Unit,
+) {
     val nav = rememberNavController()
     WarmUpSecondaryScreens()
     NavHost(navController = nav, startDestination = "chat") {
@@ -97,6 +111,8 @@ private fun AppNavHost(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> U
                 },
                 themeMode = themeMode,
                 onThemeModeChange = onThemeModeChange,
+                accent = accent,
+                onAccentChange = onAccentChange,
             )
         }
         // 模型数据源独占整屏（三级）：系统返回键/手势与顶栏返回都走
@@ -162,18 +178,26 @@ private fun WarmUpSecondaryScreens() {
     }
 }
 
-// Cyan 主题配色(Material 3 tonal palette,种子色 cyan #00BCD4)。
-// surface 全家必须整套给齐：material3 1.4 中默认 Card 容器取
-// colorScheme.surfaceContainerHighest、AppDialog 取 surfaceContainerHigh，
-// 未显式提供的角色会回落 lightColorScheme()/darkColorScheme() 的 Material
-// 基线紫种子中性色（浅 Highest=0xFFE6E0E9、深=0xFF36343B），在冷蓝
-// surface 底上显淡红/紫灰——container 阶梯一律从本套 surface/surfaceVariant
-// 同轨道插值，禁止紫基线值混入。
-private val LightCyanColors = lightColorScheme(
-    primary = Color(0xFF006689),
-    onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFFC1E8FF),
-    onPrimaryContainer = Color(0xFF001E2C),
+// ── Cyan 主题配色(Material 3 tonal palette,种子色 cyan #00BCD4) ─────────
+// 结构：强调色族（primary 四角色 + inversePrimary）随所选主题色走
+// （ui/ThemePrefs.kt 的 ACCENTS）；其余角色 = 下面工厂里的共享基础色
+// （即历史 cyan scheme 的原值原样：冷蓝灰中性面 + 低彩度蓝灰/青绿辅助
+// 色 + error 族）。surface 全家必须整套给齐：material3 1.4 中默认 Card
+// 容器取 colorScheme.surfaceContainerHighest、AppDialog 取
+// surfaceContainerHigh，未显式提供的角色会回落 lightColorScheme()/
+// darkColorScheme() 的 Material 基线紫种子中性色（浅 Highest=0xFFE6E0E9、
+// 深=0xFF36343B），在冷蓝 surface 底上显淡红/紫灰。
+// 取舍：中性面/辅助色不随 accent 轻着色——它们是全 app 的稳定视觉底盘
+// （含 ChatScreen 消息分组语义色），cyan 的中性轨道彩度已极低，任何强调
+// 色下都不冲突；这样 cyan 老值零改动、其余色也无 14 个手写中性值的偏差
+// 风险。
+
+private fun lightSchemeOf(a: AccentPalette): ColorScheme = lightColorScheme(
+    primary = a.light.primary,
+    onPrimary = a.light.onPrimary,
+    primaryContainer = a.light.primaryContainer,
+    onPrimaryContainer = a.light.onPrimaryContainer,
+    // ── 共享基础色（全主题色同一套）──
     secondary = Color(0xFF4E616D),
     onSecondary = Color(0xFFFFFFFF),
     secondaryContainer = Color(0xFFD1E5F4),
@@ -192,11 +216,10 @@ private val LightCyanColors = lightColorScheme(
     onSurface = Color(0xFF171C1F),
     surfaceVariant = Color(0xFFDCE3E9),
     onSurfaceVariant = Color(0xFF41484D),
-    // ── surface container 阶梯（由 surface F6FAFE → surfaceVariant DCE3E9
-    // 冷蓝灰轨道等距插值；每步 R−7/G−6/B−6，与既有锚点同偏量）──
-    // Lowest=纯白（对齐基线 Lowest=Neutral100 语义）；
-    // Highest=variant 终点（material3 1.4 默认 Card 容器色，取代紫基线
-    // E6E0E9）；High/Container/AppDialog 用的 surfaceContainerHigh 依次插值。
+    // surface container 阶梯（由 surface F6FAFE → surfaceVariant DCE3E9
+    // 冷蓝灰轨道等距插值；每步 R−7/G−6/B−6，与既有锚点同偏量）。
+    // Lowest=纯白（对齐基线 Lowest=Neutral100 语义）；Highest=variant
+    // 终点（material3 1.4 默认 Card 容器色，取代紫基线 E6E0E9）。
     surfaceContainerLowest = Color(0xFFFFFFFF),
     surfaceContainerLow = Color(0xFFF0F4FA),
     surfaceContainer = Color(0xFFE9EEF4),
@@ -209,14 +232,16 @@ private val LightCyanColors = lightColorScheme(
     outline = Color(0xFF71787E),
     inverseSurface = Color(0xFF2B3135),
     inverseOnSurface = Color(0xFFEDF1F5),
-    inversePrimary = Color(0xFF7AD0F7),
+    // 浅侧反色 primary = 该色深侧 primary（M3 语义，cyan 历史值同构）。
+    inversePrimary = a.dark.primary,
 )
 
-private val DarkCyanColors = darkColorScheme(
-    primary = Color(0xFF7AD0F7),
-    onPrimary = Color(0xFF00344C),
-    primaryContainer = Color(0xFF004B6C),
-    onPrimaryContainer = Color(0xFFC1E8FF),
+private fun darkSchemeOf(a: AccentPalette): ColorScheme = darkColorScheme(
+    primary = a.dark.primary,
+    onPrimary = a.dark.onPrimary,
+    primaryContainer = a.dark.primaryContainer,
+    onPrimaryContainer = a.dark.onPrimaryContainer,
+    // ── 共享基础色（全主题色同一套）──
     secondary = Color(0xFFB5C9D7),
     onSecondary = Color(0xFF20333E),
     secondaryContainer = Color(0xFF374955),
@@ -235,11 +260,11 @@ private val DarkCyanColors = darkColorScheme(
     onSurface = Color(0xFFDEE3E7),
     surfaceVariant = Color(0xFF41484D),
     onSurfaceVariant = Color(0xFFC1C7CD),
-    // ── surface container 阶梯（以 surface 0F1417 为底向 surfaceVariant
-    // 41484D 方向递进；每步 R+5~6/G+6/B+6~7，与既有锚点同偏量）──
+    // surface container 阶梯（以 surface 0F1417 为底向 surfaceVariant
+    // 41484D 方向递进；每步 R+5~6/G+6/B+6~7，与既有锚点同偏量）。
     // Lowest 比 surface 再深一档（对齐基线 Lowest=Neutral4 在 surface
     // N6 之下）；Highest=2A3138（material3 1.4 默认 Card 容器色，取代紫
-    // 基线 36343B）；Low→Highest 由 1A2025 族等距递进。
+    // 基线 36343B）。
     surfaceContainerLowest = Color(0xFF0A0F12),
     surfaceContainerLow = Color(0xFF1A2025),
     surfaceContainer = Color(0xFF1F252B),
@@ -252,19 +277,25 @@ private val DarkCyanColors = darkColorScheme(
     outline = Color(0xFF8B9297),
     inverseSurface = Color(0xFFDEE3E7),
     inverseOnSurface = Color(0xFF2B3135),
-    inversePrimary = Color(0xFF006689),
+    // 深侧反色 primary = 该色浅侧 primary（M3 语义，cyan 历史值同构）。
+    inversePrimary = a.light.primary,
 )
 
 @Composable
-fun OpenSlateTheme(mode: ThemeMode = ThemeMode.SYSTEM, content: @Composable () -> Unit) {
+fun OpenSlateTheme(
+    mode: ThemeMode = ThemeMode.SYSTEM,
+    accent: String = ThemePrefs.DEFAULT_ACCENT,
+    content: @Composable () -> Unit,
+) {
     val dark = when (mode) {
         ThemeMode.SYSTEM -> isSystemInDarkTheme()
         ThemeMode.LIGHT -> false
         ThemeMode.DARK -> true
     }
+    val palette = accentOf(accent)
     CompositionLocalProvider(LocalDarkTheme provides dark) {
         MaterialTheme(
-            colorScheme = if (dark) DarkCyanColors else LightCyanColors,
+            colorScheme = if (dark) darkSchemeOf(palette) else lightSchemeOf(palette),
             content = content,
         )
     }

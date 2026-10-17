@@ -4,6 +4,9 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -61,6 +64,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.LocalTextSelectionColors
@@ -123,6 +128,8 @@ fun SettingsScreen(
     onOpenSource: (String) -> Unit = {},
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     onThemeModeChange: (ThemeMode) -> Unit = {},
+    accent: String = ThemePrefs.DEFAULT_ACCENT,
+    onAccentChange: (String) -> Unit = {},
 ) {
     val state by RuntimeBridge.state.collectAsState()
     val config = state.config
@@ -258,6 +265,15 @@ fun SettingsScreen(
                                     onThemeModeChange(modes.first { it.first == label }.second)
                                 },
                             )
+                        }
+                        // ── 外观域：主题色（强调色圆形选择器，即时生效 + 落盘）──
+                        Section(title = "主题色") {
+                            Text(
+                                "点选应用的强调色，即时生效并保存。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline,
+                            )
+                            AccentSwatchRow(selectedId = accent, onSelect = onAccentChange)
                         }
                     }
                     1 -> {
@@ -1004,6 +1020,63 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, haz
  */
 private const val TERMUX_ALLOW_EXTERNAL_CMD =
     "mkdir -p ~/.termux && printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties && termux-reload-settings"
+
+/**
+ * 主题色圆形选择器（外观域）：一排圆圈，每圈 = 一个主题色的当前深浅
+ * 模式 primary（深浅随 [LocalDarkTheme] 切换，所见即所得）；选中态 =
+ * 同色 2dp 外环 + 环内 4dp 空隙 + 缩进圆（经典色选器语言）+ 内嵌
+ * Material Check 图标（onPrimary 色——禁 Unicode 字符，跨设备字体不可控）。
+ * 规格取舍：圈径 40dp（Material 自家颜色选择器同规格）+ 8dp 间距，360dp
+ * 标准屏（可用 328dp）恰好单行放下 7 圈；更窄屏经 horizontalScroll 横滑
+ * 兜底，不换行破坏节奏。触达 40dp 略小于 48dp 标准——再大会溢出首屏宽，
+ * 与间距/圈径三者取此平衡。
+ */
+@Composable
+private fun AccentSwatchRow(selectedId: String, onSelect: (String) -> Unit) {
+    val dark = LocalDarkTheme.current
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        for (palette in ACCENTS) {
+            val selected = palette.id == selectedId
+            val fill = if (dark) palette.dark.primary else palette.light.primary
+            val onFill = if (dark) palette.dark.onPrimary else palette.light.onPrimary
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .clickable(
+                        role = Role.RadioButton,
+                        onClickLabel = "切换到${palette.label}主题色",
+                    ) { onSelect(palette.id) }
+                    .then(
+                        if (selected) {
+                            Modifier.border(2.dp, fill, CircleShape)
+                        } else {
+                            Modifier
+                        },
+                    )
+                    .padding(if (selected) 4.dp else 0.dp)
+                    .clip(CircleShape)
+                    .background(fill),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (selected) {
+                    Icon(
+                        Icons.Filled.Check,
+                        contentDescription = null,
+                        tint = onFill,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
+    }
+}
 
 /**
  * 滑动药丸分段选择器：所有选项平铺在一个圆角容器里，选中项背后是一块

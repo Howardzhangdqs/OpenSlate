@@ -1190,22 +1190,47 @@ object RuntimeBridge {
 
     private fun applyConfig(c: JSONObject) {
         mutate { copy(config = parseConfig(c)) }
+        // 迁移第二段：config_changed 到达 → 完成校验（幂等，无待校验则 no-op）。
+        verifyModelEntryMigration()
     }
 
-    // ── 模型条目键一次性迁移（legacy `p__m` slug → `p/m`）──────────
+    // ── 模型条目键一次性迁移（legacy `p__m` slug → `p/m`；两段式）──────
 
-    /** 迁移防重跑标记（FILE_MAIN；置位后永不再跑）。 */
-    private const val PREF_MIGRATED_MODEL_ENTRY_SLASH = "migrated_model_entry_slash_v1"
+    /** 迁移防重跑标记（FILE_MAIN；**校验通过才置位**，置位后永不再跑）。
+     *  v2：v1（`migrated_model_entry_slash_v1`）被修复前的旧代码在**未校验**
+     *  的情况下无条件置位——真机上迁移实际失败但 v1=true，永久跳过修复。
+     *  v1 不可信，弃用；v2 由两段式校验通过后才写。 */
+    private const val PREF_MIGRATED_MODEL_ENTRY_SLASH = "migrated_model_entry_slash_v2"
 
     /** 进程内单发闸：snapshot 可能多次到达（重开会话等），防重复挂协程。 */
     @Volatile
     private var modelEntryMigrationLaunched = false
 
     /**
-     * 首个 snapshot（runtime 就绪 + config 已入 state）后挂一次性迁移
-     * （IO 后台，不阻塞事件泵）。prefs 标记已置位则只闸不跑。整体异常
-     * 不置标记 → 下次启动重试；操作幂等（upsert 同键覆写；legacy 公式
-     * 对已改斜杠的条目不命中），重跑无副作用。
+     * 第二段「待校验」态：本轮已发送迁移 op 的条目清单（null = 无待校验）。
+     * 第一段（IO 协程）全部发送完毕后置入；第二段（事件泵，config 落
+     * state 处）在每次 config 更新到达时核对，**全部通过才写 prefs 标记**。
+     * AtomicReference 保证 IO 协程与事件泵跨线程互见。
+     */
+    private val pendingMigrationVerify = AtomicReference<List<MigrationAttempt>?>(null)
+
+    /** 单条核对记录：旧键应消失、新键应存在、迁移时引用旧键的
+     *  levels/capabilities 应已改指新键。 */
+    private class MigrationAttempt(
+        val oldEntry: String,
+        val newEntry: String,
+        val levelKeys: List<String>,
+        val capKeys: List<String>,
+    )
+
+    /**
+     * 第一段（挂载点不变：首个 snapshot = runtime 就绪且 config 已入
+     * state 的最早时刻）：逐条发送迁移 op（**先删后插**，见
+     * [migrateModelEntrySlash]），发完**不置标记**、进入待校验态，由
+     * [verifyModelEntryMigration] 在后续 config 事件路径上完成校验。
+     * prefs 标记已置位则只闸不跑。整体异常不置标记 → 下次启动重试；
+     * 操作幂等（已迁移条目不再匹配公式、目标被占用安全跳过），重跑
+     * 无副作用。
      */
     private fun maybeMigrateModelEntrySlash() {
         if (modelEntryMigrationLaunched) return
@@ -1215,12 +1240,58 @@ object RuntimeBridge {
         if (prefs.getBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, false)) return
         scope.launch(Dispatchers.IO) {
             try {
-                migrateModelEntrySlash(_state.value.config)
-                prefs.edit().putBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, true).apply()
-                Log.i(TAG, "model-entry migration: marked done ($PREF_MIGRATED_MODEL_ENTRY_SLASH)")
+                val attempted = migrateModelEntrySlash(_state.value.config)
+                if (attempted.isEmpty()) {
+                    // 本轮没有实际发送任何迁移 op（无匹配 / 全部安全跳过）：
+                    // 空核对清单视同校验通过，直接置标记。
+                    prefs.edit().putBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, true).apply()
+                    Log.i(TAG, "model-entry migration: nothing attempted, marked done ($PREF_MIGRATED_MODEL_ENTRY_SLASH)")
+                } else {
+                    pendingMigrationVerify.set(attempted)
+                    Log.i(TAG, "model-entry migration: ops sent for ${attempted.size} entrie(s), awaiting config verification")
+                }
             } catch (t: Throwable) {
                 Log.e(TAG, "model-entry migration: aborted, will retry next launch", t)
             }
+        }
+    }
+
+    /**
+     * 第二段（挂既有 config 事件路径：applyConfig / applySnapshot，无轮询
+     * 定时器）：config 更新到达时重读 state，逐条核对**本轮实际尝试迁移**
+     * 的条目——旧键消失 && 新键存在 && levels/capabilities 引用已指向
+     * 新键。全部通过 → 写 prefs 标记 + Log.i 汇总；任一不通过 → Log.e
+     * 明细、**不置标记**（本批 op 逐条回刷期间的中间态也会短暂不通过，
+     * 保留待校验态等后续 config 事件再核；进程内始终未过 → 下次启动整体
+     * 重试，幂等自愈）。「目标键占用导致 skip」的条目没实际尝试，不在
+     * 核对清单内。
+     */
+    private fun verifyModelEntryMigration() {
+        val records = pendingMigrationVerify.get() ?: return
+        val ctx = appContext ?: return
+        val cfg = _state.value.config
+        val entries = cfg.models.map { it.entry }.toSet()
+        val problems = buildList {
+            for (r in records) {
+                if (r.oldEntry in entries) add("'${r.oldEntry}': old entry still present")
+                if (r.newEntry !in entries) add("'${r.newEntry}': new entry missing")
+                for (lvl in r.levelKeys) {
+                    val v = cfg.levels[lvl]
+                    if (v != r.newEntry) add("levels.$lvl = '${v ?: "<unset>"}' (expected '${r.newEntry}')")
+                }
+                for (cap in r.capKeys) {
+                    val v = cfg.capabilities[cap]
+                    if (v != r.newEntry) add("capabilities.$cap = '${v ?: "<unset>"}' (expected '${r.newEntry}')")
+                }
+            }
+        }
+        if (problems.isEmpty()) {
+            pendingMigrationVerify.set(null)
+            ctx.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, true).apply()
+            Log.i(TAG, "model-entry migration: verified ${records.size} entrie(s), marked done ($PREF_MIGRATED_MODEL_ENTRY_SLASH)")
+        } else {
+            Log.e(TAG, "model-entry migration: verification not passed (${problems.size}): ${problems.joinToString("; ")}")
         }
     }
 
@@ -1239,16 +1310,30 @@ object RuntimeBridge {
     }
 
     /**
-     * 逐条迁移（单条失败跳过并日志，不中断整体）。每条顺序（防悬空）：
-     * upsert 新键（完整复制原字段）→ `[levels]` value 改指新键（KEY
-     * 不变）→ `[capabilities]` 直绑值同理 → 会话别名仍指旧键则热切
-     * （set_model，防删除后内存别名悬空）→ deleteModel 旧键；levels/
-     * capabilities 改指任一失败则保留旧键不删（服务端也可能拒删被引
-     * 用条目，双保险）。全部经现有协议操作（persist 落盘 + config_
-     * changed 回刷），**无新 FFI**。目标键被其他 entry 占用则跳过该条。
+     * 逐条迁移（单条失败跳过并日志，不中断整体），返回本轮**实际尝试**
+     * （delete 已发送）的核对清单。每条顺序**先删后插**——core 的
+     * `upsert_model` 有 (provider, model) 全局唯一守卫（config_ops.rs），
+     * upsert 先行则旧键还在、同组合新键必被拒（error 通知直入用户事件
+     * 流，且 levels 改指后会指向从未建成的幽灵新键）；删模型不设引用
+     * 拦截（levels/capabilities 松耦合、悬空合法，仅发一条 Info 级悬空
+     * 提示、随后立即改指消除）：
+     * ① deleteModel 旧键（发送失败 → 跳过该条，服务端无变化，无损失）；
+     * ② upsertModel 新键（完整复制原字段；此时同 (provider, model) 已无
+     *    占用、必过守卫。发送失败 → 立即回补旧键恢复条目完整性——组合
+     *    已空出、回补同样必过守卫，**确保下次启动重试路径能自愈**；回补
+     *    也失败（通道已死）才留半迁移残局，计入 skipped + Log.e。两种
+     *    结局均入核对清单，拦住标记不置）；
+     * ③ `[levels]` value 改指新键（KEY 不变）→ `[capabilities]` 直绑值
+     *    同理（新键已在，服务端可解析性检查可过；任一发送失败只 Log.e，
+     *    由核对清单拦标记）；
+     * ④ 会话别名仍指旧键则热切（set_model，防删除后内存别名悬空）。
+     * 中途 crash 的窗口（删了没插回）按既有日志口径记 Log.e、可接受。
+     * 全部经现有协议操作（persist 落盘 + config_changed 回刷），**无新
+     * FFI**。目标键被其他 entry 占用则跳过该条（不尝试、不入清单）。
      */
-    private fun migrateModelEntrySlash(config: ConfigUi) {
+    private fun migrateModelEntrySlash(config: ConfigUi): List<MigrationAttempt> {
         val occupied = config.models.map { it.entry }.toMutableSet()
+        val attempted = mutableListOf<MigrationAttempt>()
         var migrated = 0
         var skipped = 0
         val userAuthored = config.models.count {
@@ -1262,45 +1347,70 @@ object RuntimeBridge {
                 Log.w(TAG, "model-entry migration: skip '${m.entry}' -> '$target' (target occupied)")
                 continue
             }
+            val levelKeys = config.levels.filterValues { it == m.entry }.keys.toList()
+            val capKeys = config.capabilities.filterValues { it == m.entry }.keys.toList()
             try {
-                if (!upsertModel(m.copy(entry = target))) {
+                // ① 先删旧键（避让 (provider, model) 唯一守卫）。
+                if (!deleteModel(m.entry)) {
                     skipped++
-                    Log.w(TAG, "model-entry migration: skip '${m.entry}' (upsert send failed)")
+                    Log.w(TAG, "model-entry migration: skip '${m.entry}' (delete send failed; nothing changed)")
                     continue
                 }
-                var repointOk = true
-                for ((level, e) in config.levels) {
-                    if (e == m.entry && !setLevel(level, target)) repointOk = false
-                }
-                for ((cap, alias) in config.capabilities) {
-                    if (alias == m.entry && !setCapability(cap, target)) repointOk = false
-                }
-                if (_state.value.modelAlias == m.entry) setModelAlias(target)
-                if (repointOk) {
-                    if (!deleteModel(m.entry)) {
-                        Log.w(TAG, "model-entry migration: '${m.entry}' copied but old key kept (delete failed)")
+                // ② 插新键；发送失败 → 回补旧键保住条目完整性。
+                if (!upsertModel(m.copy(entry = target))) {
+                    skipped++
+                    if (upsertModel(m)) {
+                        Log.e(
+                            TAG,
+                            "model-entry migration: '${m.entry}' rolled back " +
+                                "(new-key upsert send failed, old key restored); will retry next launch",
+                        )
+                    } else {
+                        Log.e(
+                            TAG,
+                            "model-entry migration: '${m.entry}' half-migrated " +
+                                "(old deleted, new & rollback sends failed); left for next-launch retry",
+                        )
                     }
-                } else {
-                    Log.w(
+                    attempted.add(MigrationAttempt(m.entry, target, levelKeys, capKeys))
+                    continue
+                }
+                // ③ levels/capabilities 改指新键；④ 会话别名热切。
+                var repointOk = true
+                for (level in levelKeys) if (!setLevel(level, target)) repointOk = false
+                for (cap in capKeys) if (!setCapability(cap, target)) repointOk = false
+                if (!repointOk) {
+                    Log.e(
                         TAG,
-                        "model-entry migration: '${m.entry}' copied but old key kept " +
-                            "(level/capability repoint failed; refs still on old key)",
+                        "model-entry migration: '${m.entry}' repoint send failed; " +
+                            "refs may stay on deleted old key (verification will hold the mark)",
                     )
                 }
+                if (_state.value.modelAlias == m.entry) setModelAlias(target)
                 occupied.remove(m.entry)
                 occupied.add(target)
-                migrated++
-                Log.i(TAG, "model-entry migration: '${m.entry}' -> '$target' ok")
+                attempted.add(MigrationAttempt(m.entry, target, levelKeys, capKeys))
+                if (repointOk) migrated++ else skipped++
+                Log.i(
+                    TAG,
+                    "model-entry migration: '${m.entry}' -> '$target' ops sent" +
+                        if (repointOk) "" else " (repoint incomplete)",
+                )
             } catch (t: Throwable) {
                 skipped++
+                // sendJson 不抛（返回 Boolean），此处纯防御；delete 可能已发，
+                // 入清单让校验段拦标记，宁可多等一轮也不误置。
+                attempted.add(MigrationAttempt(m.entry, target, levelKeys, capKeys))
                 Log.e(TAG, "model-entry migration: '${m.entry}' failed, skipped", t)
             }
         }
         Log.i(
             TAG,
             "model-entry migration: pass done (total=${config.models.size}, " +
-                "migrated=$migrated, skipped=$skipped, userAuthored=$userAuthored)",
+                "migrated=$migrated, skipped=$skipped, userAuthored=$userAuthored, " +
+                "awaitingVerify=${attempted.size})",
         )
+        return attempted
     }
 
     private fun applySnapshot(session: JSONObject?) {
@@ -1359,7 +1469,10 @@ object RuntimeBridge {
         )
         // 本地 transcript（含思维链/⚡meta）若存在则整体覆盖镜像版。
         tryRestoreLocalTranscript()
-        // 模型条目键一次性迁移（legacy `p__m` slug → `p/m`；prefs 防重跑，
+        // 模型条目键迁移第二段：config 已入 state → 完成校验（幂等，无待
+        // 校验则 no-op；先于第一段，首个 snapshot 时待校验必为空）。
+        verifyModelEntryMigration()
+        // 模型条目键迁移第一段（legacy `p__m` slug → `p/m`；prefs 防重跑，
         // 挂载点选在此处 = runtime 就绪且 config 已入 state 的最早时刻）。
         maybeMigrateModelEntrySlash()
     }

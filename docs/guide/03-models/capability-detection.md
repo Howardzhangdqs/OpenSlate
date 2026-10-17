@@ -70,9 +70,13 @@ pub async fn list_remote_models(
   （`[models."zhipuai/glm-4.7"]`），合法且无碍；键冲突时追加 `-` + 4 位 hex 后缀。
 - **存量 `provider__model` slug 键**（旧生成器：小写 + 非 `[a-z0-9-]` 折叠 `-`，
   冲突加 hex 后缀）由 mobile 端启动迁移统一改写（RuntimeBridge
-  `migrateModelEntrySlash`：精确公式匹配判定自动生成条目 → upsert 新键 →
-  levels/capabilities 引用同步改指 → 删旧键；SharedPreferences 标记
-  `migrated_model_entry_slash_v1` 防重跑）。手写 entry 与 levels KEY 不动。
+  `migrateModelEntrySlash`：精确公式匹配判定自动生成条目 → **先删旧键、
+  后 upsert 新键**——避让 core `upsert_model` 的 (provider, model) 全局
+  唯一守卫 → levels/capabilities 引用同步改指；发完不置标记，config 更新
+  事件路径上逐条核对（旧键消失 && 新键存在 && 引用已改指）**校验通过才写**
+  SharedPreferences 标记 `migrated_model_entry_slash_v2`（v1 被修复前旧代码
+  未校验就置位、不可信，已弃用），不通过则下次启动
+  幂等重试）。手写 entry 与 levels KEY 不动。
 - Rust 全链路（resolve_model/persist/registry/session）把 entry 当**不透明串**，
   键格式仅是 mobile 侧约定；UI 显示层经 `RuntimeBridge.modelAliasDisplay` 把
   条目键换「Provider显示名/modelId」，entry 裸串不直出。

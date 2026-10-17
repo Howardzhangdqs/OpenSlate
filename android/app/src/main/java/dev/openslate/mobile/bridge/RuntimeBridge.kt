@@ -497,7 +497,8 @@ object RuntimeBridge {
     // ── 模型选择（持久化已迁移到 [capabilities].main：设置页改绑即
     //    落盘 openslate.toml 并热切换；不再本地 SharedPreferences 重放，
     //    双真相源会互相覆盖）。会话内即时切换用下方 setModelAlias()
-    //    （协议 set_model，不落盘）。──────────────────────────────
+    //    （协议 set_model，不落盘）；对话页选择器的「直接选」双写两者
+    //    （见 [selectModel]）。──────────────────────────────
 
     // ── HTTP 代理（受限网络出站；经 adb reverse 共享电脑侧代理）──
 
@@ -608,6 +609,15 @@ object RuntimeBridge {
     fun setModelAlias(alias: String) = sendJson(
         JSONObject().put("type", "set_model").put("alias", alias).toString()
     )
+
+    /** 对话页模型选择器的统一入口（「直接选」的语义闭环）：一次选中双发
+     *  - [setModelAlias]：会话级热切换（协议 set_model，下回合即生效）；
+     *  - [setCapability]("main", …)：持久化为启动默认（落盘 openslate.toml）。
+     *  返回两次发送是否全部成功（与单发 set* 同为 Boolean 发送语义；用
+     *  `and` 而非 `&&` 确保第一条失败第二条仍发）。发送失败容忍：会话已
+     *  切换而默认滞后到下次选择，不回滚不重试（下次选中会再写齐）。 */
+    fun selectModel(entry: String): Boolean =
+        setModelAlias(entry) and setCapability("main", entry)
 
     // ── 模型别名显示（共享助手；entry 内部键不直出 UI）──────────────
 
@@ -1436,17 +1446,22 @@ object RuntimeBridge {
     //
     // UI 已全面去 levels（设置页功能绑定/选择器只列 models 条目），本迁移把
     // 存量配置里「capability → levels 代号」的引用一次性改写为「capability →
-    // 条目直绑」，并给走缺省回退的功能补显式落点。[levels] 表不删不写（无
-    // 删除 FFI，留作不被引用的遗留层；resolve_model 的 levels 优先序不变，
-    // 只读解析作遗留兜底）。沿用模型条目键迁移的两段式状态机：第一段发 op
-    // 不置标记，第二段挂 config 事件路径校验、全过才写 prefs 标记；操作幂
-    // 等（stored == target 不重发），失败下次启动重试。
+    // 条目直绑」，并给走缺省回退的功能补显式落点。迁移范围只有 main/title：
+    // compact 不再生成写入（未绑定时 core 侧继承会话模型；已存在的显式绑定
+    // 不删不写，留给用户/TUI 管理）。[levels] 表不删不写（无删除 FFI，留作
+    // 不被引用的遗留层；resolve_model 的 levels 优先序不变，只读解析作遗留
+    // 兜底）。沿用模型条目键迁移的两段式状态机：第一段发 op 不置标记，第二
+    // 段挂 config 事件路径校验、全过才写 prefs 标记；操作幂等（stored ==
+    // target 不重发），失败下次启动重试。
 
     /** 迁移防重跑标记（FILE_MAIN；**校验通过才置位**，置位后永不再跑）。 */
     private const val PREF_MIGRATED_CAPABILITY_DIRECT = "migrated_capability_direct_v1"
 
-    /** 功能 id 全集（镜像 core model_config.rs CAPABILITIES 及缺省回退）。 */
-    private val CAPABILITY_IDS = listOf("main", "compact", "title")
+    /** 迁移目标功能（镜像 core model_config.rs CAPABILITIES，但 **compact
+     *  除外**——未绑定时 core 侧继承会话模型，不再为它生成显式写入；已存在
+     *  的显式绑定不删不写，留给用户/TUI）。main 的显式写入即启动默认机制，
+     *  保留。 */
+    private val CAPABILITY_IDS = listOf("main", "title")
 
     /** 进程内单发闸：snapshot 多次到达防重复挂协程。 */
     @Volatile
@@ -1472,6 +1487,10 @@ object RuntimeBridge {
      *   main 侧 Rust 启动链对不可解析别名本就回退 root agent 别名，不会瘫。
      * stored == target（代号与条目同名的 "fast"→"fast" 形态）不发 op：配置
      * 值已就位，写无变化。
+     *
+     * 迁移范围只有 main/title（[CAPABILITY_IDS]）：compact 不再生成写入——
+     * 未绑定时 core 侧继承会话模型，已存在的显式绑定不删不写（留给用户/
+     * TUI）；main 的显式写入即启动默认机制，保留。
      */
     private fun planCapabilityDirect(config: ConfigUi): List<Pair<String, String>> {
         val entries = config.models.map { it.entry }.toSet()

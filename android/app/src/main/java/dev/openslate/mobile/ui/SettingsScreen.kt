@@ -253,25 +253,21 @@ fun SettingsScreen(
                         // ── 模型域：会话 / 模型 / Provider 三个二级 tab ──
                         when (modelTab) {
                             0 -> {
-                        // ── 会话域：功能模型（功能 → 模型条目直绑）──────
+                        // ── 会话域：标题生成模型（功能 → 模型条目直绑）──
                         // 模型条目清单在「Provider」页管理（自动检测 + 手动
                         // 增删）；levels 代号映射层已从 UI 移除（存量表保留
-                        // 不写，仅作解析兜底）。
-                        Section(title = "功能模型（哪个功能用哪只模型）") {
+                        // 不写，仅作解析兜底）。主对话模型已移至对话页输入
+                        // 框聚焦面板的选择器直接选定（选了即落盘为启动默认，
+                        // RuntimeBridge.selectModel 双写）；上下文压缩不再出
+                        // 现在 UI（未绑定时 core 侧继承会话模型）。
+                        Section(title = "标题生成模型") {
                             Text(
-                                "每个功能直接绑定一只模型条目，改动立即落盘生效。" +
-                                    "「主对话」还可在对话页输入框聚焦面板里临时切换（仅当次会话）。",
+                                "新会话的标题用哪个模型条目生成，改动立即落盘生效。" +
+                                    "主对话模型在对话页输入框面板里直接选择，选了即存为默认。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline,
                             )
-                            val capRows = listOf(
-                                "main" to "主对话（正常 API 请求）",
-                                "compact" to "上下文压缩（超限自动摘要）",
-                                "title" to "会话标题生成",
-                            )
-                            for ((cap, label) in capRows) {
-                                CapabilityModelRow(cap, label, config, hazeState)
-                            }
+                            CapabilityModelRow("title", "会话标题生成", config, hazeState)
                         }
                     }
                     1 -> {
@@ -281,7 +277,7 @@ fun SettingsScreen(
                         // 在「会话」页完成。
                         Text(
                             "模型条目在各 Provider 的「模型」管理里增删改（自动检测 + 手动添加）；" +
-                                "功能与模型的绑定在「会话」页完成。",
+                                "标题生成绑定在「会话」页，主对话模型在对话页输入框面板里直接选。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline,
                         )
@@ -788,7 +784,7 @@ private fun ProviderModelsDialog(
     pendingDelete?.let { m ->
         val capRefs = capabilities.filterValues { it == m.entry }.keys.toList()
         val dangling = if (capRefs.isEmpty()) "" else
-            "功能 ${capRefs.joinToString("、")} 将悬空（到「会话」页改绑）"
+            "功能 ${capRefs.joinToString("、")} 将悬空（到「会话」页或对话页模型选择器改绑）"
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("删除模型") },
@@ -840,8 +836,8 @@ private fun ProviderModelsDialog(
                     InfoRow("所属 Provider", m.provider)
                     if (capRefs.isNotEmpty()) {
                         Text(
-                            "功能绑定只是指向本模型的直绑引用；要整体换新模型，在「会话」页把" +
-                                "对应功能改绑到新条目即可。",
+                            "功能绑定只是指向本模型的直绑引用；要整体换新模型，把对应功能" +
+                                "改绑到新条目即可（「会话」页；主对话在对话页选择器重选）。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.outline,
                         )
@@ -885,10 +881,12 @@ private fun Section(
 }
 
 /**
- * 功能模型绑定行（会话页）：功能名居左、当前绑定模型居右、箭头指示可点；
- * 整行点击弹出共享玻璃弹层（[GlassDropdownMenu]，与对话页「本次对话模型」
- * 选择器同族磨砂语言），直选 models 条目，选中即 setCapability 落盘（main
- * 改绑由 Rust 热切换会话模型并广播 model_changed，下回合即生效）。
+ * 功能模型绑定行（会话页；现仅「标题生成」在用——主对话模型已移至对话页
+ * 输入框聚焦面板的选择器直选，compact 不再暴露）：功能名居左、当前绑定
+ * 模型居右、箭头指示可点；整行点击弹出共享玻璃弹层（[GlassDropdownMenu]，
+ * 与对话页「本次对话模型」选择器同族磨砂语言），直选 models 条目，选中即
+ * setCapability 落盘（main 改绑由 Rust 热切换会话模型并广播 model_changed，
+ * 下回合即生效）。
  *
  * 当前值解析（与 Rust capability_alias + resolve_model 同序）：生效别名 =
  * capabilities[cap]，缺省回退 main→"main"、其余→"fast"；再经

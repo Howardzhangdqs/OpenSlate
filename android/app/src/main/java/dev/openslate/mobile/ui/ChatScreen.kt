@@ -378,7 +378,9 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                     loading = panelLoading,
                     modelAlias = state.modelAlias,
                     config = state.config,
-                    onSelectModel = { RuntimeBridge.setModelAlias(it) },
+                    // 选择器「直接选」双写：会话热切 + 持久化为启动默认
+                    // （见 RuntimeBridge.selectModel）。
+                    onSelectModel = { RuntimeBridge.selectModel(it) },
                     glass = glass,
                     rootCoords = { rootCoords },
                     hazeState = hazeState,

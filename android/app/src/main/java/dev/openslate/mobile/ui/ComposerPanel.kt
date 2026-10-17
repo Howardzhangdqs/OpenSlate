@@ -79,11 +79,12 @@ import kotlinx.coroutines.withContext
  *   hidden_tools 不含该名。
  * - 模型选择：选项 = models 条目（levels 代号不再出现在选项里；capabilities
  *   也只直绑条目，见设置页会话页）。当前值经 [RuntimeBridge.modelEntryOf]
- *   解析到条目（levels 遗留兜底）再显示；当前值与切换都走 state.modelAlias /
- *   RuntimeBridge.setModelAlias（协议 set_model）——与顶栏副标题、发消息时
- *   实际生效的是同一状态源（model_changed 事件回填），面板选了什么下次请求
- *   就用什么，不存在分裂。set_model 仅会话内生效不落盘，正是"本次
- *   对话"的语义；全局默认仍在设置页改绑 [capabilities].main。
+ *   解析到条目（levels 遗留兜底）再显示；显示走 state.modelAlias /
+ *   model_changed 事件回填——与顶栏副标题、发消息时实际生效的是同一状态
+ *   源，面板选了什么下次请求就用什么，不存在分裂。切换经 onSelectModel
+ *   （ChatScreen 接 [RuntimeBridge.selectModel]）双写：set_model 会话级热
+ *   切换 + setCapability("main") 持久化为启动默认——「选了即默认」的语义
+ *   闭环，设置页会话页因此不再有主对话绑定行。
  */
 
 /** 面板数据快照（聚焦瞬间一次性 FFI 读取的投影）。 */
@@ -295,10 +296,12 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> =
 /**
  * 「本次对话模型」行：整行点击弹玻璃弹层（[GlassDropdownMenu]，与面板同
  * 族磨砂语言；Haze 局部模糊聊天内容，贴底自动向上展开），选中项带 Check
- * 图标（ui.md 基线）；切换走 onSelectModel（RuntimeBridge.setModelAlias）→
- * model_changed 回填 state.modelAlias，行内显示与实际生效恒同源。当前值经
- * [RuntimeBridge.modelEntryOf] 解析到条目再显示（levels 遗留兜底）——
- * 内部 entry 键不直出 UI，选中比对/回传仍用原始条目键。
+ * 图标（ui.md 基线）；切换走 onSelectModel（ChatScreen 接
+ * RuntimeBridge.selectModel：set_model 会话热切 + setCapability("main")
+ * 持久化为启动默认）→ model_changed 回填 state.modelAlias，行内显示与
+ * 实际生效恒同源。当前值经 [RuntimeBridge.modelEntryOf] 解析到条目再显示
+ * （levels 遗留兜底）——内部 entry 键不直出 UI，选中比对/回传仍用原始
+ * 条目键。
  */
 @Composable
 private fun ModelPickerRow(

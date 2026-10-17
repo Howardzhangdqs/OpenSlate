@@ -85,8 +85,7 @@ impl MobilePaths {
             &self.data_dir,
             &self.cache_dir,
         ] {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("创建目录失败：{}", dir.display()))?;
+            fs::create_dir_all(dir).with_context(|| format!("创建目录失败：{}", dir.display()))?;
         }
         let agents = self.agents_dir();
         fs::create_dir_all(&agents)
@@ -98,7 +97,10 @@ impl MobilePaths {
             let default = default_openslate_toml(&db_path);
             fs::write(&config_path, default)
                 .with_context(|| format!("写入默认配置失败：{}", config_path.display()))?;
-            tracing::info!("mobile bootstrap: wrote default config to {}", config_path.display());
+            tracing::info!(
+                "mobile bootstrap: wrote default config to {}",
+                config_path.display()
+            );
         }
 
         let root_md = agents.join("root.md");
@@ -108,7 +110,10 @@ impl MobilePaths {
             tracing::info!("mobile bootstrap: wrote default root agent");
         } else {
             let current = fs::read_to_string(&root_md).unwrap_or_default();
-            if LEGACY_ROOT_AGENT_MDS.iter().any(|legacy| current == *legacy) {
+            if LEGACY_ROOT_AGENT_MDS
+                .iter()
+                .any(|legacy| current == *legacy)
+            {
                 // 旧默认升级：原样覆盖即可获得 bash / termux_bash；用户
                 // 定制过的文件不会被触碰。
                 fs::write(&root_md, DEFAULT_ROOT_AGENT_MD)
@@ -376,7 +381,10 @@ mod tests {
 
         let after = std::fs::read_to_string(&config).unwrap();
         assert!(after.contains(&paths.data_dir.join("openslate.db").display().to_string()));
-        assert!(!paths.data_dir.join("openslate.db").exists(), "不应生成空库文件");
+        assert!(
+            !paths.data_dir.join("openslate.db").exists(),
+            "不应生成空库文件"
+        );
     }
 
     /// toml 彻底无法解析 → 唯一的 Err 路径。

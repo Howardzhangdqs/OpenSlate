@@ -705,6 +705,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_tool_visibility(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_builtin_tool_name_template(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_server_name(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_tool_name_template(
@@ -740,6 +742,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_http_proxy(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_mcp_builtin_tool_name_template(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_mcp_server_name(
     ): Int
@@ -784,6 +788,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_agent_tool_visibility(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_builtin_tool_name_template(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_server_name(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_tool_name_template(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -820,6 +826,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_http_proxy(`ptr`: Long,`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_mcp_builtin_tool_name_template(`ptr`: Long,`template`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_mcp_server_name(`ptr`: Long,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_mcp_tool_name_template(`ptr`: Long,`template`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -961,6 +969,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_tool_visibility() and 0xFFFF) != 39909) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_builtin_tool_name_template() and 0xFFFF) != 27774) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_server_name() and 0xFFFF) != 14930) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1013,6 +1024,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_http_proxy() and 0xFFFF) != 421) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_mcp_builtin_tool_name_template() and 0xFFFF) != 59201) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_mcp_server_name() and 0xFFFF) != 16972) {
@@ -1488,6 +1502,14 @@ public interface OpenSlateRuntimeInterface {
     fun `getAgentToolVisibility`(): kotlin.String
     
     /**
+     * 读取当前生效的 builtin 工具名模板（小模板；未设置 / 空白 →
+     * 默认 `"{prefix}_{tool}"`；读最新落盘配置）。作用于不含 `__`
+     * 的裸上游名——聚合 host 内置 server 的裸名与桌面直连裸名共用
+     * 这条展开分支。占位符仅 `{prefix}`/`{tool}`（无 `{server}`）。
+     */
+    fun `getMcpBuiltinToolNameTemplate`(): kotlin.String
+    
+    /**
      * 读取当前聚合 server 名（`[mcp.servers]` 的键，模板 `{prefix}`
      * 占位符的展开值）。恰好一个键 → 该键；多键 → termux 优先否则
      * 任取；空 / 读失败 → `termux`。
@@ -1606,6 +1628,16 @@ public interface OpenSlateRuntimeInterface {
      * 代理）。进程级、立即生效于后续 provider 构建；空串清除。
      */
     fun `setHttpProxy`(`url`: kotlin.String)
+    
+    /**
+     * 设置 builtin 工具名模板：校验（与启动校验同一套规则：必须含
+     * `{tool}`、占位符仅 `{prefix}`/`{tool}`、拒 `{server}`、禁字面
+     * `__`）→ 落盘；空白 = 清除回默认。**不自动热重载**——新模板经
+     * 既有 `reload_mcp_servers()` 生效（reload 会按新模板的展开名交接
+     * HostTool 让位/兜底）。返回 `{"ok":true}` 或
+     * `{"ok":false,"error":"…"}`。
+     */
+    fun `setMcpBuiltinToolNameTemplate`(`template`: kotlin.String): kotlin.String
     
     /**
      * 改聚合 server 名（即 `{prefix}` 值）：校验（非空、
@@ -1782,6 +1814,25 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_agent_tool_visibility(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 读取当前生效的 builtin 工具名模板（小模板；未设置 / 空白 →
+     * 默认 `"{prefix}_{tool}"`；读最新落盘配置）。作用于不含 `__`
+     * 的裸上游名——聚合 host 内置 server 的裸名与桌面直连裸名共用
+     * 这条展开分支。占位符仅 `{prefix}`/`{tool}`（无 `{server}`）。
+     */override fun `getMcpBuiltinToolNameTemplate`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_builtin_tool_name_template(
         it,
         _status)
 }
@@ -2120,6 +2171,28 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 }
     }
     
+    
+
+    
+    /**
+     * 设置 builtin 工具名模板：校验（与启动校验同一套规则：必须含
+     * `{tool}`、占位符仅 `{prefix}`/`{tool}`、拒 `{server}`、禁字面
+     * `__`）→ 落盘；空白 = 清除回默认。**不自动热重载**——新模板经
+     * 既有 `reload_mcp_servers()` 生效（reload 会按新模板的展开名交接
+     * HostTool 让位/兜底）。返回 `{"ok":true}` 或
+     * `{"ok":false,"error":"…"}`。
+     */override fun `setMcpBuiltinToolNameTemplate`(`template`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_set_mcp_builtin_tool_name_template(
+        it,
+        
+        FfiConverterString.lower(`template`),_status)
+}
+    }
+    )
+    }
     
 
     

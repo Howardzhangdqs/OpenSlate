@@ -10,7 +10,8 @@
 //! - `set_mcp_host_token(token)`（namespace 函数）→ MCP host 鉴权注入
 //! - `reload_mcp_servers()` → 外部 MCP 热重载（重连 + 工具重注册）
 //! - `get/set_mcp_tool_name_template()` → MCP 工具注册名模板读写
-//!   （占位符 `{prefix}`/`{server}`/`{tool}`；落盘，生效走既有
+//! - `get/set_mcp_builtin_tool_name_template()` → builtin（裸名）工具名
+//!   模板读写（占位符仅 `{prefix}`/`{tool}`；落盘，生效走既有
 //!   `reload_mcp_servers()`）
 //! - `get/set_mcp_server_name()` → 聚合 server 键名读写（`{prefix}`
 //!   占位符的展开值；生效同样走 `reload_mcp_servers()`）
@@ -64,18 +65,23 @@ pub struct OpenSlateRuntime {
     inner: Arc<MobileRuntime>,
 }
 
-fn catch<T>(label: &str, err: MobileError, f: impl FnOnce() -> anyhow::Result<T>) -> Result<T, MobileError> {
-    std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|p| {
-        let panic_text = p
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| p.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic".to_owned());
-        let reason = format!("{label}: rust panic: {panic_text}");
-        tracing::error!("{reason}");
-        err_dup(&err, reason)
-    })
-    .and_then(|r| r.map_err(|e| err_dup(&err, format!("{label}: {e}"))))
+fn catch<T>(
+    label: &str,
+    err: MobileError,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> Result<T, MobileError> {
+    std::panic::catch_unwind(AssertUnwindSafe(f))
+        .map_err(|p| {
+            let panic_text = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            let reason = format!("{label}: rust panic: {panic_text}");
+            tracing::error!("{reason}");
+            err_dup(&err, reason)
+        })
+        .and_then(|r| r.map_err(|e| err_dup(&err, format!("{label}: {e}"))))
 }
 
 /// 把 reason 填进同类错误的克隆（保持 Kotlin 侧单一 catch 类型）。
@@ -97,7 +103,9 @@ impl OpenSlateRuntime {
         openslate_mobile::alog!("ffi create: entry");
         let result = catch(
             "create",
-            MobileError::CreateFailed { reason: String::new() },
+            MobileError::CreateFailed {
+                reason: String::new(),
+            },
             || {
                 let mobile_paths = MobilePaths {
                     config_dir: paths.config_dir.into(),
@@ -125,10 +133,10 @@ impl OpenSlateRuntime {
     pub fn send(&self, msg: String) -> Result<(), MobileError> {
         catch(
             "send",
-            MobileError::SendFailed { reason: String::new() },
-            || {
-                self.inner.send(&msg).map_err(|e| anyhow::anyhow!("{e:#}"))
+            MobileError::SendFailed {
+                reason: String::new(),
             },
+            || self.inner.send(&msg).map_err(|e| anyhow::anyhow!("{e:#}")),
         )
     }
 
@@ -179,6 +187,26 @@ impl OpenSlateRuntime {
         self.inner.get_mcp_tool_name_template()
     }
 
+    /// 读取当前生效的 builtin 工具名模板（小模板；未设置 / 空白 →
+    /// 默认 `"{prefix}_{tool}"`；读最新落盘配置）。作用于不含 `__`
+    /// 的裸上游名——聚合 host 内置 server 的裸名与桌面直连裸名共用
+    /// 这条展开分支。占位符仅 `{prefix}`/`{tool}`（无 `{server}`）。
+    pub fn get_mcp_builtin_tool_name_template(&self) -> String {
+        openslate_mobile::alog!("ffi: get_mcp_builtin_tool_name_template");
+        self.inner.get_mcp_builtin_tool_name_template()
+    }
+
+    /// 设置 builtin 工具名模板：校验（与启动校验同一套规则：必须含
+    /// `{tool}`、占位符仅 `{prefix}`/`{tool}`、拒 `{server}`、禁字面
+    /// `__`）→ 落盘；空白 = 清除回默认。**不自动热重载**——新模板经
+    /// 既有 `reload_mcp_servers()` 生效（reload 会按新模板的展开名交接
+    /// HostTool 让位/兜底）。返回 `{"ok":true}` 或
+    /// `{"ok":false,"error":"…"}`。
+    pub fn set_mcp_builtin_tool_name_template(&self, template: String) -> String {
+        openslate_mobile::alog!("ffi: set_mcp_builtin_tool_name_template({template:?})");
+        self.inner.set_mcp_builtin_tool_name_template(template)
+    }
+
     /// 设置 MCP 工具名模板：校验（与启动校验同一套规则）→ 落盘；
     /// 空白 = 清除回默认。**不自动热重载**——新模板经既有
     /// `reload_mcp_servers()` 生效（重连后按新模板重注册工具名）。
@@ -227,11 +255,16 @@ impl OpenSlateRuntime {
     /// 可见/隐藏）。外科手术式改写 `agents/root.md` frontmatter（其余
     /// 字段与正文不动）并热生效——下一对话回合即按新可见性过滤，无需
     /// 重启 app。返回 `{"ok":true}` 或 `{"ok":false,"error":"…"}`。
-    pub fn set_agent_tool_visibility(&self, tools: Vec<String>, hidden_tools: Vec<String>) -> String {
+    pub fn set_agent_tool_visibility(
+        &self,
+        tools: Vec<String>,
+        hidden_tools: Vec<String>,
+    ) -> String {
         openslate_mobile::alog!(
             "ffi: set_agent_tool_visibility(tools={tools:?}, hidden={hidden_tools:?})"
         );
-        self.inner.set_agent_tool_visibility_json(tools, hidden_tools)
+        self.inner
+            .set_agent_tool_visibility_json(tools, hidden_tools)
     }
 
     /// 应答 host call。`ok=true` → payload 为结果 JSON；`ok=false` →

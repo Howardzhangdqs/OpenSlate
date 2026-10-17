@@ -44,12 +44,7 @@ impl ModelProvider for ScriptedProvider {
         _request: GenerateRequest,
     ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let script = self
-            .scripts
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_default();
+        let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
         tokio::spawn(async move {
             for event in script {
                 let _ = tx.send(Ok(event)).await;
@@ -64,9 +59,7 @@ impl ModelProvider for ScriptedProvider {
 }
 
 fn factory_for(provider: ScriptedProvider) -> ProviderFactory {
-    Arc::new(move |_config, _alias| {
-        Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>)
-    })
+    Arc::new(move |_config, _alias| Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>))
 }
 
 // ── 事件采集回调（泵线程 → std mpsc 通知）────────────────────────────
@@ -100,11 +93,19 @@ impl Collector {
     }
 
     /// 阻塞等待直到出现匹配 type 的第 n 条（超时失败）。
-    fn wait_for(&self, rx: &std_mpsc::Receiver<()>, want_type: &str, deadline: Duration) -> Vec<serde_json::Value> {
+    fn wait_for(
+        &self,
+        rx: &std_mpsc::Receiver<()>,
+        want_type: &str,
+        deadline: Duration,
+    ) -> Vec<serde_json::Value> {
         let start = Instant::now();
         loop {
             let all = self.events.lock().unwrap().clone();
-            if all.iter().any(|e| e.get("type").and_then(|t| t.as_str()) == Some(want_type)) {
+            if all
+                .iter()
+                .any(|e| e.get("type").and_then(|t| t.as_str()) == Some(want_type))
+            {
                 return all;
             }
             assert!(
@@ -178,7 +179,10 @@ fn mobile_runtime_closed_loop_streaming() {
         .iter()
         .filter_map(|e| e.get("type").and_then(|t| t.as_str()))
         .collect();
-    let i_start = types.iter().position(|t| t == &"request_start").expect("request_start");
+    let i_start = types
+        .iter()
+        .position(|t| t == &"request_start")
+        .expect("request_start");
     let i_delta = types.iter().position(|t| t == &"delta").expect("delta");
     let i_ok = types.iter().position(|t| t == &"turn_ok").expect("turn_ok");
     assert!(i_start < i_delta && i_delta < i_ok, "事件序: {types:?}");
@@ -199,7 +203,7 @@ fn mobile_runtime_host_call_roundtrip() {
 
     // 第一回合：模型点名调用 mobile.ping；第二回合：拿到工具结果后收尾。
     let step1 = vec![ModelStreamEvent::Done(ModelResponse {
-    reasoning_content: None,
+        reasoning_content: None,
         content: None,
         tool_calls: vec![ToolCall {
             id: ToolCallId("call-1".into()),
@@ -217,7 +221,9 @@ fn mobile_runtime_host_call_roundtrip() {
     };
 
     let runtime = MobileRuntime::create_with(paths, collector.clone(), opts).unwrap();
-    runtime.send(r#"{"type":"submit","text":"ping 一下宿主"}"#).unwrap();
+    runtime
+        .send(r#"{"type":"submit","text":"ping 一下宿主"}"#)
+        .unwrap();
 
     // 宿主侧收到 host_call_requested 信封并应答。
     let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
@@ -234,7 +240,10 @@ fn mobile_runtime_host_call_roundtrip() {
     let tool_start_seen = events
         .iter()
         .any(|e| e["type"] == "tool_start" && e["name"] == "mobile.ping");
-    assert!(tool_start_seen, "应有 mobile.ping 的 tool_start: {events:?}");
+    assert!(
+        tool_start_seen,
+        "应有 mobile.ping 的 tool_start: {events:?}"
+    );
 
     runtime.shutdown();
 }
@@ -252,9 +261,7 @@ fn mobile_runtime_hello_version_check() {
     collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
 
     // 错误版本号 → proto_mismatch 错误信封，而非 snapshot。
-    runtime
-        .send(r#"{"type":"hello","proto":999}"#)
-        .unwrap();
+    runtime.send(r#"{"type":"hello","proto":999}"#).unwrap();
     let events = collector.wait_for(&rx, "error", Duration::from_secs(5));
     let err = events.iter().find(|e| e["type"] == "error").unwrap();
     assert_eq!(err["code"].as_str().unwrap(), "proto_mismatch");
@@ -323,11 +330,20 @@ fn mobile_runtime_tool_visibility_roundtrip() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"mobile.ping"), "mobile.ping 应注册: {names:?}");
+    assert!(
+        names.contains(&"mobile.ping"),
+        "mobile.ping 应注册: {names:?}"
+    );
     // bash 工具按后端探测注册（桌面测试环境可能缺席），只验排序与字段。
-    assert!(names.windows(2).all(|w| w[0] <= w[1]), "按 name 排序: {names:?}");
+    assert!(
+        names.windows(2).all(|w| w[0] <= w[1]),
+        "按 name 排序: {names:?}"
+    );
     for t in tools.as_array().unwrap() {
-        assert!(t["description"].is_string(), "name+description 字段固定: {t}");
+        assert!(
+            t["description"].is_string(),
+            "name+description 字段固定: {t}"
+        );
         // input_schema 键恒存在（无 schema 时为 {}）；且必须是对象。
         assert!(
             t["input_schema"].is_object(),
@@ -336,9 +352,11 @@ fn mobile_runtime_tool_visibility_roundtrip() {
     }
     // 至少一个工具的参数 schema 非空（mobile.ping 恒注册且带完整 schema）。
     assert!(
-        tools.as_array().unwrap().iter().any(|t| {
-            t["input_schema"].as_object().is_some_and(|o| !o.is_empty())
-        }),
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| { t["input_schema"].as_object().is_some_and(|o| !o.is_empty()) }),
         "应存在参数 schema 非空的工具: {tools}"
     );
 

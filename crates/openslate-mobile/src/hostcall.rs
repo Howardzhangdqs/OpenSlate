@@ -89,7 +89,10 @@ impl HostCallRouter {
             // 发送端 drop（fail_all / runtime 关停）。
             Ok(Err(_)) => Err("host call aborted (runtime shutting down)".to_owned()),
             Err(_) => {
-                self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
                 return Err(format!(
                     "host call timeout after {}ms (host did not resolve)",
                     self.timeout.as_millis()
@@ -110,9 +113,8 @@ impl HostCallRouter {
         match pending {
             Some(tx) => {
                 let result = if ok {
-                    serde_json::from_str(&payload).map_err(|e| {
-                        format!("host returned invalid JSON payload: {e}")
-                    })
+                    serde_json::from_str(&payload)
+                        .map_err(|e| format!("host returned invalid JSON payload: {e}"))
                 } else {
                     Err(payload)
                 };
@@ -203,7 +205,8 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
 
     fn wait_event(rx: &std_mpsc::Receiver<String>) -> String {
-        rx.recv_timeout(Duration::from_secs(2)).expect("event within 2s")
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("event within 2s")
     }
 
     #[tokio::test]
@@ -254,9 +257,8 @@ mod tests {
         let sink = EventSink::new(Arc::new(Cb(tx)));
         let router = HostCallRouter::new(sink, Duration::from_secs(2));
         let router_clone = router.clone();
-        let task = tokio::spawn(async move {
-            router_clone.call("boom", &serde_json::json!({})).await
-        });
+        let task =
+            tokio::spawn(async move { router_clone.call("boom", &serde_json::json!({})).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         let event = wait_event(&rx);
         let id = serde_json::from_str::<Value>(&event).unwrap()["id"]
@@ -299,9 +301,8 @@ mod tests {
         let sink = EventSink::new(Arc::new(Cb(tx)));
         let router = HostCallRouter::new(sink, Duration::from_secs(60));
         let router_clone = router.clone();
-        let task = tokio::spawn(async move {
-            router_clone.call("stuck", &serde_json::json!({})).await
-        });
+        let task =
+            tokio::spawn(async move { router_clone.call("stuck", &serde_json::json!({})).await });
         tokio::time::sleep(Duration::from_millis(30)).await;
         router.fail_all("shutdown");
         let err = task.await.unwrap().expect_err("fail_all unblocks");

@@ -20,7 +20,12 @@ pub fn log(level: Level, tag: &str, msg: &str) {
 #[allow(non_snake_case)]
 extern "C" {
     #[link_name = "__android_log_print"]
-    fn __android_log_print(prio: i32, tag: *const std::os::raw::c_char, fmt: *const std::os::raw::c_char, ...) -> i32;
+    fn __android_log_print(
+        prio: i32,
+        tag: *const std::os::raw::c_char,
+        fmt: *const std::os::raw::c_char,
+        ...
+    ) -> i32;
 }
 
 #[cfg(not(target_os = "android"))]

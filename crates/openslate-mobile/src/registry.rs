@@ -85,11 +85,17 @@ impl RegistryStore {
 
     fn read_meta(&self) -> MetaFile {
         let Ok(text) = std::fs::read_to_string(self.meta_path()) else {
-            return MetaFile { v: 1, sources: HashMap::new() };
+            return MetaFile {
+                v: 1,
+                sources: HashMap::new(),
+            };
         };
         serde_json::from_str(&text).unwrap_or_else(|e| {
             crate::alog!("registry: meta.json 损坏，按空处理（{e}）");
-            MetaFile { v: 1, sources: HashMap::new() }
+            MetaFile {
+                v: 1,
+                sources: HashMap::new(),
+            }
         })
     }
 
@@ -129,8 +135,7 @@ impl RegistryStore {
     /// 手动/自动更新一个源：拉取 → 解析计数 → ZSTD 压缩 → 原子写 →
     /// 更新 meta → 失效内存解析缓存。返回条目数。
     pub async fn update_source(&self, id: &str) -> anyhow::Result<usize> {
-        let def = source_by_id(id)
-            .ok_or_else(|| anyhow::anyhow!("未知数据源 '{id}'"))?;
+        let def = source_by_id(id).ok_or_else(|| anyhow::anyhow!("未知数据源 '{id}'"))?;
         let v = http_get_json(def.url).await?;
         let map = parse_source_map(def.format, &v)?;
         let entries = map.len();
@@ -180,16 +185,17 @@ impl RegistryStore {
                 .sources
                 .get(def.id)
                 .and_then(|s| s.fetched_at_ms)
-                .map(|at| {
-                    now_ms().saturating_sub(at) < def.stale_after.as_millis() as u64
-                })
+                .map(|at| now_ms().saturating_sub(at) < def.stale_after.as_millis() as u64)
                 .unwrap_or(false);
             if fresh {
                 continue;
             }
             crate::alog!("registry: auto update '{}' (stale/missing)", def.name);
             if let Err(e) = self.update_source(def.id).await {
-                crate::alog!("registry: auto update '{}' FAILED (keep old): {e:#}", def.name);
+                crate::alog!(
+                    "registry: auto update '{}' FAILED (keep old): {e:#}",
+                    def.name
+                );
             }
         }
     }
@@ -258,9 +264,7 @@ impl RegistryStore {
         if !local.is_empty() {
             return local;
         }
-        probe_cloudprice_by_id(model_id)
-            .await
-            .unwrap_or_default()
+        probe_cloudprice_by_id(model_id).await.unwrap_or_default()
     }
 
     /// 本地条目搜索 / 浏览（数据源页面「查看条目 / 跨源搜索」）。
@@ -297,7 +301,9 @@ impl RegistryStore {
         let mut total = 0usize;
         let mut results: Vec<serde_json::Value> = Vec::new();
         for def in defs {
-            let Some(v) = self.raw_value(def.id) else { continue };
+            let Some(v) = self.raw_value(def.id) else {
+                continue;
+            };
             let Some(obj) = v.as_object() else { continue };
             for (key, entry) in obj {
                 if !is_model_entry(def.format, entry) {
@@ -364,8 +370,7 @@ mod tests {
         assert_eq!(store2.lookup_local("glm-4.7").context_tokens, Some(204800));
 
         // sources_json 结构完整。
-        let sj: serde_json::Value =
-            serde_json::from_str(&store2.sources_json()).unwrap();
+        let sj: serde_json::Value = serde_json::from_str(&store2.sources_json()).unwrap();
         let arr = sj["sources"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert!(arr.iter().any(|s| s["id"] == "models_dev"));
@@ -387,11 +392,7 @@ mod tests {
         let raw = serde_json::to_vec(v).unwrap();
         let zst = zstd::encode_all(raw.as_slice(), zstd_level()).unwrap();
         std::fs::create_dir_all(base.join("registry")).unwrap();
-        std::fs::write(
-            base.join("registry").join(format!("{id}.json.zst")),
-            zst,
-        )
-        .unwrap();
+        std::fs::write(base.join("registry").join(format!("{id}.json.zst")), zst).unwrap();
     }
 
     /// 搜索测试夹具：models_dev 3 条（glm × 2 + gpt × 1）+
@@ -504,7 +505,9 @@ mod tests {
         // 指定源 + 子串匹配（尾段子串）。
         let (total, results) = run_search(&store, "models_dev", "glm", 50);
         assert_eq!(total, 2);
-        assert!(results.iter().all(|r| r["id"].as_str().unwrap().starts_with("zhipuai/glm-")));
+        assert!(results
+            .iter()
+            .all(|r| r["id"].as_str().unwrap().starts_with("zhipuai/glm-")));
         // 双侧归一化：大小写 / 分隔符不敏感；尾段与全前缀键都能命中。
         assert_eq!(run_search(&store, "models_dev", "GLM 4.7", 50).0, 1);
         assert_eq!(run_search(&store, "models_dev", "zhipuai/glm-4.7", 50).0, 1);
@@ -512,9 +515,14 @@ mod tests {
         assert_eq!(run_search(&store, "models_dev", "claude", 50).0, 0);
         // 空 source_id 跨源：命中 litellm 条目（计价字段 USD/Mtok）。
         let (total, results) = run_search(&store, "", "glm", 50);
-        assert_eq!(total, 3, "models_dev ×2 + litellm ×1（cloudprice 无数据跳过）");
-        let lt: Vec<&serde_json::Value> =
-            results.iter().filter(|r| r["sourceId"] == "litellm").collect();
+        assert_eq!(
+            total, 3,
+            "models_dev ×2 + litellm ×1（cloudprice 无数据跳过）"
+        );
+        let lt: Vec<&serde_json::Value> = results
+            .iter()
+            .filter(|r| r["sourceId"] == "litellm")
+            .collect();
         assert_eq!(lt.len(), 1);
         assert_eq!(lt[0]["id"], "zai/glm-4.7", "原始键保留 litellm 前缀");
         assert_eq!(lt[0]["source"], "LiteLLM");

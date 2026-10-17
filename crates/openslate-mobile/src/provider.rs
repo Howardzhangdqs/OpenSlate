@@ -69,8 +69,7 @@ pub fn mobile_provider_factory(
                     "provider '{provider_name}' 的 API key 未配置（宿主请先 set_api_key）"
                 )
             })?;
-        build_genai_provider(config, alias, Some(key))
-            .map(|p| p as Box<dyn ModelProvider>)
+        build_genai_provider(config, alias, Some(key)).map(|p| p as Box<dyn ModelProvider>)
     })
 }
 

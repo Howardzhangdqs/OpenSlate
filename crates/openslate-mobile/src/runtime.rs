@@ -27,10 +27,10 @@ use openslate_protocol::{
     ClientMsg, EntryDto, NoticeLevel, ServerMsg, ToolStatusDto, PROTOCOL_VERSION,
 };
 use openslate_session::approval::SessionApprovalBridge;
-use openslate_session::state::{
-    build_snapshot, AppState, ConfigPaths, CoreInner, ProviderFactory, SessionCore, MsgSink,
-};
 use openslate_session::session as session_dispatch;
+use openslate_session::state::{
+    build_snapshot, AppState, ConfigPaths, CoreInner, MsgSink, ProviderFactory, SessionCore,
+};
 
 use crate::bootstrap::MobilePaths;
 use crate::events::{EventCallback, EventSink, MOBILE_CONN_ID};
@@ -91,10 +91,7 @@ pub struct MobileRuntime {
 
 impl MobileRuntime {
     /// 默认装配（生产入口：FFI 调这个）。
-    pub fn create(
-        paths: MobilePaths,
-        callback: Arc<dyn EventCallback>,
-    ) -> Result<Arc<Self>> {
+    pub fn create(paths: MobilePaths, callback: Arc<dyn EventCallback>) -> Result<Arc<Self>> {
         Self::create_with(paths, callback, RuntimeOptions::default())
     }
 
@@ -161,13 +158,28 @@ impl MobileRuntime {
         ))?;
         crate::alog!("create_with: state assembled, emitting first snapshot");
         // 拿到运行期注册表并按当前（默认）多选注册 bash 工具。
-        let runtime_registry = state.core.lock().manager.as_ref()
-            .expect("manager present").tool_registry.clone();
+        let runtime_registry = state
+            .core
+            .lock()
+            .manager
+            .as_ref()
+            .expect("manager present")
+            .tool_registry
+            .clone();
+        // 选择点 1（装配期）：外部 MCP 工具已在 assemble_state 里注册，
+        // 其名册 ∩ bash 域 = MCP 接管名（builtin 模板按装配时的同一份
+        // 配置展开）——HostTool/native 让位：不清理、不顶位。
+        let mcp_cfg = state.core.lock().config.mcp.clone().unwrap_or_default();
+        let mcp_owned = crate::exec::mcp_owned_bash_names(&mcp_tool_names, &mcp_cfg);
+        if !mcp_owned.is_empty() {
+            crate::alog!("create_with: MCP 已接管 bash 名 {mcp_owned:?}（host 侧让位）");
+        }
         register_bash_tools(
             &runtime_registry,
             exec_selection.get(),
             paths.workspace_dir.clone(),
             host_router.clone(),
+            &mcp_owned,
         );
         let runtime = Arc::new(Self {
             rt: std::sync::Mutex::new(Some(rt)),
@@ -217,9 +229,7 @@ impl MobileRuntime {
                 if proto != PROTOCOL_VERSION {
                     self.sink.broadcast(ServerMsg::Error {
                         code: "proto_mismatch".into(),
-                        message: format!(
-                            "协议版本不匹配：宿主 {proto}，运行时 {PROTOCOL_VERSION}"
-                        ),
+                        message: format!("协议版本不匹配：宿主 {proto}，运行时 {PROTOCOL_VERSION}"),
                     });
                     return Ok(());
                 }
@@ -249,24 +259,56 @@ impl MobileRuntime {
     /// 设置 bash 工具后端多选（逗号分隔："native"、"termux"、
     /// "native,termux"；热生效，无需重启）。命名规则：
     /// 单选 → `bash`；双选 → `bash`=native + `termux_bash`=termux。
+    ///
+    /// 选择点 3：热切换前重算 MCP 接管（统一谓词 [`crate::exec::
+    /// mcp_owned_bash_names`]）——MCP 已接管的名字不清理、不顶替，修掉
+    /// 旧实现「切后端 = 无条件 unregister 全部 bash 名」对 MCP bash
+    /// 工具的误杀。
     pub fn set_exec_backends(&self, backends: &str) {
         let sel = ExecSelection::parse_csv(backends).normalized();
         self.exec_selection.set(sel);
-        register_bash_tools(&self.registry, sel, self.workspace_dir.clone(), self.host_router.clone());
+        let mcp_owned = self.current_mcp_owned_bash_names();
+        register_bash_tools(
+            &self.registry,
+            sel,
+            self.workspace_dir.clone(),
+            self.host_router.clone(),
+            &mcp_owned,
+        );
         crate::alog!(
-            "exec backends set to {backends:?} (native={}, termux={})",
+            "exec backends set to {backends:?} (native={}, termux={}, mcp_owned={mcp_owned:?})",
             sel.native,
             sel.termux
         );
+    }
+
+    /// 当前 MCP bash 接管名（统一谓词的 runtime 侧入口）：名册取
+    /// `mcp_tool_names` 快照，模板读最新落盘配置（与 `reload_mcp` 同源；
+    /// 读失败回空配置——无 server 时展开名集为空，仅剩「名册 ∩ bash 域」
+    /// 防线）。
+    fn current_mcp_owned_bash_names(&self) -> Vec<String> {
+        let roster = self
+            .mcp_tool_names
+            .lock()
+            .expect("mcp_tool_names lock poisoned")
+            .clone();
+        let mcp_cfg = load_config(&self.config_path)
+            .ok()
+            .and_then(|c| c.mcp)
+            .unwrap_or_default();
+        crate::exec::mcp_owned_bash_names(&roster, &mcp_cfg)
     }
 
     // ── MCP 外部 server 热重载（设置页增删改后免重启生效）──────────
 
     /// 热重载外部 MCP：读最新落盘配置 → 连新（工具先进 scratch 注册表，
     /// 批内名字冲突此时以 Err 体现，真实注册表未动、旧工具仍在）→
-    /// 反注册旧名 → 注册新工具（此时撞名只可能是与非 MCP 工具冲突，
-    /// Err 则回滚：清掉已注册的新名、旧工具原样装回、保留旧 guard）→
-    /// 成功后整体换 guard（旧 guard drop，旧连接自然关闭）。
+    /// 反注册旧名 → **bash 域让位**（新名册含 bash 名而 HostTool/native
+    /// 正占着时先卸载让位，修掉撞名整体回滚死锁）→ 注册新工具（此时
+    /// 撞名只可能是与非 MCP 工具冲突，Err 则回滚：清掉已注册的新名、
+    /// 旧工具与让位的 bash 工具原样装回、保留旧 guard）→ 成功后整体换
+    /// guard（旧 guard drop，旧连接自然关闭）→ 重算 host bash 注册
+    /// （MCP 接管名让位保持 / MCP 缺席时 HostTool 兜底回装）。
     /// 完全失败（配置读不了 / 所有 enabled server 都失败且旧态非空）→
     /// 保留旧工具，返回错误。返回 JSON：
     /// `{"ok":bool,"tools":N,"servers":{"name":count,…},"failed":[…],"error":"…"}`。
@@ -348,16 +390,46 @@ impl MobileRuntime {
             self.registry.unregister(name);
         }
 
+        // 3.5) 先让位再 swap（选择点 2，修撞名回滚死锁）：新名册含 bash
+        //      域名（HostTool 兜底 / native 正占着）时先卸载让位，否则
+        //      try_register 必撞名 → 整体回滚 → 下次 reload 还是撞（MCP
+        //      永远接管不了）。让位范围只限 bash 工具域
+        //      （exec::ALL_BASH_NAMES）；其它 builtin/host 工具撞名仍是
+        //      真冲突，保持回滚报错语义。让位的 Arc 备份，回滚时装回。
+        let yield_names: Vec<String> = new_names
+            .iter()
+            .filter(|n| crate::exec::ALL_BASH_NAMES.contains(&n.as_str()))
+            .filter(|n| !old_names.contains(n))
+            .filter(|n| self.registry.contains(n))
+            .cloned()
+            .collect();
+        let yielded_tools: Vec<(String, Arc<dyn Tool>)> = yield_names
+            .iter()
+            .filter_map(|n| self.registry.get(n).map(|t| (n.clone(), t)))
+            .collect();
+        for name in &yield_names {
+            self.registry.unregister(name);
+        }
+        if !yield_names.is_empty() {
+            crate::alog!("reload_mcp: host bash 工具 {yield_names:?} 让位给 MCP 接管");
+        }
+
         // 4) 注册新工具（从 scratch 取 Arc 包装迁移；此处撞名只可能是
         //    与 builtin/host 等非 MCP 工具冲突——装配期同样致命）。
         let mut registered: Vec<String> = Vec::with_capacity(new_names.len());
         for name in &new_names {
-            let Some(tool) = scratch.get(name) else { continue };
+            let Some(tool) = scratch.get(name) else {
+                continue;
+            };
             if let Err(e) = self.registry.try_register(SharedTool(tool)) {
                 for n in &registered {
                     self.registry.unregister(n);
                 }
                 for (_, t) in old_tools {
+                    self.registry.register_boxed(Box::new(SharedTool(t)));
+                }
+                // 让位的 host bash 工具原样装回：回滚路径兜底在场。
+                for (_, t) in yielded_tools {
                     self.registry.register_boxed(Box::new(SharedTool(t)));
                 }
                 let error = format!(
@@ -375,10 +447,35 @@ impl MobileRuntime {
 
         // 5) 换 guard（旧 guard drop → 旧连接关闭）+ 更新名册。
         {
-            let mut guard_cell = self.mcp_external.lock().expect("mcp_external lock poisoned");
+            let mut guard_cell = self
+                .mcp_external
+                .lock()
+                .expect("mcp_external lock poisoned");
             *guard_cell = new_guard;
         }
-        *self.mcp_tool_names.lock().expect("mcp_tool_names lock poisoned") = new_names;
+        // 名册接管名先算（new_names 随后被 move 进名册）。
+        let mcp_owned = crate::exec::mcp_owned_bash_names(&new_names, &mcp_cfg);
+        *self
+            .mcp_tool_names
+            .lock()
+            .expect("mcp_tool_names lock poisoned") = new_names;
+
+        // 6) swap 成功后重算 host bash 注册（同一统一谓词）：MCP 接管名
+        //    保持让位；MCP 缺席（host 掉线 / 清单无 bash）时 HostTool
+        //    兜底回装——bash 能力在 reload 前后始终有人在场，不因重载
+        //    出现空窗。运行期 host 死亡不做热切换（工具列表已进上下文，
+        //    McpTool 失败语义由调用方感知），接管/兜底的交接只在 reload
+        //    边界发生。
+        crate::exec::register_bash_tools(
+            &self.registry,
+            self.exec_selection.get(),
+            self.workspace_dir.clone(),
+            self.host_router.clone(),
+            &mcp_owned,
+        );
+        if !mcp_owned.is_empty() {
+            crate::alog!("reload_mcp: MCP 接管 bash 名 {mcp_owned:?}，host 侧让位保持");
+        }
 
         let total: usize = counts.values().sum();
         crate::alog!("reload_mcp: ok tools={total} servers={counts:?} failed={failed:?}");
@@ -407,6 +504,29 @@ impl MobileRuntime {
             Err(e) => {
                 crate::alog!("get_mcp_tool_name_template: 读取配置失败: {e:#}");
                 openslate_core::mcp::DEFAULT_TOOL_NAME_TEMPLATE.to_owned()
+            }
+        }
+    }
+
+    /// 当前生效的 builtin 工具名模板（小模板，设置页回显；Phase C 的
+    /// Kotlin 侧判断「MCP 名册里的 bash 名」也经 FFI 读它）。作用于
+    /// 不含 `__` 的裸上游名——host-builtin 裸名与桌面直连裸名同一条
+    /// 展开分支。读最新落盘配置——与 `reload_mcp` 同源
+    /// （`load_config(active)`），保证回显值 = 下次热重载实际展开的值；
+    /// 未设置 / 空白 → 默认 `"{prefix}_{tool}"`。解析统一经 core 的
+    /// `McpConfig::builtin_template_or_default()`（跨 crate 接缝契约，
+    /// 空白语义只此一份），此处不写第二份 blank-filter、不抄字面常量。
+    /// 配置读不了（理论上装配期已挡）也回默认：回显接口不设错误通道，
+    /// 默认值与装配期兜底一致。
+    pub fn get_mcp_builtin_tool_name_template(&self) -> String {
+        match load_config(&self.config_path) {
+            Ok(cfg) => match cfg.mcp {
+                Some(mcp) => mcp.builtin_template_or_default().to_owned(),
+                None => openslate_core::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE.to_owned(),
+            },
+            Err(e) => {
+                crate::alog!("get_mcp_builtin_tool_name_template: 读取配置失败: {e:#}");
+                openslate_core::mcp::DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE.to_owned()
             }
         }
     }
@@ -440,6 +560,43 @@ impl MobileRuntime {
             Err(e) => {
                 let error = format!("写入配置失败: {e:#}");
                 crate::alog!("set_mcp_tool_name_template: {error}");
+                serde_json::json!({ "ok": false, "error": error }).to_string()
+            }
+        }
+    }
+
+    /// 写 builtin（裸名）工具名模板并落盘：空白 = 清除（回默认）。校验
+    /// 复用 core 的 `validate_mcp_builtin_tool_name_template`（必须含
+    /// `{tool}`、占位符仅 `{prefix}`/`{tool}`、拒 `{server}`、禁字面
+    /// `__`——与启动校验同一套规则，避免 FFI 收下的值把下次启动变成
+    /// validation error）。**不自动 reload**：新模板经调用方显式走既有
+    /// `reload_mcp` 生效——reload 的让位/兜底重算会按新模板展开名交接
+    /// HostTool。返回 `{"ok":true}` / `{"ok":false,"error":"…"}`。
+    pub fn set_mcp_builtin_tool_name_template(&self, template: String) -> String {
+        let blank = template.trim().is_empty();
+        if !blank {
+            if let Err(message) =
+                openslate_core::config::validation::validate_mcp_builtin_tool_name_template(
+                    &template,
+                )
+            {
+                crate::alog!("set_mcp_builtin_tool_name_template: 校验失败: {message}");
+                return serde_json::json!({ "ok": false, "error": message }).to_string();
+            }
+        }
+        // 空白归一成空串：persist 的清空语义（删键回默认）。
+        let effective: &str = if blank { "" } else { template.as_str() };
+        match openslate_core::config::persist::set_mcp_builtin_tool_name_template(
+            &self.config_path,
+            effective,
+        ) {
+            Ok(()) => {
+                crate::alog!("set_mcp_builtin_tool_name_template: 已落盘 {effective:?}");
+                serde_json::json!({ "ok": true }).to_string()
+            }
+            Err(e) => {
+                let error = format!("写入配置失败: {e:#}");
+                crate::alog!("set_mcp_builtin_tool_name_template: {error}");
                 serde_json::json!({ "ok": false, "error": error }).to_string()
             }
         }
@@ -513,11 +670,8 @@ impl MobileRuntime {
             // 成功，不动文件、不触发 reload。
             return serde_json::json!({ "ok": true }).to_string();
         }
-        match openslate_core::config::persist::rename_mcp_server(
-            &self.config_path,
-            &current,
-            &name,
-        ) {
+        match openslate_core::config::persist::rename_mcp_server(&self.config_path, &current, &name)
+        {
             Ok(()) => {
                 crate::alog!("set_mcp_server_name: {current:?} → {name:?} 已落盘");
                 serde_json::json!({ "ok": true }).to_string()
@@ -687,11 +841,7 @@ impl MobileRuntime {
                 }
             }
         }
-        let rt = self
-            .rt
-            .lock()
-            .expect("mobile runtime lock poisoned")
-            .take();
+        let rt = self.rt.lock().expect("mobile runtime lock poisoned").take();
         if let Some(rt) = rt {
             rt.shutdown_timeout(Duration::from_secs(5));
         }
@@ -743,9 +893,15 @@ impl MobileRuntime {
             )
             .await
             {
-                Ok(Ok(entries)) => serde_json::json!({ "ok": true, "entries": entries }).to_string(),
-                Ok(Err(e)) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
-                Err(_) => serde_json::json!({ "ok": false, "error": "更新超时（120s）" }).to_string(),
+                Ok(Ok(entries)) => {
+                    serde_json::json!({ "ok": true, "entries": entries }).to_string()
+                }
+                Ok(Err(e)) => {
+                    serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string()
+                }
+                Err(_) => {
+                    serde_json::json!({ "ok": false, "error": "更新超时（120s）" }).to_string()
+                }
             }
         })
     }
@@ -972,11 +1128,7 @@ impl MobileRuntime {
             // user 消息前 40 字符补写回库——治愈后的标题随 list_sessions
             // 直接从 run.title 读出。新 run 建立时已直接写入 prompt 摘
             // 要，不会命中本分支。
-            if run
-                .title
-                .as_deref()
-                .is_none_or(|t| t == "mobile session")
-            {
+            if run.title.as_deref().is_none_or(|t| t == "mobile session") {
                 if let Some(healed) = messages
                     .iter()
                     .find(|m| m.role == MessageRole::User)
@@ -1051,11 +1203,7 @@ async fn assemble_state(
     provider_factory: ProviderFactory,
     extra_tools: Vec<Box<dyn Tool>>,
     run_retention: i64,
-) -> Result<(
-    Arc<AppState>,
-    McpConnectionGuard,
-    Vec<String>,
-)> {
+) -> Result<(Arc<AppState>, McpConnectionGuard, Vec<String>)> {
     let config_flag = config_path.to_str().map(|s| s.to_owned());
     crate::alog!("assemble: build_app_context begin");
     let ctx: AppContext = build_app_context_with(config_flag.as_deref(), extra_tools)
@@ -1084,8 +1232,10 @@ async fn assemble_state(
     // 初始会话模型：capabilities.main（用户在设置页改的主对话模型）
     // 优先；无该节/代号不可解析时回退 root agent 的别名（旧配置行为）。
     let root_alias = agent_tree.get_root().model_alias.clone();
-    let main_alias =
-        openslate_core::model_config::capability_alias(&config, openslate_core::model_config::CAP_MAIN);
+    let main_alias = openslate_core::model_config::capability_alias(
+        &config,
+        openslate_core::model_config::CAP_MAIN,
+    );
     let initial_alias = if openslate_core::model_config::resolve_model(&config, &main_alias).is_ok()
     {
         main_alias
@@ -1142,10 +1292,8 @@ async fn assemble_state(
     if let Some(store) = store.clone() {
         match store.get_last_resumable_run().await {
             Ok(Some(run)) => {
-                match openslate_store_sqlite::recorder::RunRecorder::load_messages(
-                    &store, &run.id,
-                )
-                .await
+                match openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &run.id)
+                    .await
                 {
                     Ok(messages) if !messages.is_empty() => {
                         crate::alog!(
@@ -1157,13 +1305,12 @@ async fn assemble_state(
                         restored_cost = run.cost_usd;
                         restored_transcript = messages_to_transcript(&messages);
                         restored_history = messages;
-                        if let Ok(recorder) =
-                            openslate_store_sqlite::recorder::RunRecorder::resume(
-                                store.clone(),
-                                openslate_core::types::RunId(run.id.clone()),
-                                &root_agent_id,
-                            )
-                            .await
+                        if let Ok(recorder) = openslate_store_sqlite::recorder::RunRecorder::resume(
+                            store.clone(),
+                            openslate_core::types::RunId(run.id.clone()),
+                            &root_agent_id,
+                        )
+                        .await
                         {
                             restored_run = Some(openslate_session::state::SessionRun {
                                 run_id: openslate_core::types::RunId(run.id.clone()),
@@ -1359,28 +1506,22 @@ fn messages_to_transcript(messages: &[Message]) -> Vec<EntryDto> {
             }
             MessageRole::Tool => {
                 // 工具结果并入上一条同名 ToolCall（简化：追加 output）。
-                if let Some(EntryDto::ToolCall { detail, .. }) = out.iter_mut().rev().find_map(|e| {
-                    if let EntryDto::ToolCall {
-                        name, call_id, ..
-                    } = e
-                    {
-                        if call_id.as_deref()
-                            == m.tool_call_id.as_ref().map(|x| x.0.as_str())
-                            || (m.tool_call_id.is_none() && name == m.name.as_deref().unwrap_or(""))
-                        {
-                            return Some(e);
+                if let Some(EntryDto::ToolCall { detail, .. }) =
+                    out.iter_mut().rev().find_map(|e| {
+                        if let EntryDto::ToolCall { name, call_id, .. } = e {
+                            if call_id.as_deref() == m.tool_call_id.as_ref().map(|x| x.0.as_str())
+                                || (m.tool_call_id.is_none()
+                                    && name == m.name.as_deref().unwrap_or(""))
+                            {
+                                return Some(e);
+                            }
+                            None
+                        } else {
+                            None
                         }
-                        None
-                    } else {
-                        None
-                    }
-                }) {
-                    detail.output = Some(
-                        m.content
-                            .chars()
-                            .take(2000)
-                            .collect::<String>(),
-                    );
+                    })
+                {
+                    detail.output = Some(m.content.chars().take(2000).collect::<String>());
                 }
             }
             _ => {}
@@ -1429,7 +1570,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ScriptedProvider {
-        async fn generate(&self, _request: GenerateRequest) -> Result<ModelResponse, ProviderError> {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
             Err(ProviderError::ServerError(500))
         }
 
@@ -1438,12 +1582,7 @@ mod tests {
             _request: GenerateRequest,
         ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
-            let script = self
-                .scripts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default();
+            let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
             tokio::spawn(async move {
                 for event in script {
                     let _ = tx.send(Ok(event)).await;
@@ -1458,9 +1597,7 @@ mod tests {
     }
 
     fn factory_for(provider: ScriptedProvider) -> ProviderFactory {
-        Arc::new(move |_config, _alias| {
-            Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>)
-        })
+        Arc::new(move |_config, _alias| Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>))
     }
 
     struct Collector {
@@ -1657,9 +1794,7 @@ mod tests {
         .unwrap();
         collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
 
-        runtime
-            .send(r#"{"type":"submit","text":"你好"}"#)
-            .unwrap();
+        runtime.send(r#"{"type":"submit","text":"你好"}"#).unwrap();
         collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
         let run_id = runtime.current_run_id().expect("run 应已打开");
 
@@ -1837,6 +1972,365 @@ mod tests {
             serde_json::from_str(&runtime.list_sessions_json(100)).unwrap();
         assert!(page2.is_empty(), "翻过头 → 空页");
 
+        runtime.shutdown();
+    }
+
+    // ── 7+. termux bash 降级阶梯（MCP 接管 × HostTool 兜底）──────────
+    //
+    // 挡板与 app wiring 集成测试同款：手写最小 MCP Streamable HTTP
+    // server（std::net + 每连接线程），只实现 legacy `initialize` +
+    // `tools/list`，通知回 202。不引新依赖。
+
+    /// 起 mock MCP host（后台线程常驻，随测试进程退出回收），返回 /mcp
+    /// URL。`tools` 为 tools/list 原样返回的裸名清单。
+    fn spawn_mock_mcp_host(tools: &[&str]) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        fn serve_connection(stream: TcpStream, tools: Vec<(String, String)>) {
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut stream = stream;
+            loop {
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let method = request_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = header.split_once(':') {
+                        if k.eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 && reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+                if method != "POST" {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.flush();
+                    continue;
+                }
+                let msg: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let rpc_method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = msg.get("id").cloned();
+                let is_request = id.is_some();
+                let response: Option<serde_json::Value> = match (rpc_method, is_request) {
+                    ("initialize", true) => Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-11-25"),
+                            "capabilities": { "tools": { "listChanged": false } },
+                            "serverInfo": { "name": "mobile-mock-host", "version": "0.0.0" }
+                        }
+                    })),
+                    ("tools/list", true) => Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": tools.iter().map(|(name, desc)| serde_json::json!({
+                                "name": name,
+                                "description": desc,
+                                "inputSchema": { "type": "object", "properties": {}, "required": [] }
+                            })).collect::<Vec<_>>()
+                        }
+                    })),
+                    ("ping", true) => {
+                        Some(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                    }
+                    _ => None,
+                };
+                match response {
+                    Some(payload) => {
+                        let bytes = payload.to_string().into_bytes();
+                        let _ = write!(stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            bytes.len());
+                        let _ = stream.write_all(&bytes);
+                    }
+                    None if !is_request => {
+                        let _ =
+                            stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    None => {
+                        let bytes = serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32601, "message": "method not found" }
+                        })
+                        .to_string()
+                        .into_bytes();
+                        let _ = write!(stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            bytes.len());
+                        let _ = stream.write_all(&bytes);
+                    }
+                }
+                let _ = stream.flush();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local addr");
+        let tools: Vec<(String, String)> = tools
+            .iter()
+            .map(|n| ((*n).to_string(), "mock tool".to_string()))
+            .collect();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let tools = tools.clone();
+                std::thread::spawn(move || serve_connection(stream, tools));
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    /// 在生效配置尾部追加 `[mcp]` 节（默认 toml 无该表，追加合法；
+    /// `[mcp]` 必须在 `[mcp.servers.*]` 之前显式出现一次）。
+    /// `builtin_template`：Some → 写 `builtin_tool_name_template`。
+    fn append_mcp_config(paths: &MobilePaths, url: &str, builtin_template: Option<&str>) {
+        let config = paths.config_file();
+        let mut body = std::fs::read_to_string(&config).unwrap();
+        body.push_str("\n[mcp]\n");
+        if let Some(t) = builtin_template {
+            body.push_str(&format!("builtin_tool_name_template = \"{t}\"\n"));
+        }
+        body.push_str(&format!(
+            "[mcp.servers.termux]\ntransport = \"http\"\nurl = \"{url}\"\nenabled = true\n"
+        ));
+        std::fs::write(&config, body).unwrap();
+    }
+
+    fn envelope(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("envelope json")
+    }
+
+    /// 选择点 3：set_exec_backends 热切换不误杀 MCP 已注册的 bash 工具。
+    #[test]
+    fn set_exec_backends_does_not_kill_mcp_bash_tool() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        let url = spawn_mock_mcp_host(&["bash"]);
+        append_mcp_config(&paths, &url, None);
+        let (collector, _rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
+
+        // 装配期接管：默认模板 + 键 termux → termux_bash 已是 MCP 工具。
+        let roster = runtime.mcp_tool_names.lock().unwrap().clone();
+        assert!(roster.iter().any(|n| n == "termux_bash"), "{roster:?}");
+        let mcp_tool = runtime.registry.get("termux_bash").expect("MCP bash 工具");
+
+        // 多次热切换（含双选 → 仅 termux → 仅 native）：MCP 的
+        // termux_bash 必须原 Arc 存活（不被 unregister / HostTool 顶替）。
+        runtime.set_exec_backends("native,termux");
+        runtime.set_exec_backends("termux");
+        runtime.set_exec_backends("native");
+        let after = runtime.registry.get("termux_bash").expect("MCP 工具仍在场");
+        assert!(
+            Arc::ptr_eq(&mcp_tool, &after),
+            "MCP 的 termux_bash 必须原 Arc 存活"
+        );
+        // 仅 native 切换后 native bash 正常注册。
+        assert!(runtime.registry.contains("bash"));
+        runtime.shutdown();
+    }
+
+    /// 选择点 2：HostTool 兜底在场时 reload 升级接管成功（让位，不撞
+    /// 名回滚）。
+    #[test]
+    fn reload_mcp_takes_over_from_host_tool_without_rollback() {
+        let (paths, _dir) = temp_paths();
+        // 起始无 MCP：HostTool 兜底占位 termux_bash（双选命名）。
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
+        runtime.set_exec_backends("native,termux");
+        let host_tool = runtime.registry.get("termux_bash").expect("HostTool 兜底");
+        assert!(runtime.mcp_tool_names.lock().unwrap().is_empty());
+
+        // MCP host 上线（裸名 bash → 展开名 termux_bash）：reload 让位
+        // HostTool 后接管成功，而非撞名整体回滚（旧实现的死锁）。
+        let url = spawn_mock_mcp_host(&["bash"]);
+        append_mcp_config(&paths, &url, None);
+        let env = envelope(&runtime.reload_mcp());
+        assert!(env["ok"].as_bool().unwrap(), "reload 应成功: {env}");
+        assert_eq!(env["tools"].as_i64(), Some(1), "{env}");
+
+        // 接管完成：termux_bash 换成 MCP 工具（名册内 + 非 HostTool Arc）。
+        let roster = runtime.mcp_tool_names.lock().unwrap().clone();
+        assert!(roster.iter().any(|n| n == "termux_bash"), "{roster:?}");
+        let now = runtime.registry.get("termux_bash").expect("接管后在场");
+        assert!(!Arc::ptr_eq(&host_tool, &now), "应已换成 MCP 工具");
+        // native bash 不受牵连。
+        assert!(runtime.registry.contains("bash"));
+        runtime.shutdown();
+    }
+
+    /// reload 全败（全部 server 连不上且旧态为空）：不砸 HostTool 兜底。
+    #[test]
+    fn reload_mcp_all_failed_keeps_host_tool_fallback() {
+        let (paths, _dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
+        runtime.set_exec_backends("termux");
+        assert!(runtime.registry.contains("bash"), "HostTool 兜底（顶替名）");
+
+        // 死端口：bind 取端口后立刻 drop，连接必然被拒。
+        let dead_url = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            format!("http://127.0.0.1:{port}/mcp")
+        };
+        append_mcp_config(&paths, &dead_url, None);
+        let env = envelope(&runtime.reload_mcp());
+        // 全败 + 旧态空 → 空交换（ok:true / tools:0 / failed 非空），
+        // 不走「冲突回滚」错误路径。
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(env["tools"].as_i64(), Some(0), "{env}");
+        assert!(!env["failed"].as_array().unwrap().is_empty(), "{env}");
+        // 兜底仍在场（重算后 HostTool 回装/保持）。
+        assert!(
+            runtime.registry.contains("bash"),
+            "全败后 HostTool 兜底仍在"
+        );
+        runtime.shutdown();
+    }
+
+    /// reload 撞真冲突（非 bash 域的 builtin 工具）→ 整体回滚，让位的
+    /// HostTool 原样装回（回滚路径兜底在场）。
+    #[test]
+    fn reload_mcp_conflict_rollback_restores_yielded_host_tool() {
+        let (paths, _dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
+        runtime.set_exec_backends("termux");
+        let host_tool = runtime
+            .registry
+            .get("bash")
+            .expect("HostTool 兜底（顶替名）");
+        let ping_before = runtime.registry.get("mobile.ping").expect("extra ping");
+
+        // 模板 `{tool}`：裸名原样注册 → bash（让位）+ mobile.ping（与
+        // extra_tools 演示工具真冲突 → 回滚）。
+        let url = spawn_mock_mcp_host(&["bash", "mobile.ping"]);
+        append_mcp_config(&paths, &url, Some("{tool}"));
+        let env = envelope(&runtime.reload_mcp());
+        assert!(!env["ok"].as_bool().unwrap(), "应因真冲突失败: {env}");
+        assert!(
+            env["error"].as_str().unwrap().contains("撞名"),
+            "错误文案: {env}"
+        );
+
+        // （host_tool 变量保用于断言兜底语义：装回的 bash 必须仍是
+        // HostTool 而非 mock 工具，见下方 description 断言。）
+        let _ = host_tool;
+        // 回滚后：让位的 HostTool 装回（SharedTool 包同一 Arc，外层 Arc
+        // 必然新——以描述语义判定是 HostTool 而非 mock），ping 未被顶替，
+        // MCP 名册仍为空。
+        let restored = runtime.registry.get("bash").expect("回滚后兜底装回");
+        assert!(
+            restored.description().contains("Termux environment"),
+            "装回的应是 HostTool 兜底: {}",
+            restored.description()
+        );
+        let ping_after = runtime.registry.get("mobile.ping").unwrap();
+        assert!(Arc::ptr_eq(&ping_before, &ping_after), "ping 不被顶替");
+        assert!(runtime.mcp_tool_names.lock().unwrap().is_empty());
+        runtime.shutdown();
+    }
+
+    /// termux-only 命名矩阵：仅选 termux 后端 + MCP 提供裸 bash →
+    /// HostTool 顶替 `bash`，MCP 注册名 = builtin 模板展开（默认
+    /// termux_bash；自定义 `{prefix}.bash` → termux.bash，证明不硬编码）。
+    #[test]
+    fn termux_only_naming_matrix_follows_builtin_template() {
+        // (a) 默认模板。
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        let url = spawn_mock_mcp_host(&["bash"]);
+        append_mcp_config(&paths, &url, None);
+        let (collector, _rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
+        runtime.set_exec_backends("termux");
+        let names = runtime.registry.tool_names();
+        assert!(names.contains(&"bash".to_owned()), "{names:?}");
+        assert!(names.contains(&"termux_bash".to_owned()), "{names:?}");
+        runtime.shutdown();
+
+        // (b) 自定义模板 {prefix}.{tool}（展开 termux.bash；比照任务
+        // 建议的字面 `{prefix}.bash`——后者缺 {tool} 占位符过不了 core
+        // 校验，取等价合法形态）。
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        let url = spawn_mock_mcp_host(&["bash"]);
+        append_mcp_config(&paths, &url, Some("{prefix}.{tool}"));
+        let (collector, _rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
+        runtime.set_exec_backends("termux");
+        let names = runtime.registry.tool_names();
+        assert!(names.contains(&"bash".to_owned()), "{names:?}");
+        assert!(
+            names.contains(&"termux.bash".to_owned()),
+            "MCP 注册名 = 模板展开: {names:?}"
+        );
+        assert!(
+            !names.contains(&"termux_bash".to_owned()),
+            "不得硬编码 termux_bash: {names:?}"
+        );
+        runtime.shutdown();
+    }
+
+    /// C2：builtin 模板 setter（校验 → 落盘 → 空串删键回默认）。
+    #[test]
+    fn builtin_template_setter_validates_and_persists() {
+        let (paths, _dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
+
+        assert_eq!(
+            runtime.get_mcp_builtin_tool_name_template(),
+            "{prefix}_{tool}"
+        );
+        // 非法值全被拒（拒 {server} / 禁 __ / 缺 {tool} / 非法字符）。
+        for bad in ["{server}_{tool}", "a__b_{tool}", "{prefix}", "a b_{tool}"] {
+            let env = envelope(&runtime.set_mcp_builtin_tool_name_template(bad.to_owned()));
+            assert!(!env["ok"].as_bool().unwrap(), "{bad} 应被拒: {env}");
+        }
+        // 合法值落盘 + 回读。
+        let env =
+            envelope(&runtime.set_mcp_builtin_tool_name_template("{prefix}.{tool}".to_owned()));
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(
+            runtime.get_mcp_builtin_tool_name_template(),
+            "{prefix}.{tool}"
+        );
+        // 空串删键回默认。
+        let env = envelope(&runtime.set_mcp_builtin_tool_name_template(String::new()));
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(
+            runtime.get_mcp_builtin_tool_name_template(),
+            "{prefix}_{tool}"
+        );
         runtime.shutdown();
     }
 }

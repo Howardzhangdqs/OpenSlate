@@ -119,6 +119,7 @@ import dev.openslate.mobile.bridge.TermuxDiagnostics
 fun SettingsScreen(
     onBack: () -> Unit,
     onOpenKeys: () -> Unit,
+    onOpenSource: (String) -> Unit = {},
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     onThemeModeChange: (ThemeMode) -> Unit = {},
 ) {
@@ -216,13 +217,13 @@ fun SettingsScreen(
             }
 
             // ── 域内容 ─────────────────────────────────────────
-            // 「模型 > 模型数据源」子页条目全量达数千条，用自带 LazyColumn
-            // 分组虚拟化、自管滚动，不能嵌进下方共享 verticalScroll 列 →
-            // 该组合下在此独立渲染本子页；其余子页布局与 hazeSource 行为
-            // 零变化（会话页玻璃弹层依赖本列的 hazeSource）。
+            // 「模型 > 模型数据源」子页自管布局（三卡首屏；点源卡经
+            // onOpenSource 跳独立整屏 registry-source/{sourceId}），在独立
+            // Box 渲染、不嵌下方共享 verticalScroll 列；其余子页布局与
+            // hazeSource 行为零变化（会话页玻璃弹层依赖本列的 hazeSource）。
             if (tab == 1 && modelTab == 1) {
                 Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
-                    ModelRegistrySection()
+                    ModelRegistrySection(onOpenSource = onOpenSource)
                 }
             } else {
             // hazeSource：本内容列即弹层背后实际可见的内容区域（含键盘上方）。

@@ -24,12 +24,15 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -58,33 +61,23 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 模型数据源子页（设置 > 模型 > 模型数据源，内嵌二级 tab）——**按源下钻**
- * 浏览（用户拍板：三个源各自独立呈现，不要跨源合并视图）：
+ * 模型数据源首屏（设置 > 模型 > 模型数据源，内嵌二级 tab）：
  *
- * - 首屏 = 「数据源管理」卡片区常开置顶（每源手动更新 + 缓存元信息 +
- *   启动自动刷新说明）+ 卡片下方一行提示；**无任何跨源合并列表，也不保留
- *   跨源搜索**；
- * - 点某张源卡 → 进入**该源独占视图**（子页内状态切换，不进导航栈）：
- *   内嵌页头（返回箭头 + 源名，形态对齐重构前整屏版 TopAppBar）+
- *   「在 {源名} 内搜索」+ 该源条目按 provider 前缀分组（`registrySearch(
- *   sourceId, "", 10万上限)` 空 query 字典序浏览通道当全量用，IO 线程；
- *   零 Rust/FFI 改动）；组默认收起（组很多），点组头展开/收起，组内条目
- *   以 LazyColumn 逐行虚拟化（分组头与条目是平级 item，不是整组
- *   AnimatedVisibility——单组可达数百行，整组动画会一次性全部组合）；
- * - 源内搜索（防抖 300ms）只查该源条目，命中组自动展开（之后仍可手动
- *   收起）；清空回到该源浏览（复用全量数据，不再发查询）；
- * - 点条目行 → 详情弹层：该源条目的完整数据（null 字段如实标「源未提供」，
- *   不臆造）；
- * - 源卡点按进源视图与卡内「更新」按钮事件隔离：SoftButton 自带 clickable
- *   消费点按，不会穿透触发下钻。
+ * - 「数据源管理」卡片区常开置顶（每源手动更新 + 缓存元信息 + 启动自动
+ *   刷新说明）+ 卡片下方一行提示；**无跨源合并列表，也不保留跨源搜索**
+ *   （用户拍板：三个源各自独立呈现）；
+ * - 点某张源卡 → `onOpenSource(sourceId)` 经 NavController 跳转该源独占
+ *   整屏 [ModelRegistrySourceScreen]（路由 `registry-source/{sourceId}`），
+ *   系统返回键 / 手势 / 顶栏返回都走导航栈 pop；点按与「更新」按钮事件
+ *   隔离：SoftButton 自带 clickable 消费点按，不会穿透触发卡片 onClick。
  *
  * 元数据消费方：Provider 模型管理里的「自动检测入库后补全」与模型编辑
  * 弹窗的「从 registry 补全」。
  */
 @Composable
-fun ModelRegistrySection() {
+fun ModelRegistrySection(onOpenSource: (String) -> Unit) {
     val scope = rememberCoroutineScope()
-    /** 数据版本键：数据源手动更新成功后 +1，触发源状态与当前源条目重拉。 */
+    /** 数据版本键：数据源手动更新成功后 +1，重拉源状态。 */
     var reloadKey by remember { mutableStateOf(0) }
     var sources by remember { mutableStateOf<List<RegistrySourceUi>>(emptyList()) }
 
@@ -92,70 +85,6 @@ fun ModelRegistrySection() {
         sources = withContext(Dispatchers.IO) { RuntimeBridge.registrySources() }
     }
 
-    // ── 下钻状态 ─────────────────────────────────────────────────
-    /** 打开的源（null = 首屏：源管理卡片 + 提示行）。 */
-    var openSource by remember { mutableStateOf<RegistrySourceUi?>(null) }
-    /** 该源全量条目（null = 首载进行中）。 */
-    var sourceEntries by remember { mutableStateOf<List<RegistryEntryUi>?>(null) }
-    var query by remember { mutableStateOf("") }
-    var searchResult by remember { mutableStateOf<RegistrySearchUi?>(null) }
-    /** 展开的 provider 组（键 = provider 前缀；默认收起）。 */
-    var expandedProviders by remember { mutableStateOf<Set<String>>(emptySet()) }
-
-    val src = openSource
-    val q = query.trim()
-    val searching = src != null && q.isNotEmpty()
-
-    /** 进源视图：清空浏览态，条目由下方 effect 按 src.id 重拉。 */
-    fun enterSource(s: RegistrySourceUi) {
-        openSource = s
-        sourceEntries = null
-        query = ""
-        searchResult = null
-        expandedProviders = emptySet()
-    }
-
-    /** 返回首屏：一并清空该源浏览态（下次进入重拉，数据新鲜）。 */
-    fun exitSource() {
-        openSource = null
-        sourceEntries = null
-        query = ""
-        searchResult = null
-        expandedProviders = emptySet()
-    }
-
-    // 该源全量条目：进入源视图或该源数据更新后重拉（空 query = 字典序
-    // 浏览；limit 给大值一次拉全量，数千条本地读，手机可承受）。
-    LaunchedEffect(src?.id, reloadKey) {
-        val s = src ?: return@LaunchedEffect
-        sourceEntries = null
-        sourceEntries = withContext(Dispatchers.IO) {
-            RuntimeBridge.registrySearch(s.id, "", 100_000).results
-        }
-    }
-
-    // 防抖 300ms 源内搜索（沿用原页面节奏）；清空即回该源浏览（复用全量
-    // 数据，不再发查询）。
-    LaunchedEffect(src?.id, q) {
-        if (src == null || q.isEmpty()) {
-            searchResult = null
-            return@LaunchedEffect
-        }
-        delay(300)
-        searchResult = withContext(Dispatchers.IO) {
-            RuntimeBridge.registrySearch(src.id, q, 100_000)
-        }
-    }
-
-    // 搜索命中的组自动展开（之后仍可手动收起）。
-    LaunchedEffect(searchResult) {
-        searchResult?.let { r ->
-            expandedProviders = expandedProviders + r.results.map { providerOf(it.id) }
-        }
-    }
-
-    /** 详情弹层中的条目（null = 关闭）。 */
-    var detail by remember { mutableStateOf<RegistryEntryUi?>(null) }
     /** 正在更新的源 id 集合与结果消息（数据源管理小节）。 */
     var updating by remember { mutableStateOf<Set<String>>(emptySet()) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -173,54 +102,136 @@ fun ModelRegistrySection() {
                 } else {
                     "${s.name} 更新失败：${r.error}"
                 }
-                // 新数据生效：重拉源状态；若正浏览该源，条目随之刷新（
-                // reloadKey 也驱动 openSource 的条目 effect）。
+                // 新数据生效：重拉源状态。源页是独立导航目的地，条目在进入
+                // 时自取（见 [ModelRegistrySourceScreen]），返回后重进即新数据。
                 reloadKey++
             }
         }
     }
 
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        // 顶部 16dp 与 TabRow 拉开呼吸感（会话/Provider 子页走共享滚动列
+        // 的 padding(16.dp)，同节奏；此前本页缺这笔上边距所以显挤）。
+        contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        item(key = "manage", contentType = "manage") {
+            SourceManageSection(
+                sources = sources,
+                updating = updating,
+                message = message,
+                onUpdate = ::updateSource,
+                onOpen = onOpenSource,
+            )
+        }
+        item(key = "hint", contentType = "hint") {
+            Text(
+                "点数据源查看其条目",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+    }
+}
+
+/**
+ * 数据源独占整屏（导航目的地 `registry-source/{sourceId}`；首屏点源卡进入，
+ * 系统返回键 / 手势与顶栏返回箭头都走 NavController pop，标准 Android 形态）。
+ *
+ * 数据经路由参数 sourceId 自取（零 Rust/FFI 改动，IO 线程）：
+ * `registrySources()` 取源元信息（名称等）；`registrySearch(sourceId, "",
+ * 10万上限)` 空 query 字典序浏览通道当全量用。该源条目按 provider 前缀
+ * 分组（`providerOf` 取 `/` 之前），组默认收起，点组头展开/收起，组内条目
+ * 以 LazyColumn 逐行虚拟化（分组头与条目是平级 item，不是整组
+ * AnimatedVisibility——单组可达数百行，整组动画会一次性全部组合）；
+ * 源内搜索（防抖 300ms）只查该源条目，命中组自动展开（之后仍可手动收起），
+ * 清空回该源浏览（复用全量数据，不再发查询）；点条目行 → 详情弹层（null
+ * 字段如实标「源未提供」，不臆造）。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ModelRegistrySourceScreen(sourceId: String, onBack: () -> Unit) {
+    // 源元信息（本地读，进屏即达；读到前标题先落 sourceId 兜底）。
+    var source by remember { mutableStateOf<RegistrySourceUi?>(null) }
+    LaunchedEffect(sourceId) {
+        if (sourceId.isEmpty()) return@LaunchedEffect
+        val list = withContext(Dispatchers.IO) { RuntimeBridge.registrySources() }
+        source = list.firstOrNull { it.id == sourceId }
+    }
+
+    // 该源全量条目（null = 首载进行中；空 query = 字典序浏览，limit 给大值
+    // 一次拉全量，数千条本地读，手机可承受）。
+    var entries by remember { mutableStateOf<List<RegistryEntryUi>?>(null) }
+    LaunchedEffect(sourceId) {
+        if (sourceId.isEmpty()) return@LaunchedEffect
+        entries = null
+        entries = withContext(Dispatchers.IO) {
+            RuntimeBridge.registrySearch(sourceId, "", 100_000).results
+        }
+    }
+
+    var query by remember { mutableStateOf("") }
+    var searchResult by remember { mutableStateOf<RegistrySearchUi?>(null) }
+    /** 展开的 provider 组（键 = provider 前缀；默认收起）。 */
+    var expandedProviders by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    val q = query.trim()
+    val searching = q.isNotEmpty()
+
+    // 防抖 300ms 源内搜索（沿用原页面节奏）；清空即回该源浏览（复用全量
+    // 数据，不再发查询）。
+    LaunchedEffect(sourceId, q) {
+        if (sourceId.isEmpty() || q.isEmpty()) {
+            searchResult = null
+            return@LaunchedEffect
+        }
+        delay(300)
+        searchResult = withContext(Dispatchers.IO) {
+            RuntimeBridge.registrySearch(sourceId, q, 100_000)
+        }
+    }
+
+    // 搜索命中的组自动展开（之后仍可手动收起）。
+    LaunchedEffect(searchResult) {
+        searchResult?.let { r ->
+            expandedProviders = expandedProviders + r.results.map { providerOf(it.id) }
+        }
+    }
+
+    /** 详情弹层中的条目（null = 关闭）。 */
+    var detail by remember { mutableStateOf<RegistryEntryUi?>(null) }
+
     // 展示条目：搜索态用搜索结果，浏览态用该源全量；按 provider 前缀分组，
     // 组与组内条目均按字典序（空 query 的 FFI 浏览结果本就有序，重排兜底）。
-    val entries: List<RegistryEntryUi>? = if (searching) searchResult?.results else sourceEntries
-    val groups: List<Pair<String, List<RegistryEntryUi>>> = entries
+    val shown: List<RegistryEntryUi>? = if (searching) searchResult?.results else entries
+    val groups: List<Pair<String, List<RegistryEntryUi>>> = shown
         ?.groupBy { providerOf(it.id) }
         ?.map { (p, list) -> p to list.sortedBy { it.id.lowercase() } }
         ?.sortedBy { it.first.lowercase() }
         .orEmpty()
 
-    if (src == null) {
-        // ── 首屏：源管理卡片区 + 提示行（无任何合并列表）────────────
-        LazyColumn(
-            Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(source?.name ?: sourceId.ifEmpty { "数据源" }) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding),
         ) {
-            item(key = "manage", contentType = "manage") {
-                SourceManageSection(
-                    sources = sources,
-                    updating = updating,
-                    message = message,
-                    onUpdate = ::updateSource,
-                    onOpen = ::enterSource,
-                )
-            }
-            item(key = "hint", contentType = "hint") {
-                Text(
-                    "点数据源查看其条目",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-        }
-    } else {
-        // ── 源视图：内嵌页头 + 源内搜索 + 该源条目分组浏览 ──────────
-        Column(Modifier.fillMaxSize()) {
-            SourceViewHeader(s = src, onBack = ::exitSource)
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },
-                label = { Text("在 ${src.name} 内搜索") },
+                label = { Text("在 ${source?.name ?: "该数据源"} 内搜索") },
                 singleLine = true,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -232,7 +243,7 @@ fun ModelRegistrySection() {
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 when {
-                    entries == null -> item(key = "loading") {
+                    shown == null -> item(key = "loading") {
                         Row(
                             Modifier.fillMaxWidth().padding(top = 24.dp),
                             horizontalArrangement = Arrangement.Center,
@@ -241,7 +252,7 @@ fun ModelRegistrySection() {
                     groups.isEmpty() -> item(key = "empty") {
                         Text(
                             if (searching) "无匹配「$q」的条目"
-                            else "该源还没有本地缓存：回首屏点「更新」拉取后可浏览。",
+                            else "该源还没有本地缓存：返回后点「更新」拉取，再进入即可浏览。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.outline,
                             modifier = Modifier.padding(top = 8.dp),
@@ -253,7 +264,7 @@ fun ModelRegistrySection() {
                                 if (searching) {
                                     "匹配 ${searchResult?.total ?: 0} 条 · ${groups.size} 个 provider"
                                 } else {
-                                    "共 ${entries.size} 条 · ${groups.size} 个 provider"
+                                    "共 ${shown.size} 条 · ${groups.size} 个 provider"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.outline,
@@ -319,31 +330,10 @@ fun ModelRegistrySection() {
 private fun providerOf(id: String): String = id.substringBefore('/', id)
 
 /**
- * 源视图内嵌页头（子页内状态切换，不进导航栈）：返回箭头 + 源名。形态
- * 对齐重构前整屏版的 TopAppBar（64dp 高、48dp 导航图标触达域），以普通
- * Row 内嵌实现；返回回三卡首屏。
- */
-@Composable
-private fun SourceViewHeader(s: RegistrySourceUi, onBack: () -> Unit) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .height(64.dp)
-            .padding(horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        IconButton(onClick = onBack) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
-        }
-        Text(s.name, style = MaterialTheme.typography.titleLarge)
-    }
-}
-
-/**
  * provider 组头：provider 前缀 + 条目数 + 展开箭头。折叠语言对齐
  * ToolManagementSection 的「工具命名模板」小节（标题行点击展开/收起，
  * KeyboardArrowDown 随态旋转）；组内条目是 LazyColumn 平级 item（见
- * [ModelRegistrySection] KDoc），组头自身不包条目。
+ * [ModelRegistrySourceScreen] KDoc），组头自身不包条目。
  */
 @Composable
 private fun ProviderGroupHeader(
@@ -385,8 +375,9 @@ private fun ProviderGroupHeader(
 
 /**
  * 「数据源管理」区（常开置顶，无折叠/入口点击——打开子页即直接看到各源
- * 卡片）：标题行（右侧缓存摘要）+ 说明灰字 + 每源卡片（点卡片进该源条目
- * 浏览 + 手动更新 + 缓存元信息）+ 更新结果消息；随内容一起滚动。
+ * 卡片）：标题行（右侧缓存摘要）+ 说明灰字 + 每源卡片（点卡片经
+ * [onOpen] 跳转该源条目整屏 + 手动更新 + 缓存元信息）+ 更新结果消息；
+ * 随内容一起滚动。
  */
 @Composable
 private fun SourceManageSection(
@@ -394,7 +385,7 @@ private fun SourceManageSection(
     updating: Set<String>,
     message: String?,
     onUpdate: (RegistrySourceUi) -> Unit,
-    onOpen: (RegistrySourceUi) -> Unit,
+    onOpen: (String) -> Unit,
 ) {
     val cached = sources.filter { it.fetchedAtMs != null }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -429,7 +420,7 @@ private fun SourceManageSection(
                 s,
                 updating = s.id in updating,
                 onUpdate = { onUpdate(s) },
-                onOpen = { onOpen(s) },
+                onOpen = { onOpen(s.id) },
             )
         }
         if (message != null) {
@@ -442,9 +433,9 @@ private fun SourceManageSection(
     }
 }
 
-/** 单个数据源卡片：点卡片进该源条目浏览 + 手动更新 + 缓存元信息（条目数 /
- *  更新时间 / 压缩体积）。点按与「更新」按钮事件隔离：SoftButton 自带
- *  clickable 消费点按，不会穿透触发卡片 onClick（下钻）。 */
+/** 单个数据源卡片：点卡片跳转该源条目整屏 + 手动更新 + 缓存元信息（条目
+ *  数 / 更新时间 / 压缩体积）。点按与「更新」按钮事件隔离：SoftButton 自带
+ *  clickable 消费点按，不会穿透触发卡片 onClick（跳转）。 */
 @Composable
 private fun SourceCard(
     s: RegistrySourceUi,

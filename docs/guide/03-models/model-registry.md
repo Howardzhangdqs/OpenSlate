@@ -13,7 +13,7 @@
 |------|------|
 | `crates/openslate-core/src/model_registry.rs`（573 行） | **纯逻辑，无 IO 状态**：数据源定义（`SOURCES`，L56）、两种格式解析（`SourceFormat::{ModelsDev, LiteLLM}`，L30）、id 归一化与匹配（`norm_id` L92 / `id_candidates` L102）、按源优先级合并（`merge_metas` L218）、CloudPrice 在线单查（`probe_cloudprice_by_id` L383）、`http_get_json`（L336，Android TLS + 代理） |
 | `crates/openslate-mobile/src/registry.rs`（541 行） | **存储与更新**：`RegistryStore`（L46）——本地 ZSTD 持久化、手动/自动更新、三源合并查询、搜索/浏览 |
-| 设置页「模型数据源」（mobile，内嵌子页） | UI：**按源下钻**（用户拍板 2026-10：首屏 = 源管理卡片区常开置顶 + 提示行，无跨源合并列表、无跨源搜索；点源卡进该源独占视图——内嵌页头返回 + 该源条目 provider 分组浏览 + 源内搜索）+ 条目详情弹层；每源独立「更新」按钮在首屏「数据源管理」区（卡片点按与「更新」事件隔离） |
+| 设置页「模型数据源」（mobile） | UI：**按源下钻（导航式）**（用户拍板 2026-10：首屏 = 源管理卡片区常开置顶 + 提示行，内嵌设置页二级 tab，无跨源合并列表、无跨源搜索；点源卡经 NavController 跳**独立整屏** `registry-source/{sourceId}`——TopAppBar 源名 + 返回箭头，系统返回键/手势与顶栏返回都走 pop；返回后设置页 tab/modelTab 经 `rememberSaveable` 保持）+ 源页条目 provider 分组浏览 + 源内搜索 + 条目详情弹层；每源独立「更新」按钮在首屏「数据源管理」区（卡片点按与「更新」事件隔离） |
 
 ## 2. 数据源（`SOURCES` 常量，L56-83；声明序 = 优先级序）
 

@@ -25,9 +25,11 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import dev.openslate.mobile.service.AgentService
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
@@ -38,6 +40,7 @@ import dev.openslate.mobile.ui.ThemePrefs
 import dev.openslate.mobile.ui.ChatScreen
 import dev.openslate.mobile.ui.HistoryScreen
 import dev.openslate.mobile.ui.KeysScreen
+import dev.openslate.mobile.ui.ModelRegistrySourceScreen
 import dev.openslate.mobile.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
@@ -66,7 +69,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** 页面导航栈：chat（起点）/ settings / history，回退键沿栈逐级返回。 */
+/** 页面导航栈：chat（起点）/ settings / history / registry-source/{sourceId}（模型数据源三级页），回退键沿栈逐级返回。 */
 @Composable
 private fun AppNavHost(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> Unit) {
     val nav = rememberNavController()
@@ -89,8 +92,26 @@ private fun AppNavHost(themeMode: ThemeMode, onThemeModeChange: (ThemeMode) -> U
             SettingsScreen(
                 onBack = { nav.popBackStack() },
                 onOpenKeys = { nav.navigate("keys") { launchSingleTop = true } },
+                onOpenSource = { id ->
+                    nav.navigate("registry-source/$id") { launchSingleTop = true }
+                },
                 themeMode = themeMode,
                 onThemeModeChange = onThemeModeChange,
+            )
+        }
+        // 模型数据源独占整屏（三级）：系统返回键/手势与顶栏返回都走
+        // popBackStack；转场同其他二级页家族（右滑入/原路滑出）。
+        composable(
+            "registry-source/{sourceId}",
+            arguments = listOf(navArgument("sourceId") { type = NavType.StringType }),
+            enterTransition = { slideInHorizontally(tween(280)) { it } + fadeIn(tween(280)) },
+            exitTransition = { slideOutHorizontally(tween(280)) { -it / 4 } + fadeOut(tween(280)) },
+            popEnterTransition = { slideInHorizontally(tween(280)) { -it / 4 } + fadeIn(tween(280)) },
+            popExitTransition = { slideOutHorizontally(tween(280)) { it } + fadeOut(tween(280)) },
+        ) { backStackEntry ->
+            ModelRegistrySourceScreen(
+                sourceId = backStackEntry.arguments?.getString("sourceId").orEmpty(),
+                onBack = { nav.popBackStack() },
             )
         }
         composable(

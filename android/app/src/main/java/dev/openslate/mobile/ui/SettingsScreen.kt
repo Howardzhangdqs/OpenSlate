@@ -74,6 +74,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -285,6 +286,9 @@ fun SettingsScreen(
                         // ── Provider 域：Provider CRUD + API key ─────────
                         Section(
                             title = "Provider",
+                            // 首行标题与「会话」子页同节奏：Add 按钮的 48dp
+                            // 最小触达域悬垂于标题行，不再把标题下挤 12dp。
+                            actionOverhang = true,
                             action = {
                                 IconButton(onClick = { editProvider = ProviderUi("", "", "", null); editProviderIsNew = true }) {
                                     Icon(Icons.Filled.Add, contentDescription = "新增 Provider")
@@ -836,11 +840,31 @@ private fun ProviderModelsDialog(
             },
         )
     }
-}@Composable
+}/**
+ * 动作按钮悬垂：子内容按常规约束测量（IconButton 的 48dp 最小触达域与
+ * 40dp 可点盒完整保留），但向上层报告高度 0，并把内容以该 0 高锚点为轴
+ * 负向摆放回垂直居中位置。用于 [Section] 标题行：行高回归标题文字自身
+ * （与会话页同节奏），动作按钮以标题行中线为轴上下对称悬垂——可点盒
+ * 上沿探入标题行上方的滚动留白、下沿恰好停在 spacedBy(8.dp) 间隙底，
+ * 不遮任何内容、触达域不缩水。
+ */
+private fun Modifier.overhangRowHeight(): Modifier = layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    layout(placeable.width, 0) {
+        placeable.placeRelative(0, -placeable.height / 2)
+    }
+}
+
+@Composable
 private fun Section(
     title: String,
     subtitle: String? = null,
     action: (@Composable () -> Unit)? = null,
+    // true = action 不参与标题行高度（见 [overhangRowHeight]）：IconButton
+    // 的 48dp 最小触达域不再把 Row 撑高后把 titleMedium 标题垂直居中下挤
+    // 12dp。仅首行要与其他子页对齐的入口（Provider 页）启用；工具域 MCP
+    // 小节等既有 action 调用点保持原布局零变化。
+    actionOverhang: Boolean = false,
     content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -861,7 +885,13 @@ private fun Section(
                     )
                 }
             }
-            action?.invoke()
+            if (action != null) {
+                if (actionOverhang) {
+                    Box(Modifier.overhangRowHeight()) { action() }
+                } else {
+                    action()
+                }
+            }
         }
         content()
     }

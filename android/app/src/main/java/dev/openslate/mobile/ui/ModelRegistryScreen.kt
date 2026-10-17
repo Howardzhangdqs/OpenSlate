@@ -111,9 +111,11 @@ fun ModelRegistrySection(onOpenSource: (String) -> Unit) {
 
     LazyColumn(
         Modifier.fillMaxSize(),
-        // 顶部 16dp 与 TabRow 拉开呼吸感（会话/Provider 子页走共享滚动列
-        // 的 padding(16.dp)，同节奏；此前本页缺这笔上边距所以显挤）。
-        contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 16.dp),
+        // 顶部 19dp = 16dp 滚动列节奏 + 3dp 光学补偿：本页首行标题是
+        // titleSmall（14sp/20sp 行高），比会话/Provider 页的 titleMedium
+        // （16sp/24sp 行高）首行基线高约 2.7~2.9dp（随字体度量浮动），
+        // 补一笔让三个子页首行标题到二级 TabRow 的目视距离一致。
+        contentPadding = PaddingValues(start = 16.dp, top = 19.dp, end = 16.dp, bottom = 16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         item(key = "manage", contentType = "manage") {

@@ -1941,6 +1941,14 @@ private data class McpStatus(
      *  该 server 的工具未注册（未起来，或起来但没注册 → 差异自愈会
      *  尝试重连一次）。 */
     val hostTools: Map<String, Int>? = null,
+    /** 本轮检测已完成的项目（渐进渲染：检测完一项就显示一项；五个灯的 key）。 */
+    val checked: Set<String> = emptySet(),
+)
+
+/** 五个状态灯的 key（渐进渲染的判定 + 摘要行进度统计共用；整轮结束时
+ *  短路路径未检测的项也一次性补齐，保证五灯语义完整）。 */
+private val MCP_LIGHT_KEYS = listOf(
+    "termuxInstalled", "termuxPerm", "termuxAllowed", "hostInstalled", "hostAlive",
 )
 
 /**
@@ -2165,9 +2173,10 @@ private fun McpSection() {
                 termuxAllowed = false, hostInstalled = false, hostAlive = false)
             log("Termux 已安装：${s.termuxInstalled}；RUN_COMMAND 权限：${s.termuxPerm}")
             ensureActive() // 被更新的触发取消 → 立即退出，不写状态
-            // 快检查立即写回：慢通道（RUN_COMMAND 往返最长 12s）探测期间，
-            // 按钮状态（如「打开 Termux」）就该正确亮起，不能等整轮结束。
-            status = s.copy(probing = true)
+            // 渐进提交：每步完成即写回，检测完一项显示一项（灯区块只
+            // 渲染已完成的项），不再等整轮结束才统一落地。probing 保持
+            // true 到整轮结束——期间摘要行显示进度而非结论。
+            status = s.copy(probing = true, checked = setOf("termuxInstalled", "termuxPerm"))
             var full = s
             var alive = false
             var missing = emptySet<String>()
@@ -2185,7 +2194,20 @@ private fun McpSection() {
                         log("仍在等待 RUN_COMMAND 应答…（Termux 冷启动或被系统冻结后首次命令较慢；" +
                             "常开 Termux 通知常驻 + Wakelock 并对其关闭电池优化可避免）")
                     }
-                    val chan = TermuxDiagnostics.ensureTermuxUp(context, log = { log(it) })
+                    val chan = TermuxDiagnostics.ensureTermuxUp(context, log = { log(it) }, onStall = {
+                        // 0.5s 无应答：不等整轮，先亮「打开 Termux」指引（复用
+                        // NoResponse 渲染路径）。这是早写的显示态，refresh 协程
+                        // 内部流程不受影响（allowed 来自返回值 chan）；整轮结束
+                        // 后 2207 行处用真实结论覆盖（重试通过则变绿）。
+                        log("RUN_COMMAND 已 ${TermuxDiagnostics.PROBE_STALL_HINT_MS}ms 无应答——先显示「打开 Termux」指引，检测仍在后台继续…")
+                        status = status.copy(
+                            channel = TermuxDiagnostics.ChannelResult.NoResponse(
+                                stopped = TermuxDiagnostics.isTermuxStopped(context), ms = 0,
+                            ),
+                            termuxAllowed = false,
+                            checked = status.checked + "termuxAllowed",
+                        )
+                    })
                     watcher.cancel()
                     log("RUN_COMMAND 通道最终结果：${TermuxDiagnostics.describe(chan)}")
                     val allowed = chan is TermuxDiagnostics.ChannelResult.Ok
@@ -2194,6 +2216,9 @@ private fun McpSection() {
                     if (!s.termuxPerm && permNow) {
                         log("Termux 启动后权限检查结果已更新：未授予 → 已授予")
                     }
+                    ensureActive() // 取消轮不写中间态
+                    status = status.copy(termuxPerm = permNow, termuxAllowed = allowed, channel = chan,
+                        checked = status.checked + "termuxAllowed")
 
                     // ── 步骤 2：host 安装（通道已热，秒回）──
                     val inst = if (allowed) {
@@ -2201,6 +2226,8 @@ private fun McpSection() {
                         McpHostManager.isHostInstalled(context)
                     } else false
                     log("host 已安装：$inst")
+                    ensureActive() // 取消轮不写中间态
+                    status = status.copy(hostInstalled = inst, checked = status.checked + "hostInstalled")
 
                     // ── 步骤 2.5：server 启动命令探测（通道放行才有意义）──
                     // 首 token 在 Termux 缺失（如未装 npx）的 server 必然无法
@@ -2214,6 +2241,8 @@ private fun McpSection() {
                         if (missing.isNotEmpty()) {
                             log("Termux 缺少命令：${missing.joinToString("、")}（对应服务器无法启动，见行内提示）")
                         }
+                        ensureActive() // 取消轮不写中间态
+                        status = status.copy(missingCommands = missing)
                     }
 
                     // ── 步骤 3：端口探活（并行已发出，此时收结果）──
@@ -2221,6 +2250,8 @@ private fun McpSection() {
                     val (a, adetail) = aliveD.await()
                     alive = a
                     log("探活 ${McpHostManager.HOST_URL}：${if (a) "应答正常（$adetail）" else "无应答（$adetail）"}")
+                    ensureActive() // 取消轮不写中间态
+                    status = status.copy(hostAlive = alive, checked = status.checked + "hostAlive")
 
                     // ── 步骤 4：host 已装但未运行 → 自动拉起（无需点重装）──
                     if (allowed && inst && !alive && !busy) {
@@ -2230,6 +2261,8 @@ private fun McpSection() {
                             .onSuccess {
                                 val (a2, d2) = McpHostManager.hostAliveDetail(context)
                                 alive = a2
+                                ensureActive() // 取消轮不写中间态
+                                status = status.copy(hostAlive = alive)
                                 log(
                                     if (a2) "服务已自动恢复（$d2），无需重装"
                                     else "自动拉起后仍未应答（$d2）——可点「自动化操作（重新安装）」修复",
@@ -2247,6 +2280,8 @@ private fun McpSection() {
                         step("获取 host 工具列表")
                         val reg = RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES)
                         tools = reg
+                        ensureActive() // 取消轮不写中间态
+                        status = status.copy(hostTools = reg)
                         log("注册表工具：" + (reg?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
                             ?: "runtime 未就绪（状态未知）"))
                         val hostSide = McpHostManager.hostToolsByPrefix(context)
@@ -2263,9 +2298,13 @@ private fun McpSection() {
                 val (a, adetail) = McpHostManager.hostAliveDetail(context)
                 alive = a
                 log("探活 ${McpHostManager.HOST_URL}：${if (a) "应答正常（$adetail）" else "无应答（$adetail）"}")
+                ensureActive() // 取消轮不写中间态
+                status = status.copy(hostAlive = alive, checked = status.checked + "hostAlive")
             }
             ensureActive() // 取消轮不落地：不覆盖更新一轮已写的新状态/快照
-            val final = full.copy(hostAlive = alive)
+            // 五灯 key 一次性补齐：短路路径某些检测没跑，最终落地补全五灯
+            // 语义（与改造前的最终态一致）。
+            val final = full.copy(hostAlive = alive, checked = MCP_LIGHT_KEYS.toSet())
             status = final
             McpStatusCache.update(final)
             step(null)
@@ -2530,7 +2569,9 @@ private fun McpSection() {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (status.probing) {
-                Text("探测状态…", style = MaterialTheme.typography.labelMedium,
+                // 渐进进度：五灯 key 命中数（检测完一项 +1）。
+                val done = MCP_LIGHT_KEYS.count { it in status.checked }
+                Text("检测中 · 已完成 $done/5", style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.outline)
             } else {
                 if (allGreen) {
@@ -2548,10 +2589,12 @@ private fun McpSection() {
                 }
             }
         }
-        if (expanded && !status.probing) {
-            McpStatusLine(status.termuxInstalled, "Termux 已安装")
-            McpStatusLine(status.termuxPerm, "RUN_COMMAND 权限")
-            McpStatusLine(status.termuxAllowed, "RUN_COMMAND 通道")
+        // 检测中也显示（expanded 即渲染）：区块内每个灯按 checked 命中
+        // 才出现——检测完一项显示一项，未完成的项不占位。
+        if (expanded) {
+            if ("termuxInstalled" in status.checked) McpStatusLine(status.termuxInstalled, "Termux 已安装")
+            if ("termuxPerm" in status.checked) McpStatusLine(status.termuxPerm, "RUN_COMMAND 权限")
+            if ("termuxAllowed" in status.checked) McpStatusLine(status.termuxAllowed, "RUN_COMMAND 通道")
             status.channel?.let {
                 Text(
                     TermuxDiagnostics.describe(it),
@@ -2599,6 +2642,14 @@ private fun McpSection() {
                             color = MaterialTheme.colorScheme.outline,
                         )
                     }
+                    if (status.probing) {
+                        // 0.5s stall 的早写状态：检测未完，注明非最终结论。
+                        Text(
+                            "通道检测仍在后台继续，若随后通过会自动更新。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
                     // 按钮紧贴指引文案（原文案「点下方」即指此处），不放远处按钮排。
                     CompactButton(text = "打开 Termux", enabled = !busy) {
                         log("打开 Termux（请手动返回 OpenSlate，返回后自动重新检测）…")
@@ -2624,7 +2675,8 @@ private fun McpSection() {
                 // Ok / null（未探测短路，如未安装/无权限）：不显示指引块。
                 is TermuxDiagnostics.ChannelResult.Ok, null -> {}
             }
-            if (!status.termuxPerm) {
+            // checked 命中才渲染：避免权限检测完成前的瞬间闪现。
+            if ("termuxPerm" in status.checked && !status.termuxPerm) {
                 CompactButton(text = "申请 RUN_COMMAND 权限", onClick = {
                     val activity = context as? android.app.Activity
                     if (activity != null) {
@@ -2637,8 +2689,8 @@ private fun McpSection() {
                     }
                 })
             }
-            McpStatusLine(status.hostInstalled, "MCP 服务已安装")
-            McpStatusLine(status.hostAlive, "服务运行中")
+            if ("hostInstalled" in status.checked) McpStatusLine(status.hostInstalled, "MCP 服务已安装")
+            if ("hostAlive" in status.checked) McpStatusLine(status.hostAlive, "服务运行中")
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             // 前置三绿（Termux/权限/放行）就绪才出现 —— 那时恰好只剩
@@ -2906,7 +2958,9 @@ private fun McpSection() {
                     // 正常态的前缀片段用等宽字体（与对话框预览行同款做法）。
                     val cmdToken = s.command.trim().split(Regex("\\s+")).first()
                     val tools = status.hostTools
-                    if (!status.probing && status.hostAlive && tools != null && slug in tools) {
+                    // hostAlive 与 tools 都渐进落地：检测中命中即转绿，
+                    // 不必等 probing 翻 false。
+                    if (status.hostAlive && tools != null && slug in tools) {
                         Text(
                             buildAnnotatedString {
                                 append("正常运行（${tools[slug]} 个工具）· 前缀 ")
@@ -2918,14 +2972,19 @@ private fun McpSection() {
                             color = successGreen(),
                         )
                     } else {
+                        // 已落地数据优先于「检测中」：missingCommands 先于
+                        // 探活结果写入，警示不等整轮；probing=false 时各
+                        // 分支与旧逻辑等价（hostAlive=true 且 tools=null →
+                        // 状态未知；hostAlive=false → 服务未运行）。
                         val (statusText, statusColor) = when {
-                            status.probing -> "检测中…" to MaterialTheme.colorScheme.outline
-                            !status.hostAlive -> "服务未运行" to MaterialTheme.colorScheme.outline
-                            tools == null -> "状态未知（工具列表获取失败）" to MaterialTheme.colorScheme.outline
-                            cmdToken in status.missingCommands ->
+                            tools != null && cmdToken in status.missingCommands ->
                                 "无法启动：Termux 缺少 $cmdToken" to MaterialTheme.colorScheme.error
-                            else -> "启动中或启动失败（npx 首次运行需下载依赖，可稍候刷新；" +
-                                "持续失败请查看 Termux 侧 ~/.openslate/host.log）" to MaterialTheme.colorScheme.error
+                            tools != null ->
+                                "启动中或启动失败（npx 首次运行需下载依赖，可稍候刷新；" +
+                                    "持续失败请查看 Termux 侧 ~/.openslate/host.log）" to MaterialTheme.colorScheme.error
+                            !status.probing && !status.hostAlive -> "服务未运行" to MaterialTheme.colorScheme.outline
+                            !status.probing -> "状态未知（工具列表获取失败）" to MaterialTheme.colorScheme.outline
+                            else -> "检测中…" to MaterialTheme.colorScheme.outline
                         }
                         Text(statusText, style = MaterialTheme.typography.labelSmall, color = statusColor)
                     }

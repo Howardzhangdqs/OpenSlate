@@ -2,7 +2,13 @@ package dev.openslate.mobile.ui
 
 import android.os.Build
 import android.util.Log
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -37,6 +43,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
@@ -80,6 +87,7 @@ import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -90,6 +98,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
 import kotlin.math.roundToInt
@@ -306,16 +315,28 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                     }
                 }
             }
-            Composer(
-                glass = glass,
-                rootCoords = { rootCoords },
-                modifier = Modifier.align(Alignment.BottomCenter),
-                running = state.running,
-                onSend = { text ->
-                    RuntimeBridge.submit(text)
-                },
-                onCancel = { RuntimeBridge.cancel() },
-            )
+            // 底部悬浮组：termux stall 提示卡（出现时从输入区上方展开）+ 输入区。
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth(),
+            ) {
+                TermuxStallBanner(
+                    visible = state.running && state.termuxStallSince != null,
+                    stallSince = state.termuxStallSince,
+                    glass = glass,
+                    rootCoords = { rootCoords },
+                )
+                Composer(
+                    glass = glass,
+                    rootCoords = { rootCoords },
+                    running = state.running,
+                    onSend = { text ->
+                        RuntimeBridge.submit(text)
+                    },
+                    onCancel = { RuntimeBridge.cancel() },
+                )
+            }
 
             // 工具详情弹窗（Dialog 自身是独立 window，不参与列表布局）。
             detailLive?.let { tc ->
@@ -848,25 +869,13 @@ private fun ReasoningBlock(
     }
 }
 
-/** 模型回复气泡：Markdown 渲染（代码块/粗体/列表/标题等，紧凑字号）。 */
+/** 模型回复气泡：增强 Markdown 渲染（高亮代码块/图片 SVG/HTML 降级，紧凑字号）。 */
 @Composable
 private fun MarkdownBubble(text: String) {
     val clipboard = LocalClipboardManager.current
-    // 标题降档：聊天场景 H1≈titleLarge(20sp)，逐级收紧（默认 headlineMedium
-    // 32sp 起太占屏）；正文 bodyMedium。
-    val typography = (
-        com.mikepenz.markdown.m3.markdownTypography()
-            as com.mikepenz.markdown.model.DefaultMarkdownTypography
-        ).copy(
-            h1 = MaterialTheme.typography.titleLarge,
-            h2 = MaterialTheme.typography.titleMedium,
-            h3 = MaterialTheme.typography.titleSmall,
-            h4 = MaterialTheme.typography.titleSmall,
-            h5 = MaterialTheme.typography.bodyLarge,
-            h6 = MaterialTheme.typography.bodyLarge,
-            text = MaterialTheme.typography.bodyMedium,
-            paragraph = MaterialTheme.typography.bodyMedium,
-        )
+    // 空心气泡：不用实底色（surfaceVariant 浅色下发白、与页面难分），改为
+    // 透明背景 + 1dp outlineVariant 描边；与用户气泡（primaryContainer 实底）
+    // 形成"空心/实心"对比，深浅色主题都成立。
     Surface(
         shape = RoundedCornerShape(
             topStart = 4.dp,
@@ -874,15 +883,16 @@ private fun MarkdownBubble(text: String) {
             bottomStart = 16.dp,
             bottomEnd = 16.dp,
         ),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 4.dp),
         onClick = { clipboard.setText(AnnotatedString(text)) },
     ) {
-        com.mikepenz.markdown.m3.Markdown(
-            content = text,
-            typography = typography,
+        // 标题降档等排版细节内聚在 EnhancedMarkdown 中。
+        EnhancedMarkdown(
+            text = text,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
         )
     }
@@ -1133,6 +1143,98 @@ private fun ApprovalBanner(
                 SoftButton(onClick = { onAnswer(pending.id, "approve_all") }) { Text("全部允许") }
                 SoftButton(onClick = { onAnswer(pending.id, "approve") }) { Text("允许") }
                 SoftButton(onClick = { onAnswer(pending.id, "deny") }) { Text("拒绝") }
+            }
+        }
+    }
+}
+
+/**
+ * Termux stall 提示卡：termux 命令发出 0.5s 仍无应答时悬浮在输入区上方
+ * （与输入胶囊同语言：磨砂玻璃面板 + 细边框 + 轻阴影）。「打开 Termux」
+ * 直接拉起 Termux 前台完成初始化；命令仍在等结果，横幅不消失——结果
+ * 到达（termuxStallSince 变 null）时经 AnimatedVisibility 自动收起。
+ */
+@Composable
+private fun TermuxStallBanner(
+    visible: Boolean,
+    stallSince: Long?,
+    glass: Glass,
+    rootCoords: () -> LayoutCoordinates?,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
+        exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
+    ) {
+        val context = LocalContext.current
+        // 点击后的轻量反馈：按钮文字切换 + 禁用重复点击。横幅本身保持可见。
+        var pulled by remember { mutableStateOf(false) }
+        // 已等待秒数（每秒跳一次；stallSince 换新则重算）。
+        var waitedSec by remember(stallSince) { mutableStateOf(0) }
+        LaunchedEffect(stallSince) {
+            if (stallSince == null) return@LaunchedEffect
+            while (true) {
+                waitedSec =
+                    ((System.currentTimeMillis() - stallSince) / 1000).toInt().coerceAtLeast(0)
+                delay(1_000)
+            }
+        }
+        Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+            GlassPanel(
+                glass = glass,
+                rootCoords = rootCoords,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .shadow(elevation = 2.dp, shape = RoundedCornerShape(16.dp), clip = false),
+                shape = RoundedCornerShape(16.dp),
+                tint = MaterialTheme.colorScheme.surfaceVariant.copy(
+                    alpha = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0.6f else 0.92f,
+                ),
+                border = true,
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Outlined.Terminal,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.tertiary,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "Termux 未响应",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "已等待 ${waitedSec}s",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
+                    Text(
+                        "命令已发出一段时间仍无应答，Termux 可能未启动或被系统冻结。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                    Row(Modifier.padding(top = 8.dp)) {
+                        SoftButton(
+                            onClick = {
+                                if (McpHostManager.startTermuxApp(context.applicationContext)) {
+                                    pulled = true
+                                }
+                            },
+                            enabled = !pulled,
+                        ) {
+                            Text(if (pulled) "已拉起，等待应答…" else "打开 Termux")
+                        }
+                    }
+                }
             }
         }
     }

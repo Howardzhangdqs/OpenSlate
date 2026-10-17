@@ -114,6 +114,9 @@ object TermuxExec {
         pending[id]?.complete(result)
     }
 
+    /** 该 id 是否仍有一条未应答的命令（UI stall 看门狗探测用）。 */
+    fun isPending(id: Long): Boolean = pending.containsKey(id)
+
     fun cancelAll() {
         for ((id, d) in pending) {
             d.complete(TermuxResult(errmsg = "runtime shutting down"))

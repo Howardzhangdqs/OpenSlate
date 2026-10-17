@@ -3,7 +3,9 @@ package dev.openslate.mobile.bridge
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 
@@ -48,6 +50,9 @@ object TermuxDiagnostics {
     const val LAUNCH_RETURN_MS = 1_800L
     /** 无应答时的静默重试上限（startForegroundService 自动冷启动进程）。 */
     const val PROBE_AFTER_LAUNCH_MS = 6_000L
+    /** 无应答早提示阈值（用户拍板：0.5s 无应答即亮「打开 Termux」指引，
+     *  不等 1s/6s 探测阶梯跑完；探测自身照常继续，结论仍由返回值给出）。 */
+    const val PROBE_STALL_HINT_MS = 500L
 
     /** 本对象专用 Termux 调用 id 段（host call 从 0 起；McpHostManager 用 900_000_000 段）。 */
     private val probeIds = AtomicLong(800_000_000L)
@@ -61,12 +66,42 @@ object TermuxDiagnostics {
     /**
      * 单次通道探测：`echo ok` 往返并分类。超时（含 TermuxExec 内部 90s
      * 兜底被外层截断）→ NoResponse（附 stopped 状态）。
+     *
+     * [onStall]：发出 [PROBE_STALL_HINT_MS] 仍无应答时的早提示回调
+     * （最多一次）——UI 借此在探测继续的同时先亮出指引。锁内双检
+     * isPending：结果可能在 delay 期间已到达。
      */
-    suspend fun probeChannel(ctx: Context, timeoutMs: Long): ChannelResult {
+    suspend fun probeChannel(
+        ctx: Context,
+        timeoutMs: Long,
+        onStall: (() -> Unit)? = null,
+    ): ChannelResult {
         val t0 = System.currentTimeMillis()
         val appCtx = ctx.applicationContext
-        val outcome: Pair<String?, String>? = withTimeoutOrNull(timeoutMs) {
-            TermuxExec.run(appCtx, probeIds.incrementAndGet(), "echo ok")
+        val probeId = probeIds.incrementAndGet()
+        var stallFired = false
+        val outcome: Pair<String?, String>? = coroutineScope {
+            // stall 看门狗：随结果返回（finally）一并取消；探测阶梯不变。
+            val watchdog = if (onStall != null) launch {
+                delay(PROBE_STALL_HINT_MS)
+                // 锁内定夺、锁外调用：回调里可能写 UI 状态，不持锁。
+                val fire = synchronized(this@TermuxDiagnostics) {
+                    if (!stallFired && TermuxExec.isPending(probeId)) {
+                        stallFired = true
+                        onStall
+                    } else {
+                        null
+                    }
+                }
+                fire?.invoke()
+            } else {
+                null
+            }
+            try {
+                withTimeoutOrNull(timeoutMs) { TermuxExec.run(appCtx, probeId, "echo ok") }
+            } finally {
+                watchdog?.cancel()
+            }
         }
         val (out, err) = outcome ?: return ChannelResult.NoResponse(
             stopped = isTermuxStopped(ctx),
@@ -130,8 +165,15 @@ object TermuxDiagnostics {
      *    不允许后台拉起，自动跳转打扰用户），由 UI 引导用户手动打开
      *    Termux，返回 ON_RESUME 自动重检。
      */
-    suspend fun ensureTermuxUp(ctx: Context, log: (String) -> Unit): ChannelResult {
-        val first = probeChannel(ctx, PROBE_FIRST_MS)
+    suspend fun ensureTermuxUp(
+        ctx: Context,
+        log: (String) -> Unit,
+        onStall: (() -> Unit)? = null,
+    ): ChannelResult {
+        // onStall 只挂首探：配置类快速失败（PolicyRejected/Rejected/
+        // DispatchError）毫秒级返回，无需早提示；重试阶段首探的 NoResponse
+        // 指引已在场，也无需重复触发。
+        val first = probeChannel(ctx, PROBE_FIRST_MS, onStall)
         if (first is ChannelResult.Ok) {
             log("RUN_COMMAND 通道：通过（${first.ms}ms）")
             return first

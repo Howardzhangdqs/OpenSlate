@@ -124,12 +124,17 @@ private fun dependsOnTermux(name: String, backendsCsv: String?): Boolean {
  * 未安装 → 无权限 → `echo ok` 通道往返。全程 IO 线程（PackageManager
  * 查询与 RUN_COMMAND 派发都不该压主线程）。
  */
-private suspend fun detectTermuxStatus(context: Context): TermuxStatus =
+private suspend fun detectTermuxStatus(
+    context: Context,
+    onStall: (() -> Unit)? = null,
+): TermuxStatus =
     withContext(Dispatchers.IO) {
         when {
             !TermuxExec.isTermuxInstalled(context) -> TermuxStatus.NotInstalled
             !TermuxExec.hasPermission(context) -> TermuxStatus.NoPermission
-            else -> when (val r = TermuxDiagnostics.ensureTermuxUp(context) { }) {
+            else -> when (
+                val r = TermuxDiagnostics.ensureTermuxUp(context, log = { }, onStall = onStall)
+            ) {
                 is TermuxDiagnostics.ChannelResult.Ok -> TermuxStatus.Ready
                 is TermuxDiagnostics.ChannelResult.NoResponse ->
                     TermuxStatus.ChannelDown(TermuxDiagnostics.describe(r), stopped = r.stopped)
@@ -207,7 +212,15 @@ fun ToolManagementSection() {
                 return@launch
             }
             termuxStatus = TermuxStatus.Checking
-            termuxStatus = detectTermuxStatus(context)
+            termuxStatus = detectTermuxStatus(context, onStall = {
+                // 0.5s 无应答：先按 ChannelDown 渲染警示（复用
+                // termuxUnavailableHint 路径），不等 1s/6s 探测阶梯跑完；
+                // 整轮结论到达后由此行赋值自然覆盖。
+                termuxStatus = TermuxStatus.ChannelDown(
+                    "0.5 秒无应答，检测仍在确认",
+                    stopped = TermuxDiagnostics.isTermuxStopped(context),
+                )
+            })
         }
     }
 

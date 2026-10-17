@@ -71,9 +71,17 @@ dependencies {
     implementation(libs.androidx.material.icons)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.kotlinx.coroutines.android)
-    // Markdown 渲染（模型回复）。
+    // Markdown 渲染（模型回复）：code 模块提供语法高亮代码块，coil3 模块提供
+    // 图片加载（配 coil3 + SvgDecoder 支持 SVG）。
     implementation(libs.markdown.renderer)
     implementation(libs.markdown.renderer.core)
+    implementation(libs.markdown.renderer.code)
+    implementation(libs.markdown.renderer.coil3)
+    // 代码高亮引擎（SyntaxMP tokenizer 层：XML/HTML/SVG 等标记语言支持）。
+    implementation(libs.syntaxmp.tokenizer)
+    implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
+    implementation(libs.coil.svg)
     // UniFFI 生成的 Kotlin 绑定依赖 JNA（com.sun.jna.*）。
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     // Shizuku（设置页一键授权 Termux RUN_COMMAND；仅一次性 pm grant 用）。

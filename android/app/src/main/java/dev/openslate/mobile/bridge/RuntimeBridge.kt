@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -132,6 +133,9 @@ data class RuntimeUiState(
     /** 请求已发出但尚未收到任何首个 token（reasoning/content/tool）：
      *  期间若模型支持思维链则显示"思考中"，TTFT 等待计入思考时长。 */
     val awaitingFirstToken: Boolean = false,
+    /** termux 命令发出 0.5s 仍无应答的最早时刻（null = 无 stall）。非 null
+     *  时聊天页显示"Termux 未响应"横幅，UI 可据此换算已等待秒数。 */
+    val termuxStallSince: Long? = null,
     /** run 标题异步生成完成的版本号（run_title 事件递增）。历史会话页
      *  观察它做增量刷新——LLM 标题通常在首条消息后几秒到达，此时
      *  列表里的占位标题需要原位替换。 */
@@ -228,6 +232,12 @@ object RuntimeBridge {
     /** 工具名 → 待消费输出队列（同名工具并发时按序配对）。 */
     private val pendingToolOutputs =
         java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<String>>()
+
+    /** 0.5s 仍无应答的 termux host call id 集合（并发调用共用；空 = 熄灭横幅）。
+     *  点亮/熄灭与状态更新都经 termuxStallMutex 串行，避免竞态下横幅残留。 */
+    private val termuxStalledCalls: MutableSet<Long> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+    private val termuxStallMutex = Mutex()
 
     private fun recordToolOutput(name: String, output: String) {
         pendingToolOutputs.getOrPut(name) { java.util.concurrent.ConcurrentLinkedDeque() }.add(output)
@@ -1199,16 +1209,43 @@ object RuntimeBridge {
             return
         }
         scope.launch(Dispatchers.IO) {
-            val (output, error) = TermuxExec.run(ctx, id, command)
-            if (output != null) {
-                recordToolOutput("termux_bash", output)
-                runtime.resolveHostCall(
-                    id.toULong(), true,
-                    JSONObject().put("output", output).put("command", command).toString(),
-                )
-            } else {
-                recordToolOutput("termux_bash", error)
-                runtime.resolveHostCall(id.toULong(), false, error)
+            // stall 看门狗：命令发出 0.5s 仍无应答（Termux 未启动/被冻结时
+            // 结果 PendingIntent 永不回传）→ 记入 stall 集合并点亮"Termux
+            // 未响应"横幅，用户可直接拉起 Termux 而不是干等 90s 超时。
+            val watchdog = launch {
+                delay(500)
+                termuxStallMutex.withLock {
+                    // 锁内双检 isPending：结果可能在 delay 期间已到达。
+                    if (TermuxExec.isPending(id)) {
+                        termuxStalledCalls.add(id)
+                        mutate {
+                            val now = System.currentTimeMillis()
+                            copy(termuxStallSince = termuxStallSince?.coerceAtMost(now) ?: now)
+                        }
+                    }
+                }
+            }
+            try {
+                val (output, error) = TermuxExec.run(ctx, id, command)
+                if (output != null) {
+                    recordToolOutput("termux_bash", output)
+                    runtime.resolveHostCall(
+                        id.toULong(), true,
+                        JSONObject().put("output", output).put("command", command).toString(),
+                    )
+                } else {
+                    recordToolOutput("termux_bash", error)
+                    runtime.resolveHostCall(id.toULong(), false, error)
+                }
+            } finally {
+                watchdog.cancel()
+                // 结果到达/取消/异常都退出 stall；仅当没有其他并发 termux
+                // 调用仍处 stall 时才熄灭横幅（不能被先完成的那次误清）。
+                termuxStallMutex.withLock {
+                    if (termuxStalledCalls.remove(id) && termuxStalledCalls.isEmpty()) {
+                        mutate { copy(termuxStallSince = null) }
+                    }
+                }
             }
         }
     }

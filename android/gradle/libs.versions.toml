@@ -7,6 +7,8 @@ activityCompose = "1.11.0"
 composeBom = "2026.09.00"
 navigation = "2.9.5"
 coroutines = "1.10.2"
+coil = "3.6.0"
+syntaxmp = "0.3.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -25,6 +27,12 @@ androidx-navigation-compose = { group = "androidx.navigation", name = "navigatio
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 markdown-renderer = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-m3", version = "0.45.0" }
 markdown-renderer-core = { group = "com.mikepenz", name = "multiplatform-markdown-renderer", version = "0.45.0" }
+markdown-renderer-code = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-code", version = "0.45.0" }
+markdown-renderer-coil3 = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-coil3", version = "0.45.0" }
+syntaxmp-tokenizer = { group = "com.gallatinapps.syntaxmp", name = "syntaxmp-tokenizer", version.ref = "syntaxmp" }
+coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
+coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
+coil-svg = { group = "io.coil-kt.coil3", name = "coil-svg", version.ref = "coil" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

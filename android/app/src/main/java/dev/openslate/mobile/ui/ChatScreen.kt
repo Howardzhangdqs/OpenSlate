@@ -69,6 +69,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
@@ -116,6 +117,19 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
     // 输入胶囊）会消费 tap 事件，不会走到这里，行为互不影响。
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
+    // 输入框聚焦面板：显示 = 输入框持有焦点（编辑状态）。未聚焦时面板
+    // 不参与组合，底部布局零变化。数据在每次聚焦瞬间一次性读取
+    // （无轮询）；失焦保留上次快照，再聚焦先显示快照、后台静默刷新。
+    var composerFocused by remember { mutableStateOf(false) }
+    var panelData by remember { mutableStateOf<ComposerPanelData?>(null) }
+    var panelLoading by remember { mutableStateOf(false) }
+    LaunchedEffect(composerFocused, state.ready) {
+        if (!composerFocused || !state.ready) return@LaunchedEffect
+        panelLoading = true
+        panelData = loadComposerPanelData(context)
+        panelLoading = false
+    }
     // 相邻的连续工具调用聚合为一组（圆角矩形容器内多个 chip），
     // 其余条目原样单行渲染。
     val renderItems: List<RenderItem> = remember(state.entries) { groupEntries(state.entries) }
@@ -144,6 +158,17 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
         if (target >= 0) {
             listState.animateScrollToItem(target)
         }
+    }
+
+    // 聚焦面板展开时会盖住列表底部约 100dp：聚焦瞬间若视口已贴近底部，
+    // 顺势把末条滚到面板上沿之上；正身处更早的阅读位置则不动（不打断浏览）。
+    LaunchedEffect(composerFocused) {
+        if (!composerFocused) return@LaunchedEffect
+        val target = renderItems.lastIndex + if (showThinking) 1 else 0
+        if (target < 0) return@LaunchedEffect
+        val lastVisible =
+            listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: return@LaunchedEffect
+        if (lastVisible >= target - 2) listState.animateScrollToItem(target)
     }
 
     Scaffold(
@@ -327,12 +352,27 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                     glass = glass,
                     rootCoords = { rootCoords },
                 )
+                // 聚焦面板：composer 上方展开（与 TermuxStallBanner 同列同语言），
+                // 未聚焦时不参与组合 → composer 几何与未聚焦态完全一致。
+                ComposerFocusPanel(
+                    visible = composerFocused,
+                    data = panelData,
+                    loading = panelLoading,
+                    modelAlias = state.modelAlias,
+                    config = state.config,
+                    onSelectModel = { RuntimeBridge.setModelAlias(it) },
+                    glass = glass,
+                    rootCoords = { rootCoords },
+                )
                 Composer(
                     glass = glass,
                     rootCoords = { rootCoords },
                     running = state.running,
+                    onInputFocusChange = { composerFocused = it },
                     onSend = { text ->
                         RuntimeBridge.submit(text)
+                        // 发送后退出编辑状态：清焦点 → 聚焦面板收起（键盘随之收起）。
+                        focusManager.clearFocus()
                     },
                     onCancel = { RuntimeBridge.cancel() },
                 )
@@ -923,8 +963,9 @@ private fun Bubble(text: String, mine: Boolean) {
     }
 }
 
-/** 磨砂玻璃共享状态：内容捕获层 + 模糊参数（effect 为 null 表示不支持真模糊，退化为蒙层）。 */
-private class Glass(
+/** 磨砂玻璃共享状态：内容捕获层 + 模糊参数（effect 为 null 表示不支持真模糊，退化为蒙层）。
+ *  internal：聚焦面板（ComposerPanel.kt）复用同一 GlassPanel 视觉语言。 */
+internal class Glass(
     val source: GraphicsLayer,
     val effect: BlurEffect?,
     val radiusPx: Float,
@@ -935,7 +976,7 @@ private class Glass(
 private val GlassBlurRadius = 12.dp
 
 @Composable
-private fun rememberGlass(): Glass {
+internal fun rememberGlass(): Glass {
     val source = rememberGraphicsLayer()
     val radiusPx = with(LocalDensity.current) { GlassBlurRadius.toPx() }
     val effect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -960,7 +1001,7 @@ private fun rememberGlass(): Glass {
  * 低版本（renderEffect 依赖 API 31 的 RenderEffect）退化为纯半透明蒙层。
  */
 @Composable
-private fun GlassPanel(
+internal fun GlassPanel(
     glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
     tint: Color,
@@ -1026,12 +1067,14 @@ private fun GlassPanel(
  * 紧凑输入区：自绘 BasicTextField 替代 M3 OutlinedTextField（后者强制 56dp 最小高度，
  * 显得过高）。输入胶囊为磨砂玻璃面板（GlassPanel）：Android 12+ 重绘背景模糊层，
  * 低版本退化为半透明蒙层；配细边框 + 轻阴影悬浮于透明底条之上。
+ * 聚焦状态经 [onInputFocusChange] 上抛，驱动 ChatScreen 底部的聚焦面板。
  */
 @Composable
 private fun Composer(
     glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
     running: Boolean,
+    onInputFocusChange: (Boolean) -> Unit = {},
     onSend: (String) -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1068,6 +1111,7 @@ private fun Composer(
                     maxLines = 5,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .onFocusChanged { onInputFocusChange(it.isFocused) }
                         .padding(horizontal = 14.dp, vertical = 10.dp),
                     decorationBox = { inner ->
                         Box {

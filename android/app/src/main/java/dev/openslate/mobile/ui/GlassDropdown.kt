@@ -2,11 +2,13 @@ package dev.openslate.mobile.ui
 
 import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.MutableTransitionState
-import androidx.compose.animation.expandVertically
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -76,9 +79,11 @@ import kotlin.math.roundToInt
  *   局部模糊叠加成双重模糊）。
  *
  * 弹层窗口是 Popup 子窗口且 focusable：点外部/返回键触发 onDismissRequest、
- * 与 IME 的共存关系与既有 DropdownMenu 完全一致。进出场与面板同族
- * （fadeIn + expandVertically 自底 / fadeOut + shrinkVertically），退场期间
- * Popup 保持组合至动画结束（M3 DropdownMenu 同款 MutableTransitionState 模式）。
+ * 与 IME 的共存关系与既有 DropdownMenu 完全一致。进出场 = 玻璃 Box 外层的
+ * 纯绘制相位过渡（fadeIn + scaleIn 自底 origin / fadeOut + scaleOut）：玻璃
+ * 面布局尺寸首帧定型，Haze 模糊区域不随动画逐帧伸缩（布局尺寸与动画解耦
+ * ——尺寸驱动的进出场会让模糊逐帧重配，收起帧全丢）；退场期间 Popup 保持
+ * 组合至动画结束（M3 DropdownMenu 同款 MutableTransitionState 模式）。
  */
 
 /** 弹层选项：value 回传原值（models 条目键），label 主文字，subtitle 可选副行。 */
@@ -181,26 +186,46 @@ internal fun GlassDropdownMenu(
             ),
             popupPositionProvider = AnchorFlipPositionProvider(marginPx, alignEnd),
         ) {
-            Box(
-                modifier = modifier
-                    .widthIn(max = 320.dp)
-                    .shadow(elevation = 2.dp, shape = shape, clip = false)
-                    .graphicsLayer {
-                        this.shape = shape
-                        clip = true
-                    }
-                    // 玻璃面 = Haze 局部模糊（含 fallback 蒙层路径），整块
-                    // 面板背景由 haze 绘制；圆角裁剪交给上层 graphicsLayer。
-                    .hazeBlur(
-                        HazeInput.Sources(hazeState),
-                        style = style,
-                    )
-                    .border(0.5.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), shape),
+            // 进出场 = 纯绘制相位（scale + fade），套在玻璃 Box 外层：
+            // Box 布局尺寸首帧即定型为最终内容尺寸，hazeBlur 的模糊区域
+            // 一次成型——动画期只是对已模糊整层做绘制变换（免逐帧重配
+            // RenderEffect）。原 expandVertically/shrinkVertically 直接
+            // 驱动玻璃面布局尺寸逐帧伸缩：展开＝模糊区逐帧扩大（残余
+            // 卡顿），收起＝缩至 0 时帧全丢（观感「没动画直接消失」），
+            // 且 AnchorFlipPositionProvider 按内容尺寸定位会跟着逐帧
+            // 重算（翻上分支收起时 y 跳动）。transformOrigin 取底部
+            // 中心，等价原 expandFrom/shrinkTowards Bottom 的自底展开
+            // 语言（向上翻开的分支原实现也无 origin 联动，保持等价）。
+            AnimatedVisibility(
+                visibleState = expandedState,
+                enter = fadeIn(tween(160, easing = FastOutSlowInEasing)) +
+                    scaleIn(
+                        animationSpec = tween(160, easing = FastOutSlowInEasing),
+                        initialScale = 0.9f,
+                        transformOrigin = TransformOrigin(0.5f, 1f),
+                    ),
+                exit = fadeOut(tween(120, easing = FastOutSlowInEasing)) +
+                    scaleOut(
+                        animationSpec = tween(120, easing = FastOutSlowInEasing),
+                        targetScale = 0.95f,
+                        transformOrigin = TransformOrigin(0.5f, 1f),
+                    ),
             ) {
-                AnimatedVisibility(
-                    visibleState = expandedState,
-                    enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
-                    exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
+                Box(
+                    modifier = modifier
+                        .widthIn(max = 320.dp)
+                        .shadow(elevation = 2.dp, shape = shape, clip = false)
+                        .graphicsLayer {
+                            this.shape = shape
+                            clip = true
+                        }
+                        // 玻璃面 = Haze 局部模糊（含 fallback 蒙层路径），整块
+                        // 面板背景由 haze 绘制；圆角裁剪交给上层 graphicsLayer。
+                        .hazeBlur(
+                            HazeInput.Sources(hazeState),
+                            style = style,
+                        )
+                        .border(0.5.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), shape),
                 ) {
                     Column(
                         Modifier

@@ -79,8 +79,10 @@ pub struct OpenSlateConfig {
     /// Capabilities (`[capabilities]`): 固定功能 id → 代号（`[levels]` key
     /// 或 legacy `[models]` 条目名）。功能 id 见 [`crate::model_config`]
     /// 的 `CAP_*` 常量（`main` 主对话 / `compact` 上下文压缩 / `title`
-    /// 会话标题生成）。缺省回退：`main`→"main"、`compact`→"fast"、
-    /// `title`→"fast"（[`crate::model_config::capability_alias`]）。
+    /// 会话标题生成）。缺省回退：`main`→"main"、`title`→"fast"
+    /// （[`crate::model_config::capability_alias`]）；`compact` 未绑定
+    /// 时由调用方决定——session 引擎继承会话当前模型
+    /// （`model_alias`），不使用该函数的 "fast" 缺省。
     /// levels 是用户自由命名的"代号"；capabilities 决定每个功能用哪个
     /// 代号——两层解耦：换模型只动 levels 绑定，换功能分工只动
     /// capabilities。

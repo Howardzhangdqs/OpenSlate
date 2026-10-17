@@ -79,9 +79,9 @@ pub const CAP_TITLE: &str = "title";
 pub const CAPABILITIES: &[&str] = &[CAP_MAIN, CAP_COMPACT, CAP_TITLE];
 ```
 
-`[capabilities]`：功能 id → 代号（levels key 或 models 条目名）。缺省回退（`capability_alias`，model_config.rs:46）：`main`→"main"、`compact`→"fast"、`title`→"fast"。
+`[capabilities]`：功能 id → 代号（levels key 或 models 条目名）。缺省回退（`capability_alias`，model_config.rs:46）：`main`→"main"、`title`→"fast"；`compact` 的 "fast" 缺省仅为函数兼容值——session 引擎未绑定 compact 时**继承会话当前模型**（`model_alias`，engine.rs `run_auto_compact` 自行取值，不走 `capability_alias` 缺省）。
 
-- `main` = 会话主模型；`compact` = auto-compact 摘要用；`title` = 会话标题生成用。
+- `main` = 会话主模型；`compact` = auto-compact 摘要用（显式绑定优先，未绑定 = 会话模型）；`title` = 会话标题生成用。
 - 两层解耦设计：换模型只动 levels 绑定，换功能分工只动 capabilities。
 - `capability == "main"` 的 SetCapability 落盘后同时热切换会话模型并广播 `model_changed`（session/config_ops.rs）。
 

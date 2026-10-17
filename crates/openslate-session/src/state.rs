@@ -188,6 +188,10 @@ pub fn build_config_view(inner: &CoreInner) -> ConfigViewDto {
     let levels = inner.config.levels.clone().into_iter().collect();
     // 功能映射出"生效值"（并入缺省回退）——客户端拿到的即真相，
     // 与 limits 的"server 解析默认值"同一先例。
+    // 注意：compact 行的 "fast" 缺省仅是展示层的历史默认值，与引擎
+    // 实际行为不同——未绑定时 auto-compact 继承会话当前模型
+    // （engine.rs `run_auto_compact`），本视图不反映该继承（现无
+    // 消费方依赖 compact 行做行为决策，纯展示）。
     let capabilities = openslate_core::model_config::CAPABILITIES
         .iter()
         .map(|cap| {

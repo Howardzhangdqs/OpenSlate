@@ -13,8 +13,10 @@ use crate::error::ConfigError;
 //
 // `[capabilities]` 把"功能"（谁在用模型）与"代号"（用哪个模型档位）
 // 解耦：代号是用户自由命名的 `[levels]` key（fast / main / vision …，
-// 想配几个配几个），功能是固定 id。默认映射让无该节的旧配置行为
-// 完全不变（compact 历史上硬编码 "fast"，main 沿用 "main"）。
+// 想配几个配几个），功能是固定 id。缺省映射仅为历史兼容值：main 沿用
+// "main"；compact 的"未绑定 → fast"缺省已不再被 session 引擎使用
+// （未绑定 = 继承会话当前模型，见 openslate-session engine.rs
+// `run_auto_compact`，其取值不走本模块的 `capability_alias`）。
 
 /// 功能 id：主对话（正常 API 请求）。
 pub const CAP_MAIN: &str = "main";
@@ -38,11 +40,13 @@ pub fn capability_title(cap: &str) -> &'static str {
 
 /// 功能 → 代号（含缺省回退）。
 ///
-/// `[capabilities]` 有值用值；没有该节/该 key 的旧配置回退到历史
-/// 默认（`main`→"main"、`compact`/`title`→"fast"），与引入本节之前
-/// 的行为逐字节一致。返回的代号交给 [`resolve_model`] 解析；解析
-/// 失败由调用方按各功能自己的兜底策略处理（compact → 机械拼接、
-/// title → prompt 截断）。
+/// `[capabilities]` 有值用值；没有该节/该 key 时回退到历史默认
+/// （`main`→"main"、`compact`/`title`→"fast"）。**注意**：`compact`
+/// 分支的 "fast" 缺省仅保留兼容旧调用方——session 引擎已不再依赖它，
+/// 未绑定 compact 时直接继承会话当前模型（openslate-session
+/// `engine.rs::run_auto_compact` 自行取值，不走本函数缺省）。返回的
+/// 代号交给 [`resolve_model`] 解析；解析失败由调用方按各功能自己的
+/// 兜底策略处理（compact → 机械拼接、title → prompt 截断）。
 pub fn capability_alias(config: &OpenSlateConfig, cap: &str) -> String {
     let fallback = match cap {
         CAP_MAIN => "main",
@@ -245,8 +249,9 @@ fast = "small"
 
     #[test]
     fn capability_alias_defaults_without_section() {
-        // 无 [capabilities]：回退历史默认（main→"main"，compact/title→"fast"），
-        // 与引入该节之前的硬编码行为一致。
+        // 无 [capabilities]：回退历史默认（main→"main"，compact/title→"fast"）。
+        // 注：compact 的 "fast" 缺省仅保留函数兼容——session 引擎未绑定
+        // 时已改为继承会话当前模型，不再消费该缺省值。
         let toml = r#"
 [providers.p]
 base_url = "http://localhost"

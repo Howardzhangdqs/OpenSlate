@@ -6,8 +6,9 @@
 //!   放回（与 TUI 同模式；manager 非 Sync，不能共享引用进异步任务）。
 //! - 进度回调 = `SessionProgressBridge`：持 core 锁「先改转写镜像、再
 //!   广播」，同一连接上的事件序 == 转写追加序。
-//! - auto-compact：回合提交时 history 超阈值 → 先用 `fast` 模型摘要压缩
-//!   （provider 失败/别名缺失 → 机械拼接兜底，core `compact()` 内建），
+//! - auto-compact：回合提交时 history 超阈值 → 先用压缩模型摘要压缩
+//!   （capability=compact 绑定的代号；未绑定 → 继承会话当前模型。
+//!   provider 失败/别名缺失 → 机械拼接兜底，core `compact()` 内建），
 //!   再进正式回合。compact 的 usage 计入会话累计（不计 run 行，同 TUI）。
 
 use std::sync::Arc;
@@ -270,13 +271,21 @@ pub async fn run_auto_compact(state: &Arc<AppState>) {
 
     tracing::info!("session auto-compact: history over context limits, summarizing");
 
-    // 压缩模型计划（capability=compact → 代号；缺失/构建失败 → None →
-    // 机械兜底，core compact 内建）。无 [capabilities] 节回退 "fast"，
-    // 与历史硬编码行为一致。
+    // 压缩模型计划：[capabilities] 显式绑定 compact → 用绑定代号；
+    // 未绑定 → 继承会话当前模型（model_alias，与主对话同档；历史上
+    // 硬编码回退 "fast" 已废止——未配 compact 又无 "fast" 条目的配置
+    // 会无谓退化到机械拼接）。解析/构建失败 → None → 机械兜底
+    // （core compact 内建），路径不变。
     let factory = state.provider_factory.clone();
-    let config = state.core.lock().config.clone();
-    let compact_alias =
-        openslate_core::model_config::capability_alias(&config, openslate_core::model_config::CAP_COMPACT);
+    let (config, session_alias) = {
+        let inner = state.core.lock();
+        (inner.config.clone(), inner.model_alias.clone())
+    };
+    let compact_alias = config
+        .capabilities
+        .get(openslate_core::model_config::CAP_COMPACT)
+        .cloned()
+        .unwrap_or(session_alias);
     let summary_plan: Option<(String, Box<dyn ModelProvider>, CostSpec)> = {
         match resolve_model(&config, &compact_alias) {
             Ok(resolved) => match factory(&config, &compact_alias) {
@@ -526,5 +535,276 @@ mod tests {
             reasoning_tokens: None,
         };
         assert_eq!(meta_line_for_test(&cached), "↑10 ↓2 ⎓4");
+    }
+
+    // ── run_auto_compact：压缩模型选择（绑定优先，未绑定继承会话模型）──
+
+    mod auto_compact {
+        use super::*;
+        use crate::approval::SessionApprovalBridge;
+        use crate::state::{ConfigPaths, CoreInner, MsgSink, ProviderFactory, SessionCore};
+        use openslate_core::agent_tree::AgentTree;
+        use openslate_core::config::{parse_openslate_toml, AgentsConfig};
+        use openslate_core::types::{AgentConfig, AgentId};
+        use std::sync::Mutex;
+
+        /// 摘要桩的固定回复（区别于机械拼接兜底的 "User: …" 文案）。
+        const STUB_SUMMARY: &str = "STUB-LLM-SUMMARY";
+
+        /// 桩 provider / 工厂侧的调用记录（代号询问 + 实际请求 model_id）。
+        #[derive(Default)]
+        struct Recorder {
+            aliases_asked: Mutex<Vec<String>>,
+            models_used: Mutex<Vec<String>>,
+        }
+
+        struct SummaryStub {
+            recorder: Arc<Recorder>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for SummaryStub {
+            async fn generate(
+                &self,
+                req: openslate_core::provider::GenerateRequest,
+            ) -> Result<openslate_core::types::ModelResponse, openslate_core::error::ProviderError>
+            {
+                self.recorder
+                    .models_used
+                    .lock()
+                    .unwrap()
+                    .push(req.model_id);
+                Ok(openslate_core::types::ModelResponse {
+                    content: Some(STUB_SUMMARY.into()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    finish_reason: None,
+                })
+            }
+
+            fn provider_name(&self) -> &str {
+                "summary-stub"
+            }
+        }
+
+        /// run_auto_compact 不触 sink / 审批，no-op 实现即可。
+        #[derive(Default)]
+        struct NoopSink;
+
+        impl MsgSink for NoopSink {
+            fn broadcast(&self, _msg: ServerMsg) {}
+            fn send_to(&self, _conn_id: u64, _msg: ServerMsg) -> bool {
+                true
+            }
+            fn conn_ids(&self) -> Vec<u64> {
+                Vec::new()
+            }
+            fn count(&self) -> usize {
+                0
+            }
+            fn close_all(&self) {}
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        /// 最小 state：9 条 history + limits.max_context_messages=10 →
+        /// 9/10 > 0.8 触发 compact（保持 KEEP_RECENT_COUNT=2 → 压后 3 条）。
+        /// 无 [levels]：代号直查 [models]（legacy 路径，本测试只关心
+        /// compact 选哪个代号）。返回调用记录供断言（工厂被问的代号 +
+        /// 桩实际收到的 model_id）。
+        fn test_state(toml: &str, model_alias: &str) -> (Arc<AppState>, Arc<Recorder>) {
+            let recorder = Arc::new(Recorder::default());
+            let state = build_state(toml, model_alias, Arc::clone(&recorder));
+            (state, recorder)
+        }
+
+        fn build_state(toml: &str, model_alias: &str, recorder: Arc<Recorder>) -> Arc<AppState> {
+            let config = parse_openslate_toml(toml).expect("fixture parses");
+            let agents = AgentsConfig {
+                agents: vec![AgentConfig {
+                    hidden_tools: Vec::new(),
+                    id: AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    children: vec![],
+                    tools: vec![],
+                    default_prompt: "root prompt".into(),
+                }],
+            };
+            let agent_tree = AgentTree::from_configs(&agents.agents).expect("tree builds");
+            let history: Vec<Message> = (0..9)
+                .map(|i| Message {
+                    role: if i % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    },
+                    content: format!("msg-{i}"),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                })
+                .collect();
+            let sink = Arc::new(NoopSink);
+            let factory_recorder = Arc::clone(&recorder);
+            let factory: ProviderFactory = Arc::new(move |_cfg, alias| {
+                factory_recorder
+                    .aliases_asked
+                    .lock()
+                    .unwrap()
+                    .push(alias.to_owned());
+                Ok(Box::new(SummaryStub {
+                    recorder: Arc::clone(&factory_recorder),
+                }) as Box<dyn ModelProvider>)
+            });
+            let inner = CoreInner {
+                session_id: "test-session".into(),
+                session_label: "test".into(),
+                history,
+                transcript: Vec::new(),
+                running: false,
+                compacting: true,
+                depth_cur: 0,
+                agents_running: 0,
+                tool_calls_cur: 0,
+                model_alias: model_alias.into(),
+                cancel: None,
+                config,
+                agents_cfg: agents,
+                agent_tree,
+                skills: Vec::new(),
+                store: None,
+                session_run: None,
+                manager: None,
+                engine_task: None,
+                paths: ConfigPaths {
+                    active: std::path::PathBuf::from("/dev/null"),
+                    global: None,
+                    local: None,
+                },
+                stats: Default::default(),
+                stream: Default::default(),
+                tool_timers: Default::default(),
+                pending_step_meta: None,
+            };
+            Arc::new(AppState {
+                core: Arc::new(SessionCore::new(inner)),
+                sink,
+                approval: Arc::new(SessionApprovalBridge::new(Arc::new(NoopSink))),
+                auth_token: None,
+                provider_factory: factory,
+                origin: "test",
+                _mcp: Default::default(),
+            })
+        }
+
+        fn base_toml(capabilities: Option<&str>) -> String {
+            // entry-a / entry-b 两个可解析条目；limits 收紧到 10 条触发
+            // auto-compact。capabilities 由用例注入（None = 未绑定）。
+            format!(
+                r#"
+[providers.zhipu]
+base_url = "https://example.com"
+api_key_env = "KEY"
+
+[models.entry_a]
+provider = "zhipu"
+model = "model-a"
+
+[models.entry_b]
+provider = "zhipu"
+model = "model-b"
+
+[limits]
+max_context_messages = 10
+{}"#,
+                capabilities.unwrap_or("")
+            )
+        }
+
+        fn history_after(state: &Arc<AppState>) -> Vec<Message> {
+            state.core.lock().history.clone()
+        }
+
+        #[tokio::test]
+        async fn unbound_compact_inherits_session_model() {
+            // 未绑定 compact + 会话 model_alias=entry_a → 用 entry_a
+            //（工厂被问 entry_a、实际请求 model-a；摘要非机械拼接）。
+            let (state, recorder) = test_state(&base_toml(None), "entry_a");
+            run_auto_compact(&state).await;
+            assert_eq!(
+                *recorder.aliases_asked.lock().unwrap(),
+                vec!["entry_a".to_owned()],
+                "factory must be asked for the session model alias"
+            );
+            assert_eq!(
+                *recorder.models_used.lock().unwrap(),
+                vec!["model-a".to_owned()],
+                "summary request must use the session model"
+            );
+            let history = history_after(&state);
+            assert_eq!(history.len(), 3, "1 summary + 2 recent");
+            assert!(
+                history[0].content.contains(STUB_SUMMARY),
+                "summary must come from the stub provider (session model): {}",
+                history[0].content
+            );
+            assert!(!history[0].content.contains("msg-0"), "not mechanical concat");
+        }
+
+        #[tokio::test]
+        async fn bound_compact_overrides_session_model() {
+            // 显式 [capabilities] compact=entry_b → 用 entry_b（优先于
+            // 会话模型 entry_a）：工厂被问 entry_b、实际请求 model-b。
+            let toml = base_toml(Some("\n[capabilities]\ncompact = \"entry_b\"\n"));
+            let (state, recorder) = test_state(&toml, "entry_a");
+            run_auto_compact(&state).await;
+            assert_eq!(
+                *recorder.aliases_asked.lock().unwrap(),
+                vec!["entry_b".to_owned()],
+                "explicit capability binding must win over session model"
+            );
+            assert_eq!(
+                *recorder.models_used.lock().unwrap(),
+                vec!["model-b".to_owned()]
+            );
+            let history = history_after(&state);
+            assert_eq!(history.len(), 3);
+            assert!(
+                history[0].content.contains(STUB_SUMMARY),
+                "summary via bound model expected: {}",
+                history[0].content
+            );
+        }
+
+        #[tokio::test]
+        async fn unresolved_alias_falls_back_to_mechanical() {
+            // 会话模型解析失败（别名不在 [models]）且未绑定 → 机械兜底：
+            // 工厂零调用，摘要是 "User: …" 拼接文案，不含桩回复。
+            let (state, recorder) = test_state(&base_toml(None), "ghost-alias");
+            run_auto_compact(&state).await;
+            assert!(
+                recorder.aliases_asked.lock().unwrap().is_empty(),
+                "no factory call for unresolvable alias"
+            );
+            assert!(
+                recorder.models_used.lock().unwrap().is_empty(),
+                "no LLM call for unresolvable alias"
+            );
+            let history = history_after(&state);
+            assert_eq!(history.len(), 3, "mechanical fallback still compacts");
+            assert!(
+                history[0].content.contains("User: msg-0"),
+                "mechanical concat summary expected: {}",
+                history[0].content
+            );
+            assert!(
+                !history[0].content.contains(STUB_SUMMARY),
+                "no LLM call should happen for unresolvable alias"
+            );
+        }
     }
 }

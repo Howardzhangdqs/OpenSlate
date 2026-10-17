@@ -61,7 +61,7 @@ pub struct CoreInner {
 ### 视图构造（纯函数）
 
 - `effective_limits(config) -> LimitsConfig`（:170）：`limits.clone().unwrap_or_default()`——Option 语义解掉。
-- `build_config_view(inner) -> ConfigViewDto`（:175）：capabilities 出**生效值**（并入缺省回退——客户端拿到的即真相，与 limits 的"server 解析默认值"同一先例）。
+- `build_config_view(inner) -> ConfigViewDto`（:175）：capabilities 出**生效值**（并入缺省回退——客户端拿到的即真相，与 limits 的"server 解析默认值"同一先例）。注意 compact 行的 "fast" 缺省仅是展示层历史默认值——引擎未绑定时实际继承会话当前模型（见 `run_auto_compact`），本视图不反映该继承（纯展示，无行为消费方）。
 - `build_snapshot(inner, approval) -> SnapshotDto`（:215）：纯投影 + 审批桥队首待审。
 
 ### 转写镜像辅助（与 TUI transcript.rs 行为 1:1）
@@ -94,7 +94,7 @@ pub struct CoreInner {
 
 ### run_auto_compact（:253）
 
-pre-turn 摘要。history 整体搬出（std Mutex 守卫不能跨 await）→ `needs_compact` 判定 → capability=compact 计划（resolve_model + provider_factory；任一失败 → None → 机械兜底）→ `compact()`（空白回复视作失败 → 机械兜底）→ 搬回。**compact 的 usage 计入会话累计（不计 run 行）**。`SUMMARY_SYSTEM_PROMPT`（:29）与 REPL/TUI **逐字一致**。
+pre-turn 摘要。history 整体搬出（std Mutex 守卫不能跨 await）→ `needs_compact` 判定 → capability=compact 计划（**代号选取：`[capabilities]` 显式绑定优先；未绑定 → 继承会话当前 `model_alias`**（同一 core 锁临界区取；历史上的"回退 fast 硬编码"已废止，不走 `capability_alias` 缺省）。resolve_model + provider_factory 任一失败 → None → 机械兜底）→ `compact()`（空白回复视作失败 → 机械兜底）→ 搬回。**compact 的 usage 计入会话累计（不计 run 行）**。`SUMMARY_SYSTEM_PROMPT`（:29）与 REPL/TUI **逐字一致**。
 
 ### 会话标题（:379-441）
 

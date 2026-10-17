@@ -142,7 +142,7 @@ pub struct RunManager {
 ## 9. model_config.rs —— 别名解析（469 行）
 
 - 常量：`CAP_MAIN`/`CAP_COMPACT`/`CAP_TITLE`（:20-24）+ `CAPABILITIES`（:27）。
-- `capability_title`（:30）/ `capability_alias(config, cap) -> String`（:46，缺省回退 main→"main"、compact→"fast"、title→"fast"）。
+- `capability_title`（:30）/ `capability_alias(config, cap) -> String`（:46，缺省回退 main→"main"、title→"fast"；compact 的 "fast" 缺省仅保留函数兼容——session 引擎未绑定时继承会话当前模型，不消费该缺省）。
 - `ResolvedModel`（:61）：解析结果（model_id + 计价等）；`cost_spec()`（:86）→ `CostSpec`。
 - `resolve_model(config, alias) -> Result<ResolvedModel, ConfigError>`（:111）：levels 映射优先，无 levels 段直接查 models（legacy 保持）。
 - `resolve_all_models`（:158）：批量。

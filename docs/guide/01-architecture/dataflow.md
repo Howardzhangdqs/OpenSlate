@@ -173,7 +173,8 @@ resume 路径: list_messages_by_run 按 seq 读回 → 解码为 core::Message
 ```text
 submit 时 needs_compact(条数/字节超阈值, auto_compact 开)
   → history 整体搬出（std Mutex 守卫不能跨 await）
-  → capability=compact → 代号 → resolve_model + provider_factory
+  → capability=compact → 代号（显式绑定优先；未绑定 → 继承会话当前
+    模型 model_alias）→ resolve_model + provider_factory
     （别名缺失/构建失败 → None → 机械拼接兜底，core compact 内建）
   → compact(&mut history, summarize)  // LLM 摘要
   → 搬回 history；compact 的 usage 计入会话累计 stats（不进 run 行）

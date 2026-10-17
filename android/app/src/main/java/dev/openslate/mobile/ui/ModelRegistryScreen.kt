@@ -284,8 +284,11 @@ private fun RegistryEntryRow(e: RegistryEntryUi, showSource: Boolean) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
+                    // registry 原始键（如 zhipuai/glm-4.7）= 标识类文本 →
+                    // 内嵌 MonoFont 子集。
                     e.id,
                     style = MaterialTheme.typography.bodyMedium,
+                    fontFamily = MonoFont,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     softWrap = false,

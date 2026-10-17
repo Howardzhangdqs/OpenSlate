@@ -46,8 +46,6 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextRange
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -57,7 +55,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import dev.openslate.mobile.R
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.TermuxDiagnostics
@@ -70,10 +67,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-
-/** 内嵌等宽字体（JetBrains Mono 子集；ASCII+常用标点，中文自动回退系统
- *  字体）。用于工具名、参数名/类型等代码类文本。 */
-private val MonoFont = FontFamily(Font(R.font.jetbrains_mono_subset))
 
 /** 工具分组固定展示顺序（类别按名前缀推导）。 */
 private val TOOL_GROUP_ORDER = listOf("主机", "命令行", "MCP 工具", "内置")
@@ -658,7 +651,7 @@ private fun ToolNameTemplateSection(onRecheck: () -> Unit) {
                         Text(
                             ph,
                             style = MaterialTheme.typography.labelMedium,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = MonoFont,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
@@ -677,7 +670,7 @@ private fun ToolNameTemplateSection(onRecheck: () -> Unit) {
                     Text(
                         "示例：$previewName",
                         style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = MonoFont,
                         color = MaterialTheme.colorScheme.outline,
                     )
                 } else {
@@ -775,7 +768,7 @@ private fun ToolNameTemplateSection(onRecheck: () -> Unit) {
                         Text(
                             ph,
                             style = MaterialTheme.typography.labelMedium,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = MonoFont,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
@@ -795,7 +788,7 @@ private fun ToolNameTemplateSection(onRecheck: () -> Unit) {
                     Text(
                         "示例：$builtinPreview",
                         style = MaterialTheme.typography.labelSmall,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = MonoFont,
                         color = MaterialTheme.colorScheme.outline,
                     )
                 } else {

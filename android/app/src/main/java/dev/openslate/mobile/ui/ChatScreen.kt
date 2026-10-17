@@ -95,6 +95,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -203,11 +206,18 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                             Text(
                                 // 直绑条目键经共享显示助手换「Provider/modelId」，
                                 // 内部 entry 不直出；levels 代号原样（遗留兜底）。
+                                // 模型名（标识类文本）用内嵌 MonoFont 子集，混排的
+                                // 运行状态文案保持默认字体；启动/就绪等纯状态分支
+                                // 不涉及模型名，原样渲染。
                                 text = when {
-                                    !state.ready -> "runtime 启动中…"
-                                    state.running ->
-                                        "$modelDisplay · Step ${state.step} · 工具 ${state.toolCalls}"
-                                    else -> modelDisplay.ifEmpty { "就绪" }
+                                    !state.ready -> AnnotatedString("runtime 启动中…")
+                                    state.running -> buildAnnotatedString {
+                                        withStyle(SpanStyle(fontFamily = MonoFont)) { append(modelDisplay) }
+                                        append(" · Step ${state.step} · 工具 ${state.toolCalls}")
+                                    }
+                                    else -> if (modelDisplay.isEmpty()) AnnotatedString("就绪") else buildAnnotatedString {
+                                        withStyle(SpanStyle(fontFamily = MonoFont)) { append(modelDisplay) }
+                                    }
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                             )
@@ -636,6 +646,7 @@ private fun parseToolOut(raw: String): ToolOutParts {
 private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     val clipboard = LocalClipboardManager.current
     val scroll = rememberScrollState()
+    // 系统等宽（不用 MonoFont 子集）：工具输出是任意内容，子集字形覆盖不全。
     val mono = MaterialTheme.typography.bodySmall.copy(
         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
     )
@@ -675,6 +686,7 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                         Text(
                             "exit ${parts.exitCode}",
                             style = MaterialTheme.typography.labelSmall.copy(
+                                // 系统等宽：与输出体 mono 同源（见上），不换子集字体。
                                 fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                             ),
                             color = tint,

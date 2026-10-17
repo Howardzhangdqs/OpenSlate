@@ -74,6 +74,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.SpanStyle
@@ -321,7 +322,7 @@ fun SettingsScreen(
                                             Text(
                                                 p.baseUrl,
                                                 style = MaterialTheme.typography.bodySmall,
-                                                fontFamily = FontFamily.Monospace,
+                                                fontFamily = MonoFont,
                                                 color = MaterialTheme.colorScheme.outline,
                                             )
                                             // null = 预取进行中（避免先闪"未配置"再变"已存"）。
@@ -655,7 +656,7 @@ private fun ProviderModelsDialog(
                     ) {
                         // 点击左侧信息区查看完整详情（摘要行被省略号截断的补全）。
                         Column(Modifier.weight(1f).clickable { detailModel = m }) {
-                            Text(m.modelId, style = MaterialTheme.typography.bodyMedium)
+                            Text(m.modelId, style = MaterialTheme.typography.bodyMedium, fontFamily = MonoFont)
                             // 能力摘要（内部条目 ID 不对外展示）。
                             ModelCapsRow(m)
                         }
@@ -728,7 +729,7 @@ private fun ProviderModelsDialog(
                                             modifier = Modifier.height(13.dp).width(13.dp),
                                             tint = MaterialTheme.colorScheme.primary,
                                         )
-                                        Text(id)
+                                        Text(id, fontFamily = MonoFont)
                                     }
                                 },
                             )
@@ -816,7 +817,7 @@ private fun ProviderModelsDialog(
         val capRefs = capabilities.filterValues { it == m.entry }.keys.sorted()
         AlertDialog(
             onDismissRequest = { detailModel = null },
-            title = { Text(m.modelId) },
+            title = { Text(m.modelId, fontFamily = MonoFont) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
@@ -928,10 +929,16 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, haz
                 modifier = Modifier.weight(1f),
             )
             Text(
-                when {
-                    items.isEmpty() -> "先在 Provider 页添加模型"
-                    bound == null -> "未设置"
-                    else -> RuntimeBridge.modelAliasDisplay(bound, config)
+                // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
+                // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
+                text = when {
+                    items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
+                    bound == null -> AnnotatedString("未设置")
+                    else -> buildAnnotatedString {
+                        withStyle(SpanStyle(fontFamily = MonoFont)) {
+                            append(RuntimeBridge.modelAliasDisplay(bound, config))
+                        }
+                    }
                 },
                 style = MaterialTheme.typography.labelLarge,
                 color = if (bound == null) {
@@ -1134,7 +1141,7 @@ private fun CodeBlock(text: String, modifier: Modifier = Modifier) {
                             onValueChange = { value = it },
                             readOnly = true,
                             textStyle = TextStyle(
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = MonoFont,
                                 fontSize = 12.sp,
                                 lineHeight = 17.sp,
                                 color = MaterialTheme.colorScheme.onSurface,
@@ -1163,7 +1170,7 @@ private fun CodeBlock(text: String, modifier: Modifier = Modifier) {
                     Text(
                         text,
                         style = TextStyle(
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = MonoFont,
                             fontSize = 12.sp,
                             lineHeight = 17.sp,
                             color = MaterialTheme.colorScheme.onSurface,
@@ -1907,6 +1914,7 @@ private fun LogSection() {
             }
         }
         status?.let {
+            // 系统等宽（不换 MonoFont 子集）：状态行混排中文与动态错误信息。
             Text(it, style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.outline)
         }
@@ -2650,6 +2658,8 @@ private fun McpSection() {
                         Text(
                             line,
                             style = MaterialTheme.typography.labelSmall,
+                            // 系统等宽（不换 MonoFont 子集）：诊断日志是任意
+                            // 内容（时间戳 + 多源诊断文本），需全字形覆盖。
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.outline,
                         )
@@ -2678,7 +2688,7 @@ private fun McpSection() {
             Text("（空）添加一个 MCP 服务器，例如：", color = MaterialTheme.colorScheme.outline, style = MaterialTheme.typography.labelSmall)
             Text(
                 "npx -y @modelcontextprotocol/server-filesystem /sdcard",
-                style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall, fontFamily = MonoFont,
                 color = MaterialTheme.colorScheme.outline,
             )
         }
@@ -2695,7 +2705,7 @@ private fun McpSection() {
                 Column(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 6.dp)) {
                     Text(s.name, style = MaterialTheme.typography.titleSmall)
                     Text(s.command, style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.outline)
+                        fontFamily = MonoFont, color = MaterialTheme.colorScheme.outline)
                     // ── 每服务器运行状态行：按 host 实际工具列表判定，
                     // 而非只看端口是否应答（端口活着 ≠ server 起来了）。
                     // 正常态的前缀片段用等宽字体（与对话框预览行同款做法）。
@@ -2707,7 +2717,7 @@ private fun McpSection() {
                         Text(
                             buildAnnotatedString {
                                 append("正常运行（${tools[slug]} 个工具）· 前缀 ")
-                                withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+                                withStyle(SpanStyle(fontFamily = MonoFont)) {
                                     append("${slug}__")
                                 }
                             },
@@ -2850,7 +2860,7 @@ private fun McpSection() {
                     Text(
                         buildAnnotatedString {
                             append("工具名前缀：")
-                            withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(finalSlug + "__") }
+                            withStyle(SpanStyle(fontFamily = MonoFont)) { append(finalSlug + "__") }
                             append(if (slugSpecified) "（已指定）" else "（自动派生）")
                         },
                         style = MaterialTheme.typography.labelSmall,

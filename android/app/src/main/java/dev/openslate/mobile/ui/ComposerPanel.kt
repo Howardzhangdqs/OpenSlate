@@ -41,7 +41,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import dev.openslate.mobile.bridge.ConfigUi
 import dev.openslate.mobile.bridge.McpHostManager
@@ -342,10 +346,16 @@ private fun ModelPickerRow(
             )
             Spacer(Modifier.weight(1f))
             Text(
-                when {
-                    options.isEmpty() -> "未配置模型"
-                    modelAlias.isEmpty() -> "未设置"
-                    else -> RuntimeBridge.modelAliasDisplay(currentEntry, config)
+                // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
+                // 子集；「未配置/未设置」等纯状态分支保持默认字体。
+                text = when {
+                    options.isEmpty() -> AnnotatedString("未配置模型")
+                    modelAlias.isEmpty() -> AnnotatedString("未设置")
+                    else -> buildAnnotatedString {
+                        withStyle(SpanStyle(fontFamily = MonoFont)) {
+                            append(RuntimeBridge.modelAliasDisplay(currentEntry, config))
+                        }
+                    }
                 },
                 style = MaterialTheme.typography.labelLarge,
                 color = if (options.isEmpty()) {

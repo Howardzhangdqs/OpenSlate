@@ -37,6 +37,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -140,7 +141,8 @@ private fun rememberGlassMenuStyle(): HazeBlurStyle {
  * 玻璃弹层本体。调用方把它放在锚点行的同一 Box 内（Popup 以父布局锚定），
  * 展开时在锚点上/下方弹出条目列。[hazeState] 为宿主屏标注过 hazeSource 的
  * 状态（ChatScreen / SettingsScreen 各自持有并传入）。空 items 不弹（调用
- * 方一般已禁用触发行）。
+ * 方一般已禁用触发行）。[labelFontFamily] 可选注入条目主文字字体（如模型
+ * 菜单传 MonoFont 等宽子集），null = 默认字体，行为不变。
  */
 @Composable
 internal fun GlassDropdownMenu(
@@ -151,6 +153,7 @@ internal fun GlassDropdownMenu(
     modifier: Modifier = Modifier,
     shape: Shape = RoundedCornerShape(16.dp),
     maxHeight: Dp = GlassMenuMaxHeight,
+    labelFontFamily: FontFamily? = null,
     onSelect: (GlassDropdownItem) -> Unit,
 ) {
     // 退场动画期间保持 Popup 组合（currentState 在退场结束前仍为 true）。
@@ -196,10 +199,14 @@ internal fun GlassDropdownMenu(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         for (item in items) {
-                            GlassDropdownMenuItem(item = item, onClick = {
-                                onSelect(item)
-                                onDismissRequest()
-                            })
+                            GlassDropdownMenuItem(
+                                item = item,
+                                labelFontFamily = labelFontFamily,
+                                onClick = {
+                                    onSelect(item)
+                                    onDismissRequest()
+                                },
+                            )
                         }
                     }
                 }
@@ -208,9 +215,14 @@ internal fun GlassDropdownMenu(
     }
 }
 
-/** 弹层条目行：主文字（+可选副行）居左，选中带 Check 图标（ui.md 基线）。 */
+/** 弹层条目行：主文字（+可选副行）居左，选中带 Check 图标（ui.md 基线）。
+ *  [labelFontFamily] 由菜单级注入（null = 默认字体），仅作用于主文字。 */
 @Composable
-private fun GlassDropdownMenuItem(item: GlassDropdownItem, onClick: () -> Unit) {
+private fun GlassDropdownMenuItem(
+    item: GlassDropdownItem,
+    labelFontFamily: FontFamily?,
+    onClick: () -> Unit,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -222,6 +234,7 @@ private fun GlassDropdownMenuItem(item: GlassDropdownItem, onClick: () -> Unit) 
             Text(
                 item.label,
                 style = MaterialTheme.typography.bodyMedium,
+                fontFamily = labelFontFamily,
                 color = if (item.selected) {
                     MaterialTheme.colorScheme.primary
                 } else {

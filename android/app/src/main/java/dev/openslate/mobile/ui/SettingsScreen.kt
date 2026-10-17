@@ -915,54 +915,68 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, haz
         label = "capModelArrow",
     )
     Box {
+        // 经典设置项布局：标签居左、当前值控件（值 + 箭头）贴行右缘
+        // （SpaceBetween + 双方 weight 限宽兜底：值至多占 2/3，超出单行
+        // Ellipsis 截断，标签恒保至少 1/3）。触发域收窄：仅右侧当前值
+        // 控件可点弹层，行其余区域不响应点击。
         Row(
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .clickable(enabled = items.isNotEmpty()) { expanded = true }
                 .padding(horizontal = 4.dp, vertical = 6.dp),
         ) {
             Text(
                 title,
                 style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
-                // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
-                text = when {
-                    items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
-                    bound == null -> AnnotatedString("未设置")
-                    else -> buildAnnotatedString {
-                        withStyle(SpanStyle(fontFamily = MonoFont)) {
-                            append(RuntimeBridge.modelAliasDisplay(bound, config))
-                        }
-                    }
-                },
-                style = MaterialTheme.typography.labelLarge,
-                color = if (bound == null) {
-                    MaterialTheme.colorScheme.outline
-                } else {
-                    MaterialTheme.colorScheme.primary
-                },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(2f, fill = false),
+                modifier = Modifier.weight(1f, fill = false),
             )
-            Spacer(Modifier.width(4.dp))
-            Icon(
-                Icons.Filled.KeyboardArrowDown,
-                contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
-                tint = MaterialTheme.colorScheme.outline,
-                modifier = Modifier.rotate(arrowAngle),
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(2f, fill = false)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(enabled = items.isNotEmpty()) { expanded = true }
+                    .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
+            ) {
+                Text(
+                    // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
+                    // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
+                    text = when {
+                        items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
+                        bound == null -> AnnotatedString("未设置")
+                        else -> buildAnnotatedString {
+                            withStyle(SpanStyle(fontFamily = MonoFont)) {
+                                append(RuntimeBridge.modelAliasDisplay(bound, config))
+                            }
+                        }
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (bound == null) {
+                        MaterialTheme.colorScheme.outline
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
+                    tint = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.rotate(arrowAngle),
+                )
+            }
         }
         GlassDropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
             hazeState = hazeState,
             items = items,
+            labelFontFamily = MonoFont,
             onSelect = { RuntimeBridge.setCapability(cap, it.value) },
         )
     }

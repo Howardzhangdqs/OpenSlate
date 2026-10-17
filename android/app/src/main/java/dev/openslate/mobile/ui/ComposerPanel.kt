@@ -382,6 +382,7 @@ private fun ModelPickerRow(
             items = options.map { opt ->
                 GlassDropdownItem(value = opt.entry, label = opt.label, selected = opt.entry == currentEntry)
             },
+            labelFontFamily = MonoFont,
             onSelect = { opt -> onSelectModel(opt.value) },
         )
     }

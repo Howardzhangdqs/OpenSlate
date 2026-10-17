@@ -18,11 +18,13 @@ use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
 use serde::Deserialize;
 
-/// 下游 spawn + 握手超时（npx 首次解析较慢，给足）。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 下游 spawn + 握手超时（npx 首次解析较慢，给足）。builtin server 的
+/// 进程内握手复用同一值（`crate::builtin`）。
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 单次工具调用超时（与 OpenSlate 侧 per-call 300s 对齐）。
-const CALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// 单次工具调用超时（与 OpenSlate 侧 per-call 300s 对齐）。builtin
+/// 调用同样外包此值（`crate::builtin`）。
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 工具名前缀分隔符：`alias__tool`。
 pub const PREFIX_SEP: &str = "__";

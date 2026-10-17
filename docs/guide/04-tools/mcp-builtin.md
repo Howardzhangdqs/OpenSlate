@@ -1,9 +1,12 @@
-# 04 · openslate-mcp-builtin：内置 MCP server（fs / shell / edit / skill）
+# 04 · openslate-mcp-builtin：内置 MCP server（fs / shell / bash / edit / skill）
 
-> 面向接手本项目的 AI agent。四个**进程内** MCP server（rmcp `ServerHandler`），
+> 面向接手本项目的 AI agent。五个**进程内** MCP server（rmcp `ServerHandler`），
 > 取代 legacy 的 `openslate-core::tool` 内置工具。全部是库代码：不写 stdout/stderr，
-> 理论上也可以走 stdio 对外提供而协议保持干净。crate 只依赖 `rmcp`，**不依赖
-> openslate-core**（避免环）。
+> 理论上也可以走 stdio 对外提供而协议保持干净。crate 只依赖
+> futures/rmcp/serde/thiserror/tokio，**不依赖 openslate-core**（避免环）。
+> 消费方有两个：core 侧 `connect_builtin_servers`（桌面/App 装配）与
+> **openslate-mcp-host**（Termux 聚合宿主，host 的唯一 workspace 依赖——见
+> `01-architecture/crate-layers.md` 规则5 白名单）。
 
 ---
 
@@ -12,11 +15,22 @@
 | 模块 | server 类型 | 工具 | 沙箱 | 行数 |
 |------|------------|------|------|------|
 | `src/fs.rs` | `FsServer::new(root)` | `read_file` / `write_file` | workspace root | 716 |
-| `src/shell.rs` | `ShellServer::new(root)` | `shell` | cwd = workspace root | 562 |
+| `src/shell.rs` | `ShellServer::new(root)` | `shell` | cwd = workspace root | 590 |
+| `src/bash.rs` | `BashServer::new(root, bash_path)` | `bash` | cwd = workspace root | 214 |
 | `src/edit/mod.rs` + `edit/editor.rs` | `EditServer::new(root)` | `edit_file` | workspace-relative，文件必须已存在 | 440 + 875 |
 | `src/skill.rs` | `SkillServer::new(skills: Vec<SkillInfo>)` | `read_skill` | 无（内存目录快照） | 549 |
 
-### 1.1 rmcp 宏套路（每个 server 一致）
+### 1.1 bash.rs：显式 bash 路径 + 共享执行核心
+
+`BashServer` 是 Termux 场景（mcp-host 嵌入）的 bash 执行 server：**bash 可执行路径
+由调用方显式传入**（host 侧从 `$PREFIX/bin/bash` 解析，PATH `bash` 兜底）——
+`$PREFIX` 是 Termux 环境知识，本 crate 保持零环境探测。执行语义与 `shell` **完全
+共享**：`shell::run_shell_command`（shell.rs，pub(crate)）一份实现供给两个工具
+（超时阶梯 / 64KB 头尾截断 / 敏感 env 脱敏 / exit_code+stdout/stderr 分节），
+防两份 ~250 行实现漂移。`bash`ism 回归测试（`[[ ]]`）保证走的确实是 bash 而非
+平台 `sh`。
+
+### 1.2 rmcp 宏套路（每个 server 一致）
 
 ```rust
 #[tool_router]
@@ -34,7 +48,7 @@ impl ServerHandler for FsServer {}
 参数结构体 derive `serde::Deserialize + schemars::JsonSchema`，schema 自动生成，
 字段用 `#[schemars(description = "…")]` 给模型提示。
 
-### 1.2 错误约定（所有 server 一致）
+### 1.3 错误约定（所有 server 一致）
 
 - **业务失败**（文件缺失、沙箱拒绝、IO 错误、非零退出码）→
   `Ok(CallToolResult::error(vec![ContentBlock::text(msg)]))`（`error_text` helper），
@@ -67,9 +81,13 @@ tool-level error result（镜像 legacy `ToolError::SecurityError/ExecutionError
 - `write_file`（L204-236）：父目录 `create_dir_all`（legacy 行为）；成功文案
   `Successfully wrote {N} bytes to '{path}'`。
 
-## 3. shell.rs：限额与安全
+## 3. shell.rs：限额与安全（bash.rs 共享）
 
-### 3.1 常量（shell.rs:25-33）
+执行核心 `run_shell_command`（pub(crate)，shell.rs:145 起）一份实现同时供给 `shell`
+（平台 shell）与 `bash`（显式 bash 路径）两个工具——本节全部限额/安全语义对二者
+一体生效。
+
+### 3.1 常量（shell.rs:29-37）
 
 ```rust
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;        // 默认命令超时
@@ -174,5 +192,6 @@ if !any_tool && skills.is_empty() { return Ok((Vec::new(), Vec::new())); }
 - 新增内置工具 → 按 `adding-a-tool.md` 手把手流程；deny-by-default 开关别忘了。
 - 动沙箱 → `resolve_workspace_path` 的 5 条规则与单测是安全边界，符号链接逃逸用例
   必须继续过。
-- 动 shell 限额 → 常量集中在 shell.rs 顶部；截断必须字符边界安全（多字节用例有测试）。
+- 动 shell 限额 → 常量集中在 shell.rs 顶部；截断必须字符边界安全（多字节用例有测试）；
+  `shell` 与 `bash` 走同一 `run_shell_command` 核心，**不许给 bash 复制一份**。
 - 动 skill 上限 → `MAX_BODY_BYTES` / `MAX_RESOURCE_ENTRIES` 是上下文保护，不是可调配置。

@@ -34,8 +34,8 @@ OpenSlate 是一个 Rust workspace 实现的**多前端 Agent Runtime**：同一
 |-------|----|-----------|-----------------|
 | `openslate-core` | 核心层 | 领域模型 + 执行引擎（types/provider/tool/runner/runtime/run_manager/config/mcp/skills/approval/…） | mcp-builtin, ptc |
 | `openslate-ptc` | 核心层（叶子） | QuickJS 沙箱：PTC 脚本执行器 + `ToolCallMode` 枚举 | 无 |
-| `openslate-mcp-builtin` | 核心层（叶子） | 内置 in-process MCP server（read_file/write_file/shell/edit_file/skill） | 无 |
-| `openslate-mcp-host` | 独立 | Termux 侧 MCP 聚合宿主（Android 外部工具供给） | **零** workspace 依赖 |
+| `openslate-mcp-builtin` | 核心层（叶子） | 内置 in-process MCP server（read_file/write_file/shell/bash/edit_file/skill） | 无 |
+| `openslate-mcp-host` | 独立 | Termux 侧 MCP 聚合宿主（Android 外部工具供给 + builtin bash/fs/edit 进程内拉起） | mcp-builtin（唯一白名单项） |
 | `openslate-store-sqlite` | 数据层 | SQLite 持久化：7 张表、版本化迁移、RunRecorder | core |
 | `openslate-protocol` | 协议层 | ClientMsg/ServerMsg + 全部 DTO（单一文件 crate，纯数据） | core |
 | `openslate-model-genai` | 装配层 | `ModelProvider` 的 genai 实现（唯一实现） | core |

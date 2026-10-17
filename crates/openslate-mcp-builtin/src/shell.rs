@@ -7,6 +7,10 @@
 //!
 //! A non-zero exit code is reported as a tool-level error result — with the
 //! full output included — so the LLM can see what failed and self-correct.
+//!
+//! The execution core ([`run_shell_command`]) is shared with the `bash`
+//! server in [`crate::bash`]: identical timeout ladder, truncation, env
+//! scrubbing and output format, only the interpreter binary differs.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -140,6 +144,119 @@ fn is_sensitive_env(name: &str) -> bool {
     SENSITIVE_ENV_MARKERS.iter().any(|m| upper.contains(m))
 }
 
+/// Shared execution core behind the `shell` tool here and the `bash` tool in
+/// [`crate::bash`]: spawn `program flag command` with `root` as the working
+/// directory, apply the timeout ladder, output truncation and env scrubbing,
+/// then render the sectioned result. One implementation (instead of two
+/// ~250-line copies) keeps the two tools' semantics from drifting apart.
+pub(crate) async fn run_shell_command<P: AsRef<std::ffi::OsStr>>(
+    program: P,
+    flag: &str,
+    root: &Path,
+    command: &str,
+    timeout_ms: Option<u64>,
+) -> Result<CallToolResult, McpError> {
+    if command.trim().is_empty() {
+        return Err(McpError::invalid_params(
+            "'command' must not be empty",
+            None,
+        ));
+    }
+    let timeout = effective_timeout(timeout_ms);
+
+    let mut spawn_cmd = tokio::process::Command::new(program);
+    spawn_cmd
+        .arg(flag)
+        .arg(command)
+        .current_dir(root)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Scrub secret-bearing variables (API keys, tokens, ...) inherited
+    // from this process so the model cannot read them out of the child
+    // (e.g. `env | grep -i key`) into its context.
+    for (name, _value) in std::env::vars() {
+        if is_sensitive_env(&name) {
+            spawn_cmd.env_remove(&name);
+        }
+    }
+
+    let mut child = match spawn_cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(error_text(format!(
+                "Failed to run command '{}': {}",
+                command, e
+            )));
+        }
+    };
+
+    // Keep the pipe handles and buffers outside the timed future so a
+    // timeout cannot drop already-captured output.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+
+    // Wait and pipe reads must run concurrently: a child producing more
+    // than the pipe buffer blocks until we read.
+    let run = async {
+        let read_out = read_pipe(stdout_pipe.as_mut(), &mut stdout_buf);
+        let read_err = read_pipe(stderr_pipe.as_mut(), &mut stderr_buf);
+        let wait = child.wait();
+        // `join!` polls all three; borrows (pipes/buffers vs child) are
+        // pairwise disjoint.
+        let ((), (), status) = tokio::join!(read_out, read_err, wait);
+        status
+    };
+
+    let status = match tokio::time::timeout(timeout, run).await {
+        Ok(status) => status,
+        Err(_elapsed) => {
+            // Kill the (direct) shell process, reap it, then drain any
+            // pipe data already buffered.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = tokio::time::timeout(
+                DRAIN_GRACE,
+                read_pipe(stdout_pipe.as_mut(), &mut stdout_buf),
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                DRAIN_GRACE,
+                read_pipe(stderr_pipe.as_mut(), &mut stderr_buf),
+            )
+            .await;
+            let stdout = String::from_utf8_lossy(&stdout_buf);
+            let stderr = String::from_utf8_lossy(&stderr_buf);
+            let mut msg = format!(
+                "TIMEOUT: command killed after {}ms\n\n{}",
+                timeout.as_millis(),
+                format_output(-1, &stdout, &stderr)
+            );
+            if msg.len() > MAX_OUTPUT_BYTES {
+                msg = truncate_output(&msg);
+            }
+            return Ok(error_text(msg));
+        }
+    };
+
+    let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&stdout_buf);
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+
+    let output = truncate_output(&format_output(exit_code, &stdout, &stderr));
+    if exit_code == 0 {
+        Ok(success_text(output))
+    } else {
+        // Non-zero exit: error result, but the full output is included so
+        // the LLM can diagnose and retry.
+        Ok(error_text(output))
+    }
+}
+
 #[tool_router]
 impl ShellServer {
     /// Create a server that runs commands with `root` as working directory.
@@ -163,105 +280,16 @@ impl ShellServer {
         &self,
         Parameters(args): Parameters<ShellParams>,
     ) -> Result<CallToolResult, McpError> {
-        if args.command.trim().is_empty() {
-            return Err(McpError::invalid_params(
-                "'command' must not be empty",
-                None,
-            ));
-        }
-        let timeout = effective_timeout(args.timeout_ms);
-
-        let mut command = tokio::process::Command::new(SHELL_PROGRAM);
-        command
-            .arg(SHELL_FLAG)
-            .arg(&args.command)
-            .current_dir(&self.root)
-            .kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Scrub secret-bearing variables (API keys, tokens, ...) inherited
-        // from this process so the model cannot read them out of the child
-        // (e.g. `env | grep -i key`) into its context.
-        for (name, _value) in std::env::vars() {
-            if is_sensitive_env(&name) {
-                command.env_remove(&name);
-            }
-        }
-
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(error_text(format!(
-                    "Failed to run command '{}': {}",
-                    args.command, e
-                )));
-            }
-        };
-
-        // Keep the pipe handles and buffers outside the timed future so a
-        // timeout cannot drop already-captured output.
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-        let mut stdout_buf: Vec<u8> = Vec::new();
-        let mut stderr_buf: Vec<u8> = Vec::new();
-
-        // Wait and pipe reads must run concurrently: a child producing more
-        // than the pipe buffer blocks until we read.
-        let run = async {
-            let read_out = read_pipe(stdout_pipe.as_mut(), &mut stdout_buf);
-            let read_err = read_pipe(stderr_pipe.as_mut(), &mut stderr_buf);
-            let wait = child.wait();
-            // `join!` polls all three; borrows (pipes/buffers vs child) are
-            // pairwise disjoint.
-            let ((), (), status) = tokio::join!(read_out, read_err, wait);
-            status
-        };
-
-        let status = match tokio::time::timeout(timeout, run).await {
-            Ok(status) => status,
-            Err(_elapsed) => {
-                // Kill the (direct) shell process, reap it, then drain any
-                // pipe data already buffered.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = tokio::time::timeout(
-                    DRAIN_GRACE,
-                    read_pipe(stdout_pipe.as_mut(), &mut stdout_buf),
-                )
-                .await;
-                let _ = tokio::time::timeout(
-                    DRAIN_GRACE,
-                    read_pipe(stderr_pipe.as_mut(), &mut stderr_buf),
-                )
-                .await;
-                let stdout = String::from_utf8_lossy(&stdout_buf);
-                let stderr = String::from_utf8_lossy(&stderr_buf);
-                let mut msg = format!(
-                    "TIMEOUT: command killed after {}ms\n\n{}",
-                    timeout.as_millis(),
-                    format_output(-1, &stdout, &stderr)
-                );
-                if msg.len() > MAX_OUTPUT_BYTES {
-                    msg = truncate_output(&msg);
-                }
-                return Ok(error_text(msg));
-            }
-        };
-
-        let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&stdout_buf);
-        let stderr = String::from_utf8_lossy(&stderr_buf);
-
-        let output = truncate_output(&format_output(exit_code, &stdout, &stderr));
-        if exit_code == 0 {
-            Ok(success_text(output))
-        } else {
-            // Non-zero exit: error result, but the full output is included so
-            // the LLM can diagnose and retry.
-            Ok(error_text(output))
-        }
+        // 执行核心与 `bash` 工具（crate::bash）共享，保证超时/截断/脱敏
+        // 语义两处一致；此处只决定用哪个解释器（平台 shell）。
+        run_shell_command(
+            SHELL_PROGRAM,
+            SHELL_FLAG,
+            &self.root,
+            &args.command,
+            args.timeout_ms,
+        )
+        .await
     }
 }
 

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use openslate_mcp_host::{build_router, load_config, resolve_bind, DownstreamHub};
+use openslate_mcp_host::{build_router, load_config, resolve_bind, BuiltinHub, DownstreamHub};
 
 #[derive(Parser)]
 #[command(
@@ -73,10 +73,18 @@ async fn main() -> Result<()> {
         .token
         .as_deref()
         .is_some_and(|t| !t.is_empty());
+    // builtin server 群：进程内拉起（bash/fs/edit）。失败 = 代码 bug
+    // （与环境无关），硬错误退出——不像外部下游"失败即跳过"。
+    let builtin = Arc::new(
+        BuiltinHub::spawn(&cfg.builtin)
+            .await
+            .context("spawning builtin servers")?,
+    );
+    let n_builtin = builtin.tools().len();
     let hub = Arc::new(DownstreamHub::new(cfg.servers));
-    let router = build_router(hub, cfg.token);
+    let router = build_router(hub, builtin, cfg.token);
     tracing::info!(target: "mcp_host",
-        "listening on http://{bind}/mcp ({n_servers} downstream server(s), auth {})",
+        "listening on http://{bind}/mcp ({n_servers} downstream server(s), {n_builtin} builtin tool(s), auth {})",
         if auth_on { "on" } else { "OFF" });
 
     let listener = tokio::net::TcpListener::bind(bind)

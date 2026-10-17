@@ -42,7 +42,8 @@
                         │                edit/skill）                   │
                         └───────────────────────────────────────────────┘
   另有独立 crate：openslate-model-genai（ModelProvider 的 genai 实现，依赖 core）
-                  openslate-mcp-host  （Termux 侧 MCP 聚合宿主，零 workspace 依赖）
+                  openslate-mcp-host  （Termux 侧 MCP 聚合宿主；唯一 workspace
+                                        依赖 = openslate-mcp-builtin，见规则5白名单）
 ```
 
 ## 2. 精确依赖表（来源：各 crate 的 `Cargo.toml`）
@@ -51,8 +52,8 @@
 |-------|-----------------|
 | `openslate-core` | `openslate-mcp-builtin`, `openslate-ptc` |
 | `openslate-ptc` | 无 |
-| `openslate-mcp-builtin` | 无 |
-| `openslate-mcp-host` | **无**（刻意独立，可单独装进 Termux） |
+| `openslate-mcp-builtin` | 无（futures/rmcp/serde/thiserror/tokio 叶子） |
+| `openslate-mcp-host` | **`openslate-mcp-builtin`**（唯一白名单项，见规则5；用于进程内拉起 bash/fs/edit） |
 | `openslate-store-sqlite` | core |
 | `openslate-protocol` | core |
 | `openslate-model-genai` | core |
@@ -72,7 +73,12 @@ vendor 说明：`vendor/genai` 在根 `Cargo.toml` 的 `exclude` 列表里——
 2. **ptc 不得依赖 core**（方向是 core → ptc）。`openslate-ptc` 的公开 API 只用纯数据类型（如 `[ptc]` 配置与沙箱共享的 `ToolCallMode` 枚举），保证沙箱 crate 可独立演进/复用。
 3. **protocol 是纯数据层**：不依赖 tokio/axum，server 与 client（TUI）两侧共用同一真相源。任何传输概念（连接、队列）不进 protocol。
 4. **session 不依赖任何传输**（axum/WS/FFI 均不在依赖树）。WS server 与 mobile 共用一个 `SessionCore`，事件出口抽象成 `MsgSink` trait。
-5. **mcp-host 零 workspace 依赖**：它是部署在 Termux 里的独立二进制，与主工程只共享 MCP 协议本身。
+5. **mcp-host 唯一允许的 workspace 依赖是 `openslate-mcp-builtin`**（白名单式豁免）：
+   host 启动时进程内拉起 builtin server 群（bash/fs/edit，见 `04-tools/mcp-host.md`
+   §6.5）。前提是 **mcp-builtin 必须保持 rmcp+tokio 级叶子**——禁止依赖
+   core/protocol（否则 host 经 mcp-builtin 传递依赖 core，破层且 musl 静态交叉构建
+   会被 core 的依赖树拖垮）。除 mcp-builtin 外，host 不得新增任何 workspace 依赖
+   （它是部署在 Termux 里的独立二进制，与主工程只共享 MCP 协议本身）。
 
 违反上述任一条（例如让 core 引用 protocol、让 ptc 引用 core、在 session 里 use axum）都会破坏既有的复用边界——review 时按红线处理。
 
@@ -82,7 +88,7 @@ vendor 说明：`vendor/genai` 在根 `Cargo.toml` 的 `exclude` 列表里——
 
 - `openslate-core`：领域类型系统（`types.rs` 的 ID newtype 家族、Message/Usage/ToolCall）、模型调用抽象（`provider.rs`）、agent 执行引擎（`runtime.rs` 单 agent 循环 + `runner.rs` 递归子代理编排 + `run_manager.rs` 入口）、配置解析/合并/写回（`config/`）、工具注册（`tool.rs`）、MCP 接入（`mcp.rs`）、审批（`approval.rs`）、技能（`skills.rs`）、提示词（`prompt.rs`）、路径发现（`paths.rs`）、Chrome Trace（`trace.rs`）、错误体系（`error.rs`）。详见 [../02-core/openslate-core.md](../02-core/openslate-core.md)。
 - `openslate-ptc`：QuickJS 沙箱执行器。输入是模型写的 JS async 箭头函数字符串，沙箱内经桥接闭包调用宿主工具；无网络、硬超时、每 run 一个 isolate。
-- `openslate-mcp-builtin`：内置工具的 in-process MCP server。用 tuple transport 直连（无子进程、无序列化开销），core 侧经 `connect_builtin_servers`（`core/src/mcp.rs:578`）挂进 ToolRegistry，工具名用裸名（`read_file` 等）。
+- `openslate-mcp-builtin`：内置工具的 in-process MCP server（fs/shell/bash/edit/skill）。core 侧经 `connect_builtin_servers`（`core/src/mcp.rs:578`）挂进 ToolRegistry，工具名用裸名（`read_file` 等）；**openslate-mcp-host 也复用它**（Termux 侧拉起 bash/fs/edit，见规则 5 白名单）。bash server 的执行语义与 shell 共享同一核心（`shell::run_shell_command`）。
 
 ### 数据层（store-sqlite）
 
@@ -113,4 +119,5 @@ vendor 说明：`vendor/genai` 在根 `Cargo.toml` 的 `exclude` 列表里——
 - 给 core 加依赖前问：这个 crate 是否比 core 更"核心"？protocol/store 都依赖 core，core 反向引用它们会成环。
 - 给 ptc 加 core 依赖 = 直接违反规则 2。
 - 在 session 里 `use axum::*` / 在 protocol 里 `use tokio::*` = 违反规则 3/4。
-- mcp-host 加任何 workspace 依赖 = 违反规则 5。
+- mcp-host 加 mcp-builtin 以外的 workspace 依赖 = 违反规则 5；给 mcp-builtin 加
+  core/protocol（或任何第三方）依赖 = 同样违反规则 5（叶子前提被拆）。

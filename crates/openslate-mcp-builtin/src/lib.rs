@@ -7,6 +7,10 @@
 //!   (faithful port of the original tools' semantics and messages).
 //! - [`shell`]: `shell`, runs a command in the workspace root with timeout
 //!   and output truncation.
+//! - [`bash`]: `bash`, same execution semantics as [`shell`] but running an
+//!   explicit bash executable (path supplied by the caller — e.g. Termux
+//!   `$PREFIX/bin/bash` resolved by openslate-mcp-host, which embeds this
+//!   crate as its only workspace dependency).
 //! - [`edit`]: `edit_file`, applies a small context patch (with `@@` anchors)
 //!   to an existing file via the pure engine in [`edit::editor`].
 //! - [`skill`]: `read_skill`, loads the full markdown body of an agent skill
@@ -17,11 +21,13 @@
 //! (no stdio / HTTP transport). Everything here is a library: nothing writes
 //! to stdout/stderr, so serving these over stdio stays protocol-clean.
 
+pub mod bash;
 pub mod edit;
 pub mod fs;
 pub mod shell;
 pub mod skill;
 
+pub use bash::BashServer;
 pub use skill::{SkillInfo, SkillServer};
 
 #[cfg(test)]

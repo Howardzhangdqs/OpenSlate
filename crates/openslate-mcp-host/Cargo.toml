@@ -12,8 +12,14 @@ license.workspace = true
 #
 # 部署形态：aarch64 musl 静态二进制（零运行时依赖），adb push / /sdcard
 # 中转到 Termux 执行；与 App 共用同一 rmcr 版本，协议协商零分歧。
+#
+# 唯一允许的 workspace 依赖（crate-layers.md 规则5的白名单豁免）：
+# openslate-mcp-builtin——host 启动时进程内拉起 BashServer/FsServer/
+# EditServer 供给裸名工具（bash/read_file/…）。mcp-builtin 保持
+# rmcp+tokio 级叶子（禁止依赖 core/protocol），故不破分层。
 
 [dependencies]
+openslate-mcp-builtin = { path = "../openslate-mcp-builtin" }
 # rmcp 独立声明（不走 workspace = true）：避免继承 workspace 统一 feature 集
 # 里的 transport-streamable-http-client-reqwest（reqwest+rustls+ring）——
 # musl 静态交叉构建 ring 需要额外工具链；host 上游是 server、下游是 stdio

@@ -2413,6 +2413,7 @@ dependencies = [
  "clap",
  "futures",
  "http",
+ "openslate-mcp-builtin",
  "reqwest",
  "rmcp",
  "serde",

@@ -33,7 +33,6 @@ import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Key
@@ -1739,15 +1738,15 @@ internal fun CompactButton(
     }
 }
 
-/** 状态行：成功 → 实心对勾圆（绿）；未就绪 → 空心圆（灰）。 */
+/** 状态行：成功 → 实心对勾圆（绿）；未就绪 → 实心红叉圆（error 色）。 */
 @Composable
 private fun McpStatusLine(ok: Boolean, text: String) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(
-            imageVector = if (ok) Icons.Filled.CheckCircle else Icons.Outlined.Circle,
+            imageVector = if (ok) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
             contentDescription = if (ok) "已就绪" else "未就绪",
             tint = if (ok) successGreen()
-            else MaterialTheme.colorScheme.outline,
+            else MaterialTheme.colorScheme.error,
             modifier = Modifier.height(14.dp).width(14.dp),
         )
         Text("  $text", style = MaterialTheme.typography.labelMedium)

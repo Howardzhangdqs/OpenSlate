@@ -80,6 +80,13 @@ pub async fn list_remote_models(
 - Rust 全链路（resolve_model/persist/registry/session）把 entry 当**不透明串**，
   键格式仅是 mobile 侧约定；UI 显示层经 `RuntimeBridge.modelAliasDisplay` 把
   条目键换「Provider显示名/modelId」，entry 裸串不直出。
+- **UI 已去 levels 映射层**（2026-10）：设置页功能绑定/对话页选择器一律直绑
+  `[models]` 条目；存量「capability → levels 代号」引用由启动迁移一次性改写
+  （RuntimeBridge `maybeMigrateCapabilityDirect`：代号引用解析成条目后
+  `set_capability` 直绑 + main 缺省时补显式落点；两段式校验通过才写标记
+  `migrated_capability_direct_v1`，且必须等上面的条目键迁移完成后链式启动
+  ——两者都改写 capabilities 引用，并行互踩）。`[levels]` 表不删不写，仅作
+  resolve 的遗留兼容层（levels 语义见 model-genai.md §4 UI 注记）。
 
 ## 7. 检测之后：能力字段哪里来
 

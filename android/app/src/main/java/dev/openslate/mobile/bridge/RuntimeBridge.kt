@@ -612,15 +612,26 @@ object RuntimeBridge {
     // ── 模型别名显示（共享助手；entry 内部键不直出 UI）──────────────
 
     /**
+     * 别名 → 实际命中的 [models] 条目键（镜像 Rust resolve_model 首步：
+     * 先查 [levels]，未命中则原样直查 [models]）。UI 侧「把当前值解析到
+     * 条目」统一走此助手：模型选择器选中比对/显示、顶栏副标题、思考中
+     * chip 的能力判定共用。levels 为 UI 不再暴露的遗留层（保留不写），
+     * 此处只读解析作兜底。
+     */
+    fun modelEntryOf(alias: String, config: ConfigUi): String =
+        if (alias.isEmpty()) alias else config.levels[alias] ?: alias
+
+    /**
      * 别名 → UI 显示串。命中 [ConfigUi.models] 条目（直绑形态）→
      * 「Provider显示名/modelId」——provider 显示名与 Provider 页/选择
      * 器同源（title 优先、回退内部 name，见 [ProviderUi.displayName]）；
-     * levels 代号（用户自命名，不转换）与未命中 → 原样返回；空串原样
-     * （「未设置」等占位由调用方处理）。内部 entry 键（`zhipuai/glm-4.7`，
-     * 历史 `zhipu__glm-4-7`）经此转换后不出现在任何 UI 文本——顶栏副
-     * 标题（ChatScreen）、模型选择器（ComposerPanel）、功能模型分段控
-     * 件（SettingsScreen）三处共用。纯函数读传入 config，无额外缓存，
-     * config_changed 刷新 state 后自动跟随。
+     * levels 代号（用户自命名，不转换）与未命中 → 原样返回（levels 为
+     * UI 不再暴露的遗留层，本分支仅作遗留兜底——调用方一律先经
+     * [modelEntryOf] 解析到条目再显示）；空串原样（「未设置」等占位由
+     * 调用方处理）。内部 entry 键（`zhipuai/glm-4.7`，历史 `zhipu__glm-4-7`）
+     * 经此转换后不出现在任何 UI 文本——顶栏副标题（ChatScreen）、模型
+     * 选择器（ComposerPanel）、功能模型绑定行（SettingsScreen）三处共用。
+     * 纯函数读传入 config，无额外缓存，config_changed 刷新 state 后自动跟随。
      */
     fun modelAliasDisplay(alias: String, config: ConfigUi): String {
         if (alias.isEmpty()) return alias
@@ -1192,6 +1203,10 @@ object RuntimeBridge {
         mutate { copy(config = parseConfig(c)) }
         // 迁移第二段：config_changed 到达 → 完成校验（幂等，无待校验则 no-op）。
         verifyModelEntryMigration()
+        verifyCapabilityDirectMigration()
+        // 条目键迁移若在本轮校验通过，链式启动 capabilities 直绑迁移（闸门/
+        // 标记幂等，未轮到时为 no-op）。
+        maybeMigrateCapabilityDirect()
     }
 
     // ── 模型条目键一次性迁移（legacy `p__m` slug → `p/m`；两段式）──────
@@ -1246,6 +1261,8 @@ object RuntimeBridge {
                     // 空核对清单视同校验通过，直接置标记。
                     prefs.edit().putBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, true).apply()
                     Log.i(TAG, "model-entry migration: nothing attempted, marked done ($PREF_MIGRATED_MODEL_ENTRY_SLASH)")
+                    // 条目键迁移完成 → capabilities 直绑迁移解锁（幂等）。
+                    maybeMigrateCapabilityDirect()
                 } else {
                     pendingMigrationVerify.set(attempted)
                     Log.i(TAG, "model-entry migration: ops sent for ${attempted.size} entrie(s), awaiting config verification")
@@ -1290,6 +1307,8 @@ object RuntimeBridge {
             ctx.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
                 .edit().putBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, true).apply()
             Log.i(TAG, "model-entry migration: verified ${records.size} entrie(s), marked done ($PREF_MIGRATED_MODEL_ENTRY_SLASH)")
+            // 条目键迁移完成 → capabilities 直绑迁移解锁（此前被闸住未启动）。
+            maybeMigrateCapabilityDirect()
         } else {
             Log.e(TAG, "model-entry migration: verification not passed (${problems.size}): ${problems.joinToString("; ")}")
         }
@@ -1413,6 +1432,130 @@ object RuntimeBridge {
         return attempted
     }
 
+    // ── capabilities 直绑一次性迁移（代号引用 → models 条目；两段式）─────
+    //
+    // UI 已全面去 levels（设置页功能绑定/选择器只列 models 条目），本迁移把
+    // 存量配置里「capability → levels 代号」的引用一次性改写为「capability →
+    // 条目直绑」，并给走缺省回退的功能补显式落点。[levels] 表不删不写（无
+    // 删除 FFI，留作不被引用的遗留层；resolve_model 的 levels 优先序不变，
+    // 只读解析作遗留兜底）。沿用模型条目键迁移的两段式状态机：第一段发 op
+    // 不置标记，第二段挂 config 事件路径校验、全过才写 prefs 标记；操作幂
+    // 等（stored == target 不重发），失败下次启动重试。
+
+    /** 迁移防重跑标记（FILE_MAIN；**校验通过才置位**，置位后永不再跑）。 */
+    private const val PREF_MIGRATED_CAPABILITY_DIRECT = "migrated_capability_direct_v1"
+
+    /** 功能 id 全集（镜像 core model_config.rs CAPABILITIES 及缺省回退）。 */
+    private val CAPABILITY_IDS = listOf("main", "compact", "title")
+
+    /** 进程内单发闸：snapshot 多次到达防重复挂协程。 */
+    @Volatile
+    private var capDirectMigrationLaunched = false
+
+    /**
+     * 第二段「待校验」态：本轮已发送的 (功能, 目标条目) 清单（null = 无待
+     * 校验）。第一段发完置入，第二段（applyConfig/applySnapshot 的 config
+     * 路径）在每次 config 更新到达时核对，全部通过才写 prefs 标记。
+     */
+    private val pendingCapDirectVerify = AtomicReference<List<Pair<String, String>>?>(null)
+
+    /**
+     * 迁移计划（纯函数）。每个功能算目标条目：
+     * - 生效别名（capabilities[cap]，缺省回退 main→"main"、compact/title→
+     *   "fast"，镜像 core capability_alias）命中 [levels] 键 → 改写为 levels
+     *   值（条目键）——含功能完全缺省、回退别名实为代号的情况；
+     * - 功能缺省且回退别名直接命中 [models] 条目（无 levels 的存量配置）→
+     *   显式写入，让主对话有明确绑定落点（行为不变，只把隐式缺省变显式）；
+     * - 已直绑（生效别名是条目键）→ 不动；
+     * - 悬空（levels 指向缺失条目 / 别名既非代号也非条目）→ 自动改写无从
+     *   谈起，剔除——UI 端该功能行显示「未设置」，用户重选条目即自愈；
+     *   main 侧 Rust 启动链对不可解析别名本就回退 root agent 别名，不会瘫。
+     * stored == target（代号与条目同名的 "fast"→"fast" 形态）不发 op：配置
+     * 值已就位，写无变化。
+     */
+    private fun planCapabilityDirect(config: ConfigUi): List<Pair<String, String>> {
+        val entries = config.models.map { it.entry }.toSet()
+        val plan = mutableListOf<Pair<String, String>>()
+        for (cap in CAPABILITY_IDS) {
+            val stored = config.capabilities[cap]
+            val fallback = if (cap == "main") "main" else "fast"
+            val effective = stored ?: fallback
+            val target = when {
+                config.levels.containsKey(effective) -> config.levels[effective]
+                stored == null && effective in entries -> effective
+                else -> null
+            }?.takeIf { it in entries }
+            if (target != null && target != stored) plan.add(cap to target)
+        }
+        return plan
+    }
+
+    /**
+     * 第一段（挂载点：applySnapshot 末尾 + 条目键迁移校验通过后的链式调用；
+     * **必须等模型条目键迁移完成**——后者同样改写 capabilities 引用，并行
+     * 互踩会把引用写回已删除的旧键，故 prefs 里 slash 标记未置位时直接
+     * 返回、不置本闸门，由后续 config 事件重试）：逐条发送 setCapability
+     * （fire-and-forget，发送失败仅 Log.e，由校验段拦标记），发完进入待
+     * 校验态；无计划（已迁移/无可改）直接置标记。
+     */
+    private fun maybeMigrateCapabilityDirect() {
+        if (capDirectMigrationLaunched) return
+        val ctx = appContext ?: return
+        val prefs = ctx.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(PREF_MIGRATED_MODEL_ENTRY_SLASH, false)) return
+        capDirectMigrationLaunched = true
+        if (prefs.getBoolean(PREF_MIGRATED_CAPABILITY_DIRECT, false)) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                val plan = planCapabilityDirect(_state.value.config)
+                if (plan.isEmpty()) {
+                    prefs.edit().putBoolean(PREF_MIGRATED_CAPABILITY_DIRECT, true).apply()
+                    Log.i(TAG, "capability-direct migration: nothing to do, marked done ($PREF_MIGRATED_CAPABILITY_DIRECT)")
+                } else {
+                    for ((cap, target) in plan) {
+                        if (!setCapability(cap, target)) {
+                            Log.e(TAG, "capability-direct migration: send failed for $cap -> $target (verification will hold the mark)")
+                        }
+                    }
+                    pendingCapDirectVerify.set(plan)
+                    Log.i(TAG, "capability-direct migration: ops sent for ${plan.size} cap(s), awaiting config verification")
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "capability-direct migration: aborted, will retry next launch", t)
+            }
+        }
+    }
+
+    /**
+     * 第二段（挂 applyConfig / applySnapshot 的 config 事件路径，无轮询）：
+     * config 更新到达时重读 state，逐条核对**本轮实际发送**的功能——值已
+     * 等于目标条目 && 条目在 [models] 里。全部通过 → 写 prefs 标记；任一
+     * 不通过 → Log.e 明细、不置标记（op 逐条回刷的中间态会短暂不通过，
+     * 保留待校验态等后续 config 事件再核；进程内始终未过 → 下次启动幂等
+     * 重试）。
+     */
+    private fun verifyCapabilityDirectMigration() {
+        val plan = pendingCapDirectVerify.get() ?: return
+        val ctx = appContext ?: return
+        val cfg = _state.value.config
+        val entries = cfg.models.map { it.entry }.toSet()
+        val problems = buildList {
+            for ((cap, target) in plan) {
+                val v = cfg.capabilities[cap]
+                if (v != target) add("capabilities.$cap = '${v ?: "<unset>"}' (expected '$target')")
+                if (target !in entries) add("'$target': entry missing")
+            }
+        }
+        if (problems.isEmpty()) {
+            pendingCapDirectVerify.set(null)
+            ctx.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_MIGRATED_CAPABILITY_DIRECT, true).apply()
+            Log.i(TAG, "capability-direct migration: verified ${plan.size} cap(s), marked done ($PREF_MIGRATED_CAPABILITY_DIRECT)")
+        } else {
+            Log.e(TAG, "capability-direct migration: verification not passed (${problems.size}): ${problems.joinToString("; ")}")
+        }
+    }
+
     private fun applySnapshot(session: JSONObject?) {
         if (session == null) return
         val transcript = session.optJSONArray("transcript") ?: return
@@ -1472,9 +1615,13 @@ object RuntimeBridge {
         // 模型条目键迁移第二段：config 已入 state → 完成校验（幂等，无待
         // 校验则 no-op；先于第一段，首个 snapshot 时待校验必为空）。
         verifyModelEntryMigration()
+        verifyCapabilityDirectMigration()
         // 模型条目键迁移第一段（legacy `p__m` slug → `p/m`；prefs 防重跑，
         // 挂载点选在此处 = runtime 就绪且 config 已入 state 的最早时刻）。
         maybeMigrateModelEntrySlash()
+        // capabilities 直绑迁移（代号引用 → 条目直绑 + main 显式落点）：
+        // 仅在条目键迁移已完成时启动，否则等其校验通过的链式调用。
+        maybeMigrateCapabilityDirect()
     }
 
     /** 增量并入最后一条同类条目（或新起一条）。 */

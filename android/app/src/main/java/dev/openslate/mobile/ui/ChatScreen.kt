@@ -134,8 +134,15 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
     // 其余条目原样单行渲染。
     val renderItems: List<RenderItem> = remember(state.entries) { groupEntries(state.entries) }
     // 当前模型声明支持思维链时，TTFT 等待期显示"思考中"；无思维链模型不显示。
+    // 会话别名经 modelEntryOf 解析到条目（levels 遗留兜底）再查能力。
     val thinkEligible = state.config.models
-        .find { it.entry == state.modelAlias }?.supportsReasoning == true
+        .find {
+            it.entry == RuntimeBridge.modelEntryOf(state.modelAlias, state.config)
+        }?.supportsReasoning == true
+    // 顶栏副标题的模型显示名：条目键经共享助手换「Provider显示名/modelId」，
+    // 内部 entry 不直出；levels 已不在 UI 暴露，仅作解析兜底。
+    val modelDisplay = RuntimeBridge
+        .modelAliasDisplay(RuntimeBridge.modelEntryOf(state.modelAlias, state.config), state.config)
     val showThinking = state.running && state.awaitingFirstToken && thinkEligible
 
     // 磨砂玻璃：共享的内容捕获层（source）+ 模糊参数；每个玻璃面板在各自
@@ -189,15 +196,12 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                             Text("OpenSlate", style = MaterialTheme.typography.titleLarge)
                             Text(
                                 // 直绑条目键经共享显示助手换「Provider/modelId」，
-                                // 内部 entry 不直出；levels 代号原样。
+                                // 内部 entry 不直出；levels 代号原样（遗留兜底）。
                                 text = when {
                                     !state.ready -> "runtime 启动中…"
                                     state.running ->
-                                        "${RuntimeBridge.modelAliasDisplay(state.modelAlias, state.config)}" +
-                                            " · Step ${state.step} · 工具 ${state.toolCalls}"
-                                    else -> RuntimeBridge
-                                        .modelAliasDisplay(state.modelAlias, state.config)
-                                        .ifEmpty { "就绪" }
+                                        "$modelDisplay · Step ${state.step} · 工具 ${state.toolCalls}"
+                                    else -> modelDisplay.ifEmpty { "就绪" }
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                             )

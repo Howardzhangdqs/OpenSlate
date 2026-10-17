@@ -9,7 +9,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.clickable
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -72,6 +71,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.TextRange
@@ -90,6 +90,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import dev.openslate.mobile.bridge.LogExporter
+import dev.openslate.mobile.bridge.ConfigUi
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.ModelUi
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -128,8 +129,6 @@ fun SettingsScreen(
     var editModelIsNew by remember { mutableStateOf(false) }
     /** Provider 页模型管理打开时锁定 provider（条目归属不可跨 provider 改）。 */
     var editModelLock by remember { mutableStateOf<String?>(null) }
-    /** 代号绑定编辑（null = 关闭；name 空 = 新建）。 */
-    var editAlias by remember { mutableStateOf<AliasDraft?>(null) }
     /** Provider 的模型管理弹窗（null = 关闭）。 */
     var modelsProvider by remember { mutableStateOf<ProviderUi?>(null) }
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
@@ -246,118 +245,38 @@ fun SettingsScreen(
                         // ── 模型域：会话 / 模型 / Provider 三个二级 tab ──
                         when (modelTab) {
                             0 -> {
-                        // ── 会话域：功能模型（功能 → 代号）──────────
-                        // 代号与具体模型的绑定在「模型」页管理；模型清单
-                        // 本身在「Provider」页管理（自动检测 + 手动增删）。
-                        Section(title = "功能模型（哪个功能用哪档模型）") {
+                        // ── 会话域：功能模型（功能 → 模型条目直绑）──────
+                        // 模型条目清单在「Provider」页管理（自动检测 + 手动
+                        // 增删）；levels 代号映射层已从 UI 移除（存量表保留
+                        // 不写，仅作解析兜底）。
+                        Section(title = "功能模型（哪个功能用哪只模型）") {
                             Text(
-                                "会话与模型的关联：每个功能在这里选一个代号，代号再经「模型」页" +
-                                    "绑定到具体模型。换新模型只需在「模型」页把代号改绑到新模型，" +
-                                    "这里不用动。",
+                                "每个功能直接绑定一只模型条目，改动立即落盘生效。" +
+                                    "「主对话」还可在对话页输入框聚焦面板里临时切换（仅当次会话）。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline,
                             )
-                            val aliases = (config.levels.keys + config.capabilities.values)
-                                .distinct().sorted()
                             val capRows = listOf(
-                                Triple("main", "主对话（正常 API 请求）", "main"),
-                                Triple("compact", "上下文压缩（超限自动摘要）", "fast"),
-                                Triple("title", "会话标题生成", "fast"),
+                                "main" to "主对话（正常 API 请求）",
+                                "compact" to "上下文压缩（超限自动摘要）",
+                                "title" to "会话标题生成",
                             )
-                            for ((cap, label, dft) in capRows) {
-                                Column {
-                                    Text(
-                                        label,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.outline,
-                                    )
-                                    SlidingSegmentedControl(
-                                        options = aliases,
-                                        selected = config.capabilities[cap] ?: dft,
-                                        onSelect = { RuntimeBridge.setCapability(cap, it) },
-                                        // 选项值可含 models 直绑条目键 → 经共享
-                                        // 显示助手换「Provider/modelId」，条目
-                                        // 键不直出；levels 代号原样。
-                                        label = { RuntimeBridge.modelAliasDisplay(it, config) },
-                                    )
-                                }
+                            for ((cap, label) in capRows) {
+                                CapabilityModelRow(cap, label, config)
                             }
                         }
                     }
                     1 -> {
-                        // ── 模型域：纯映射（代号 → Provider 的具体模型）──
-                        // 模型清单本身在 Provider 页管理（编辑 Provider 时
-                        // 自动检测 + 手动增删）；本页只做"代号绑定哪只模型"。
-                        Section(
-                            title = "模型代号（代号 → 具体模型）",
-                            action = {
-                                IconButton(onClick = { editAlias = AliasDraft() }) {
-                                    Icon(Icons.Filled.Add, contentDescription = "新增代号")
-                                }
-                            },
-                        ) {
-                            Text(
-                                "代号是「会话」页功能与模型之间的桥梁：功能指向代号，代号在这里" +
-                                    "绑定到 Provider 的具体模型条目（条目清单在 Provider 页维护）。" +
-                                    "新模型发布后把代号改绑到新条目，引用它的功能即刻切换。",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline,
-                            )
-                            if (config.levels.isEmpty()) {
-                                Text("（空）", color = MaterialTheme.colorScheme.outline)
-                            }
-                            for (level in config.levels.keys.sorted()) {
-                                val bound = config.levels[level]?.let { e ->
-                                    config.models.find { it.entry == e }
-                                }
-                                val providerName = bound?.let {
-                                    config.providers.find { p -> p.name == it.provider }?.displayName
-                                        ?: it.provider
-                                }
-                                Card(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    onClick = { editAlias = AliasDraft(level, config.levels[level] ?: "") },
-                                ) {
-                                    Row(
-                                        Modifier.padding(12.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        Column(Modifier.weight(1f)) {
-                                            Text(level, style = MaterialTheme.typography.titleSmall)
-                                            Text(
-                                                bound
-                                                    ?.let { "$providerName · ${it.modelId}" }
-                                                    ?: "绑定的模型条目缺失",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = if (bound != null) {
-                                                    MaterialTheme.colorScheme.outline
-                                                } else {
-                                                    MaterialTheme.colorScheme.error
-                                                },
-                                            )
-                                        }
-                                        Icon(
-                                            Icons.Filled.Edit,
-                                            contentDescription = "改绑",
-                                            tint = MaterialTheme.colorScheme.outline,
-                                        )
-                                        // main/fast 必需、被功能引用的代号不可删
-                                        // （服务端同款守卫，这里不显示入口）。
-                                        val deletable = level != "main" && level != "fast" &&
-                                            level !in config.capabilities.values
-                                        if (deletable) {
-                                            IconButton(onClick = { RuntimeBridge.deleteLevel(level) }) {
-                                                Icon(
-                                                    Icons.Filled.Delete,
-                                                    contentDescription = "删除代号",
-                                                    tint = MaterialTheme.colorScheme.outline,
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // ── 模型域：条目管理入口指引 + 元数据数据源 ──────
+                        // levels 代号列表/绑定/创建已随映射层一并移除；模型
+                        // 条目在各 Provider 的「模型」管理里维护，功能绑定
+                        // 在「会话」页完成。
+                        Text(
+                            "模型条目在各 Provider 的「模型」管理里增删改（自动检测 + 手动添加）；" +
+                                "功能与模型的绑定在「会话」页完成。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
                         // 元数据数据源管理（更新 / 本地缓存状态）。
                         Card(
                             modifier = Modifier.fillMaxWidth(),
@@ -515,7 +434,7 @@ fun SettingsScreen(
             initial = m,
             isNew = editModelIsNew,
             providers = config.providers.map { it.displayName to it.name },
-            lockProvider = editModelLock,
+            lockProvider = editModelLock ?: m.provider,
             onDismiss = {
                 editModel = null
                 editModelLock = null
@@ -552,28 +471,11 @@ fun SettingsScreen(
         )
     }
 
-    // 代号绑定编辑（模型页）。entry 为 [models] 条目名；选择器按
-    // provider → model 两级级联，保存即 set_level 落盘。
-    editAlias?.let { draft ->
-        AliasBindingDialog(
-            initial = draft,
-            existingAliases = config.levels.keys.toSet(),
-            providers = config.providers.map { it.displayName to it.name },
-            models = config.models,
-            onDismiss = { editAlias = null },
-            onSave = { name, entry ->
-                RuntimeBridge.setLevel(name, entry)
-                editAlias = null
-            },
-        )
-    }
-
     // Provider 的模型管理（自动检测 + 手动增删改）。
     modelsProvider?.let { p ->
         ProviderModelsDialog(
             provider = p,
             models = config.models.filter { it.provider == p.name },
-            levels = config.levels,
             capabilities = config.capabilities,
             onDismiss = { modelsProvider = null },
             onEdit = { m, isNew ->
@@ -585,9 +487,6 @@ fun SettingsScreen(
         )
     }
 }
-
-/** 代号绑定草稿（name 空 = 新建代号）。entry = 目标 [models] 条目名。 */
-data class AliasDraft(val name: String = "", val entry: String = "")
 
 /** token 数显示格式：131072 → "128K"、2000000 → "2M"、null → "—"。
  *  exact = true 时显示千分位完整数字（详情弹窗用）。 */
@@ -707,114 +606,13 @@ private fun genModelEntryId(providerId: String, modelId: String, existing: Set<S
     return id
 }
 
-/** 代号绑定对话框：代号名（新建时可填）+ Provider 选择 + 该 provider
- *  下的模型选择（级联）。保存 = set_level(alias → entry)。 */
-@Composable
-private fun AliasBindingDialog(
-    initial: AliasDraft,
-    existingAliases: Set<String>,
-    providers: List<Pair<String, String>>, // (显示名, 内部 ID)
-    models: List<ModelUi>,
-    onDismiss: () -> Unit,
-    onSave: (alias: String, entry: String) -> Unit,
-) {
-    val isNew = initial.name.isEmpty()
-    var name by remember { mutableStateOf(initial.name) }
-    // 初值：已绑条目的 provider；新建默认第一个 provider。
-    val initialEntry = models.find { it.entry == initial.entry }
-    var provider by remember {
-        mutableStateOf(initialEntry?.provider ?: providers.firstOrNull()?.second ?: "")
-    }
-    var entry by remember { mutableStateOf(initial.entry) }
-    // provider 切换后目标条目可能不属于它 → 清空重选。
-    if (models.find { it.entry == entry }?.provider != provider) entry = ""
-
-    val trimmed = name.trim()
-    val providerModels = models.filter { it.provider == provider }
-    val valid = (!isNew || (trimmed.isNotEmpty() && trimmed !in existingAliases)) &&
-        entry.isNotEmpty() && entry in providerModels.map { it.entry }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (isNew) "新增模型代号" else "改绑代号「${initial.name}」") },
-        text = {
-            Column(
-                Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (isNew) {
-                    OutlinedTextField(
-                        trimmed,
-                        { name = it },
-                        label = { Text("代号名（如 fast、vision、deep）") },
-                        isError = trimmed.isNotEmpty() && trimmed in existingAliases,
-                        supportingText = if (trimmed.isNotEmpty() && trimmed in existingAliases) {
-                            { Text("代号已存在") }
-                        } else {
-                            null
-                        },
-                    )
-                }
-                if (providers.isEmpty()) {
-                    Text(
-                        "先到「Provider」页添加至少一个 Provider。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                } else {
-                    Text("Provider", style = MaterialTheme.typography.labelMedium)
-                    Row(
-                        Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        for ((title, id) in providers) {
-                            FilterChip(
-                                selected = provider == id,
-                                onClick = { provider = id },
-                                label = { Text(title) },
-                            )
-                        }
-                    }
-                    Text("模型", style = MaterialTheme.typography.labelMedium)
-                    if (providerModels.isEmpty()) {
-                        Text(
-                            "该 Provider 下还没有模型，先在其「模型」管理里添加或自动检测。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.outline,
-                        )
-                    } else {
-                        Row(
-                            Modifier.horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            for (m in providerModels) {
-                                FilterChip(
-                                    selected = entry == m.entry,
-                                    onClick = { entry = m.entry },
-                                    label = { Text(m.modelId) },
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            SoftButton(enabled = valid, onClick = { onSave(if (isNew) trimmed else initial.name, entry) }) {
-                Text("保存")
-            }
-        },
-        dismissButton = { SoftButton(onClick = onDismiss) { Text("取消") } },
-    )
-}
-
 /** Provider 的模型管理：自动检测（远端 /models）+ 手动增删改。
  *  检测出的新模型以 chip 呈现，点击即入库（自动生成条目 ID）。 */
 @Composable
 private fun ProviderModelsDialog(
     provider: ProviderUi,
     models: List<ModelUi>, // 该 provider 名下的条目
-    levels: Map<String, String>, // 代号 → 条目（删除时悬空提示；删除不再被代号拦截）
-    capabilities: Map<String, String>, // 功能 → 代号（删除时悬空提示；删除不再被引用拦截）
+    capabilities: Map<String, String>, // 功能 → 条目直绑值（删除时悬空提示；删除不再被引用拦截）
     onDismiss: () -> Unit,
     onEdit: (ModelUi, Boolean) -> Unit, // (条目, isNew)
 ) {
@@ -837,8 +635,8 @@ private fun ProviderModelsDialog(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
                 Text(
-                    "此清单是该 Provider 的模型条目；「模型」页的代号与「会话」页的功能最终都" +
-                        "指向这里的条目。点条目左侧可查看详情与代号引用。",
+                    "此清单是该 Provider 的模型条目；「会话」页的功能模型最终都" +
+                        "指向这里的条目。点条目左侧可查看详情与功能引用。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
@@ -976,20 +774,13 @@ private fun ProviderModelsDialog(
             }
     }
 
-    // 删除确认。完全松耦合：删除永远放行，引用方悬空。代号悬空 →「模型」
-    // 页标红可改绑，用该代号时报错；功能悬空 →「会话」页可改绑，运行时
-    // 自动回退默认档（服务端 DeleteModel 无引用拦截，同款语义）。
+    // 删除确认。完全松耦合：删除永远放行，引用方悬空。功能悬空 →
+    // 「会话」页该功能行显示未设置，重选条目即自愈（服务端 DeleteModel
+    // 无引用拦截，同款语义）。
     pendingDelete?.let { m ->
-        val levelRefs = levels.filterValues { it == m.entry }.keys.toList()
         val capRefs = capabilities.filterValues { it == m.entry }.keys.toList()
-        val dangling = buildList {
-            if (levelRefs.isNotEmpty()) {
-                add("代号 ${levelRefs.joinToString("、")} 将悬空（到「模型」页改绑）")
-            }
-            if (capRefs.isNotEmpty()) {
-                add("功能 ${capRefs.joinToString("、")} 将悬空（到「会话」页改绑）")
-            }
-        }.joinToString("；")
+        val dangling = if (capRefs.isEmpty()) "" else
+            "功能 ${capRefs.joinToString("、")} 将悬空（到「会话」页改绑）"
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
             title = { Text("删除模型") },
@@ -1015,10 +806,10 @@ private fun ProviderModelsDialog(
     }
 
     // 模型详情：点击条目左侧信息区弹出（摘要行省略号截断的信息在此完整展示；
-    // 内部条目 ID 不对外）。代号是展示时从 levels 反查的（松耦合：代号 →
-    // 模型单向映射，模型侧不存 alias，换新模型只需在「模型」页改绑代号）。
+    // 内部条目 ID 不对外）。功能引用是展示时从 capabilities 反查的（松耦合：
+    // 功能 → 条目单向直绑，模型侧不存引用，换绑在「会话」页完成）。
     detailModel?.let { m ->
-        val aliases = levels.filterValues { it == m.entry }.keys.sorted()
+        val capRefs = capabilities.filterValues { it == m.entry }.keys.sorted()
         AlertDialog(
             onDismissRequest = { detailModel = null },
             title = { Text(m.modelId) },
@@ -1033,15 +824,16 @@ private fun ProviderModelsDialog(
                         CapsFlag(label = "工具调用", on = m.supportsToolCall)
                     }
                     androidx.compose.material3.HorizontalDivider()
-                    InfoRow("代号", aliases.joinToString("、").ifEmpty { "（无）" })
+                    InfoRow("被功能引用", capRefs.joinToString("、").ifEmpty { "（无）" })
                     InfoRow("上下文窗口", fmtTokensFull(m.maxContextTokens))
                     InfoRow("最大输出", fmtTokensFull(m.maxOutputTokens))
                     InfoRow("输入价格", fmtPrice(m.inputPricePerMtok))
                     InfoRow("输出价格", fmtPrice(m.outputPricePerMtok))
                     InfoRow("所属 Provider", m.provider)
-                    if (aliases.isNotEmpty()) {
+                    if (capRefs.isNotEmpty()) {
                         Text(
-                            "代号只是指向本模型的映射，不随模型存储；要换新模型，到「模型」页把对应代号改绑即可。",
+                            "功能绑定只是指向本模型的直绑引用；要整体换新模型，在「会话」页把" +
+                                "对应功能改绑到新条目即可。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.outline,
                         )
@@ -1081,6 +873,84 @@ private fun Section(
             action?.invoke()
         }
         content()
+    }
+}
+
+/**
+ * 功能模型绑定行（会话页）：功能名居左、当前绑定模型居右、箭头指示可点；
+ * 整行点击弹出共享玻璃弹层（[GlassDropdownMenu]，与对话页「本次对话模型」
+ * 选择器同族磨砂语言），直选 models 条目，选中即 setCapability 落盘（main
+ * 改绑由 Rust 热切换会话模型并广播 model_changed，下回合即生效）。
+ *
+ * 当前值解析（与 Rust capability_alias + resolve_model 同序）：生效别名 =
+ * capabilities[cap]，缺省回退 main→"main"、其余→"fast"；再经
+ * [RuntimeBridge.modelEntryOf] 的 levels 遗留兜底解析到条目。解析不出条目
+ * （悬空代号 / 条目已删）显示「未设置」——重选条目即自愈。
+ */
+@Composable
+private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi) {
+    var expanded by remember { mutableStateOf(false) }
+    val stored = config.capabilities[cap]
+    val fallback = if (cap == "main") "main" else "fast"
+    // 生效别名（镜像 capability_alias）→ 实际条目（镜像 resolve_model 首步）。
+    val currentEntry = RuntimeBridge.modelEntryOf(stored ?: fallback, config)
+    val entries = config.models.map { it.entry }.toSet()
+    val bound = currentEntry.takeIf { it in entries }
+    val items = config.models.map { m ->
+        GlassDropdownItem(
+            value = m.entry,
+            label = RuntimeBridge.modelAliasDisplay(m.entry, config),
+            selected = m.entry == bound,
+        )
+    }
+    val arrowAngle by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        label = "capModelArrow",
+    )
+    Box {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable(enabled = items.isNotEmpty()) { expanded = true }
+                .padding(horizontal = 4.dp, vertical = 6.dp),
+        ) {
+            Text(
+                title,
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                when {
+                    items.isEmpty() -> "先在 Provider 页添加模型"
+                    bound == null -> "未设置"
+                    else -> RuntimeBridge.modelAliasDisplay(bound, config)
+                },
+                style = MaterialTheme.typography.labelLarge,
+                color = if (bound == null) {
+                    MaterialTheme.colorScheme.outline
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(2f, fill = false),
+            )
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                Icons.Filled.KeyboardArrowDown,
+                contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
+                tint = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.rotate(arrowAngle),
+            )
+        }
+        GlassDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            items = items,
+            onSelect = { RuntimeBridge.setCapability(cap, it.value) },
+        )
     }
 }
 
@@ -1534,14 +1404,14 @@ private fun EditModelDialog(
     initial: ModelUi,
     isNew: Boolean,
     providers: List<Pair<String, String>>, // (显示名, 内部 ID)
-    lockProvider: String? = null, // Provider 页进入时锁定归属
+    lockProvider: String, // 归属 Provider 内部 ID（Provider 页模型管理进入时锁定，归属不可跨 provider 改）
     onDismiss: () -> Unit,
     onSave: (ModelUi) -> String?, // null = 已保存（调用方关弹窗）；非 null = 错误提示，弹窗保持打开
 ) {
     var entry by remember { mutableStateOf(initial.entry) }
-    var provider by remember {
-        mutableStateOf(lockProvider ?: initial.provider.ifBlank { providers.firstOrNull()?.second ?: "" })
-    }
+    // Provider 归属锁定：条目归属不可在此修改（levels 别名自由路径已随
+    // 映射层一并移除，模型条目一律挂在 Provider 下管理）。
+    val provider = lockProvider
     var modelId by remember { mutableStateOf(initial.modelId) }
     var showAdvanced by remember { mutableStateOf(false) }
     var saveError by remember { mutableStateOf<String?>(null) }
@@ -1561,37 +1431,15 @@ private fun EditModelDialog(
                 OutlinedTextField(
                     entry,
                     { entry = it },
-                    label = { Text(if (lockProvider != null) "条目 ID（留空自动生成）" else "别名（如 glm-main）") },
+                    label = { Text("条目 ID（留空自动生成）") },
                     enabled = isNew,
                 )
-                if (lockProvider != null) {
-                    // Provider 页模型管理进入：归属锁定，仅展示。
-                    Text(
-                        "Provider：${providers.find { it.second == lockProvider }?.first ?: lockProvider}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline,
-                    )
-                } else if (providers.isNotEmpty()) {
-                    Text("Provider", style = MaterialTheme.typography.labelMedium)
-                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        for ((label, pid) in providers) {
-                            TextButton(onClick = { provider = pid }) {
-                                Text(label)
-                                // 选中标记用 Material 图标（图标规范见 AGENTS.md）。
-                                if (pid == provider) {
-                                    Icon(
-                                        Icons.Filled.Check,
-                                        contentDescription = "已选中",
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.height(14.dp).width(14.dp),
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    OutlinedTextField(provider, { provider = it }, label = { Text("Provider ID") })
-                }
+                // 归属锁定，仅展示。
+                Text(
+                    "Provider：${providers.find { it.second == lockProvider }?.first ?: lockProvider}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
                 OutlinedTextField(modelId, { modelId = it }, label = { Text("模型 ID（如 glm-4.7）") })
 
                 // 从 registry 补全元数据（本地数据源优先，miss 在线兜底；
@@ -1649,7 +1497,7 @@ private fun EditModelDialog(
         confirmButton = {
             SoftButton(
                 onClick = {
-                    if ((entry.isNotBlank() || lockProvider != null) && provider.isNotBlank() && modelId.isNotBlank()) {
+                    if (provider.isNotBlank() && modelId.isNotBlank()) {
                         saveError = onSave(
                             initial.copy(
                                 entry = entry.trim(),

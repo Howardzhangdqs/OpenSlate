@@ -26,8 +26,6 @@ import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Hub
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -79,11 +77,11 @@ import kotlinx.coroutines.withContext
  * - 可用工具数：`listTools()` + `getAgentToolVisibility()`，可见性
  *   判定与工具管理页逐字同式：可见 = (tools 空 || tools 含该名) &&
  *   hidden_tools 不含该名。
- * - 模型选择：选项 = levels 键 + capabilities 值 + models 条目键
- *   （三者都是 set_model 的合法别名，resolve_model 先查 levels 再直查
- *   models）；当前值与切换都走 state.modelAlias / RuntimeBridge.
- *   setModelAlias（协议 set_model）——与顶栏副标题、发消息时实际生效
- *   的是同一状态源（model_changed 事件回填），面板选了什么下次请求
+ * - 模型选择：选项 = models 条目（levels 代号不再出现在选项里；capabilities
+ *   也只直绑条目，见设置页会话页）。当前值经 [RuntimeBridge.modelEntryOf]
+ *   解析到条目（levels 遗留兜底）再显示；当前值与切换都走 state.modelAlias /
+ *   RuntimeBridge.setModelAlias（协议 set_model）——与顶栏副标题、发消息时
+ *   实际生效的是同一状态源（model_changed 事件回填），面板选了什么下次请求
  *   就用什么，不存在分裂。set_model 仅会话内生效不落盘，正是"本次
  *   对话"的语义；全局默认仍在设置页改绑 [capabilities].main。
  */
@@ -272,48 +270,33 @@ internal fun ComposerFocusPanel(
     }
 }
 
-/** 「本次对话模型」选项：别名（原始值，选中/回传语义）+ 显示主文字
- *  （models 直绑条目经共享助手换「Provider/modelId」，levels 代号原样）
- *  + 解析出的展示副标题（null = 代号未绑定到模型条目）。 */
+/** 「本次对话模型」选项：models 条目键（选中/回传语义）+ 显示主文字
+ *  （经共享助手换「Provider显示名/modelId」，条目键不直出 UI）。 */
 private data class ComposerModelOption(
-    val alias: String,
+    val entry: String,
     val label: String,
-    val subtitle: String?,
 )
 
 /**
- * 可选别名全集 = levels 键 + capabilities 值 + models 条目键（三者都是
- * set_model 的合法别名——resolve_model 先查 levels 再直查 models）。
- * 主文字 = [RuntimeBridge.modelAliasDisplay]（条目键不直出 UI）；
- * 副标题 = (levels[alias] ?: alias) 对应模型条目的「Provider · modelId」，
- * 解析顺序与 Rust resolve_model 逐字一致。
+ * 可选模型全集 = models 条目（levels 代号/capabilities 不再进选项——
+ * UI 已去映射层，功能与选择器一律直绑条目）。主文字 =
+ * [RuntimeBridge.modelAliasDisplay]。
  */
-private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> {
-    val aliases = (config.levels.keys + config.capabilities.values + config.models.map { it.entry })
-        .distinct()
-        .sorted()
-    return aliases.map { alias ->
-        val entryName = config.levels[alias] ?: alias
-        val model = config.models.firstOrNull { it.entry == entryName }
+private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> =
+    config.models.map { m ->
         ComposerModelOption(
-            alias = alias,
-            label = RuntimeBridge.modelAliasDisplay(alias, config),
-            subtitle = model?.let { m ->
-                val provider = config.providers.firstOrNull { it.name == m.provider }
-                    ?.displayName ?: m.provider
-                "$provider · ${m.modelId}"
-            },
+            entry = m.entry,
+            label = RuntimeBridge.modelAliasDisplay(m.entry, config),
         )
     }
-}
 
 /**
- * 「本次对话模型」行：整行点击弹 DropdownMenu（菜单贴底自动向上展开），
- * 选中项带 Check 图标（ui.md 基线），副标题展示解析到的具体模型；切换走
- * onSelectModel（RuntimeBridge.setModelAlias）→ model_changed 回填
- * state.modelAlias，行内显示与实际生效恒同源。选项主文字与行内当前值
- * 都经 modelAliasDisplay（条目键 → 「Provider/modelId」；levels 代号
- * 原样）——内部 entry 键不直出 UI，选中比对/回传仍用原始别名。
+ * 「本次对话模型」行：整行点击弹玻璃弹层（[GlassDropdownMenu]，与面板同
+ * 族磨砂语言；贴底自动向上展开），选中项带 Check 图标（ui.md 基线）；切换
+ * 走 onSelectModel（RuntimeBridge.setModelAlias）→ model_changed 回填
+ * state.modelAlias，行内显示与实际生效恒同源。当前值经
+ * [RuntimeBridge.modelEntryOf] 解析到条目再显示（levels 遗留兜底）——
+ * 内部 entry 键不直出 UI，选中比对/回传仍用原始条目键。
  */
 @Composable
 private fun ModelPickerRow(
@@ -323,6 +306,9 @@ private fun ModelPickerRow(
 ) {
     var expanded by remember { mutableStateOf(false) }
     val options = remember(config) { composerModelOptions(config) }
+    // 当前值解析到条目（镜像 Rust resolve_model 首步：levels 优先、未命中
+    // 原样直查 models）——与选项同键比对，显示同经 modelAliasDisplay。
+    val currentEntry = RuntimeBridge.modelEntryOf(modelAlias, config)
     val arrowAngle by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
         label = "panelModelArrow",
@@ -353,7 +339,7 @@ private fun ModelPickerRow(
                 when {
                     options.isEmpty() -> "未配置模型"
                     modelAlias.isEmpty() -> "未设置"
-                    else -> RuntimeBridge.modelAliasDisplay(modelAlias, config)
+                    else -> RuntimeBridge.modelAliasDisplay(currentEntry, config)
                 },
                 style = MaterialTheme.typography.labelLarge,
                 color = if (options.isEmpty()) {
@@ -373,38 +359,13 @@ private fun ModelPickerRow(
                 modifier = Modifier.rotate(arrowAngle),
             )
         }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            for (opt in options) {
-                DropdownMenuItem(
-                    text = {
-                        Column {
-                            Text(opt.label, style = MaterialTheme.typography.bodyMedium)
-                            if (opt.subtitle != null) {
-                                Text(
-                                    opt.subtitle,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.outline,
-                                )
-                            } else {
-                                Text(
-                                    "未绑定模型条目",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
-                        }
-                    },
-                    onClick = {
-                        onSelectModel(opt.alias)
-                        expanded = false
-                    },
-                    trailingIcon = if (opt.alias == modelAlias) {
-                        { Icon(Icons.Filled.Check, contentDescription = null) }
-                    } else {
-                        null
-                    },
-                )
-            }
-        }
+        GlassDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            items = options.map { opt ->
+                GlassDropdownItem(value = opt.entry, label = opt.label, selected = opt.entry == currentEntry)
+            },
+            onSelect = { opt -> onSelectModel(opt.value) },
+        )
     }
 }

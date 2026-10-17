@@ -155,6 +155,13 @@ pub struct ResolvedModel {
 `InvalidProviderRef`。`supports_*` 能力字段给 runtime 决定是否注入工具定义；
 `cost_spec()`（L87-90）是 runtime 循环与 REPL compact 摘要共用的计价快照。
 
+> **UI 层注记（mobile）**：levels 语义在 core 侧原样保留（resolve_model 先查
+> levels、`[capabilities]` 值合法形态仍是代号或条目两种），但 **mobile UI 已不
+> 暴露 levels**——设置页功能绑定 / 对话页模型选择器一律直绑 `[models]` 条目，
+> 存量「capability → 代号」引用由启动迁移一次性改写为条目直绑（RuntimeBridge
+> `maybeMigrateCapabilityDirect`，见 `06-mobile/android-app.md`）；`[levels]` 表
+> 不删不写，仅作 resolve 的遗留兼容层。
+
 ## 5. timeout_ms 双语义（fix-20）与重试边界
 
 ### 5.1 双语义

@@ -162,7 +162,13 @@ private fun WarmUpSecondaryScreens() {
     }
 }
 
-// Cyan 主题配色(Material 3 tonal palette,种子色 cyan #00BCD4)
+// Cyan 主题配色(Material 3 tonal palette,种子色 cyan #00BCD4)。
+// surface 全家必须整套给齐：material3 1.4 中默认 Card 容器取
+// colorScheme.surfaceContainerHighest、AppDialog 取 surfaceContainerHigh，
+// 未显式提供的角色会回落 lightColorScheme()/darkColorScheme() 的 Material
+// 基线紫种子中性色（浅 Highest=0xFFE6E0E9、深=0xFF36343B），在冷蓝
+// surface 底上显淡红/紫灰——container 阶梯一律从本套 surface/surfaceVariant
+// 同轨道插值，禁止紫基线值混入。
 private val LightCyanColors = lightColorScheme(
     primary = Color(0xFF006689),
     onPrimary = Color(0xFFFFFFFF),
@@ -186,6 +192,20 @@ private val LightCyanColors = lightColorScheme(
     onSurface = Color(0xFF171C1F),
     surfaceVariant = Color(0xFFDCE3E9),
     onSurfaceVariant = Color(0xFF41484D),
+    // ── surface container 阶梯（由 surface F6FAFE → surfaceVariant DCE3E9
+    // 冷蓝灰轨道等距插值；每步 R−7/G−6/B−6，与既有锚点同偏量）──
+    // Lowest=纯白（对齐基线 Lowest=Neutral100 语义）；
+    // Highest=variant 终点（material3 1.4 默认 Card 容器色，取代紫基线
+    // E6E0E9）；High/Container/AppDialog 用的 surfaceContainerHigh 依次插值。
+    surfaceContainerLowest = Color(0xFFFFFFFF),
+    surfaceContainerLow = Color(0xFFF0F4FA),
+    surfaceContainer = Color(0xFFE9EEF4),
+    surfaceContainerHigh = Color(0xFFE2E8EE),
+    surfaceContainerHighest = Color(0xFFDCE3E9),
+    // dim/bright：基线浅色语义为 dim=Neutral87（比 variant N90 深一档）、
+    // bright=Neutral98（= surface）→ dim 在 variant 下再深一阶、bright=surface。
+    surfaceDim = Color(0xFFD7DFE6),
+    surfaceBright = Color(0xFFF6FAFE),
     outline = Color(0xFF71787E),
     inverseSurface = Color(0xFF2B3135),
     inverseOnSurface = Color(0xFFEDF1F5),
@@ -215,6 +235,20 @@ private val DarkCyanColors = darkColorScheme(
     onSurface = Color(0xFFDEE3E7),
     surfaceVariant = Color(0xFF41484D),
     onSurfaceVariant = Color(0xFFC1C7CD),
+    // ── surface container 阶梯（以 surface 0F1417 为底向 surfaceVariant
+    // 41484D 方向递进；每步 R+5~6/G+6/B+6~7，与既有锚点同偏量）──
+    // Lowest 比 surface 再深一档（对齐基线 Lowest=Neutral4 在 surface
+    // N6 之下）；Highest=2A3138（material3 1.4 默认 Card 容器色，取代紫
+    // 基线 36343B）；Low→Highest 由 1A2025 族等距递进。
+    surfaceContainerLowest = Color(0xFF0A0F12),
+    surfaceContainerLow = Color(0xFF1A2025),
+    surfaceContainer = Color(0xFF1F252B),
+    surfaceContainerHigh = Color(0xFF252C32),
+    surfaceContainerHighest = Color(0xFF2A3138),
+    // dim/bright：基线深色语义为 dim=Neutral6（= surface）、bright=Neutral24
+    // （比 Highest N22 亮一阶）→ dim=surface、bright 在 Highest 上再加一档。
+    surfaceDim = Color(0xFF0F1417),
+    surfaceBright = Color(0xFF2F363E),
     outline = Color(0xFF8B9297),
     inverseSurface = Color(0xFFDEE3E7),
     inverseOnSurface = Color(0xFF2B3135),

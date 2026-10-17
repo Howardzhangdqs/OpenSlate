@@ -1715,9 +1715,10 @@ private fun openOwnAppSettings(context: android.content.Context) {
     )
 }
 
-/** 紧凑圆角按钮：淡色背景 + 深色文字 + 小上下留白（工具页统一风格）。 */
+/** 紧凑圆角按钮：淡色背景 + 深色文字 + 小上下留白（工具页统一风格）。
+ *  internal：SettingsScreen 与 ToolManagementSection（模板小节）共用。 */
 @Composable
-private fun CompactButton(
+internal fun CompactButton(
     text: String,
     enabled: Boolean = true,
     container: androidx.compose.ui.graphics.Color =
@@ -1840,18 +1841,20 @@ private fun ExecBackendSection() {
                     )
                 }
                 isEnabled("native") && isEnabled("termux") -> Text(
-                    "已多选：native 工具名为 bash，Termux 工具名为 termux_bash。",
+                    "已多选：native 工具名为 bash，Termux 工具名为 termux_bash。" +
+                        "MCP 服务在线时 Termux 命令经 MCP 执行（host 内置 bash），未在线走 RUN_COMMAND 兜底。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
                 isEnabled("termux") -> Text(
-                    "仅 termux：工具名为 bash（Termux 后端）。完整环境需在 " +
-                        "~/.termux/termux.properties 设置 allow-external-apps=true。",
+                    "仅 termux：工具名为 bash（Termux 后端）。MCP 服务在线时命令走 MCP 路径，" +
+                        "未在线时以 RUN_COMMAND Intent 兜底（完整环境需在 ~/.termux/termux.properties " +
+                        "设置 allow-external-apps=true）。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
                 else -> Text(
-                    "仅 native：工具名为 bash，零依赖、零授权，无需 Termux。",
+                    "仅 native：工具名为 bash，零依赖、零授权，无需 Termux（MCP 服务不影响该路径）。",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                 )
@@ -2785,142 +2788,6 @@ private fun McpSection() {
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline,
         )
-
-        // ── 工具名模板（[mcp].tool_name_template）：保存 = Rust 校验+落盘
-        // → reload 热生效（FFI 不自动 reload，此处串起两步）→ 重检。
-        // {prefix} 占位符的展开值恒为配置键名（默认 termux，无独立设置行）。
-        // 模板状态用 TextFieldValue：占位符插入按钮需要 selection（光标/选区）。
-        var templateValue by remember { mutableStateOf(TextFieldValue("")) }
-        // 模板输入框当前是否聚焦：未聚焦时插入 = 追加到文本末尾（Compose
-        // 的 selection 恒有值，从未聚焦时是 TextRange(0)——不加此标志会
-        // 误插到文本开头）。
-        var templateFocused by remember { mutableStateOf(false) }
-        // 生效值（null = 进页 IO 读取未完成，保存禁用防把缺省值误存）。
-        var effectiveTemplate by remember { mutableStateOf<String?>(null) }
-        // 进页 IO 读当前生效模板做预填。
-        LaunchedEffect(Unit) {
-            val cur = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                RuntimeBridge.getMcpToolNameTemplate()
-            }
-            effectiveTemplate = cur
-            templateValue = TextFieldValue(cur ?: "")
-        }
-        val tpl = templateValue.text.trim()
-        // 插入占位符：聚焦时插入光标处 / 替换选区（光标落在插入内容之后）；
-        // 未聚焦 → 追加到末尾；selection 越界（理论）clamp 到末尾，同追加语义。
-        fun insertPlaceholder(p: String) {
-            val v = templateValue
-            val len = v.text.length
-            val start = (if (templateFocused) v.selection.min else len).coerceIn(0, len)
-            val end = (if (templateFocused) v.selection.max else len).coerceIn(0, len)
-            templateValue = TextFieldValue(
-                text = v.text.substring(0, start) + p + v.text.substring(end),
-                selection = TextRange(start + p.length),
-            )
-        }
-        // 本地校验镜像 Rust 侧规则：必须含 {tool}，移除三占位符后剩余
-        // 字符仅限字母数字 _ . -（`__` 合法——它是缺省模板的分隔字面）；
-        // 留空 = 恢复默认，视为合法。
-        val templateValid = tpl.isEmpty() ||
-            (tpl.contains("{tool}") &&
-                tpl.replace("{prefix}", "").replace("{server}", "").replace("{tool}", "")
-                    .matches(Regex("^[A-Za-z0-9_.-]*$")))
-        // 实时预览：{prefix} 取当前生效前缀（RuntimeBridge 缓存，只读），
-        // {server} 固定示例 memory、{tool} 固定示例 create_entities；空
-        // 模板按默认模板预览。展开为字面替换（替换值不含占位符文本，与
-        // Rust format_tool_name 的单趟扫描等价）。
-        val previewName = tpl.ifEmpty { "{prefix}_{server}__{tool}" }
-            .replace("{prefix}", RuntimeBridge.MCP_SERVER_NAMES.firstOrNull() ?: "termux")
-            .replace("{server}", "memory")
-            .replace("{tool}", "create_entities")
-        // ── 工具名模板行 ─────────────────────────────────────────
-        OutlinedTextField(
-            value = templateValue,
-            onValueChange = { templateValue = it },
-            label = { Text("工具名模板") },
-            placeholder = { Text("{prefix}_{server}__{tool}") },
-            singleLine = true,
-            modifier = Modifier
-                .fillMaxWidth()
-                .onFocusChanged { templateFocused = it.isFocused },
-        )
-        // 占位符快插 chips：等宽字面量，surface 弱化配色（明显轻于主题色
-        // 的「保存」）；clickable 不抢焦点——输入框保持聚焦与键盘，
-        // 插入位置即当前光标/选区。
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            for (ph in listOf("{prefix}", "{server}", "{tool}")) {
-                Text(
-                    ph,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                        .clickable { insertPlaceholder(ph) }
-                        .padding(horizontal = 10.dp, vertical = 5.dp),
-                )
-            }
-        }
-        Text(
-            "占位符：{prefix} = 前缀，{server} = MCP 服务器名，{tool} = 工具名（不带服务器名前缀）；留空保存恢复默认",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.outline,
-        )
-        if (templateValid) {
-            Text(
-                "示例：$previewName",
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.outline,
-            )
-        } else {
-            Text(
-                "模板无效：必须含 {tool}，且除占位符外仅限字母数字 _ . -",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-        CompactButton(
-            text = "保存",
-            enabled = !busy && effectiveTemplate != null && tpl != effectiveTemplate,
-            container = mcpBtnContainer,
-            content = mcpBtnContent,
-        ) {
-            busy = true
-            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                try {
-                    val envelope = RuntimeBridge.setMcpToolNameTemplate(tpl)
-                    val obj = envelope?.let { runCatching { JSONObject(it) }.getOrNull() }
-                    if (obj != null && obj.optBoolean("ok", false)) {
-                        log("工具名模板已保存，重连生效中…")
-                        // FFI 不自动 reload：手动重连让已注册工具按新模板重挂。
-                        val r = runCatching { RuntimeBridge.reloadMcpServers() }.getOrNull()
-                        val o = r?.let { runCatching { JSONObject(it) }.getOrNull() }
-                        if (o != null && o.optBoolean("ok", false)) {
-                            log("${o.optInt("tools", -1)} 个工具已按新模板注册")
-                        } else {
-                            val err = o?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
-                                ?: r?.take(120) ?: "runtime 未就绪"
-                            log("工具重连失败：$err")
-                        }
-                        // 读回生效值（同时刷新桥层缓存）；与输入一致后保存钮自动禁用。
-                        effectiveTemplate = RuntimeBridge.getMcpToolNameTemplate()
-                    } else {
-                        val err = obj?.optString("error")?.take(120)?.takeIf { it.isNotEmpty() }
-                            ?: envelope?.take(120) ?: "runtime 未就绪"
-                        log("模板保存失败：$err")
-                    }
-                } catch (e: Throwable) {
-                    log("模板保存失败：${e.message?.take(160) ?: e.javaClass.simpleName}")
-                } finally {
-                    busy = false
-                }
-                // 成败都全量重检：成功让 hostTools 按新模板重新聚合；失败让
-                // 状态行如实反映（与「重启」按钮的收尾惯例一致）。
-                refresh()
-            }
-        }
     }
 
     Section(

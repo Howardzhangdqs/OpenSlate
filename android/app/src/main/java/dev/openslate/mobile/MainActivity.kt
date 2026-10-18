@@ -3,11 +3,14 @@ package dev.openslate.mobile
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
@@ -44,6 +47,7 @@ import dev.openslate.mobile.ui.ChatScreen
 import dev.openslate.mobile.ui.HistoryScreen
 import dev.openslate.mobile.ui.KeysScreen
 import dev.openslate.mobile.ui.ModelRegistrySourceScreen
+import dev.openslate.mobile.ui.QuestionFullScreen
 import dev.openslate.mobile.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
@@ -93,7 +97,25 @@ private fun AppNavHost(
             ChatScreen(
                 onOpenHistory = { nav.navigate("history") { launchSingleTop = true } },
                 onOpenSettings = { nav.navigate("settings") { launchSingleTop = true } },
+                onOpenAskUser = { nav.navigate("question-fullscreen") { launchSingleTop = true } },
             )
+        }
+        // ask_user 全屏问卷：竖直滑入压在聊天上（「任务」而非「层级页」），
+        // 与二级页的横推家族区分；pending 失效时页内自动 pop。
+        composable(
+            "question-fullscreen",
+            enterTransition = {
+                slideInVertically(tween(280, easing = FastOutSlowInEasing)) { it } +
+                    fadeIn(tween(280, easing = FastOutSlowInEasing))
+            },
+            exitTransition = { fadeOut(tween(280, easing = FastOutSlowInEasing)) },
+            popEnterTransition = { fadeIn(tween(280, easing = FastOutSlowInEasing)) },
+            popExitTransition = {
+                slideOutVertically(tween(280, easing = FastOutSlowInEasing)) { it } +
+                    fadeOut(tween(280, easing = FastOutSlowInEasing))
+            },
+        ) {
+            QuestionFullScreen(onBack = { nav.popBackStack() })
         }
         // 二级页面：从右侧滑入、按返回时原路滑出（原生推入语义）。
         composable(

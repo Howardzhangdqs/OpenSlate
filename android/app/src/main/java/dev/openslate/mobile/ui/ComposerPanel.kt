@@ -2,19 +2,27 @@ package dev.openslate.mobile.ui
 
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,14 +31,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Build
-import androidx.compose.material.icons.outlined.Hub
-import androidx.compose.material.icons.outlined.Memory
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,24 +46,29 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import dev.openslate.mobile.R
 import dev.openslate.mobile.bridge.ConfigUi
-import dev.openslate.mobile.bridge.McpHostManager
+import dev.openslate.mobile.bridge.ModelUi
 import dev.openslate.mobile.bridge.RuntimeBridge
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /**
  * 输入框聚焦面板：点击聚焦输入框（进入编辑状态）时，从 composer 上方
- * 展开的一条状态带 + 「本次对话模型」选择器。
+ * 展开的一条状态带 + 模型 / Thinking Effort 双下拉控件。
  *
  * 交互形态（与 IME 共存）：
  * - 面板挂在 ChatScreen 底部悬浮列（TermuxStallBanner 同位、同语言：
@@ -74,13 +87,13 @@ import kotlinx.coroutines.withContext
  *   聚焦先显示上次快照、后台静默刷新，避免每次聚焦闪加载态。
  *
  * 数据口径：
- * - MCP 服务器数：运行时注册表（`mcpRegistryToolsByPrefix`，内部先
- *   refreshMcpNaming 再 listTools 按模板正则分 slug 计数）——只统计
- *   真正把工具注册进本次会话注册表的 server，连接失败的 server 不会
- *   出现；配置层 loadServers 只反映"配了什么"，不反映"加载了什么"。
- * - 可用工具数：`listTools()` + `getAgentToolVisibility()`，可见性
- *   判定与工具管理页逐字同式：可见 = (tools 空 || tools 含该名) &&
- *   hidden_tools 不含该名。
+ * - Termux/MCP 活性：[ComposerMcpStatusTracker] 状态流（host 活性探测 +
+ *   下游 server 连接数）。MCP 数 = **正常连接着的下游 server 数**——不是
+ *   注册总数、不是工具总数；工具计数显示已移除（卡片精简）。
+ * - 常驻状态：未聚焦时输入框内部下方一行（模型名 · effort 档 · Termux/MCP
+ *   状态）；聚焦展开后同源信息移交卡片首行，模型名/effort 档经
+ *   sharedBounds 做「输入框 → 卡片」的位移动画（key composer.model /
+ *   composer.effort），收起反向。聚焦展开时调一次 tracker.refresh。
  * - 模型选择：选项 = models 条目（levels 代号不再出现在选项里；capabilities
  *   也只直绑条目，见设置页会话页）。当前值经 [RuntimeBridge.modelEntryOf]
  *   解析到条目（levels 遗留兜底）再显示；显示走 state.modelAlias /
@@ -89,74 +102,46 @@ import kotlinx.coroutines.withContext
  *   （ChatScreen 接 [RuntimeBridge.selectModel]）双写：set_model 会话级热
  *   切换 + setCapability("main") 持久化为启动默认——「选了即默认」的语义
  *   闭环，设置页会话页因此不再有主对话绑定行。
+ * - Thinking Effort：模型下拉旁的紧凑档位选择，仅当前模型解析到条目且
+ *   家族表有支持档位时出现（不占位）。选中 = 改该条目 reasoning_effort
+ *   （onSelectEffort → ChatScreen 用 config 原条目 copy 后 upsertModel
+ *   落盘；null = Auto 不传参跟随 provider 默认），config_changed 回刷回显
+ *   ——与模型「选了即默认」同语义层级。
  */
 
-/** 面板数据快照（聚焦瞬间一次性 FFI 读取的投影）。 */
-internal data class ComposerPanelData(
-    /** 注册表里有工具注册进来的 MCP server 数（真实加载口径，0 = 无）。 */
-    val mcpServerCount: Int,
-    /** server 展示名串联（配置清单反查 slug；未命中回退 slug 本身）。 */
-    val mcpServerNames: String?,
-    /** 注册表工具总数。 */
-    val toolsTotal: Int,
-    /** 对 agent 可见的工具数（与工具管理页同口径）。 */
-    val toolsVisible: Int,
-)
-
 /**
- * 面板数据加载（挂起，全程 IO 线程；仅聚焦瞬间调用）。
- * null = 运行时未就绪（listTools 拿不到注册表），面板据此显示降级文案。
- */
-internal suspend fun loadComposerPanelData(context: Context): ComposerPanelData? =
-    withContext(Dispatchers.IO) {
-        val tools = RuntimeBridge.listTools() ?: return@withContext null
-        val visibility = RuntimeBridge.getAgentToolVisibility()
-
-        // 可见性判定与 ToolManagementSection.isVisible 逐字同式（同口径）。
-        fun isVisible(name: String): Boolean {
-            val v = visibility ?: return false
-            return (v.tools.isEmpty() || name in v.tools) && name !in v.hiddenTools
-        }
-
-        // MCP 分组计数：内部自带 refreshMcpNaming（服务名+模板缓存刷新），
-        // 用户没开过设置页时缓存也能对齐当前配置。
-        val mcpBySlug = RuntimeBridge.mcpRegistryToolsByPrefix(RuntimeBridge.MCP_SERVER_NAMES)
-        // slug → 显示名反查（prefs 读，轻量）；失败只影响名称展示不阻塞计数。
-        val configuredNames = runCatching {
-            McpHostManager.serversSlugMap(McpHostManager.loadServers(context))
-                .associate { it.second to it.first.name }
-        }.getOrDefault(emptyMap())
-        ComposerPanelData(
-            mcpServerCount = mcpBySlug?.size ?: 0,
-            mcpServerNames = mcpBySlug?.keys
-                ?.joinToString(" · ") { slug -> configuredNames[slug] ?: slug },
-            toolsTotal = tools.size,
-            toolsVisible = tools.count { isVisible(it.name) },
-        )
-    }
-
-/**
- * 面板本体。visible 由 ChatScreen 的输入框焦点状态驱动；data 为 null
- * 且 loading = 首次聚焦读取中，data 为 null 且 !loading = 运行时未就绪。
- * hazeState 透传给「本次对话模型」弹层（Haze 局部模糊内容源）。
+ * 面板本体。visible 由 ChatScreen 的输入框焦点状态驱动；聚焦展开时触发
+ * [ComposerMcpStatusTracker.refresh]（上次快照先行显示、异步探测到位回灌），
+ * Termux/MCP 活性经 tracker 状态流回灌。sharedTransitionScope 由 ChatScreen
+ * 的 SharedTransitionLayout 下发：模型/effort 值文本与输入框常驻状态行做
+ * sharedBounds 位移动画。hazeState 透传给模型选择弹层（Haze 局部模糊内容源）。
  */
 @Composable
 internal fun ComposerFocusPanel(
     visible: Boolean,
-    data: ComposerPanelData?,
-    loading: Boolean,
     modelAlias: String,
     config: ConfigUi,
     onSelectModel: (String) -> Unit,
+    onSelectEffort: (entry: String, effort: String?) -> Unit,
+    sharedTransitionScope: SharedTransitionScope,
     glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
     hazeState: dev.chrisbanes.haze.HazeState,
 ) {
+    val context = LocalContext.current
+    // Termux/MCP 活性快照（tracker 持有状态流；未聚焦时输入框常驻状态行
+    // 也消费同源数据，见 ChatScreen）。
+    val live by ComposerMcpStatusTracker.state.collectAsState()
+    // 聚焦展开刷新一次：上次快照立即上屏（无空白窗），探测结果异步回灌。
+    LaunchedEffect(visible) {
+        if (visible) ComposerMcpStatusTracker.refresh(context)
+    }
     AnimatedVisibility(
         visible = visible,
         enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
         exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
     ) {
+        val animatedVisibilityScope = this
         Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
             GlassPanel(
                 glass = glass,
@@ -175,100 +160,120 @@ internal fun ComposerFocusPanel(
                     Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 12.dp, vertical = 10.dp)
-                        // 首帧加载态 → 数据态的高度过渡平滑化。
+                        // 探测结果回灌（计数/名单变化）时高度过渡平滑化。
                         .animateContentSize(),
                 ) {
-                    when {
-                        loading && data == null -> {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                CircularProgressIndicator(
-                                    strokeWidth = 1.5.dp,
-                                    modifier = Modifier.size(12.dp),
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    "读取 MCP 与工具状态…",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.outline,
-                                )
-                            }
-                        }
-                        data == null -> {
-                            Text(
-                                "运行时未就绪，无法读取 MCP / 工具状态",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.outline,
+                    val (termuxText, termuxColor) = termuxLiveStatus(live)
+                    // ── 首行：Termux 连接状态（排首位）+ 右缘 MCP 连接数 ──
+                    // MCP 数 = 正常连接着的下游 server 数（host 活着才有值；
+                    // 死亡/未知显示 —）。工具计数已删（卡片精简）。
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(
+                            Icons.Outlined.Terminal,
+                            contentDescription = null,
+                            modifier = Modifier.size(13.dp),
+                            tint = termuxColor,
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            // 探测细节（耗时/HTTP 码）只入快照供诊断，不进
+                            // 常驻 UI——运行状态文案保持干净。
+                            termuxText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = termuxColor,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        // MCP 官方品牌 logo（非 Material 图标）：用户指定的
+                        // 「一律 Material 图标」规范例外，仅此一处；资源为
+                        // res/drawable/ic_mcp.xml（官方 SVG 机械转换生成，
+                        // 来源与许可见该文件头注释）。13dp 与 Terminal 图标
+                        // 同排光学对齐。
+                        Icon(
+                            painter = painterResource(R.drawable.ic_mcp),
+                            contentDescription = null,
+                            modifier = Modifier.size(13.dp),
+                            tint = if ((live.connectedServers ?: 0) > 0) {
+                                MaterialTheme.colorScheme.secondary
+                            } else {
+                                MaterialTheme.colorScheme.outline
+                            },
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            "MCP ${live.connectedServers ?: "—"}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        // tools 独立计数（与 MCP 并列的第二个小组件）：
+                        // 当前 Agent 可用工具总数（可见性过滤后），null =
+                        // 注册表不可用显示 —。Build 图标回归——工具计数
+                        // 重新有独立语义，不再并入 MCP 显示。
+                        Spacer(Modifier.width(14.dp))
+                        Icon(
+                            Icons.Outlined.Build,
+                            contentDescription = null,
+                            modifier = Modifier.size(13.dp),
+                            tint = if ((live.agentTools ?: 0) > 0) {
+                                MaterialTheme.colorScheme.secondary
+                            } else {
+                                MaterialTheme.colorScheme.outline
+                            },
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            "tools ${live.agentTools ?: "—"}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    // 次行：已连接 server 名单（精简保留；未连接/为空不占位）。
+                    if (live.serverNames.isNotEmpty()) {
+                        Text(
+                            live.serverNames.joinToString(" · "),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
+                    HorizontalDivider(
+                        thickness = 0.5.dp,
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                        modifier = Modifier.padding(vertical = 7.dp),
+                    )
+                    // 双控件行：模型下拉与 Thinking Effort 下拉各占
+                    // 50%（各 weight(1f)）；effort 控件仅当前模型
+                    // 解析到条目且家族表有支持档位时组合，未选/
+                    // 不支持时模型下拉独占整行（不占位）。
+                    val currentModel = resolvedCurrentModel(modelAlias, config)
+                    val effortLevels = currentModel?.let {
+                        ReasoningEffortLevels.allowed(it.supportsReasoning, it.modelId)
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        ModelPickerRow(
+                            modelAlias, config, onSelectModel, hazeState,
+                            sharedTransitionScope = sharedTransitionScope,
+                            animatedVisibilityScope = animatedVisibilityScope,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (currentModel != null && effortLevels != null) {
+                            EffortPickerRow(
+                                entry = currentModel.entry,
+                                levels = effortLevels,
+                                current = currentModel.reasoningEffort,
+                                onSelectEffort = onSelectEffort,
+                                sharedTransitionScope = sharedTransitionScope,
+                                animatedVisibilityScope = animatedVisibilityScope,
+                                modifier = Modifier.weight(1f),
+                                hazeState = hazeState,
                             )
-                        }
-                        else -> {
-                            // ── 状态行：MCP server 数 + 可见工具数 ──
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    Icons.Outlined.Hub,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(14.dp),
-                                    tint = if (data.mcpServerCount > 0) {
-                                        MaterialTheme.colorScheme.secondary
-                                    } else {
-                                        MaterialTheme.colorScheme.outline
-                                    },
-                                )
-                                Spacer(Modifier.width(4.dp))
-                                Text(
-                                    "MCP ${data.mcpServerCount}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Spacer(Modifier.width(14.dp))
-                                Icon(
-                                    Icons.Outlined.Build,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(13.dp),
-                                    tint = if (data.toolsVisible > 0) {
-                                        MaterialTheme.colorScheme.secondary
-                                    } else {
-                                        MaterialTheme.colorScheme.error
-                                    },
-                                )
-                                Spacer(Modifier.width(4.dp))
-                                Text(
-                                    "可用工具 ${data.toolsVisible}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = if (data.toolsVisible > 0) {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    } else {
-                                        MaterialTheme.colorScheme.error
-                                    },
-                                )
-                                // 有隐藏工具时右上角补总数（与工具管理页统计呼应）。
-                                if (data.toolsTotal > data.toolsVisible) {
-                                    Spacer(Modifier.weight(1f))
-                                    Text(
-                                        "共 ${data.toolsTotal} 个",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.outline,
-                                    )
-                                }
-                            }
-                            // 第二行：加载到的 server 名单 / 零加载提示。
-                            Text(
-                                if (data.mcpServerCount > 0) {
-                                    data.mcpServerNames.orEmpty()
-                                } else {
-                                    "未加载 MCP 服务器（可在设置中配置）"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.outline,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(top = 2.dp),
-                            )
-                            HorizontalDivider(
-                                thickness = 0.5.dp,
-                                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                                modifier = Modifier.padding(vertical = 7.dp),
-                            )
-                            ModelPickerRow(modelAlias, config, onSelectModel, hazeState)
                         }
                     }
                 }
@@ -277,7 +282,7 @@ internal fun ComposerFocusPanel(
     }
 }
 
-/** 「本次对话模型」选项：models 条目键（选中/回传语义）+ 显示主文字
+/** 模型下拉控件选项：models 条目键（选中/回传语义）+ 显示主文字
  *  （经共享助手换「Provider显示名/modelId」，条目键不直出 UI）。 */
 private data class ComposerModelOption(
     val entry: String,
@@ -297,15 +302,99 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> =
         )
     }
 
+/** 当前选中模型条目：会话别名经 modelEntryOf 解析到 models 反查；
+ *  未选 / 未命中（levels 遗留兜底也落空）= null。面板双控件行与输入框
+ *  常驻状态行（ChatScreen）共用，保证两处「当前模型」恒同源。 */
+internal fun resolvedCurrentModel(modelAlias: String, config: ConfigUi): ModelUi? =
+    config.models.firstOrNull { it.entry == RuntimeBridge.modelEntryOf(modelAlias, config) }
+
+/** Termux/MCP 活性 → 首行文案 + 语义色（面板首行与输入框状态点共用）。
+ *  优先级：探测中 > 已连接 > 未连接 > 未探测。 */
+@Composable
+internal fun termuxLiveStatus(s: McpLiveSnapshot): Pair<String, Color> = when {
+    s.probing -> "检测中…" to MaterialTheme.colorScheme.outline
+    s.hostAlive == true -> "Termux 运行中" to MaterialTheme.colorScheme.secondary
+    s.hostAlive == false -> "Termux 未连接" to MaterialTheme.colorScheme.error
+    else -> "未检测" to MaterialTheme.colorScheme.outline
+}
+
+/** 输入框内常驻状态（未聚焦显示；聚焦后同源信息在面板卡片展开）。
+ *  termuxText 兼作状态图标的 contentDescription。 */
+internal data class ComposerInlineStatus(
+    val modelDisplay: String,
+    /** 宽度不足时的短版显示（仅 modelId，如「glm-5.2」）；未解析到条目
+     *  时与 modelDisplay 同值（降级无意义但无害）。 */
+    val modelId: String,
+    /** null = 当前模型不支持档位选择，不显示 effort 段。 */
+    val effortLabel: String?,
+    /** 正常连接的下游 server 数；null = host 死亡/未知（显示 —）。 */
+    val mcpConnected: Int?,
+    /** 当前 Agent 可用工具总数（可见性过滤后）；null = 注册表不可用（显示 —）。 */
+    val agentTools: Int?,
+    val termuxText: String,
+    val termuxColor: Color,
+)
+
+/** 常驻状态组装（ChatScreen 组合期调用；与面板卡片同源同判定）。 */
+@Composable
+internal fun composerInlineStatus(
+    modelAlias: String,
+    config: ConfigUi,
+    live: McpLiveSnapshot,
+): ComposerInlineStatus {
+    val model = resolvedCurrentModel(modelAlias, config)
+    val effortLabel = model?.let { m ->
+        ReasoningEffortLevels.allowed(m.supportsReasoning, m.modelId)?.let { levels ->
+            m.reasoningEffort
+                ?.takeIf { v -> v in levels }
+                ?.let { v -> ReasoningEffortLevels.label(v) }
+                ?: "默认"
+        }
+    }
+    val (termuxText, termuxColor) = termuxLiveStatus(live)
+    val modelDisplay = when {
+        config.models.isEmpty() -> "未配置模型"
+        modelAlias.isEmpty() -> "未设置"
+        else -> RuntimeBridge.modelAliasDisplay(
+            RuntimeBridge.modelEntryOf(modelAlias, config),
+            config,
+        )
+    }
+    return ComposerInlineStatus(
+        modelDisplay,
+        model?.modelId ?: modelDisplay,
+        effortLabel,
+        live.connectedServers,
+        live.agentTools,
+        termuxText,
+        termuxColor,
+    )
+}
+
+/** 弹层 dismiss 后忽略胶囊重开的时间窗口（毫秒）：focusable=false 的
+ *  弹层点外部 dismiss 走 ACTION_OUTSIDE（DOWN 时刻触发、不消费事件），
+ *  同一手势的 UP 随后落进胶囊 clickable——无抑制则「关了又开」视觉
+ *  收不起。窗口只需盖住一次触摸手势时长，250ms 足够宽。 */
+private const val DropdownReopenSuppressMs = 250L
+
 /**
- * 「本次对话模型」行：整行点击弹玻璃弹层（[GlassDropdownMenu]，与面板同
- * 族磨砂语言；Haze 局部模糊聊天内容，贴底自动向上展开），选中项带 Check
- * 图标（ui.md 基线）；切换走 onSelectModel（ChatScreen 接
- * RuntimeBridge.selectModel：set_model 会话热切 + setCapability("main")
- * 持久化为启动默认）→ model_changed 回填 state.modelAlias，行内显示与
- * 实际生效恒同源。当前值经 [RuntimeBridge.modelEntryOf] 解析到条目再显示
- * （levels 遗留兜底）——内部 entry 键不直出 UI，选中比对/回传仍用原始
- * 条目键。
+ * 模型下拉控件（输入面板内，双控件行的左/主控件）：无静态标签的软底下拉框，SoftButton 同族
+ * 语言——语义 primary 低透明度底 + 同色文字、10dp 圆角、34dp 最小触达
+ * 高度；形态为「左当前值 + 右下拉箭头」的选择框。点击整块弹玻璃弹层
+ * （[GlassDropdownMenu]，与面板同族磨砂语言；Haze 局部模糊聊天内容，
+ * 贴底自动向上展开），选中项带 Check 图标（ui.md 基线）；切换走
+ * onSelectModel（ChatScreen 接 RuntimeBridge.selectModel：set_model
+ * 会话热切 + setCapability("main") 持久化为启动默认）→ model_changed
+ * 回填 state.modelAlias，行内显示与实际生效恒同源。当前值经
+ * [RuntimeBridge.modelEntryOf] 解析到条目再显示（levels 遗留兜底）——
+ * 内部 entry 键不直出 UI，选中比对/回传仍用原始条目键。
+ *
+ * 无障碍：静态标签删除后，语义上移到控件级 contentDescription（「选择
+ * 本次对话模型，当前 X」，展开态换「收起」措辞）；当前值 Text 清空自身
+ * 文本语义，避免与控件描述重复播报裸模型名。
+ *
+ * modifier 由调用方注入宽度（双控件行里传 weight(1f) 占主宽度；effort
+ * 下拉不显示时独占整行效果不变）。
  */
 @Composable
 private fun ModelPickerRow(
@@ -313,47 +402,81 @@ private fun ModelPickerRow(
     config: ConfigUi,
     onSelectModel: (String) -> Unit,
     hazeState: dev.chrisbanes.haze.HazeState,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope,
+    modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    // 同手势抑制时刻（单调时钟，不受系统对时跳变影响）：onDismissRequest
+    // 记录，胶囊 click 在 [DropdownReopenSuppressMs] 窗口内忽略打开。
+    // 四场景：①弹层开 + 点胶囊 → DOWN dismiss、UP 在窗口内被忽略 →
+    // 收起；②弹层关 + 点胶囊 → 无近期 dismiss → 打开；③点弹层外其他
+    // 区域 → 仅 dismiss → 收起；④点菜单项 → GlassDropdownMenu 在
+    // onSelect 后内部调 onDismissRequest（菜单项 UP 消费在弹层内，本无
+    // 同手势竞态，记时刻是选中后速点胶囊误重开的双保险）。
+    var lastDismissElapsedMs by remember { mutableStateOf(0L) }
     val options = remember(config) { composerModelOptions(config) }
     // 当前值解析到条目（镜像 Rust resolve_model 首步：levels 优先、未命中
     // 原样直查 models）——与选项同键比对，显示同经 modelAliasDisplay。
     val currentEntry = RuntimeBridge.modelEntryOf(modelAlias, config)
+    // 当前值三态合一：视觉文本与控件级无障碍描述共用同一字符串，
+    // 不给两处各自 when 漂移的机会。
+    val currentDisplay = when {
+        options.isEmpty() -> "未配置模型"
+        modelAlias.isEmpty() -> "未设置"
+        else -> RuntimeBridge.modelAliasDisplay(currentEntry, config)
+    }
     val arrowAngle by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
         label = "panelModelArrow",
     )
-    Box {
+    Box(modifier) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
-                .clickable(enabled = options.isNotEmpty()) { expanded = true }
-                .padding(horizontal = 2.dp, vertical = 4.dp),
+                // 软底选择框（SoftButton 同族公式）：primary 12% 透明底；
+                // 未配置模型（无可选项）照 SoftButton 禁用态降到 5%。
+                .heightIn(min = 34.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(
+                    MaterialTheme.colorScheme.primary.copy(
+                        alpha = if (options.isNotEmpty()) 0.12f else 0.05f,
+                    ),
+                )
+                .clickable(enabled = options.isNotEmpty()) {
+                    if (SystemClock.elapsedRealtime() - lastDismissElapsedMs > DropdownReopenSuppressMs) {
+                        expanded = true
+                    }
+                }
+                .semantics {
+                    // 行内静态标签已删，控件语义在此补足；可见值文本的
+                    // 语义被清空（见下），TalkBack 只播报这一句。
+                    contentDescription =
+                        if (expanded) "收起模型选择，当前 $currentDisplay"
+                        else "选择本次对话模型，当前 $currentDisplay"
+                }
+                .padding(horizontal = 12.dp, vertical = 4.dp),
         ) {
-            Icon(
-                Icons.Outlined.Memory,
-                contentDescription = null,
-                modifier = Modifier.size(14.dp),
-                tint = MaterialTheme.colorScheme.primary,
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                "本次对话模型",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-            Spacer(Modifier.weight(1f))
+            // sharedBounds 锚点：与输入框常驻状态行的模型名同 key——聚焦
+            // 展开/收起时做「输入框 ↔ 卡片」bounds 缩放位移（320ms，FOOM
+            // 曲线 FastOutSlowInEasing）；面板关闭时另一侧未组合，本修饰
+            // 无匹配即原样渲染。
+            val modelSharedBounds = with(sharedTransitionScope) {
+                Modifier.sharedBounds(
+                    rememberSharedContentState(key = "composer.model"),
+                    animatedVisibilityScope = animatedVisibilityScope,
+                    boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
+                )
+            }
             Text(
                 // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
                 // 子集；「未配置/未设置」等纯状态分支保持默认字体。
-                text = when {
-                    options.isEmpty() -> AnnotatedString("未配置模型")
-                    modelAlias.isEmpty() -> AnnotatedString("未设置")
-                    else -> buildAnnotatedString {
+                text = if (options.isEmpty() || modelAlias.isEmpty()) {
+                    AnnotatedString(currentDisplay)
+                } else {
+                    buildAnnotatedString {
                         withStyle(SpanStyle(fontFamily = MonoFont)) {
-                            append(RuntimeBridge.modelAliasDisplay(currentEntry, config))
+                            append(currentDisplay)
                         }
                     }
                 },
@@ -365,12 +488,17 @@ private fun ModelPickerRow(
                 },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(2f, fill = false),
+                modifier = modelSharedBounds
+                    .weight(1f)
+                    // 控件级 contentDescription 已含当前值，清掉裸文本
+                    // 语义避免 TalkBack 把模型名读两遍。
+                    .clearAndSetSemantics { },
             )
             Spacer(Modifier.width(4.dp))
             Icon(
                 Icons.Filled.KeyboardArrowDown,
-                contentDescription = if (expanded) "收起模型选择" else "选择本次对话模型",
+                // 描述语义已上移控件级，箭头自身不再播报。
+                contentDescription = null,
                 tint = MaterialTheme.colorScheme.outline,
                 // 同 SettingsScreen.CapabilityModelRow：绘制相位读取，避免逐帧重组。
                 modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
@@ -378,14 +506,137 @@ private fun ModelPickerRow(
         }
         GlassDropdownMenu(
             expanded = expanded,
-            onDismissRequest = { expanded = false },
+            onDismissRequest = {
+                expanded = false
+                lastDismissElapsedMs = SystemClock.elapsedRealtime()
+            },
             hazeState = hazeState,
             items = options.map { opt ->
                 GlassDropdownItem(value = opt.entry, label = opt.label, selected = opt.entry == currentEntry)
             },
             labelFontFamily = MonoFont,
             alignEnd = true,
+            // 非聚焦 Popup：弹层不抢窗口焦点 → 输入框保焦、键盘不收
+            // （面板不塌）。代价：BACK 不再先关弹层（作用于底层界面），
+            // composer 场景可接受——点选/点外部均正常关闭。
+            focusable = false,
             onSelect = { opt -> onSelectModel(opt.value) },
+        )
+    }
+}
+
+/**
+ * Thinking Effort 下拉（双控件行右半，与模型下拉各占 50%）：软底同族
+ * 视觉——primary
+ * 12% 透明底 + 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头（展开
+ * 180° 旋转）。仅当前模型解析到条目且 [ReasoningEffortLevels.allowed]
+ * 有支持档位时由调用方组合——不显示时不占位。选项 = 「默认」+ 支持档
+ * 位（同 [ReasoningEffortLevels.label] 文案）；当前值 = 条目
+ * reasoning_effort（null / 越界显示「默认」）。
+ *
+ * 选中语义 = 改模型条目配置：onSelectEffort 回传 (entry, effort)，由
+ * ChatScreen 用 config 里原 ModelUi copy 改字段后 upsertModel 回写
+ * （选了即落盘，config_changed 回刷面板回显）——与模型选择的「选了即
+ * 默认」同语义层级；null = Auto（不传参，跟随 provider 默认）。
+ */
+@Composable
+private fun EffortPickerRow(
+    entry: String,
+    levels: List<String>,
+    current: String?,
+    onSelectEffort: (String, String?) -> Unit,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope,
+    modifier: Modifier = Modifier,
+    hazeState: dev.chrisbanes.haze.HazeState,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    // 同手势抑制：完整四场景语义与 GlassDropdownMenu 回调路径说明见
+    // ModelPickerRow（本控件同款，onSelect 后弹层内部同样走
+    // onDismissRequest，选中即记时刻）。
+    var lastDismissElapsedMs by remember { mutableStateOf(0L) }
+    val arrowAngle by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        label = "panelEffortArrow",
+    )
+    // 越界值（换模型后旧档位不在新支持列表）→ 按「默认」显示与回显。
+    val currentEffort = current?.takeIf { it in levels }
+    Box(modifier) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                // 宽度由外层 Box 承接（weight 在调用方的双控件行注入，
+                // 对各占 50%）；fillMaxWidth 铺满 Box，值文本 weight(1f)
+                // 吸收富余宽度，超长档位名省略。
+                .fillMaxWidth()
+                .heightIn(min = 34.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                .clickable {
+                    if (SystemClock.elapsedRealtime() - lastDismissElapsedMs > DropdownReopenSuppressMs) {
+                        expanded = true
+                    }
+                }
+                .semantics {
+                    // 控件级语义（值文本自身语义被清空，见下），TalkBack
+                    // 只播报这一句；展开态换「收起」措辞，与模型下拉一致。
+                    val cur = currentEffort?.let { ReasoningEffortLevels.label(it) } ?: "默认"
+                    contentDescription =
+                        if (expanded) "收起思考档位选择，当前 $cur" else "思考档位，当前 $cur"
+                }
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            Text(
+                text = currentEffort?.let { ReasoningEffortLevels.label(it) } ?: "默认",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                // sharedBounds 锚点同模型下拉（key composer.effort）：与
+                // 输入框常驻状态行的 effort 档位做 bounds 位移过渡。
+                modifier = with(sharedTransitionScope) {
+                    Modifier.sharedBounds(
+                        rememberSharedContentState(key = "composer.effort"),
+                        animatedVisibilityScope = animatedVisibilityScope,
+                        boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
+                    )
+                }
+                    .weight(1f)
+                    .clearAndSetSemantics { },
+            )
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                Icons.Filled.KeyboardArrowDown,
+                // 描述语义已上移控件级，箭头自身不再播报。
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.outline,
+                // 同模型下拉：绘制相位读取，避免逐帧重组。
+                modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+            )
+        }
+        GlassDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = {
+                expanded = false
+                lastDismissElapsedMs = SystemClock.elapsedRealtime()
+            },
+            hazeState = hazeState,
+            items = listOf(
+                // GlassDropdownItem.value 非空类型：空串表达「默认」，回传
+                // 时 ifEmpty 归 null（与 EditModelDialog 选择器同约定）。
+                GlassDropdownItem(value = "", label = "默认", selected = currentEffort == null),
+            ) + levels.map { lvl ->
+                GlassDropdownItem(
+                    value = lvl,
+                    label = ReasoningEffortLevels.label(lvl),
+                    selected = lvl == currentEffort,
+                )
+            },
+            // 档位名非模型 ID，不注入 MonoFont 子集。
+            alignEnd = true,
+            // 非聚焦 Popup 同模型下拉：键盘不收；BACK 取舍见 ModelPickerRow。
+            focusable = false,
+            onSelect = { opt -> onSelectEffort(entry, opt.value.ifEmpty { null }) },
         )
     }
 }

@@ -3,15 +3,23 @@ package dev.openslate.mobile.ui
 import android.os.Build
 import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.SharedTransitionLayout
+import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -25,6 +33,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -32,6 +41,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -39,9 +53,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -50,6 +66,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -60,16 +77,25 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
@@ -79,6 +105,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
@@ -93,48 +120,78 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.gallatinapps.syntaxmp.tokenizer.SyntaxTokenizer
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
+import dev.openslate.mobile.R
 import dev.openslate.mobile.bridge.McpHostManager
+import dev.openslate.mobile.bridge.PendingQuestionUi
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
+import dev.openslate.mobile.bridge.RuntimeBridge.ASK_USER_TOOL
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Phase 1 聊天主界面：transcript 流 + 输入框 + 审批横幅。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
+fun ChatScreen(
+    onOpenHistory: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenAskUser: () -> Unit = {},
+) {
     val state by RuntimeBridge.state.collectAsState()
     val listState = rememberLazyListState()
     // 点击空白区域 → 收起输入法 + 取消输入框焦点。可点击的子组件（按钮、工具 chip、
     // 输入胶囊）会消费 tap 事件，不会走到这里，行为互不影响。
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
+    // 收起聚焦面板的统一路径（与空白点击同款：键盘收 + 焦点清 → 面板经
+    // 既有反向动画收回、卡片落回输入框）。
+    val collapseComposer = {
+        keyboard?.hide()
+        focusManager.clearFocus()
+    }
     val context = LocalContext.current
     // 输入框聚焦面板：显示 = 输入框持有焦点（编辑状态）。未聚焦时面板
-    // 不参与组合，底部布局零变化。数据在每次聚焦瞬间一次性读取
-    // （无轮询）；失焦保留上次快照，再聚焦先显示快照、后台静默刷新。
+    // 不参与组合，底部布局零变化。Termux/MCP 活性走 tracker 状态流
+    // （聚焦展开时面板内部 refresh），未聚焦时喂输入框内常驻状态行。
     var composerFocused by remember { mutableStateOf(false) }
-    var panelData by remember { mutableStateOf<ComposerPanelData?>(null) }
-    var panelLoading by remember { mutableStateOf(false) }
-    LaunchedEffect(composerFocused, state.ready) {
-        if (!composerFocused || !state.ready) return@LaunchedEffect
-        panelLoading = true
-        panelData = loadComposerPanelData(context)
-        panelLoading = false
+    val live by ComposerMcpStatusTracker.state.collectAsState()
+    val inlineStatus = composerInlineStatus(state.modelAlias, state.config, live)
+    // MCP 活性常新鲜（不依赖聚焦）：初次组合刷一次 + 回前台（ON_RESUME）
+    // 刷一次。tracker 自带单飞去重（重复触发安全），探活为本机回环 HTTP
+    // 成本低，故不设轮询定时器；面板聚焦时另有 refresh（ComposerFocusPanel）。
+    // ChatScreen 无 config_changed / MCP reload 回调处理点，按约定不新增链路。
+    LaunchedEffect(Unit) { ComposerMcpStatusTracker.refresh(context) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                ComposerMcpStatusTracker.refresh(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     // 相邻的连续工具调用聚合为一组（圆角矩形容器内多个 chip），
     // 其余条目原样单行渲染。
@@ -185,6 +242,17 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
         val lastVisible =
             listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: return@LaunchedEffect
         if (lastVisible >= target - 2) listState.animateScrollToItem(target)
+    }
+
+    // 面板展开时：手指拖动聊天列表 → 收起面板（collapseComposer 统一路径）。
+    // 监听 LazyListState.interactionSource 的 DragInteraction.Start——只有
+    // 真实手指拖动才产生；聚焦轻推与新消息贴底的 animateScrollToItem 是
+    // 程序滚动、不经过 interactionSource，不会误收刚展开的面板。
+    LaunchedEffect(composerFocused) {
+        if (!composerFocused) return@LaunchedEffect
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) collapseComposer()
+        }
     }
 
     Scaffold(
@@ -263,10 +331,7 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                 .onGloballyPositioned { rootCoords = it }
                 // 放在 padding/imePadding 之前，手势区域覆盖整个内容区（含 padding 带）。
                 .pointerInput(Unit) {
-                    detectTapGestures(onTap = {
-                        keyboard?.hide()
-                        focusManager.clearFocus()
-                    })
+                    detectTapGestures(onTap = { collapseComposer() })
                 }
                 .padding(bottom = padding.calculateBottomPadding())
                 .imePadding(),
@@ -323,6 +388,13 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                                     // 会话进行中且是最后一条 → 思考中态（实时秒数 + 贴底跟随）。
                                     activeLast = state.running && idx == renderItems.lastIndex,
                                     onOpenTool = { detailTool = it },
+                                    hazeState = hazeState,
+                                    // 气泡容器 onTap 空消费会拦住外层空白点击，
+                                    // 面板展开时点气泡 = 收起面板（未聚焦时为
+                                    // 无操作，仅保留事件消费边界）。
+                                    onTapWhileFocused = { if (composerFocused) collapseComposer() },
+                                    pendingQuestion = state.pendingQuestion,
+                                    onOpenAskUser = onOpenAskUser,
                                 )
                                 is RenderItem.ToolGroup -> ToolGroupCard(
                                     item.parts,
@@ -369,44 +441,88 @@ fun ChatScreen(onOpenHistory: () -> Unit, onOpenSettings: () -> Unit) {
                 }
             }
             // 底部悬浮组：termux stall 提示卡（出现时从输入区上方展开）+ 输入区。
-            Column(
+            // SharedTransitionLayout：输入框常驻状态行 ↔ 聚焦面板卡片之间的
+            // sharedBounds 位移动画容器（key composer.model / composer.effort，
+            // 见 Composer 状态行与 ModelPickerRow/EffortPickerRow 的锚点）。
+            SharedTransitionLayout(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth(),
             ) {
-                TermuxStallBanner(
-                    visible = state.running && state.termuxStallSince != null,
-                    stallSince = state.termuxStallSince,
-                    glass = glass,
-                    rootCoords = { rootCoords },
-                )
-                // 聚焦面板：composer 上方展开（与 TermuxStallBanner 同列同语言），
-                // 未聚焦时不参与组合 → composer 几何与未聚焦态完全一致。
-                ComposerFocusPanel(
-                    visible = composerFocused,
-                    data = panelData,
-                    loading = panelLoading,
-                    modelAlias = state.modelAlias,
-                    config = state.config,
-                    // 选择器「直接选」双写：会话热切 + 持久化为启动默认
-                    // （见 RuntimeBridge.selectModel）。
-                    onSelectModel = { RuntimeBridge.selectModel(it) },
-                    glass = glass,
-                    rootCoords = { rootCoords },
-                    hazeState = hazeState,
-                )
-                Composer(
-                    glass = glass,
-                    rootCoords = { rootCoords },
-                    running = state.running,
-                    onInputFocusChange = { composerFocused = it },
-                    onSend = { text ->
-                        RuntimeBridge.submit(text)
-                        // 发送后退出编辑状态：清焦点 → 聚焦面板收起（键盘随之收起）。
-                        focusManager.clearFocus()
-                    },
-                    onCancel = { RuntimeBridge.cancel() },
-                )
+                Column(Modifier.fillMaxWidth()) {
+                    // ask_user 待答提醒 pill：pending 问卷滚出视口时浮出
+                    //（TermuxStallBanner 同槽位同语言），点击滚动回卡片。
+                    val askPending = state.pendingQuestion?.takeIf {
+                        it.phase == "pending" || it.phase == "submitting"
+                    }
+                    val askItemIdx = askPending?.let { pq ->
+                        renderItems.indexOfFirst {
+                            it is RenderItem.Single &&
+                                it.entry is UiEntry.ToolCall &&
+                                it.entry.name == ASK_USER_TOOL &&
+                                it.entry.fullArgs == pq.argsKey
+                        }
+                    }
+                    val askCardVisible = askItemIdx != null && askItemIdx >= 0 &&
+                        listState.layoutInfo.visibleItemsInfo.any { it.index == askItemIdx }
+                    val listScope = rememberCoroutineScope()
+                    PendingNudgePill(
+                        visible = askPending?.phase == "pending" &&
+                            askItemIdx != null && askItemIdx >= 0 && !askCardVisible,
+                        count = askPending?.questions?.size ?: 0,
+                        glass = glass,
+                        rootCoords = { rootCoords },
+                        onClick = {
+                            askItemIdx?.takeIf { it >= 0 }?.let { idx ->
+                                listScope.launch { listState.animateScrollToItem(idx) }
+                            }
+                        },
+                    )
+                    TermuxStallBanner(
+                        visible = state.running && state.termuxStallSince != null,
+                        stallSince = state.termuxStallSince,
+                        glass = glass,
+                        rootCoords = { rootCoords },
+                    )
+                    // 聚焦面板：composer 上方展开（与 TermuxStallBanner 同列同语言），
+                    // 未聚焦时不参与组合 → composer 几何与未聚焦态完全一致。
+                    ComposerFocusPanel(
+                        visible = composerFocused,
+                        modelAlias = state.modelAlias,
+                        config = state.config,
+                        // 选择器「直接选」双写：会话热切 + 持久化为启动默认
+                        // （见 RuntimeBridge.selectModel）。
+                        onSelectModel = { RuntimeBridge.selectModel(it) },
+                        // Effort 直改条目配置：config 里原 ModelUi copy 改字段
+                        // 后 upsertModel 回写（persist 落盘 + config_changed
+                        // 回刷面板回显）；条目不在当前 config 时静默跳过。
+                        onSelectEffort = { entry, effort ->
+                            state.config.models.firstOrNull { it.entry == entry }?.let {
+                                RuntimeBridge.upsertModel(it.copy(reasoningEffort = effort))
+                            }
+                        },
+                        sharedTransitionScope = this@SharedTransitionLayout,
+                        glass = glass,
+                        rootCoords = { rootCoords },
+                        hazeState = hazeState,
+                    )
+                    Composer(
+                        glass = glass,
+                        rootCoords = { rootCoords },
+                        running = state.running,
+                        onInputFocusChange = { composerFocused = it },
+                        onSend = { text ->
+                            RuntimeBridge.submit(text)
+                            // 发送后退出编辑状态：清焦点 → 聚焦面板收起（键盘随之收起）。
+                            focusManager.clearFocus()
+                        },
+                        onCancel = { RuntimeBridge.cancel() },
+                        // 常驻状态行：仅未聚焦时显示（聚焦后同源信息移交面板卡片）。
+                        showInlineStatus = !composerFocused,
+                        inlineStatus = inlineStatus,
+                        sharedTransitionScope = this@SharedTransitionLayout,
+                    )
+                }
             }
 
             // 工具详情弹窗（Dialog 自身是独立 window，不参与列表布局）。
@@ -431,12 +547,19 @@ private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {
     while (i < entries.size) {
         val e = entries[i]
         if (e is UiEntry.ToolCall) {
+            // ask_user 的工具条目由 QuestionCard 吸收（内联问卷卡特化渲染），
+            // 不进通用工具组、不出工具 chip；摘要/终态与 output 转写同源。
+            if (e.name == ASK_USER_TOOL) {
+                out.add(RenderItem.Single(e, i))
+                i++
+                continue
+            }
             val start = i
             val parts = mutableListOf<UiEntry>()
             while (i < entries.size) {
                 val cur = entries[i]
                 when {
-                    cur is UiEntry.ToolCall -> { parts.add(cur); i++ }
+                    cur is UiEntry.ToolCall && cur.name != ASK_USER_TOOL -> { parts.add(cur); i++ }
                     // 夹在工具调用之间的统计行/步分隔：向后看，若后面还是工具调用则吸收进组。
                     (cur is UiEntry.Meta || cur == UiEntry.StepBreak) &&
                         i + 1 < entries.size && entries[i + 1] is UiEntry.ToolCall -> {
@@ -455,10 +578,18 @@ private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {
 }
 
 @Composable
-private fun EntryRow(entry: UiEntry, activeLast: Boolean = false, onOpenTool: (UiEntry.ToolCall) -> Unit = {}) {
+private fun EntryRow(
+    entry: UiEntry,
+    activeLast: Boolean = false,
+    onOpenTool: (UiEntry.ToolCall) -> Unit = {},
+    hazeState: HazeState,
+    onTapWhileFocused: () -> Unit = {},
+    pendingQuestion: PendingQuestionUi? = null,
+    onOpenAskUser: () -> Unit = {},
+) {
     when (entry) {
         is UiEntry.User -> Bubble(entry.text, mine = true)
-        is UiEntry.Assistant -> MarkdownBubble(entry.text)
+        is UiEntry.Assistant -> MarkdownBubble(entry.text, hazeState, onTapWhileFocused)
         is UiEntry.Reasoning -> ReasoningBlock(entry.text, entry.meta, entry.startTs, activeLast)
         is UiEntry.Meta -> Text(
             entry.text,
@@ -467,7 +598,15 @@ private fun EntryRow(entry: UiEntry, activeLast: Boolean = false, onOpenTool: (U
             modifier = Modifier.padding(horizontal = 8.dp),
         )
         // 分组投影后正常不会到达；保留兜底（sealed when 完整性）。
-        is UiEntry.ToolCall -> ToolGroupCard(listOf(entry), onOpenTool)
+        is UiEntry.ToolCall -> when {
+            // ask_user 特化渲染：内联问卷卡 / 已答摘要 / 终态轻摘要。
+            entry.name == ASK_USER_TOOL -> QuestionCardHost(
+                tc = entry,
+                pending = pendingQuestion,
+                onOpenFullScreen = onOpenAskUser,
+            )
+            else -> ToolGroupCard(listOf(entry), onOpenTool)
+        }
         is UiEntry.Delegate -> Text(
             (if (entry.done) "↳ agent " else "↻ agent ") + entry.agent,
             style = MaterialTheme.typography.labelMedium,
@@ -942,10 +1081,27 @@ private fun ReasoningBlock(
     }
 }
 
-/** 模型回复气泡：增强 Markdown 渲染（高亮代码块/图片 SVG/HTML 降级，紧凑字号）。 */
+/**
+ * 模型回复气泡：增强 Markdown 渲染（高亮代码块/图片 SVG/HTML 降级，紧凑字号）。
+ *
+ * 交互（原「点击整段复制」已移除——误触率高，且长文一键复制鲜有用处）：
+ * - 长按弹上下文菜单（玻璃弹层，锚定长按触点 + 触觉反馈）：复制全文 /
+ *   查看源码。
+ * - tap：消费事件（不透传底层），面板展开时 = 收起面板（[onTapWhileFocused]
+ *   回调内部判聚焦）；子元素（链接、代码块头部按钮、代码可选文本）先于
+ *   容器命中——链接点击不受影响；长按代码块内文本仍走文本选择，不弹菜单。
+ */
 @Composable
-private fun MarkdownBubble(text: String) {
+private fun MarkdownBubble(
+    text: String,
+    hazeState: HazeState,
+    onTapWhileFocused: () -> Unit = {},
+) {
     val clipboard = LocalClipboardManager.current
+    val haptics = LocalHapticFeedback.current
+    // 上下文菜单触点锚点（null = 菜单关闭）；源码查看器开关。
+    var menuAnchor by remember { mutableStateOf<Offset?>(null) }
+    var showSource by remember { mutableStateOf(false) }
     // 空心气泡：不用实底色（surfaceVariant 浅色下发白、与页面难分），改为
     // 透明背景 + 1dp outlineVariant 描边；与用户气泡（primaryContainer 实底）
     // 形成"空心/实心"对比，深浅色主题都成立。
@@ -960,14 +1116,140 @@ private fun MarkdownBubble(text: String) {
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 4.dp),
-        onClick = { clipboard.setText(AnnotatedString(text)) },
+            .padding(horizontal = 4.dp)
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    // 消费 tap 维持既有事件边界（不透传底层）；面板展开时
+                    // 点气泡 = 收起面板（回调内部已判聚焦，未聚焦为无操作）。
+                    // 点击自动复制早已移除。
+                    onTap = { onTapWhileFocused() },
+                    onLongPress = { offset ->
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        menuAnchor = offset
+                    },
+                )
+            },
     ) {
         // 标题降档等排版细节内聚在 EnhancedMarkdown 中。
         EnhancedMarkdown(
             text = text,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
         )
+        // 触点锚定的零尺寸 Box：GlassDropdownMenu 的 Popup 以父布局锚定，
+        // 菜单在触点下方展开（放不下自动上翻，横向超窗夹取进屏内）。
+        menuAnchor?.let { anchor ->
+            Box(
+                Modifier
+                    .offset { IntOffset(anchor.x.roundToInt(), anchor.y.roundToInt()) }
+                    .size(0.dp),
+            ) {
+                GlassDropdownMenu(
+                    expanded = true,
+                    onDismissRequest = { menuAnchor = null },
+                    hazeState = hazeState,
+                    items = listOf(
+                        GlassDropdownItem(
+                            value = "copy",
+                            label = "复制",
+                            leadingIcon = Icons.Filled.ContentCopy,
+                        ),
+                        GlassDropdownItem(
+                            value = "source",
+                            label = "查看源码",
+                            leadingIcon = Icons.Filled.Code,
+                        ),
+                    ),
+                    onSelect = { opt ->
+                        when (opt.value) {
+                            "copy" -> clipboard.setText(AnnotatedString(text))
+                            "source" -> showSource = true
+                        }
+                    },
+                )
+            }
+        }
+    }
+    if (showSource) {
+        SourceCodeDialog(text = text, onDismiss = { showSource = false })
+    }
+}
+
+/**
+ * 源码查看器：气泡原始 Markdown 带语法高亮展示。高亮管线与气泡内代码块
+ * 同源——SyntaxMP `markdown` 语法整段 tokenize，其 grammar 内置 fence 嵌套
+ * （代码块内容按围栏语言二次着色：kotlin/python/xml 等各自出 keyword/
+ * string/tag 角色），markdown 结构角色（标题/强调/引用/markup.*）与嵌套
+ * 代码角色共用代码块同一套 GitHub light/dark 配色映射；tokenize 较重，
+ * produceState 异步计算、首帧先显示纯文本。硬约束保持：SelectionContainer
+ * 选中复制片段、softWrap 自动换行、仅纵向滚动、系统 FontFamily.Monospace
+ * 全字形（禁 JetBrains Mono 子集，见 ui/Fonts.kt 边界）。
+ *
+ * 布局：无标题行（不占标题空间），自定义 Dialog（usePlatformDefaultWidth
+ * = false）近全屏铺开、整块即代码底（surfaceVariant），右上角小号关闭
+ * 按钮（圆形，悬浮于内容之上）——关闭途径 = BACK + 该按钮。
+ */
+@Composable
+private fun SourceCodeDialog(text: String, onDismiss: () -> Unit) {
+    val dark = isSystemInDarkTheme()
+    val tokenizer = remember { SyntaxTokenizer() }
+    // 角色配色随明暗主题切换（与气泡内代码块同一套映射）。
+    val theme = remember(dark) { syntaxRoleColors(dark) }
+    val highlighted = produceState(
+        initialValue = remember(text) { AnnotatedString(text) },
+        text, tokenizer, theme,
+    ) {
+        value = buildSyntaxAnnotatedString(text, "markdown", tokenizer, theme)
+    }.value
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Box(
+            Modifier
+                .padding(horizontal = 10.dp)
+                .padding(vertical = 20.dp)
+                .fillMaxWidth()
+                .heightIn(max = 620.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp)),
+        ) {
+            SelectionContainer {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        // 顶部 40dp 让出关闭按钮悬浮区（滚动内容从其下穿过）。
+                        .padding(top = 40.dp, start = 12.dp, end = 12.dp, bottom = 12.dp),
+                ) {
+                    Text(
+                        highlighted,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                        ),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        softWrap = true,
+                    )
+                }
+            }
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp)
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surface)
+                    .clickable { onDismiss() },
+            ) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "关闭",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
     }
 }
 
@@ -1101,6 +1383,17 @@ internal fun GlassPanel(
  * 显得过高）。输入胶囊为磨砂玻璃面板（GlassPanel）：Android 12+ 重绘背景模糊层，
  * 低版本退化为半透明蒙层；配细边框 + 轻阴影悬浮于透明底条之上。
  * 聚焦状态经 [onInputFocusChange] 上抛，驱动 ChatScreen 底部的聚焦面板。
+ *
+ * 常驻状态块（[showInlineStatus] = 未聚焦）：输入区居左，**原字号**单行
+ * （bodyLarge 16sp/24sp 行盒 + 10dp 上下边距，与无状态行时代完全一致 →
+ * 输入列单独把条高精确锚在原单条高度，任意 fontScale 成立）；右侧上下
+ * 两行小字块贴右缘——上行 模型名 · effort 档，下行 Termux/MCP/tools
+ * （labelSmall 族，块高恒小于输入列预算，垂直居中不撑高）。输入文字横向
+ * 溢出末尾 DstIn 离屏渐隐。整条点按 = 聚焦展开（FocusRequester 直打输入
+ * 框，不拦输入区可点性）。聚焦后状态块横向收出、输入区扩至全宽恢复多行。
+ * 模型名 / effort 档与聚焦面板卡片做 sharedBounds 位移动画（key
+ * composer.model / composer.effort，320ms FastOutSlowInEasing，收起反向）
+ * ——状态块其余部分尺寸与卡片锚点差异大，降级为随面板容器过渡。
  */
 @Composable
 private fun Composer(
@@ -1110,9 +1403,24 @@ private fun Composer(
     onInputFocusChange: (Boolean) -> Unit = {},
     onSend: (String) -> Unit,
     onCancel: () -> Unit,
+    showInlineStatus: Boolean,
+    inlineStatus: ComposerInlineStatus,
+    sharedTransitionScope: SharedTransitionScope,
     modifier: Modifier = Modifier,
 ) {
     var input by remember { mutableStateOf("") }
+    // 常驻状态行「整块点按 = 聚焦展开」：行本身不拦输入区可点性，
+    // 点击经 FocusRequester 直打输入框（焦点 → 面板展开 + IME 弹出，
+    // 与直接点输入框同一路径）。
+    val inputFocusRequester = remember { FocusRequester() }
+    // 输入区字号/行盒/上下 padding 一律保持原单条输入条的原始值
+    //（bodyLarge 16sp/24sp 行盒 + 10dp 上下边距）→ 输入列单独就把条高
+    // 锚在原单条高度（20dp + 24sp，任意 fontScale 精确成立）；右侧状态
+    // 块（两行 labelSmall = 32sp + 1dp 间隙）恒小于该预算，垂直居中于
+    // 条内不撑高。
+    // 未聚焦单行横向溢出标记（onTextLayout 布局相位回填）：驱动文字
+    // 末尾 DstIn 渐隐遮罩。
+    var inputOverflow by remember { mutableStateOf(false) }
     // 底部条透明：去掉 tonalElevation 带来的色调底色，仅保留布局占位。
     Surface(color = androidx.compose.ui.graphics.Color.Transparent, modifier = modifier) {
         Row(
@@ -1134,31 +1442,87 @@ private fun Composer(
                 ),
                 border = true,
             ) {
-                BasicTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    textStyle = MaterialTheme.typography.bodyLarge.copy(
-                        color = MaterialTheme.colorScheme.onSurface,
-                    ),
-                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                    maxLines = 5,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { onInputFocusChange(it.isFocused) }
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    decorationBox = { inner ->
-                        Box {
-                            if (input.isEmpty()) {
-                                Text(
-                                    "发消息…",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = MaterialTheme.colorScheme.outline,
-                                )
+                // 未聚焦左右布局：输入区在左（weight 占剩余宽，原字号单行
+                // + 末尾渐隐），右侧上下两行状态块贴右缘（wrap 内容）。聚焦
+                // 后状态块横向收出、输入区扩至全宽恢复多行。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    BasicTextField(
+                        value = input,
+                        onValueChange = { input = it },
+                        textStyle = MaterialTheme.typography.bodyLarge.copy(
+                            color = MaterialTheme.colorScheme.onSurface,
+                        ),
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                        maxLines = if (showInlineStatus) 1 else 5,
+                        onTextLayout = { result ->
+                            if (showInlineStatus) inputOverflow = result.hasVisualOverflow
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .focusRequester(inputFocusRequester)
+                            .onFocusChanged { onInputFocusChange(it.isFocused) }
+                            .padding(horizontal = 14.dp, vertical = 10.dp)
+                            // 溢出末尾渐隐需独立离屏层：DstIn 只与自身内容
+                            // 运算，否则会透掉玻璃底（同模型名遮罩）。蒙层在
+                            // padding 之内 → 渐变恰好收在文字区右缘，淡出
+                            // 完成后才轮到状态块内容。
+                            .then(
+                                if (showInlineStatus && inputOverflow) {
+                                    Modifier
+                                        .graphicsLayer {
+                                            compositingStrategy = CompositingStrategy.Offscreen
+                                        }
+                                        .drawWithContent {
+                                            drawContent()
+                                            drawRect(
+                                                brush = Brush.horizontalGradient(
+                                                    0f to Color.Black,
+                                                    0.75f to Color.Black,
+                                                    1f to Color.Black.copy(alpha = 0f),
+                                                ),
+                                                blendMode = BlendMode.DstIn,
+                                            )
+                                        }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                        decorationBox = { inner ->
+                            Box {
+                                if (input.isEmpty()) {
+                                    Text(
+                                        "发消息…",
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = MaterialTheme.colorScheme.outline,
+                                        maxLines = 1,
+                                    )
+                                }
+                                inner()
                             }
-                            inner()
-                        }
-                    },
-                )
+                        },
+                    )
+                    AnimatedVisibility(
+                        visible = showInlineStatus,
+                        // 状态块水平收放（贴右缘）：聚焦时向右收出，未聚焦
+                        // 反向从右缘展开；与面板 320ms 过渡同一时钟家族，
+                        // 输入区随 weight 逐帧让位/扩宽，无字号跳变。
+                        enter = fadeIn() + expandHorizontally(
+                            expandFrom = Alignment.End,
+                            animationSpec = tween(320, easing = FastOutSlowInEasing),
+                        ),
+                        exit = fadeOut() + shrinkHorizontally(
+                            shrinkTowards = Alignment.End,
+                            animationSpec = tween(320, easing = FastOutSlowInEasing),
+                        ),
+                    ) {
+                        ComposerInlineStatusRow(
+                            status = inlineStatus,
+                            sharedTransitionScope = sharedTransitionScope,
+                            animatedVisibilityScope = this,
+                            onFocusInput = { inputFocusRequester.requestFocus() },
+                        )
+                    }
+                }
             }
             Spacer(Modifier.width(6.dp))
             Box(
@@ -1194,6 +1558,173 @@ private fun Composer(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * 常驻状态行模型名三态降级阶段：FULL（Provider/modelId 全串）→ SHORT
+ * （仅 modelId）→ FADE（短版 + 末尾渐隐）。只进不退——一次定型 + 随
+ * 模型名变化重置（remember key），杜绝临界宽度来回翻转闪烁。
+ */
+private enum class ModelNameStage { FULL, SHORT, FADE }
+
+/**
+ * 输入框内常驻状态块（未聚焦）：右侧上下两行小字（labelSmall 族），wrap
+ * 内容贴玻璃容器右缘——上行 模型名 · effort 档，下行 Termux · MCP N ·
+ * tools N。块高（两行 16sp 行盒 + 1dp 间隙）恒小于输入列的 20dp + 24sp
+ * 预算，垂直居中于原单条高度内不撑高（高度账见 Composer）。模型名三态
+ * 降级见 [ModelNameStage]（宽压 110dp 上限；无障碍语义固定读全串，视觉
+ * 降级不牺牲朗读）。整块点按 = 聚焦输入框（见 Composer 的 FocusRequester
+ * 说明）。模型名 / effort 档带 sharedBounds 锚点，与聚焦面板卡片的两个
+ * 下拉值文本配对位移。
+ */
+@Composable
+private fun ComposerInlineStatusRow(
+    status: ComposerInlineStatus,
+    sharedTransitionScope: SharedTransitionScope,
+    animatedVisibilityScope: AnimatedVisibilityScope,
+    onFocusInput: () -> Unit,
+) {
+    var nameStage by remember(status.modelDisplay) { mutableStateOf(ModelNameStage.FULL) }
+    Column(
+        horizontalAlignment = Alignment.End,
+        modifier = Modifier
+            .clickable(onClickLabel = "展开输入") { onFocusInput() }
+            // 贴右缘：end 14dp 对齐容器内边距，start 2dp 呼吸位紧挨输入区
+            // 渐隐尾部（输入区自身右 padding 14dp 是主间隙）。
+            .padding(start = 2.dp, end = 14.dp),
+    ) {
+        // 上行：模型名 · effort 档。
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val modelBounds = with(sharedTransitionScope) {
+                Modifier.sharedBounds(
+                    rememberSharedContentState(key = "composer.model"),
+                    animatedVisibilityScope = animatedVisibilityScope,
+                    boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
+                )
+            }
+            Text(
+                // 三态：全串 → 仅 modelId → 短版末尾渐隐（Clip + 内容级 DstIn
+                // 渐变遮罩——遮的是内容本身，玻璃底上正确；不用省略号字符）。
+                // MonoFont 与面板下拉当前值同字体（sharedBounds 位移过渡）。
+                text = buildAnnotatedString {
+                    withStyle(SpanStyle(fontFamily = MonoFont)) {
+                        append(
+                            if (nameStage == ModelNameStage.FULL) {
+                                status.modelDisplay
+                            } else {
+                                status.modelId
+                            },
+                        )
+                    }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = if (nameStage == ModelNameStage.FADE) {
+                    TextOverflow.Clip
+                } else {
+                    TextOverflow.Ellipsis
+                },
+                onTextLayout = { result ->
+                    when (nameStage) {
+                        ModelNameStage.FULL -> if (result.hasVisualOverflow) {
+                            nameStage = ModelNameStage.SHORT
+                        }
+                        ModelNameStage.SHORT -> if (result.hasVisualOverflow) {
+                            nameStage = ModelNameStage.FADE
+                        }
+                        ModelNameStage.FADE -> Unit
+                    }
+                },
+                modifier = modelBounds
+                    // 右侧状态块 wrap 内容：模型名压到固定上限，三态降级在
+                    // 上限内逐级触发（FULL → SHORT → FADE）。
+                    .widthIn(max = 110.dp)
+                    // 淡出遮罩需独立离屏层：DstIn 只与自身内容运算，
+                    // 否则会透掉玻璃底。
+                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                    .drawWithContent {
+                        drawContent()
+                        if (nameStage == ModelNameStage.FADE) {
+                            drawRect(
+                                brush = Brush.horizontalGradient(
+                                    0f to Color.Black,
+                                    0.75f to Color.Black,
+                                    1f to Color.Black.copy(alpha = 0f),
+                                ),
+                                blendMode = BlendMode.DstIn,
+                            )
+                        }
+                    }
+                    // 视觉可能已降级为短版/渐隐，语义固定读完整
+                    // 「Provider/modelId」。
+                    .clearAndSetSemantics { contentDescription = status.modelDisplay },
+            )
+            if (status.effortLabel != null) {
+                Spacer(Modifier.width(3.dp))
+                val effortBounds = with(sharedTransitionScope) {
+                    Modifier.sharedBounds(
+                        rememberSharedContentState(key = "composer.effort"),
+                        animatedVisibilityScope = animatedVisibilityScope,
+                        boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
+                    )
+                }
+                Text(
+                    status.effortLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = effortBounds,
+                )
+            }
+        }
+        // 下行：Termux · MCP N · tools N（右对齐，图标全 Material）。
+        Spacer(Modifier.height(1.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Outlined.Terminal,
+                // 文案作状态点语义（运行中/未连接/检测中…），行内空间留给图形。
+                contentDescription = status.termuxText,
+                modifier = Modifier.size(11.dp),
+                tint = status.termuxColor,
+            )
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                painter = painterResource(R.drawable.ic_mcp),
+                contentDescription = null,
+                modifier = Modifier.size(11.dp),
+                tint = if ((status.mcpConnected ?: 0) > 0) {
+                    MaterialTheme.colorScheme.secondary
+                } else {
+                    MaterialTheme.colorScheme.outline
+                },
+            )
+            Spacer(Modifier.width(2.dp))
+            Text(
+                status.mcpConnected?.toString() ?: "—",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            Spacer(Modifier.width(5.dp))
+            Icon(
+                Icons.Outlined.Build,
+                contentDescription = null,
+                modifier = Modifier.size(11.dp),
+                tint = if ((status.agentTools ?: 0) > 0) {
+                    MaterialTheme.colorScheme.secondary
+                } else {
+                    MaterialTheme.colorScheme.outline
+                },
+            )
+            Spacer(Modifier.width(2.dp))
+            Text(
+                status.agentTools?.toString() ?: "—",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
         }
     }
 }

@@ -66,6 +66,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.LocalTextSelectionColors
@@ -214,7 +216,12 @@ fun SettingsScreen(
             // ── 工具域二级 Tab：吸顶固定（在滚动容器外），紧贴主 Tab ──
             if (tab == 2) {
                 androidx.compose.material3.TabRow(selectedTabIndex = toolTab) {
-                    for ((label, idx) in listOf("MCP" to 0, "命令行" to 1, "工具管理" to 2)) {
+                    for ((label, idx) in listOf(
+                        "MCP" to 0,
+                        "命令行" to 1,
+                        "工具管理" to 2,
+                        "内置工具" to 3,
+                    )) {
                         androidx.compose.material3.Tab(
                             selected = toolTab == idx,
                             onClick = { toolTab = idx },
@@ -361,7 +368,8 @@ fun SettingsScreen(
                                         // 增删改）；卡片其余区域仍是编辑 Provider。
                                         val modelCount = config.models.count { it.provider == p.name }
                                         SoftButton(onClick = { modelsProvider = p }) {
-                                            Text("模型（$modelCount）")
+                                            Text("模型")
+                                            ModelCountBadge(count = modelCount)
                                         }
                                     }
                                 }
@@ -376,14 +384,15 @@ fun SettingsScreen(
                         }
                     }
                     2 -> {
-                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 命令行 / 工具管理 ──
+                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 命令行 / 工具管理 / 内置工具 ──
                         when (toolTab) {
                             0 -> {
                                 McpSection()
                                 LogSection()
                             }
                             1 -> ExecBackendSection()
-                            else -> ToolManagementSection()
+                            2 -> ToolManagementSection()
+                            else -> BuiltinToolBehaviorSection()
                         }
                     }
                 }
@@ -615,6 +624,30 @@ private fun genModelEntryId(providerId: String, modelId: String, existing: Set<S
         id = "$p/$m-" + List(4) { chars.random() }.joinToString("")
     }
     return id
+}
+
+/** 模型计数角标：SoftButton 内「模型」旁的小号数字胶囊，替代按钮
+ *  文字里的「（N）」以收窄按钮。配色沿用 SoftButton 的柔和公式——
+ *  语义 primary 低透明度叠底（按钮自身 12% 底之上再叠 20%，形成同
+ *  色系深一档的层次），数字继承按钮 tint，浅色/深色主题均由语义色
+ *  推导、不硬编码。几何：胶囊圆角 + 5dp 水平内边距，总高约 18dp，
+ *  不破坏按钮 34dp 最小高度；三位数计数时胶囊横向生长、不溢出。
+ *  无障碍：clearAndSetSemantics 用「N 个模型」替换裸数字语义，避免
+ *  TalkBack 与按钮文字合读成「模型，3」这种缺上下文的播报。 */
+@Composable
+private fun ModelCountBadge(count: Int) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.2f))
+            .padding(horizontal = 5.dp, vertical = 1.dp)
+            .clearAndSetSemantics { contentDescription = "$count 个模型" },
+    ) {
+        Text(
+            "$count",
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
 }
 
 /** Provider 的模型管理：自动检测（远端 /models）+ 手动增删改。
@@ -1533,6 +1566,87 @@ private fun DropdownChoice(
     }
 }
 
+/**
+ * reasoning_effort 档位支持表：按模型家族前缀过滤，只让选择器显示该
+ * 模型真正接受的档位（菜单里选了不认的值会在请求层报错）。
+ *
+ * 数据来源：各家官方文档调研（2026-10，lib-1 报告）。匹配规则：modelId
+ * 小写、去非字母数字后**前缀**匹配（"GLM-5.3-Flash" → "glm53flash"）：
+ * - GLM：5.3（glm53*，含 flash）→ low/high/max（不支持 none，传错 400）；
+ *   5.2（glm52*）→ 全六档 + none 七档；其余 glm*（5 / 5.1 / 4.x / Air 等）
+ *   只有 thinking.type、无 effort → 隐藏。
+ * - GPT：5.x / 6.x → 全六档；刻意不给 none——none 支持按模型而异
+ *   （GPT-6 Astra/6.1 Sol 传 none 直接 400），家族粒度无法区分、宁缺勿错。
+ * - Claude：4.6 / 4.7 / 5.x → low/medium/high/xhigh/max（无 minimal）；
+ *   ≤4.5 → 隐藏。
+ * - Gemini：3.x → minimal/low/medium/high（3 系无法关闭思考，无 none）；
+ *   2.5 → none + 四档；更老 → 隐藏。
+ * - DeepSeek：v4 / flash → low/high/max；其余 → 隐藏。
+ * - Qwen：走 thinking_budget、不认 reasoning_effort → 隐藏。
+ * 未匹配家族（o 系、kimi、grok 等）→ 全六档兜底（不含 none）：宁可多
+ * 显示由服务端纠错，不错杀新模型的能力。
+ *
+ * none 档语义：显式发 "reasoning_effort":"none"（请求参数），与「默认」
+ * （不传参、跟随 provider 默认）是两回事——GLM-5.2 默认 max，想关思考
+ * 必须显式选 none。仅对文档明确支持的家族提供（glm52/gemini25），
+ * 且在档位列表内放首位（「默认」之后第一项——关闭是常用动作；
+ * EditModelDialog 与 ComposerPanel 的 EffortPickerRow 均按列表序渲染）。
+ *
+ * internal：SettingsScreen（编辑弹窗）与 ComposerPanel（输入面板双下拉
+ * 控件行）共用，同 package 引用。
+ */
+internal object ReasoningEffortLevels {
+    val ALL = listOf("minimal", "low", "medium", "high", "xhigh", "max")
+
+    /**
+     * 该模型允许的档位（强度升序；支持 none 的家族把 none 放首位——
+     * 强度语义低于 minimal，兼为常用动作）；null = 隐藏整个选择器。
+     * [supportsReasoning] 为条目「推理」开关（registry 自动回填）：
+     * 明确关闭即隐藏——effort 只在思考模型上有意义（ModelUi 该字段为
+     * 布尔、无 null 态；registry 查询结果为 null 时不会改写开关状态，
+     * 不会误触发隐藏）。
+     */
+    fun allowed(supportsReasoning: Boolean, modelId: String): List<String>? {
+        if (!supportsReasoning) return null
+        val id = modelId.lowercase().filter { it.isLetterOrDigit() }
+        return when {
+            id.startsWith("glm53") -> listOf("low", "high", "max")
+            // GLM-5.2：全六档 + none（默认 max，关闭思考必须显式传 none）；
+            // none 放首位（「默认」之后第一项，常用动作）。
+            id.startsWith("glm52") -> listOf("none") + ALL
+            id.startsWith("glm") -> null
+            // 刻意不给 none：GPT 系 none 支持按模型而异（6.x 直接 400），
+            // 家族粒度无法区分，宁缺勿错。
+            id.startsWith("gpt5") || id.startsWith("gpt6") -> ALL
+            id.startsWith("claude46") || id.startsWith("claude47") || id.startsWith("claude5") ->
+                listOf("low", "medium", "high", "xhigh", "max")
+            id.startsWith("claude") -> null
+            // 3 系无法关闭思考，不给 none。
+            id.startsWith("gemini3") -> listOf("minimal", "low", "medium", "high")
+            // 2.5 系文档明确接受 none（显式关闭思考），放首位。
+            id.startsWith("gemini25") -> listOf("none", "minimal", "low", "medium", "high")
+            id.startsWith("gemini") -> null
+            id.startsWith("deepseekv4") || id.startsWith("deepseekflash") ->
+                listOf("low", "high", "max")
+            id.startsWith("deepseek") -> null
+            id.startsWith("qwen") -> null
+            else -> ALL
+        }
+    }
+
+    /** 菜单标签：协议值保留英文原词（与各家文档一致），括注中文程度。 */
+    fun label(v: String): String = when (v) {
+        "none" -> "none（关闭思考）"
+        "minimal" -> "minimal（最简）"
+        "low" -> "low（低）"
+        "medium" -> "medium（中）"
+        "high" -> "high（高）"
+        "xhigh" -> "xhigh（超高）"
+        "max" -> "max（最大）"
+        else -> v
+    }
+}
+
 @Composable
 private fun EditModelDialog(
     initial: ModelUi,
@@ -1552,6 +1666,7 @@ private fun EditModelDialog(
     var toolCall by remember { mutableStateOf(initial.supportsToolCall) }
     var vision by remember { mutableStateOf(initial.supportsVision) }
     var reasoning by remember { mutableStateOf(initial.supportsReasoning) }
+    var effort by remember { mutableStateOf(initial.reasoningEffort) }
     var maxCtx by remember { mutableStateOf(initial.maxContextTokens?.toString() ?: "") }
     var maxOut by remember { mutableStateOf(initial.maxOutputTokens?.toString() ?: "") }
     var priceIn by remember { mutableStateOf(initial.inputPricePerMtok?.toString() ?: "") }
@@ -1613,6 +1728,21 @@ private fun EditModelDialog(
                         Toggle("视觉", vision) { vision = !vision }
                         Toggle("推理", reasoning) { reasoning = !reasoning }
                     }
+                    // Thinking Effort（reasoning_effort）：只显示该模型支持
+                    // 的档位——「推理」关闭或家族表不支持 → 整行隐藏；
+                    // 当前值不在过滤后列表（如换过 modelId）时显示「默认」
+                    // 可重选，保存时越界值归 null（见确认按钮处）。
+                    val effortLevels = ReasoningEffortLevels.allowed(reasoning, modelId)
+                    if (effortLevels != null) {
+                        DropdownChoice(
+                            options = listOf("" to "默认（跟随服务商）") +
+                                effortLevels.map { it to ReasoningEffortLevels.label(it) },
+                            selected = effort?.takeIf { it in effortLevels } ?: "",
+                            onSelect = { effort = it.ifEmpty { null } },
+                            fieldLabel = "Thinking Effort",
+                            supportingText = "思考深度档位；仅在模型支持思考时生效，默认跟随服务商",
+                        )
+                    }
                     OutlinedTextField(maxCtx, { maxCtx = it.filter { c -> c.isDigit() } }, label = { Text("最大上下文 tokens（空=默认）") })
                     OutlinedTextField(maxOut, { maxOut = it.filter { c -> c.isDigit() } }, label = { Text("最大输出 tokens（空=默认）") })
                     OutlinedTextField(priceIn, { priceIn = it }, label = { Text("输入单价 USD/Mtok（空=0）") })
@@ -1640,6 +1770,12 @@ private fun EditModelDialog(
                                 supportsToolCall = toolCall,
                                 supportsVision = vision,
                                 supportsReasoning = reasoning,
+                                // 选择器隐藏（模型不支持）或当前值越界
+                                // （换过 modelId）→ 落 null（Auto），不把
+                                // 模型不认的档位传到请求层。
+                                reasoningEffort =
+                                    ReasoningEffortLevels.allowed(reasoning, modelId.trim())
+                                        ?.let { levels -> effort?.takeIf { it in levels } },
                                 maxContextTokens = maxCtx.toLongOrNull(),
                                 maxOutputTokens = maxOut.toLongOrNull(),
                                 inputPricePerMtok = priceIn.toDoubleOrNull(),
@@ -1910,6 +2046,104 @@ private fun ExecBackendSection() {
                 grantMsg?.let {
                     Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                 }
+            }
+        }
+    }
+}
+
+/**
+ * 内置工具行为（ask_user 等）：默认超时 / 输出脱敏 / 凭据管理入口。
+ *
+ * 生效真值在 Rust 侧 openslate.toml 的 `[ask_user]` 节（default_timeout /
+ * mask_secrets）：设置页每次变更经 RuntimeBridge 以协议 set_ask_user_config
+ * 推送（落盘 + 热替换 + config_changed），启动时另推一次本地值做同步；
+ * 本地 SharedPreferences 仅为 UI 显示源，两端不漂移。
+ */
+@Composable
+private fun BuiltinToolBehaviorSection() {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    // prefs 读取预取到 IO 线程（组合期同步读盘会卡帧）；null = 加载中。
+    var timeoutSec by remember { mutableStateOf<Long?>(null) }
+    var maskSecrets by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            timeoutSec = RuntimeBridge.askUserTimeoutSec()
+            maskSecrets = RuntimeBridge.askUserMaskSecrets()
+        }
+    }
+
+    Section(title = "Agent 提问") {
+        Text(
+            "Agent 缺少关键信息时会向你提问（ask_user）；未作答时它将自行判断并继续。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+        if (timeoutSec == null) {
+            Text("加载中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+        } else {
+            DropdownChoice(
+                options = listOf(
+                    "-1" to "永不超时",
+                    "300" to "5 分钟",
+                    "600" to "10 分钟",
+                    "1800" to "30 分钟",
+                    "3600" to "60 分钟",
+                ),
+                selected = timeoutSec.toString(),
+                onSelect = { v ->
+                    val sec = v.toLong()
+                    timeoutSec = sec
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        RuntimeBridge.setAskUserTimeoutSecAndPersist(sec)
+                    }
+                },
+                fieldLabel = "默认等待时长",
+                supportingText = "超过该时长未作答，Agent 将按「用户可能不在」自行判断继续；单次提问可由 Agent 覆盖。",
+            )
+        }
+    }
+
+    Section(title = "输出脱敏") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("密钥自动打码", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "工具输出中出现已存凭据的明文时自动以 *** 替代。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            androidx.compose.material3.Switch(
+                checked = maskSecrets == true,
+                onCheckedChange = { on ->
+                    maskSecrets = on
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        RuntimeBridge.setAskUserMaskSecretsAndPersist(on)
+                    }
+                },
+            )
+        }
+    }
+
+    Section(title = "凭据管理") {
+        Text(
+            "通过 Agent 提问提交并勾选「记住此凭据」的密钥会保存在这里，可按条删除。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+        // TODO(凭据数据源)：Rust 侧持久凭据库已落地（store v4 credentials 表 +
+        // PersistentSecretVault），但列表/删除需要新增 uniffi 导出面：
+        // listCredentialsJson()（无明文清单：name/kind/target/updated_at）与
+        // deleteCredential(name)。mobile-ffi lane 补齐后接真数据源；当前先渲染
+        // 空态占位。
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("暂无已保存的凭据", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "数据接入开发中",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
             }
         }
     }

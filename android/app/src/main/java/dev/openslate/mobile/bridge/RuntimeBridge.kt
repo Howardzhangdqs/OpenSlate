@@ -57,6 +57,76 @@ data class PendingApprovalUi(
     val reason: String,
 )
 
+// ── ask_user（Agent 向用户提问）的 UI 投影与草稿 ─────────────────────
+
+/** ask_user 单题选项。 */
+data class QuestionOptionUi(
+    val label: String,
+    val description: String = "",
+    val recommended: Boolean = false,
+)
+
+/** ask_user 单题（payload 解析投影；type 未知值由 UI 按 text 兜底渲染）。 */
+data class QuestionUi(
+    val id: String,
+    val header: String,
+    val question: String,
+    val type: String, // choice | text | confirm | secret
+    val options: List<QuestionOptionUi>,
+    val multiSelect: Boolean = false,
+    val placeholder: String? = null,
+    val optional: Boolean = false,
+    /** 仅 secret：落地形态（env / file）。 */
+    val storageKind: String? = null,
+    /** 仅 secret：env 变量名 / file 路径。 */
+    val storageName: String? = null,
+)
+
+/**
+ * 每题作答草稿。挂 UiState 层（以 requestId 为键随 [PendingQuestionUi]
+ * 携带）：切题、进出全屏、卡片重组、列表滚动回收都不丢；**未提交草稿
+ * 不持久化**（重启后空草稿重答，r4/r5 语义）。
+ */
+data class QuestionDraft(
+    /** choice：已选模型选项 label（单/多选共用）。 */
+    val selected: List<String> = emptyList(),
+    /** choice：内置「其他」兜底行是否勾选。 */
+    val otherChecked: Boolean = false,
+    /** choice：「其他」说明文字。 */
+    val otherText: String = "",
+    /** text / secret：输入内容（secret 明文仅存在于内存草稿与 resolve payload）。 */
+    val text: String = "",
+    /** confirm：null 未选，true/false 已选。 */
+    val confirm: Boolean? = null,
+    /** secret：记住此凭据。 */
+    val remember: Boolean = false,
+    /** 逐题 decline（「此题不答」）。 */
+    val declined: Boolean = false,
+    /** 跳过（仅 optional 题显示入口）。 */
+    val skipped: Boolean = false,
+)
+
+/**
+ * pending 问卷（含草稿与卡内相位）。终态渲染不依赖它——declined /
+ * cancelled / superseded / expired / answered 摘要统一由关联
+ * [UiEntry.ToolCall] 的 output JSON 承载（转写与摘要同源，重启可恢复）。
+ */
+data class PendingQuestionUi(
+    val requestId: Long,
+    val questions: List<QuestionUi>,
+    val drafts: List<QuestionDraft>,
+    /** 秒；-1 = 永不（S2 超时语义本版仅预留展示位）。 */
+    val timeoutSec: Long = -1L,
+    /** 关联 ToolCall 条目的 fullArgs（工具 chip 吸收 / 答案回写的定位键）。 */
+    val argsKey: String = "",
+    /** pending → submitting → answered / declined；answered/declined 随 turn 结束清除。 */
+    val phase: String = "pending",
+    /** 当前题页码（分段条 / Pager 共享；存 UiState 保证进出全屏不丢）。 */
+    val current: Int = 0,
+    /** host call 到达时刻（S2 超时文案预留；不驱动任何自动 resolve）。 */
+    val createdAtMs: Long = System.currentTimeMillis(),
+)
+
 /** 配置视图（snapshot/config_changed 的投影）。 */
 data class ProviderUi(
     val name: String,
@@ -81,6 +151,10 @@ data class ModelUi(
     val supportsReasoning: Boolean = false,
     val inputPricePerMtok: Double? = null,
     val outputPricePerMtok: Double? = null,
+    /** thinking effort 档位（minimal/low/medium/high/xhigh/max）；
+     *  null = Auto（不传参，跟随 provider 默认）——wire 键 reasoning_effort
+     *  在 Rust 侧 null 时 skip 序列化（serde skip_serializing_if）。 */
+    val reasoningEffort: String? = null,
 )
 
 data class ConfigUi(
@@ -124,6 +198,8 @@ data class RuntimeUiState(
     val modelAlias: String = "",
     val entries: List<UiEntry> = emptyList(),
     val pendingApproval: PendingApprovalUi? = null,
+    /** ask_user 待答问卷（含草稿）；null = 无待答卡。 */
+    val pendingQuestion: PendingQuestionUi? = null,
     val sessionId: String = "",
     val lastError: String? = null,
     val config: ConfigUi = ConfigUi(),
@@ -311,6 +387,9 @@ object RuntimeBridge {
                     }
                     restoreHttpProxy()
                     restoreExecBackend()
+                    // ask_user 行为配置：本地偏好推一次给引擎做同步
+                    //（openslate.toml [ask_user] 为生效真值）。
+                    syncAskUserConfig()
                     // 模型元数据注册表：启动时按需自动更新（后台执行；
                     // 本地缺失或超过各源 stale_after 才真正拉取）。
                     runtime.registryScheduleAutoUpdate()
@@ -567,6 +646,13 @@ object RuntimeBridge {
                     .put("supports_tool_call", m.supportsToolCall)
                     .put("supports_vision", m.supportsVision)
                     .put("supports_reasoning", m.supportsReasoning)
+                    .put(
+                        // null = Auto（跟随 provider 默认）：显式 JSON null 经
+                        // serde Option 反序列化为 None，落盘即跳键——与既有
+                        // 可空字段（max_context_tokens 等）同一模式。
+                        "reasoning_effort",
+                        m.reasoningEffort ?: JSONObject.NULL,
+                    )
                     .put(
                         "max_context_tokens",
                         m.maxContextTokens ?: JSONObject.NULL,
@@ -981,6 +1067,320 @@ object RuntimeBridge {
         JSONObject().put("type", "approval_answer").put("id", id).put("choice", choice).toString()
     )
 
+    // ── ask_user：Agent 向用户提问（内联问卷卡 + 全屏作答）──────────────
+    //
+    // 契约（供 Rust 侧对齐）：
+    // - 下发：host_call_requested 事件 {"type":"host_call_requested","id":<Long>,
+    //   "tool":"ask_user","args":{"v":1,"questions":[…],"timeout":-1}}；
+    //   questions[] 每题 {id,header,question,type,options[{label,description,recommended}],
+    //   multi_select,placeholder,optional,storage{kind,name|path}}。
+    // - 提交：resolveHostCall(id, true, {"outcome":"answered","answers":[…]}）；
+    //   answers[] 每题 {id,selected:[label…]} | {id,value} | {id,value,remember}（secret，
+    //   明文仅走本通道）| {id,confirm:bool,selected:[label]} | {id,skipped:true} | {id,declined:true}。
+    // - 整卡 decline：resolveHostCall(id, true, {"outcome":"declined"})。
+    // - 一切业务结果 ok=true；ok=false 仅基础设施错误。幂等首答赢——对失效
+    //   id 的 resolve 必须是无害 no-op（Rust 侧保证）。
+    // - 转写：Kotlin 侧在提交/decline 时把**脱敏后**的 outcome JSON 写入关联
+    //   ToolCall 条目的 output（secret 只留引用 {name,kind,remember}，明文不进
+    //   output、不进日志、不进本地持久化）。
+
+    /** ask_user 工具注册名（groupEntries 吸收判定 / 条目定位共用）。 */
+    const val ASK_USER_TOOL = "ask_user"
+
+    /** host call 到达 → 解析题目、建立 pendingQuestion（UI 出卡）。 */
+    private fun handleAskUser(id: Long, obj: JSONObject) {
+        val args = obj.optJSONObject("args")
+        val questionsArr = args?.optJSONArray("questions") ?: obj.optJSONArray("questions")
+        val timeout = args?.optLong("timeout", -1L) ?: obj.optLong("timeout", -1L)
+        if (questionsArr == null || questionsArr.length() == 0) {
+            runtimeRef.get()?.resolveHostCall(id.toULong(), false, "ask_user: empty questions payload")
+            return
+        }
+        val questions = mutableListOf<QuestionUi>()
+        for (i in 0 until questionsArr.length()) {
+            val q = questionsArr.optJSONObject(i) ?: continue
+            val storage = q.optJSONObject("storage")
+            questions.add(
+                QuestionUi(
+                    id = q.optString("id").ifBlank { "q${i + 1}" },
+                    header = q.optString("header").ifBlank { "问题 ${i + 1}" },
+                    question = q.optString("question"),
+                    type = q.optString("type", "choice").ifBlank { "choice" },
+                    options = buildList {
+                        val os = q.optJSONArray("options") ?: return@buildList
+                        for (j in 0 until os.length()) {
+                            val o = os.optJSONObject(j) ?: continue
+                            val label = o.optString("label")
+                            if (label.isEmpty()) continue
+                            add(QuestionOptionUi(label, o.optString("description"), o.optBoolean("recommended")))
+                        }
+                    },
+                    multiSelect = q.optBoolean("multi_select"),
+                    placeholder = if (q.has("placeholder") && !q.isNull("placeholder")) {
+                        q.optString("placeholder")
+                    } else null,
+                    optional = q.optBoolean("optional"),
+                    storageKind = storage?.optString("kind")?.takeIf { it == "env" || it == "file" },
+                    storageName = when (storage?.optString("kind")) {
+                        "env" -> storage.optString("name")
+                        "file" -> storage.optString("path").ifBlank { storage.optString("name") }
+                        else -> null
+                    },
+                )
+            )
+        }
+        if (questions.isEmpty()) {
+            runtimeRef.get()?.resolveHostCall(id.toULong(), false, "ask_user: no parseable questions")
+            return
+        }
+        // 关联最近的 running ask_user ToolCall 条目（tool_start 先于 host call
+        // 到达）；定位失败仍出卡（argsKey 为空则无法回写转写，卡片自身可用）。
+        val argsKey = _state.value.entries.asReversed().asSequence()
+            .filterIsInstance<UiEntry.ToolCall>()
+            .firstOrNull { it.name == ASK_USER_TOOL && it.status == "running" }
+            ?.fullArgs ?: ""
+        if (argsKey.isEmpty()) {
+            Log.w(TAG, "ask_user: no running tool entry to associate (id=$id)")
+        }
+        mutate {
+            copy(
+                pendingQuestion = PendingQuestionUi(
+                    requestId = id,
+                    questions = questions,
+                    drafts = List(questions.size) { QuestionDraft() },
+                    timeoutSec = timeout,
+                    argsKey = argsKey,
+                )
+            )
+        }
+        Log.i(TAG, "ask_user: pending card shown (id=$id, ${questions.size} question(s))")
+    }
+
+    /** 草稿更新（pending 期有效；切题/进出全屏/重组均经 UiState 不丢）。 */
+    fun updateQuestionDraft(requestId: Long, index: Int, transform: (QuestionDraft) -> QuestionDraft) {
+        mutate {
+            val p = pendingQuestion ?: return@mutate this
+            if (p.requestId != requestId || p.phase != "pending" || index !in p.drafts.indices) {
+                return@mutate this
+            }
+            val drafts = p.drafts.toMutableList()
+            drafts[index] = transform(drafts[index])
+            copy(pendingQuestion = p.copy(drafts = drafts))
+        }
+    }
+
+    /** 当前题切换（分段条点击 / Pager 滑动共用入口）。 */
+    fun setCurrentQuestion(requestId: Long, index: Int) {
+        mutate {
+            val p = pendingQuestion ?: return@mutate this
+            if (p.requestId != requestId || index !in p.questions.indices || index == p.current) {
+                return@mutate this
+            }
+            copy(pendingQuestion = p.copy(current = index))
+        }
+    }
+
+    /**
+     * 提交全部答案。resolve payload 含 secret 明文（仅 FFI 通道传递，不打
+     * 日志）；转写 output 为脱敏快照（重启后摘要卡可恢复）。校验由 UI 侧
+     * 完成（全部题目「已处理」才可点），此处不再重复判定。
+     */
+    fun submitQuestionAnswers(requestId: Long) {
+        val p = _state.value.pendingQuestion ?: return
+        if (p.requestId != requestId || p.phase != "pending") return
+        val answers = JSONArray()
+        val display = JSONArray()
+        for ((i, q) in p.questions.withIndex()) {
+            val d = p.drafts[i]
+            val a = JSONObject().put("id", q.id)
+            val disp = JSONObject().put("id", q.id).put("header", q.header)
+            when {
+                d.skipped -> {
+                    a.put("skipped", true)
+                    disp.put("skipped", true)
+                }
+                d.declined -> {
+                    a.put("declined", true)
+                    disp.put("declined", true)
+                }
+                q.type == "choice" -> {
+                    val sel = d.selected.toMutableList()
+                    if (d.otherChecked && d.otherText.isNotBlank()) sel.add(d.otherText.trim())
+                    a.put("selected", JSONArray(sel))
+                    disp.put("selected", JSONArray(sel))
+                }
+                q.type == "secret" -> {
+                    // resolve：明文 + remember（仅 FFI 通道）；转写：仅引用。
+                    a.put("value", d.text).put("remember", d.remember)
+                    disp.put(
+                        "secret",
+                        JSONObject()
+                            .put("name", q.storageName ?: "")
+                            .put("kind", q.storageKind ?: "env")
+                            .put("remember", d.remember),
+                    )
+                }
+                q.type == "confirm" -> {
+                    val label = if (d.confirm == true) {
+                        q.options.getOrNull(0)?.label ?: "是"
+                    } else {
+                        q.options.getOrNull(1)?.label ?: "否"
+                    }
+                    a.put("confirm", d.confirm == true).put("selected", JSONArray(listOf(label)))
+                    disp.put("confirm", d.confirm == true).put("selected", JSONArray(listOf(label)))
+                }
+                else -> { // text（含未知题型兜底）
+                    a.put("value", d.text.trim())
+                    disp.put("value", d.text.trim())
+                }
+            }
+            answers.put(a)
+            display.put(disp)
+        }
+        val payload = JSONObject().put("outcome", "answered").put("answers", answers).toString()
+        val transcript = JSONObject().put("outcome", "answered").put("answers", display).toString()
+        mutate {
+            val cur = pendingQuestion ?: return@mutate this
+            if (cur.requestId != requestId) return@mutate this
+            copy(pendingQuestion = cur.copy(phase = "submitting"))
+        }
+        scope.launch(Dispatchers.Default) {
+            val runtime = runtimeRef.get()
+            val ok = runtime != null && runCatching {
+                runtime.resolveHostCall(requestId.toULong(), true, payload)
+            }.getOrDefault(false)
+            if (!ok) {
+                // 发送失败（runtime 亡 / FFI 异常）：回滚到 pending 允许重试。
+                Log.w(TAG, "ask_user: submit resolve failed (id=$requestId)")
+                mutate {
+                    val cur = pendingQuestion
+                    if (cur != null && cur.requestId == requestId && cur.phase == "submitting") {
+                        copy(pendingQuestion = cur.copy(phase = "pending"))
+                    } else this
+                }
+                return@launch
+            }
+            // turn 可能已在提交瞬间结束（cancel 竞态）→ pendingQuestion 被
+            // finalize 清除：跳过回写（cancelled 已胜出，resolve 为无害 no-op）。
+            val stillOwned = _state.value.pendingQuestion
+                ?.let { it.requestId == requestId } == true
+            if (stillOwned) {
+                writeAskUserOutcome(p.argsKey, transcript)
+                mutate {
+                    val cur = pendingQuestion
+                    if (cur != null && cur.requestId == requestId && cur.phase == "submitting") {
+                        copy(pendingQuestion = cur.copy(phase = "answered"))
+                    } else this
+                }
+            }
+            Log.i(TAG, "ask_user: answered (id=$requestId)")
+        }
+    }
+
+    /** 整卡 decline（「不回答」，UI 层已二次确认）。 */
+    fun declineQuestionCard(requestId: Long) {
+        val p = _state.value.pendingQuestion ?: return
+        if (p.requestId != requestId || p.phase != "pending") return
+        scope.launch(Dispatchers.Default) {
+            val runtime = runtimeRef.get() ?: return@launch
+            runtime.resolveHostCall(requestId.toULong(), true, """{"outcome":"declined"}""")
+        }
+        writeAskUserOutcome(p.argsKey, """{"outcome":"declined"}""")
+        mutate { copy(pendingQuestion = pendingQuestion?.takeIf { it.requestId != requestId }) }
+        Log.i(TAG, "ask_user: declined (id=$requestId)")
+    }
+
+    /** 把终态/答案 JSON 写回关联条目（转写与摘要同源）。首答赢：条目已有的
+     *  本工具终态 JSON（含 outcome 字段）不覆盖（cancelled/declined 先胜）；
+     *  tool_end 先到的事件 preview（无 outcome 字段的普通文本）可被修正。 */
+    private fun writeAskUserOutcome(argsKey: String, json: String) {
+        if (argsKey.isEmpty()) return
+        mutate {
+            val idx = entries.indexOfFirst {
+                it is UiEntry.ToolCall && it.name == ASK_USER_TOOL && it.fullArgs == argsKey
+            }
+            if (idx < 0) return@mutate this
+            val e = entries[idx] as UiEntry.ToolCall
+            if (e.output != null && isAskUserOutcomeJson(e.output)) return@mutate this
+            copy(entries = entries.toMutableList().also { it[idx] = e.copy(output = json) })
+        }
+    }
+
+    private fun isAskUserOutcomeJson(s: String?): Boolean {
+        if (s.isNullOrBlank()) return false
+        val o = runCatching { JSONObject(s) }.getOrNull() ?: return false
+        return o.has("outcome")
+    }
+
+    /**
+     * turn 离开 running 态：清理 ask_user pending 态。已答/已拒只清（摘要由
+     * entry.output 承载）；仍 pending/submitting = turn 被打断（用户停止等）
+     * → 写 cancelled 终态。迟到的 resolve 对失效 id 无害（幂等首答赢）。
+     */
+    private fun finalizeAskUserOnTurnEnd() {
+        val p = _state.value.pendingQuestion ?: return
+        if (p.phase == "pending" || p.phase == "submitting") {
+            writeAskUserOutcome(p.argsKey, """{"outcome":"cancelled"}""")
+        }
+        mutate { copy(pendingQuestion = null) }
+    }
+
+    // ── ask_user 行为偏好（本地 SharedPreferences = UI 显示源；生效真值
+    //    在 Rust 侧 openslate.toml 的 [ask_user] 节——每次变更经协议
+    //    set_ask_user_config 推送落盘，启动时同步一次本地值）──
+
+    private const val PREF_ASK_USER_TIMEOUT_SEC = "ask_user_timeout_sec"
+    private const val PREF_ASK_USER_MASK_SECRETS = "ask_user_mask_secrets"
+
+    /** ask_user 默认超时（秒；-1 = 永不。首装默认永不超时）。 */
+    fun askUserTimeoutSec(): Long =
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.getLong(PREF_ASK_USER_TIMEOUT_SEC, -1L) ?: -1L
+
+    fun setAskUserTimeoutSecAndPersist(sec: Long) {
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.edit()?.putLong(PREF_ASK_USER_TIMEOUT_SEC, sec)?.apply()
+        Log.i(TAG, "ask_user default timeout set to ${sec}s")
+        pushAskUserConfig(sec, askUserMaskSecrets())
+    }
+
+    /** 工具输出脱敏开关（对已知密钥值自动打码；默认开）。 */
+    fun askUserMaskSecrets(): Boolean =
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.getBoolean(PREF_ASK_USER_MASK_SECRETS, true) ?: true
+
+    fun setAskUserMaskSecretsAndPersist(on: Boolean) {
+        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.edit()?.putBoolean(PREF_ASK_USER_MASK_SECRETS, on)?.apply()
+        Log.i(TAG, "ask_user secret masking set to $on")
+        pushAskUserConfig(askUserTimeoutSec(), on)
+    }
+
+    /**
+     * 推送 ask_user 行为配置到引擎（协议 set_ask_user_config：Rust 侧写
+     * active openslate.toml [ask_user] 落盘 + 热替换 + 广播 config_changed）。
+     * timeoutSec：-1 = 永不（线格式 "never"），>0 = 秒（{"seconds": n}）。
+     */
+    private fun pushAskUserConfig(timeoutSec: Long, maskSecrets: Boolean): Boolean {
+        val timeout = if (timeoutSec < 0) "never"
+            else JSONObject().put("seconds", timeoutSec)
+        return sendJson(
+            JSONObject().put("type", "set_ask_user_config")
+                .put("default_timeout", timeout)
+                .put("mask_secrets", maskSecrets)
+                .toString()
+        )
+    }
+
+    /** 启动同步：本地偏好推一次给引擎（配置文件为生效真值；此后设置页
+     *  每次变更均双写，两端不漂移）。 */
+    private fun syncAskUserConfig() {
+        val sec = askUserTimeoutSec()
+        val mask = askUserMaskSecrets()
+        val sent = pushAskUserConfig(sec, mask)
+        Log.i(TAG, "start: ask_user config synced (timeout=${sec}s, mask=$mask, sent=$sent)")
+    }
+
     fun sendJson(json: String): Boolean {
         val runtime = runtimeRef.get() ?: run {
             // 内容型日志（json 可含用户消息）仅 debug，release 不剥离 logcat。
@@ -1050,7 +1450,10 @@ object RuntimeBridge {
                     val idx = entries.indexOfFirst { it is UiEntry.ToolCall && it.name == name && it.status == "running" }
                     if (idx >= 0) {
                         val e = entries[idx] as UiEntry.ToolCall
-                        copy(entries = entries.toMutableList().also { it[idx] = e.copy(status = "done", output = out ?: e.output) })
+                        // ask_user 的答案/终态 JSON（提交时由 Kotlin 写入）优先于
+                        // 事件 preview：保持已答摘要与转写同源、不被覆盖。
+                        val finalOut = if (e.name == ASK_USER_TOOL && e.output != null) e.output else out ?: e.output
+                        copy(entries = entries.toMutableList().also { it[idx] = e.copy(status = "done", output = finalOut) })
                     } else this
                 }
             }
@@ -1114,14 +1517,14 @@ object RuntimeBridge {
             }.also { stepStartTs = System.currentTimeMillis() }
             "turn_ok" -> mutate {
                 copy(running = false, awaitingFirstToken = false)
-            }.also { persistTranscriptAsync() }
+            }.also { finalizeAskUserOnTurnEnd(); persistTranscriptAsync() }
             "turn_error" -> mutate {
                 copy(
                     running = false,
                     awaitingFirstToken = false,
                     entries = entries + UiEntry.Meta("⚠ " + obj.optString("message", "error")),
                 )
-            }.also { persistTranscriptAsync() }
+            }.also { finalizeAskUserOnTurnEnd(); persistTranscriptAsync() }
             "notice" -> mutate {
                 copy(entries = entries + UiEntry.Meta(obj.optString("text", "")))
             }
@@ -1140,7 +1543,7 @@ object RuntimeBridge {
                 }
             }
             "approval_resolved" -> mutate { copy(pendingApproval = null) }
-            "session_reset" -> mutate { copy(entries = emptyList(), pendingApproval = null) }
+            "session_reset" -> mutate { copy(entries = emptyList(), pendingApproval = null, pendingQuestion = null) }
             "model_changed" -> mutate { copy(modelAlias = obj.optString("alias")) }
             // run 标题生成完成：只递增版本号，历史页观察到后自行刷新
             // （会话列表不在全局 state 里，拉取式投影）。
@@ -1176,6 +1579,8 @@ object RuntimeBridge {
                     if (m.has(k) && !m.isNull(k)) m.optLong(k) else null
                 fun optDouble(k: String): Double? =
                     if (m.has(k) && !m.isNull(k)) m.optDouble(k) else null
+                fun optStr(k: String): String? =
+                    if (m.has(k) && !m.isNull(k)) m.optString(k) else null
                 add(
                     ModelUi(
                         entry = entry,
@@ -1188,6 +1593,7 @@ object RuntimeBridge {
                         supportsReasoning = m.optBoolean("supports_reasoning"),
                         inputPricePerMtok = optDouble("input_price_per_mtok"),
                         outputPricePerMtok = optDouble("output_price_per_mtok"),
+                        reasoningEffort = optStr("reasoning_effort"),
                     )
                 )
             }
@@ -1628,6 +2034,9 @@ object RuntimeBridge {
                     reason = it.optJSONObject("summary")?.optString("reason") ?: "",
                 )
             },
+            // ask_user pending 卡跨 snapshot 保留（同会话刷新）；turn 未运行时
+            // 的快照不可能有活问卷（host call 阻塞 turn），按 running 门控丢弃。
+            pendingQuestion = _state.value.pendingQuestion.takeIf { session.optBoolean("running") },
         )
         // 本地 transcript（含思维链/⚡meta）若存在则整体覆盖镜像版。
         tryRestoreLocalTranscript()
@@ -1697,6 +2106,7 @@ object RuntimeBridge {
             }
             "termux.run", "termux_bash", "bash" ->
                 runInTermux(runtime, id, tool, obj.optJSONObject("args")?.optString("command") ?: "")
+            "ask_user" -> handleAskUser(id, obj)
             else -> runtime.resolveHostCall(
                 id.toULong(), false,
                 "host tool '$tool' not implemented in Phase 1",

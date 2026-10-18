@@ -1,7 +1,8 @@
 //! OpenSlate SQLite 存储的 schema 定义与版本化迁移。
 //!
-//! 全部 7 张表：`runs`、`execution_nodes`、`steps`、`messages`、
-//! `prompt_snapshots`、`audit_log`、`trace_events`。
+//! 全部 9 张表：`runs`、`execution_nodes`、`steps`、`messages`、
+//! `prompt_snapshots`、`audit_log`、`trace_events`、`pending_questions`
+//! （v3）、`credentials`（v4）。
 //!
 //! 迁移机制（见 [`crate::store::SqliteStore::run_migrations`]）：
 //! - 以 `PRAGMA user_version` 记录当前 schema 版本，目标版本为
@@ -22,8 +23,12 @@ use sqlx::{query, query_scalar, SqliteConnection};
 /// - `1`：基线 —— 7 张表 + 索引（等价旧无版本机制的最终形态，
 ///   但基线 DDL 已含 CHECK 约束、不含 `runs.cwd`）；
 /// - `2`：`runs` 增加 `title` 列；`messages(run_id, seq)` 唯一索引；
-///   清理死列 `runs.cwd` 与死索引 `idx_runs_cwd`。
-pub const SCHEMA_VERSION: i64 = 2;
+///   清理死列 `runs.cwd` 与死索引 `idx_runs_cwd`；
+/// - `3`：新增 `pending_questions` 表（ask_user 问卷持久化，ask-user
+///   设计 r4/r5：request_id 主键 + tool_call_id 关联悬挂调用 + TTL 状态机）。
+/// - `4`：新增 `credentials` 表（ask_user secret 持久凭据库：name 主键 +
+///   kind env|file + target + value；见 `DDL_CREDENTIALS` 的威胁模型注释）。
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 基线建表 DDL（v0 → v1 执行；全新库直接建成最终形态）。
 ///
@@ -169,6 +174,54 @@ CREATE TABLE IF NOT EXISTS trace_events (
 );
 "#;
 
+/// ask_user 问卷持久化（v3；ask-user 设计 r4/r5）。
+///
+/// 无意 FK 到 `runs`：行按 `request_id`（host call id）幂等寻址，
+/// `tool_call_id` 只在迟到答案补全时用于定位消息历史中的悬挂调用
+/// （可能属于任意 run；行本身随 TTL 24h 过期清理，孤儿行无害）。
+const DDL_PENDING_QUESTIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS pending_questions (
+    request_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL,
+    questions_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','answered','declined','superseded','expired')),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+"#;
+
+/// ask_user 持久凭据库（v4；ask-user 设计 r3/r4「记住此凭据」）。
+///
+/// 行来源：用户在 ask_user secret 题型提交时勾选「记住此凭据」。
+/// - `name`：凭据键（env 变量名，或 `file:<path>` 形态的文件键）——
+///   vault 侧 lookup/注入的统一寻址，主键；
+/// - `kind`：落地形态（`env` = 注入 shell/bash 执行环境，`file` = 写入
+///   指定路径）；
+/// - `target`：变量名 / 文件路径（与 `name` 的派生关系由 vault 侧维护）；
+/// - `value`：明文凭据。
+///
+/// ## 加密边界（已拍板的工程取舍）
+///
+/// `value` 以**明文**存于 app 私有 sqlite。威胁模型：防意外泄漏（回显 /
+/// 日志 / 转写 / 误分享数据库文件时的直接可读性），依赖 Android 沙箱
+/// （app 私有目录，其他应用与普通 adb 不可读）。**不防** root、调试
+/// 备份提取与对 app 本身的攻陷；也**不承诺**防模型诱导 shell 间接拼接
+/// 输出（设计 §0 防护边界）。升级路径：Android Keystore 包裹对称密钥
+/// 经 FFI 注入、value 列改密文（表结构已把 value 隔离为单列，替换点
+/// 集中在 vault 读写两侧）。不引入 SQLCipher（不为本表新增依赖）。
+///
+/// 无 FK 到 `runs`：凭据跨会话存续，与单个 run 无从属关系。
+const DDL_CREDENTIALS: &str = r#"
+CREATE TABLE IF NOT EXISTS credentials (
+    name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('env','file')),
+    target TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+
 // ---------------------------------------------------------------------------
 // v0 → v1：存量库补列用的 ALTER（先经 pragma_table_info 检查列存在）
 // ---------------------------------------------------------------------------
@@ -235,11 +288,18 @@ const IDX_TRACE_EVENTS_RUN_ID: &str =
 const IDX_AUDIT_LOG_RUN_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_audit_log_run_id ON audit_log(run_id)";
 
+/// 问卷按状态过滤（快照回填 pending 清单 / TTL 清理扫描）。
+/// v3 步进创建（同 `idx_messages_run_seq_uq` 先例：不进基线索引集，
+/// 全新库也经 v2→v3 步进获得）。
+const IDX_PENDING_QUESTIONS_STATUS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_pending_questions_status ON pending_questions(status)";
+
 // ---------------------------------------------------------------------------
 // 常量：测试校验用
 // ---------------------------------------------------------------------------
 
-/// 期望的表名（建表顺序）。
+/// 期望的表名（建表顺序）。含 v3 的 `pending_questions` 与 v4 的
+/// `credentials`。
 pub const TABLE_NAMES: &[&str] = &[
     "runs",
     "execution_nodes",
@@ -248,9 +308,11 @@ pub const TABLE_NAMES: &[&str] = &[
     "prompt_snapshots",
     "audit_log",
     "trace_events",
+    "pending_questions",
+    "credentials",
 ];
 
-/// 期望的索引名（测试校验用）。含 v2 的唯一索引。
+/// 期望的索引名（测试校验用）。含 v2 的唯一索引与 v3 的问卷状态索引。
 pub const INDEX_NAMES: &[&str] = &[
     "idx_runs_status",
     "idx_runs_started_at",
@@ -260,6 +322,7 @@ pub const INDEX_NAMES: &[&str] = &[
     "idx_messages_run_seq_uq",
     "idx_trace_events_run_id",
     "idx_audit_log_run_id",
+    "idx_pending_questions_status",
 ];
 
 // ---------------------------------------------------------------------------
@@ -361,6 +424,33 @@ pub(crate) async fn migrate_v1_to_v2(conn: &mut SqliteConnection) -> Result<(), 
     Ok(())
 }
 
+/// v2 → v3：`pending_questions` 表 + 状态索引（全部 `IF NOT EXISTS`，
+/// 全新库与存量库同一路径，天然幂等）。
+pub(crate) async fn migrate_v2_to_v3(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
+    query(DDL_PENDING_QUESTIONS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_PENDING_QUESTIONS_STATUS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    Ok(())
+}
+
+/// v3 → v4：`credentials` 表（ask_user 持久凭据库，全部 `IF NOT EXISTS`，
+/// 全新库与存量库同一路径，天然幂等）。无附加索引（name 主键即全部
+/// 访问路径；行数量级 = 用户手动记住的凭据数，极小）。
+pub(crate) async fn migrate_v3_to_v4(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
+    query(DDL_CREDENTIALS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,12 +460,14 @@ mod tests {
     const RUN_STATUS_CHECK: &str =
         "CHECK (status IN ('running','completed','interrupted','error','failed','cancelled'))";
     const MESSAGE_ROLE_CHECK: &str = "CHECK (role IN ('system','user','assistant','tool'))";
+    const CREDENTIAL_KIND_CHECK: &str = "CHECK (kind IN ('env','file'))";
 
     /// CHECK 约束常量与 DDL 内联文本保持一致（防止两处漂移）。
     #[test]
     fn status_and_role_checks_embedded_in_ddl() {
         assert!(DDL_RUNS.contains(RUN_STATUS_CHECK));
         assert!(DDL_MESSAGES.contains(MESSAGE_ROLE_CHECK));
+        assert!(DDL_CREDENTIALS.contains(CREDENTIAL_KIND_CHECK));
         assert!(!DDL_RUNS.contains("cwd"), "基线 DDL 不应再包含 cwd 死列");
         assert!(!index_statements()
             .iter()

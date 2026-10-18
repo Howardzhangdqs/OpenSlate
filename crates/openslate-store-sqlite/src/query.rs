@@ -118,6 +118,39 @@ pub struct TraceEventRecord {
     pub args_json: Option<String>,
 }
 
+/// An ask_user pending-question record（v3；ask-user 设计 r4/r5）。
+/// `status` 用小写词表（pending/answered/declined/superseded/expired），
+/// 与协议 `QuestionStatus` 的映射由调用方（mobile 装配层）负责。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingQuestionRecord {
+    /// 幂等主键（host call id）。
+    pub request_id: String,
+    /// 关联消息历史中的悬挂 tool call（assistant `tool_calls[].id`）。
+    pub tool_call_id: String,
+    /// 问卷负载（§2 归一化后的 questions 数组 JSON，协议透传不解释）。
+    pub questions_json: String,
+    pub status: String,
+    pub version: i64,
+    pub created_at: i64,
+}
+
+/// ask_user 持久凭据行（设置页列表 / vault 镜像管理的**无明文**视图）。
+///
+/// 刻意不含 `value`：列表/管理路径只走元数据，明文只在 vault 取值时经
+/// [`SqliteStore::get_credential_value`] / [`SqliteStore::load_credentials_with_values`]
+/// 按需取（防明文随 Debug/日志意外扩散）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRecord {
+    /// 凭据键：env 变量名或 `file:<path>`。
+    pub name: String,
+    /// 落地形态（env|file）。
+    pub kind: String,
+    /// 变量名 / 文件路径。
+    pub target: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Row tuple types (column order must match SELECT *)
 // ---------------------------------------------------------------------------
@@ -205,6 +238,32 @@ type TraceEventRow = (
     String,         // track
     Option<String>, // args_json
 );
+
+type PendingQuestionRow = (
+    String, // request_id
+    String, // tool_call_id
+    String, // questions_json
+    String, // status
+    i64,    // version
+    i64,    // created_at
+);
+
+type CredentialRow = (
+    String, // name
+    String, // kind
+    String, // target
+    i64,    // created_at
+    i64,    // updated_at
+);
+
+/// vault 启动镜像加载的凭据行（**含明文**；仅 vault 内部消费，绝不
+/// derive Debug / 打日志）。
+pub struct CredentialSecretEntry {
+    pub name: String,
+    pub kind: String,
+    pub target: String,
+    pub value: String,
+}
 
 // ---------------------------------------------------------------------------
 // Conversion helpers
@@ -305,6 +364,27 @@ fn row_to_trace_event(row: TraceEventRow) -> TraceEventRecord {
         dur_ns: row.8,
         track: row.9,
         args_json: row.10,
+    }
+}
+
+fn row_to_pending_question(row: PendingQuestionRow) -> PendingQuestionRecord {
+    PendingQuestionRecord {
+        request_id: row.0,
+        tool_call_id: row.1,
+        questions_json: row.2,
+        status: row.3,
+        version: row.4,
+        created_at: row.5,
+    }
+}
+
+fn row_to_credential(row: CredentialRow) -> CredentialRecord {
+    CredentialRecord {
+        name: row.0,
+        kind: row.1,
+        target: row.2,
+        created_at: row.3,
+        updated_at: row.4,
     }
 }
 
@@ -573,6 +653,95 @@ impl SqliteStore {
         .map_err(qerr)?;
 
         Ok(row.map(row_to_run))
+    }
+
+    /// List pending ask_user questionnaires（snapshot 回填 / 迟到答案
+    /// 校验的数据源），按 `created_at` 升序（下发顺序稳定）。
+    pub async fn list_pending_questions(&self) -> Result<Vec<PendingQuestionRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<PendingQuestionRow> = query_as(
+            "SELECT request_id, tool_call_id, questions_json, status, version, created_at \
+             FROM pending_questions WHERE status = 'pending' ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows.into_iter().map(row_to_pending_question).collect())
+    }
+
+    /// 取单条问卷（任意状态；迟到答案路径用它做 pending 前置校验，
+    /// 避免先 UPDATE 再读的竞态——真正的首答者赢由
+    /// [`crate::write::SqliteStore::transition_pending_question`] 原子保证）。
+    pub async fn get_pending_question(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingQuestionRecord>, StoreError> {
+        let pool = self.pool();
+        let row: Option<PendingQuestionRow> = query_as(
+            "SELECT request_id, tool_call_id, questions_json, status, version, created_at \
+             FROM pending_questions WHERE request_id = ?",
+        )
+        .bind(request_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(row.map(row_to_pending_question))
+    }
+
+    // ── ask_user 持久凭据（v4）────────────────────────────────────────
+
+    /// 全部持久凭据的**无明文**清单（设置页 / 管理面），按 name 字典序。
+    pub async fn list_credentials(&self) -> Result<Vec<CredentialRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<CredentialRow> = query_as(
+            "SELECT name, kind, target, created_at, updated_at \
+             FROM credentials ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows.into_iter().map(row_to_credential).collect())
+    }
+
+    /// 单条凭据明文（vault 注入/重写文件用；不存在返回 None）。
+    pub async fn get_credential_value(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let pool = self.pool();
+        let value: Option<String> = query_scalar("SELECT value FROM credentials WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .map_err(qerr)?;
+        Ok(value)
+    }
+
+    /// vault 启动镜像加载：全部凭据行（含明文）。调用方仅 vault 内部，
+    /// 结果不得进日志/Debug（见 [`CredentialSecretEntry`]）。
+    pub async fn load_credentials_with_values(
+        &self,
+    ) -> Result<Vec<CredentialSecretEntry>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<(String, String, String, String)> = query_as(
+            "SELECT name, kind, target, value FROM credentials ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, kind, target, value)| CredentialSecretEntry {
+                name,
+                kind,
+                target,
+                value,
+            })
+            .collect())
     }
 }
 

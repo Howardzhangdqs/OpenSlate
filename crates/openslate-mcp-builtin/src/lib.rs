@@ -28,6 +28,7 @@ pub mod shell;
 pub mod skill;
 
 pub use bash::BashServer;
+pub use shell::{ShellEnvSource, ShellServer, set_shell_env_source};
 pub use skill::{SkillInfo, SkillServer};
 
 #[cfg(test)]

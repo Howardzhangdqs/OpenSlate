@@ -200,6 +200,42 @@ impl RunManager {
         .await
     }
 
+    /// ask_user 迟到答案续跑（ask-user 设计 r5）：为悬挂的
+    /// `tool_call_id` 在历史中补全 tool result（先经 `message_sink`
+    /// 落盘，Phase 3「落盘后再 continue」同款契约），再从该点重新进入
+    /// agent 模型循环——与正常工具结果后的继续**同一条路径**
+    /// （[`Self::execute_with_run_id`]），对模型不可区分（迟到等价
+    /// 不变量：模型看到的消息历史与「答案即时返回」完全一致）。
+    ///
+    /// `run_id`：续跑延续原逻辑 turn，调用方传会话当前 run id
+    /// （mobile 的 `SessionRun::run_id`）。答案内容 `result_content`
+    /// 由调用方按设计 §2 输出契约拼好（自然语言 + 结构化并存）。
+    pub async fn resume_from_tool_result(
+        &self,
+        run_id: RunId,
+        provider: &dyn ModelProvider,
+        prior_messages: &[Message],
+        tool_call_id: &str,
+        result_content: &str,
+        cancel: CancellationToken,
+        progress: Option<&mut dyn ProgressCallback>,
+    ) -> Result<ManagedRunResult, OpenSlateError> {
+        let mut messages = prior_messages.to_vec();
+        let inserted = crate::ask_user::append_late_tool_result(
+            &mut messages,
+            tool_call_id,
+            result_content,
+        )
+        .map_err(|e| OpenSlateError::Validation(e.to_string()))?;
+        // 补全消息先落盘（恢复场景下 store 里只有悬挂的 assistant
+        // 消息），随后引擎循环照常增量持久化。
+        if let Some(sink) = &self.message_sink {
+            sink.append(&inserted).await;
+        }
+        self.execute_with_run_id(run_id, provider, &messages, cancel, progress)
+            .await
+    }
+
     /// Execute a complete agent run with a single user message (no prior history).
     ///
     /// Convenience wrapper around [`execute_with_history`] that wraps `input`
@@ -954,6 +990,146 @@ max_output_bytes = 10_000
         let histories = provider2.histories.lock().expect("histories");
         assert_eq!(histories[0].len(), 3, "partial transcript carried over");
         assert_eq!(histories[0][2].role, MessageRole::Tool);
+    }
+
+    // ── ask_user: resume from a late tool result (ask-user r5) ──────────
+
+    #[tokio::test]
+    async fn test_resume_from_tool_result_equivalent_to_immediate_answer() {
+        // 历史尾部悬挂一个 ask_user 调用（进程中断恢复后的典型形状）。
+        let dangling: Vec<Message> = vec![
+            Message {
+                role: MessageRole::User,
+                content: "which db?".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: ToolCallId("tc-late".into()),
+                    name: "ask_user".into(),
+                    arguments: serde_json::json!({"questions": []}),
+                }]),
+                reasoning_content: None,
+            },
+        ];
+        let sink = std::sync::Arc::new(RecordingSink(std::sync::Mutex::new(Vec::new())));
+        let mut manager = RunManager::new(
+            test_config(),
+            test_agent_tree(),
+            ToolRegistry::new(),
+            SkillsCatalog::default(),
+        );
+        manager.message_sink = Some(sink.clone());
+
+        // 续跑：迟到答案补全 tc-late 后模型收到完整配对历史。
+        let provider = CapturingProvider::new(vec![final_response("resumed after answer")]);
+        let result = manager
+            .resume_from_tool_result(
+                RunId("late-answer-run".into()),
+                &provider,
+                &dangling,
+                "tc-late",
+                "User answered: SQLite",
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("resume completes");
+        assert_eq!(result.status, RunStatus::Completed);
+
+        // 迟到等价不变量：provider 看到的历史 == 手工补全后的历史
+        // （user → assistant(tool_calls) → tool result），与「答案即时
+        // 返回」无差别。
+        let histories = provider.histories.lock().expect("histories");
+        assert_eq!(histories.len(), 1);
+        let req = &histories[0];
+        assert_eq!(req.len(), 3);
+        assert_eq!(req[2].role, MessageRole::Tool);
+        assert_eq!(
+            req[2].tool_call_id,
+            Some(ToolCallId("tc-late".into())),
+            "late answer must complete the ORIGINAL tool call"
+        );
+        assert_eq!(req[2].content, "User answered: SQLite");
+        // 结果历史也包含补全消息（转写/落库同源）。
+        assert_eq!(result.messages.len(), 4);
+
+        // 补全消息经 sink 落盘（先于引擎循环的增量持久化）。
+        let observed = sink.0.lock().expect("sink poisoned");
+        assert_eq!(observed[0].role, MessageRole::Tool, "synthesized result persisted first");
+        assert_eq!(observed[0].tool_call_id, Some(ToolCallId("tc-late".into())));
+        assert_eq!(observed[1].content, "resumed after answer");
+    }
+
+    #[tokio::test]
+    async fn test_resume_from_tool_result_rejects_unknown_and_answered() {
+        let dangling = vec![Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Some(vec![ToolCall {
+                id: ToolCallId("tc-x".into()),
+                name: "ask_user".into(),
+                arguments: serde_json::json!({}),
+            }]),
+            reasoning_content: None,
+        }];
+        let manager = RunManager::new(
+            test_config(),
+            test_agent_tree(),
+            ToolRegistry::new(),
+            SkillsCatalog::default(),
+        );
+        let provider = MockProvider::new(vec![]);
+
+        // 未知 tool call id。
+        let err = manager
+            .resume_from_tool_result(
+                RunId("r".into()),
+                &provider,
+                &dangling,
+                "ghost",
+                "x",
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect_err("unknown id must fail");
+        assert!(err.to_string().contains("not found"), "{err}");
+
+        // 已有结果（首答者赢，迟到者拒绝）。
+        let answered = vec![
+            dangling[0].clone(),
+            Message {
+                role: MessageRole::Tool,
+                content: "first".into(),
+                tool_call_id: Some(ToolCallId("tc-x".into())),
+                name: Some("ask_user".into()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+        ];
+        let err = manager
+            .resume_from_tool_result(
+                RunId("r".into()),
+                &provider,
+                &answered,
+                "tc-x",
+                "second",
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect_err("second answer must fail");
+        assert!(err.to_string().contains("already has a result"), "{err}");
     }
 
     // ── Cancellation (Phase 4) ────────────────────────────────────────────

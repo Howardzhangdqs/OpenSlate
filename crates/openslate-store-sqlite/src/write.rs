@@ -499,6 +499,102 @@ impl SqliteStore {
         .map_err(werr)?;
         Ok(())
     }
+
+    // ── ask_user 问卷持久化（v3；ask-user 设计 r4/r5）──────────────────
+
+    /// 插入一条 pending 问卷（request_id = host call id，幂等主键；
+    /// 重复插入（同 request_id 重放）按主键冲突报错，由调用方决定语义）。
+    pub async fn insert_pending_question(
+        &self,
+        request_id: &str,
+        tool_call_id: &str,
+        questions_json: &str,
+        version: i64,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        query(
+            "INSERT INTO pending_questions \
+             (request_id, tool_call_id, questions_json, status, version, created_at) \
+             VALUES (?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(request_id)
+        .bind(tool_call_id)
+        .bind(questions_json)
+        .bind(version)
+        .bind(created_at)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(())
+    }
+
+    /// 原子状态迁移（幂等首答者赢）：仅当当前状态等于 `from` 时改为
+    /// `to`。返回 `true` = 本次迁移生效；`false` = 状态不匹配（已被
+    /// 首答者赢 / 不存在）。任何状态对都可表达，语义由调用方负责
+    /// （如 `answered → pending` 用于续跑失败后的回滚重开）。
+    pub async fn transition_pending_question(
+        &self,
+        request_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<bool, StoreError> {
+        let result = query(
+            "UPDATE pending_questions SET status = ? WHERE request_id = ? AND status = ?",
+        )
+        .bind(to)
+        .bind(request_id)
+        .bind(from)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    // ── ask_user 持久凭据（v4）────────────────────────────────────────
+
+    /// 写入/覆盖一条持久凭据（name 主键 upsert；`remember = true` 的
+    /// secret 提交落这里）。`now` 为毫秒时间戳（created_at 首写固定，
+    /// updated_at 每次 upsert 刷新）。明文 value 的威胁模型边界见
+    /// `schema::DDL_CREDENTIALS` 注释。
+    pub async fn upsert_credential(
+        &self,
+        name: &str,
+        kind: &str,
+        target: &str,
+        value: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        query(
+            "INSERT INTO credentials (name, kind, target, value, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET \
+               kind = excluded.kind, \
+               target = excluded.target, \
+               value = excluded.value, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(name)
+        .bind(kind)
+        .bind(target)
+        .bind(value)
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(())
+    }
+
+    /// 删除一条持久凭据（幂等：不存在返回 `false`）。只动本表行——
+    /// 会话内存条目 / 已写出的 file 由 vault 侧联动清理。
+    pub async fn delete_credential(&self, name: &str) -> Result<bool, StoreError> {
+        let result = query("DELETE FROM credentials WHERE name = ?")
+            .bind(name)
+            .execute(self.pool())
+            .await
+            .map_err(werr)?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 #[cfg(test)]
@@ -1139,5 +1235,157 @@ mod tests {
 
         let run = store.get_run("run-1").await.expect("get").expect("run");
         assert_eq!(run.status, "running");
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_user 问卷持久化（v3）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pending_question_insert_and_first_wins_transition() {
+        let store = setup_store().await;
+        store
+            .insert_pending_question("42", "call-1", r#"[{"id":"q1"}]"#, 1, 1000)
+            .await
+            .expect("insert");
+
+        // pending → answered：首答者赢（首次成功）。
+        assert!(
+            store
+                .transition_pending_question("42", "pending", "answered")
+                .await
+                .expect("transition 1")
+        );
+        // 同一 from 的第二次迁移必须失败（幂等首答者赢）。
+        assert!(
+            !store
+                .transition_pending_question("42", "pending", "declined")
+                .await
+                .expect("transition 2")
+        );
+        // 不存在的 request_id 也返回 false。
+        assert!(
+            !store
+                .transition_pending_question("ghost", "pending", "answered")
+                .await
+                .expect("transition 3")
+        );
+        // 回滚语义（answered → pending）同样可表达。
+        assert!(
+            store
+                .transition_pending_question("42", "answered", "pending")
+                .await
+                .expect("rollback")
+        );
+
+        let row = store
+            .get_pending_question("42")
+            .await
+            .expect("get")
+            .expect("row exists");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.tool_call_id, "call-1");
+        assert_eq!(row.questions_json, r#"[{"id":"q1"}]"#);
+        assert_eq!(row.version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_pending_questions_orders_and_filters() {
+        let store = setup_store().await;
+        store
+            .insert_pending_question("1", "call-a", "[]", 1, 3000)
+            .await
+            .expect("insert a");
+        store
+            .insert_pending_question("2", "call-b", "[]", 1, 1000)
+            .await
+            .expect("insert b");
+        assert!(
+            store
+                .transition_pending_question("2", "pending", "superseded")
+                .await
+                .expect("close b")
+        );
+
+        let pending = store.list_pending_questions().await.expect("list");
+        assert_eq!(pending.len(), 1, "只列 pending 状态");
+        assert_eq!(pending[0].request_id, "1");
+    }
+
+    #[tokio::test]
+    async fn test_pending_question_rejects_unknown_status() {
+        let store = setup_store().await;
+        // CHECK 约束：非法 status 直接被库拒绝。
+        let err = store
+            .insert_pending_question("x", "c", "[]", 1, 1)
+            .await;
+        assert!(err.is_ok(), "insert 本身写 pending（合法）");
+        let result = sqlx::query(
+            "UPDATE pending_questions SET status = 'weird' WHERE request_id = 'x'",
+        )
+        .execute(store.pool())
+        .await;
+        assert!(result.is_err(), "CHECK 约束应拒绝未知状态");
+    }
+
+    // -----------------------------------------------------------------------
+    // ask_user 持久凭据（v4）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_credential_upsert_overwrite_and_delete() {
+        let store = setup_store().await;
+        store
+            .upsert_credential("GITHUB_TOKEN", "env", "GITHUB_TOKEN", "v1", 1000)
+            .await
+            .expect("insert");
+        store
+            .upsert_credential("file:/tmp/netrc", "file", "/tmp/netrc", "k1", 1000)
+            .await
+            .expect("insert file");
+
+        // 同名 upsert = 覆盖（value/updated_at 刷新，created_at 保持）。
+        store
+            .upsert_credential("GITHUB_TOKEN", "env", "GITHUB_TOKEN", "v2", 2000)
+            .await
+            .expect("overwrite");
+
+        assert_eq!(
+            store.get_credential_value("GITHUB_TOKEN").await.expect("get"),
+            Some("v2".to_owned()),
+            "明文按需取值（最新覆盖值）"
+        );
+        let list = store.list_credentials().await.expect("list");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "GITHUB_TOKEN", "按 name 字典序");
+        assert_eq!(list[0].kind, "env");
+        assert_eq!(list[0].created_at, 1000, "created_at 首写固定");
+        assert_eq!(list[0].updated_at, 2000, "updated_at 随 upsert 刷新");
+        assert_eq!(list[1].name, "file:/tmp/netrc");
+        assert_eq!(list[1].target, "/tmp/netrc");
+
+        // 镜像加载（含明文）。
+        let entries = store.load_credentials_with_values().await.expect("load");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "GITHUB_TOKEN");
+        assert_eq!(entries[0].value, "v2");
+
+        // 删除：幂等（首删 true，再删 false）。
+        assert!(store.delete_credential("GITHUB_TOKEN").await.expect("del"));
+        assert!(!store.delete_credential("GITHUB_TOKEN").await.expect("del again"));
+        assert_eq!(
+            store.list_credentials().await.expect("list").len(),
+            1,
+            "file 行保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_credential_rejects_unknown_kind() {
+        let store = setup_store().await;
+        let result = store
+            .upsert_credential("x", "weird", "x", "v", 1)
+            .await;
+        assert!(result.is_err(), "CHECK 约束应拒绝未知 kind");
     }
 }

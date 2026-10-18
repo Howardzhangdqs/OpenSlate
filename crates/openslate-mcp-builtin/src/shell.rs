@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use rmcp::{
@@ -35,6 +37,41 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const KEEP_BYTES: usize = 24 * 1024;
 /// Grace period for draining pipe data after a timeout kill.
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
+
+// ── 进程级 shell 环境注入源（ask_user secret 子系统，宿主运行时装配）──────
+
+/// shell/bash 子进程的**有意注入**环境变量来源：每次命令 spawn 时取最新
+/// 键值对（ask_user secret 凭据库的 env 形态；值常含 TOKEN 等敏感命名，
+/// 因此不能走继承——见下方注入顺序说明）。
+pub type ShellEnvSource = Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
+
+/// 进程级注入源注册表（默认 `None`——桌面端行为完全不变）。
+///
+/// 为什么是进程级全局而非构造期传参：`ShellServer` / `BashServer` 由
+/// openslate-app 装配链在 `connect_builtin_servers` 内部构造，签名扩展
+/// 会波及所有装配层；本 crate 的调用方（mobile 宿主运行时）在装配前
+/// `set_shell_env_source(Some(...))` 一次即全进程生效——与 core
+/// `set_mcp_auth_override` 同款既有模式（见 mcp.rs）。注入发生在命令
+/// spawn 时（取最新值），跨会话/会话内新存凭据即时可用。
+static SHELL_ENV_SOURCE: RwLock<Option<ShellEnvSource>> = RwLock::new(None);
+
+/// 设置/清除进程级 shell 环境注入源。必须在首次 shell/bash 命令执行前
+/// 调用（mobile 在 runtime 装配期设置）；`None` = 清除。
+pub fn set_shell_env_source(source: Option<ShellEnvSource>) {
+    let mut guard = SHELL_ENV_SOURCE
+        .write()
+        .expect("shell env source 锁中毒");
+    *guard = source;
+}
+
+/// 读取当前注入源提供的键值对（无源/读锁失败 → 空；值绝不打日志）。
+fn shell_extra_env() -> Vec<(String, String)> {
+    SHELL_ENV_SOURCE
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|source| source()))
+        .unwrap_or_default()
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ShellParams {
@@ -181,6 +218,16 @@ pub(crate) async fn run_shell_command<P: AsRef<std::ffi::OsStr>>(
         if is_sensitive_env(&name) {
             spawn_cmd.env_remove(&name);
         }
+    }
+
+    // Intentional env injection (ask_user secret vault, see
+    // [`ShellEnvSource`]): applied AFTER the scrub above so credentials the
+    // user deliberately stored (often TOKEN/API_KEY-named — exactly what the
+    // scrub removes) survive into the child. Ambient inheritance stays
+    // scrubbed; only the registered source's values are (re)added. The
+    // values themselves are never logged.
+    for (name, value) in shell_extra_env() {
+        spawn_cmd.env(&name, &value);
     }
 
     let mut child = match spawn_cmd.spawn() {
@@ -489,6 +536,75 @@ mod tests {
         let text = first_text(&result);
         let root = dir.path().canonicalize().unwrap();
         assert!(text.contains(root.to_str().unwrap()), "{text}");
+    }
+
+    // ── 进程级环境注入（ask_user secret 子系统）─────────────────────
+    //
+    // 全局注册表测试：用专属变量名（避免与其他并行测试串扰），结束即
+    // 复位（None）。
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn env_source_injects_and_survives_scrub() {
+        // 场景变量：敏感命名（TOKEN）——证明注入值在「继承脱敏」之后
+        // 重新生效；同时用非敏感名覆盖普通注入。
+        // SAFETY（edition 2024：set_var/remove_var unsafe）：测试专用唯一
+        // 变量名，本测试进程内无其他线程读写该名。
+        // 注：两阶段（有源/无源）合并在同一测试内顺序执行——全局注册表
+        // 的两个变体若拆成并行测试会互相清对方的源。
+        unsafe {
+            std::env::set_var("OPSLATE_TEST_INHERITED_TOKEN", "inherited-leak");
+        }
+
+        // 阶段 1：有源——注入值生效，并覆盖被脱敏的继承名。
+        set_shell_env_source(Some(Arc::new(|| {
+            vec![
+                (
+                    "OPSLATE_TEST_VAULT_TOKEN".to_owned(),
+                    "vault-secret-value".to_owned(),
+                ),
+                ("OPSLATE_TEST_VAULT_PLAIN".to_owned(), "plain".to_owned()),
+                // 覆盖被脱敏的继承名：注入值胜出。
+                (
+                    "OPSLATE_TEST_INHERITED_TOKEN".to_owned(),
+                    "vault-override".to_owned(),
+                ),
+            ]
+        })));
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = client_in(&dir).await;
+        let result = shell(
+            &client,
+            "printf '%s\\n%s\\n%s' \
+             \"$OPSLATE_TEST_VAULT_TOKEN\" \
+             \"$OPSLATE_TEST_VAULT_PLAIN\" \
+             \"$OPSLATE_TEST_INHERITED_TOKEN\"",
+            None,
+        )
+        .await;
+        let text = first_text(&result);
+        assert!(text.contains("vault-secret-value"), "{text}");
+        assert!(text.contains("plain"), "{text}");
+        assert!(
+            text.contains("vault-override") && !text.contains("inherited-leak"),
+            "注入值覆盖被脱敏的继承变量: {text}"
+        );
+
+        // 阶段 2：无源（默认态）——脱敏照旧、无任何额外注入。
+        set_shell_env_source(None);
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = client_in(&dir).await;
+        let result = shell(&client, "echo \"[$OPSLATE_TEST_INHERITED_TOKEN]\"", None).await;
+        let text = first_text(&result);
+        assert!(
+            !text.contains("ambient") && !text.contains("inherited-leak"),
+            "继承敏感变量仍被脱敏（无注入）: {text}"
+        );
+
+        // SAFETY: 同上（唯一名，测试收尾清理）。
+        unsafe {
+            std::env::remove_var("OPSLATE_TEST_INHERITED_TOKEN");
+        }
     }
 
     // ── pure unit tests (platform-independent) ──

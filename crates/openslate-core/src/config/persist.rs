@@ -212,6 +212,11 @@ pub fn upsert_model(path: &Path, entry: &str, cfg: &super::ModelConfig) -> Resul
         if let Some(price) = cfg.output_price_per_mtok {
             table["output_price_per_mtok"] = value(price);
         }
+        // reasoning_effort：None 不写——wire 上少带该字段即跟随 provider
+        // 默认，与上面条目级可选字段的「非默认才写」口径一致。
+        if let Some(effort) = &cfg.reasoning_effort {
+            table["reasoning_effort"] = value(effort.clone());
+        }
     })?;
     save_document(path, &doc)
 }
@@ -857,6 +862,7 @@ mod tests {
             supports_reasoning: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            reasoning_effort: None,
         }
     }
 
@@ -1324,6 +1330,7 @@ mod tests {
             "supports_reasoning",
             "input_price_per_mtok",
             "output_price_per_mtok",
+            "reasoning_effort",
         ] {
             assert!(
                 doc["models"]["main"].get(absent).is_none(),
@@ -1343,6 +1350,7 @@ mod tests {
         cfg.supports_reasoning = true;
         cfg.input_price_per_mtok = Some(0.5);
         cfg.output_price_per_mtok = Some(2.0);
+        cfg.reasoning_effort = Some("high".into());
         upsert_model(&path, "vision", &cfg).expect("upsert");
 
         let doc = parse_at(&path);
@@ -1354,6 +1362,7 @@ mod tests {
         assert_eq!(entry["supports_reasoning"].as_bool(), Some(true));
         assert_eq!(entry["input_price_per_mtok"].as_float(), Some(0.5));
         assert_eq!(entry["output_price_per_mtok"].as_float(), Some(2.0));
+        assert_eq!(entry["reasoning_effort"].as_str(), Some("high"));
     }
 
     #[test]

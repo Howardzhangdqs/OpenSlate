@@ -19,11 +19,11 @@ use super::OpenSlateConfig;
 ///   field-level deep merge); local-only entries are added; global-only
 ///   entries are kept.
 /// - Every other section (`project`, `database`, `prompts`, `limits`,
-///   `trace`, `mcp`, `builtin_tools`, `skills`, `ptc`, `approval`, `tui`)
-///   is taken from local when present, else from global. For `Option`
-///   sections that means `local = None` falls back to global; non-`Option`
-///   sections take the local value verbatim (local always wins — a local
-///   file without the section keeps the section's defaults).
+///   `trace`, `mcp`, `builtin_tools`, `skills`, `ptc`, `approval`, `tui`,
+///   `ask_user`) is taken from local when present, else from global. For
+///   `Option` sections that means `local = None` falls back to global; non-
+///   `Option` sections take the local value verbatim (local always wins — a
+///   local file without the section keeps the section's defaults).
 pub fn merge_configs(global: &OpenSlateConfig, local: &OpenSlateConfig) -> OpenSlateConfig {
     OpenSlateConfig {
         project: local.project.clone().or_else(|| global.project.clone()),
@@ -41,6 +41,7 @@ pub fn merge_configs(global: &OpenSlateConfig, local: &OpenSlateConfig) -> OpenS
         ptc: local.ptc.clone(),
         approval: local.approval.clone().or_else(|| global.approval.clone()),
         tui: local.tui.clone(),
+        ask_user: local.ask_user.clone(),
     }
 }
 

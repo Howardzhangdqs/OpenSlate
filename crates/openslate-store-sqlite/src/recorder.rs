@@ -215,17 +215,7 @@ impl RunRecorder {
         store: &SqliteStore,
         run_id: &str,
     ) -> Result<Vec<Message>, StoreError> {
-        let records = store.list_messages_by_run(run_id).await?;
-        let mut messages = Vec::with_capacity(records.len());
-        for record in records {
-            let message: Message = serde_json::from_str(&record.content_json).map_err(|e| {
-                StoreError::QueryError(format!(
-                    "run '{}' message '{}' failed to decode: {e}",
-                    record.run_id, record.id
-                ))
-            })?;
-            messages.push(message);
-        }
+        let mut messages = Self::load_messages_keep_dangling(store, run_id).await?;
         if matches!(
             messages.last(),
             Some(m) if m.role == MessageRole::Assistant
@@ -237,6 +227,32 @@ impl RunRecorder {
                 "run {run_id}: dropped trailing assistant message with unanswered \
                  tool_calls (crash mid-step); the model will re-decide"
             );
+        }
+        Ok(messages)
+    }
+
+    /// [`Self::load_messages`] 的保留悬挂变体：**不**丢弃尾部带未答
+    /// `tool_calls` 的 assistant 消息。
+    ///
+    /// ask_user 重启恢复（ask-user 设计 r5 迟到等价不变量）依赖这条
+    /// 通路：悬挂的 ask_user tool call 必须留在历史里，迟到答案才能经
+    /// `append_late_tool_result` 补全该调用的 tool result 并续跑（丢掉
+    /// 即无处补全）。调用方（mobile 装配层）负责在无需恢复时自行执行
+    /// 与 `load_messages` 相同的丢弃，或悬挂修复（superseded/expired）。
+    pub async fn load_messages_keep_dangling(
+        store: &SqliteStore,
+        run_id: &str,
+    ) -> Result<Vec<Message>, StoreError> {
+        let records = store.list_messages_by_run(run_id).await?;
+        let mut messages = Vec::with_capacity(records.len());
+        for record in records {
+            let message: Message = serde_json::from_str(&record.content_json).map_err(|e| {
+                StoreError::QueryError(format!(
+                    "run '{}' message '{}' failed to decode: {e}",
+                    record.run_id, record.id
+                ))
+            })?;
+            messages.push(message);
         }
         Ok(messages)
     }

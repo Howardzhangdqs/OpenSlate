@@ -11,6 +11,9 @@ openslate-app = { path = "../openslate-app" }
 openslate-protocol = { path = "../openslate-protocol" }
 openslate-session = { path = "../openslate-session" }
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
+# shell/bash 内置 server 的进程级环境注入源注册表（ask_user secret env
+# 形态；mobile 装配期 set，mcp-builtin spawn 时取）。
+openslate-mcp-builtin = { path = "../openslate-mcp-builtin" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 # bootstrap 的 [database] path 原地改写（保持其余注释/格式零扰动）。

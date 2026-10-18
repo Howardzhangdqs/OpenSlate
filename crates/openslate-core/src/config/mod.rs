@@ -24,6 +24,7 @@
 //! | `ptc`       | `PtcConfig`         | no       | Programmatic Tool Calling settings |
 //! | `approval`  | `Option<ApprovalConfig>` | no  | Tool approval gating               |
 //! | `tui`       | `TuiConfig`         | no       | TUI frontend (icon overrides)      |
+//! | `ask_user`  | `AskUserConfig`     | no       | ask_user tool behavior (timeout/masking) |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -112,6 +113,11 @@ pub struct OpenSlateConfig {
     /// is TUI-only; other binaries ignore it.
     #[serde(default)]
     pub tui: TuiConfig,
+    /// ask_user（Agent 向用户提问）工具行为（`[ask_user]`，ask-user
+    /// 设计 r4：默认超时用户可配）。Deserialize-only：写回由 persist.rs
+    /// 手拼 TOML（模块头约定），本 lane 未接写回。
+    #[serde(default)]
+    pub ask_user: AskUserConfig,
 }
 
 /// Project metadata.
@@ -243,6 +249,17 @@ pub struct ModelConfig {
     /// Absent → the model's output usage is priced at 0.
     #[serde(default)]
     pub output_price_per_mtok: Option<f64>,
+    /// Thinking effort（推理力度）：七档全集 `"none" | "minimal" | "low"
+    /// | "medium" | "high" | "xhigh" | "max"`（各 provider 实际档位不一，
+    /// 如 GLM-5.3 仅 low/high/max、OpenAI/Claude 有 xhigh/max——存全集、
+    /// 由 UI 按模型能力裁剪）。`None` = Auto：不传该字段，跟随 provider
+    /// 默认；`"none"` = 显式硬关闭思考（wire 发
+    /// `reasoning_effort:"none"`，仅支持的家族有效，如 GLM-5.2 /
+    /// Gemini 2.5；GLM-5.3 / DeepSeek 不支持）——两种语义互不等价。
+    /// 其他非法值（手改 TOML 拼错等）在消费端（`resolve_model`）容忍
+    /// 处理：warn 后按 None，不 panic。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Tracing / observability settings.
@@ -538,6 +555,38 @@ impl ApprovalConfig {
     }
 }
 
+/// ask_user（Agent 向用户提问）工具行为（`[ask_user]`，ask-user 设计）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AskUserConfig {
+    /// 默认等待时限；工具入参 `timeout` 逐次覆盖（设计 §2）。
+    pub default_timeout: AskTimeout,
+    /// 工具输出对已知密钥值打码（secret 子系统预留，默认开）。
+    pub mask_secrets: bool,
+}
+
+impl Default for AskUserConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout: AskTimeout::Never,
+            mask_secrets: true,
+        }
+    }
+}
+
+/// ask_user 等待时限。TOML 写法：`default_timeout = "never"` 或
+/// `default_timeout = { seconds = 300 }`（serde 外部标签枚举）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskTimeout {
+    /// 永不超时（默认；移动端等人场景，进程存活即保持 pending）。
+    #[default]
+    Never,
+    /// 阈值秒数；超时回填 timeout 结果（模型收到「用户可能不在，
+    /// 自行判断继续」后继续）。`0` 秒视为立即过期，由消费端容忍。
+    Seconds(u64),
+}
+
 // ── Default helpers ──────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -750,6 +799,77 @@ max_steps = 5
 "#;
         let config = parse_openslate_toml(toml).expect("should parse");
         assert!(config.limits.expect("limits").parallel_tool_calls);
+    }
+
+    // ── [ask_user]（Agent 向用户提问；ask-user 设计 r4）─────────────────
+
+    #[test]
+    fn ask_user_defaults_when_section_absent() {
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.ask_user.default_timeout, AskTimeout::Never);
+        assert!(config.ask_user.mask_secrets);
+    }
+
+    #[test]
+    fn ask_user_explicit_never_and_seconds() {
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[ask_user]
+default_timeout = "never"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.ask_user.default_timeout, AskTimeout::Never);
+
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[ask_user]
+default_timeout = { seconds = 300 }
+mask_secrets = false
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.ask_user.default_timeout, AskTimeout::Seconds(300));
+        assert!(!config.ask_user.mask_secrets);
+    }
+
+    #[test]
+    fn ask_user_rejects_unknown_fields() {
+        // deny_unknown_fields：拼写错误早失败（与 [skills]/[ptc] 同款）。
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[ask_user]
+defaut_timeout = "never"
+"#;
+        assert!(parse_openslate_toml(toml).is_err());
     }
 
     // ── [limits].auto_compact ────────────────────────────────────────────

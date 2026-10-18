@@ -47,8 +47,15 @@ use crate::events::EventSink;
 /// 超时视为工具失败（回合可继续），不是 runtime 失败。
 pub const HOST_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 一条在途 host call 的应答通道。
-type Pending = tokio::sync::oneshot::Sender<Result<Value, String>>;
+/// 超时错误文案前缀（ask_user 等调用方靠它区分超时与基础设施错误，
+/// 同 crate 内的稳定契约）。
+pub const HOST_CALL_TIMEOUT_ERR_PREFIX: &str = "host call timeout";
+
+/// 一条在途 host call 的应答通道 + 发起工具名（`fail_all` 按名豁免）。
+struct Pending {
+    tx: tokio::sync::oneshot::Sender<Result<Value, String>>,
+    tool: String,
+}
 
 pub struct HostCallRouter {
     sink: Arc<EventSink>,
@@ -67,14 +74,39 @@ impl HostCallRouter {
         })
     }
 
+    /// 预分配一个 host call id（ask_user 需在发出信封**之前**持久化
+    /// 问卷行，幂等主键 = id；普通调用方走 [`Self::call`] 自取）。
+    pub fn allocate_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// 发起一次 host call：发出 `host_call_requested` 信封并等待应答。
     pub async fn call(&self, tool: &str, args: &Value) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_id();
+        self.call_with_id(id, tool, args, self.timeout).await
+    }
+
+    /// 带 id 与自定义超时的 host call（id 经 [`Self::allocate_id`] 预取；
+    /// ask_user 的「等人」超时远超默认 120s，never 配置取近似无限的
+    /// 极长时长）。
+    pub async fn call_with_id(
+        &self,
+        id: u64,
+        tool: &str,
+        args: &Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<Value, String>>();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id, tx);
+            .insert(
+                id,
+                Pending {
+                    tx,
+                    tool: tool.to_owned(),
+                },
+            );
 
         let envelope = serde_json::json!({
             "type": "host_call_requested",
@@ -84,7 +116,7 @@ impl HostCallRouter {
         });
         self.sink.emit_raw(envelope.to_string());
 
-        let result = match tokio::time::timeout(self.timeout, rx).await {
+        let result = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(res)) => res,
             // 发送端 drop（fail_all / runtime 关停）。
             Ok(Err(_)) => Err("host call aborted (runtime shutting down)".to_owned()),
@@ -94,8 +126,8 @@ impl HostCallRouter {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
                 return Err(format!(
-                    "host call timeout after {}ms (host did not resolve)",
-                    self.timeout.as_millis()
+                    "{HOST_CALL_TIMEOUT_ERR_PREFIX} after {}ms (host did not resolve)",
+                    timeout.as_millis()
                 ));
             }
         };
@@ -103,7 +135,8 @@ impl HostCallRouter {
     }
 
     /// 宿主应答入口。`ok=true` 时 `payload` 是结果 JSON 文本；
-    /// `ok=false` 时 `payload` 是错误说明。返回 false = 无此在途调用。
+    /// `ok=false` 时 `payload` 是错误说明。返回 false = 无此在途调用
+    /// （**对失效 id 无害 no-op**——取消后的 UI 补答安全）。
     pub fn resolve(&self, id: u64, ok: bool, payload: String) -> bool {
         let pending = self
             .pending
@@ -111,7 +144,7 @@ impl HostCallRouter {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
         match pending {
-            Some(tx) => {
+            Some(Pending { tx, .. }) => {
                 let result = if ok {
                     serde_json::from_str(&payload)
                         .map_err(|e| format!("host returned invalid JSON payload: {e}"))
@@ -124,13 +157,28 @@ impl HostCallRouter {
         }
     }
 
-    /// 关停兜底：让所有在途调用立刻失败（引擎解栈）。
+    /// 关停兜底：让在途调用立刻失败（引擎解栈）。
+    ///
+    /// **ask_user 豁免**（ask-user 设计 r5 中断豁免的对接点）：pending
+    /// 的 ask_user 不 fail——工具 future 随 runtime 收束被 drop，问卷行
+    /// 留在持久层 pending，重启后经快照回放 + 迟到答案补全恢复；若在
+    /// 此处 fail，runner 会把错误结果并入历史、行被迫关卷，迟到答案
+    /// 无处补全。其余工具照旧。
     pub fn fail_all(&self, reason: &str) {
-        let drained: Vec<Pending> = {
+        let drained: Vec<(u64, Pending)> = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            guard.drain().map(|(_, v)| v).collect()
+            guard.drain().collect()
         };
-        for tx in drained {
+        for (id, Pending { tx, tool }) in drained {
+            if tool == openslate_core::ask_user::ASK_USER_TOOL {
+                // 放回待答（进程若继续存活，问卷通路不变；随 router
+                // drop 自然消亡）。
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, Pending { tx, tool });
+                continue;
+            }
             let _ = tx.send(Err(reason.to_owned()));
         }
     }
@@ -307,5 +355,72 @@ mod tests {
         router.fail_all("shutdown");
         let err = task.await.unwrap().expect_err("fail_all unblocks");
         assert!(err.contains("shutdown"));
+    }
+
+    /// ask_user 豁免（ask-user r5 中断豁免对接点）：fail_all 不 fail 在途
+    /// 的 ask_user（留给持久化恢复）；其余工具照旧。
+    #[tokio::test]
+    async fn host_call_fail_all_exempts_ask_user() {
+        let (tx, _rx) = std_mpsc::channel::<String>();
+        struct Cb(std_mpsc::Sender<String>);
+        impl EventCallback for Cb {
+            fn on_event(&self, event_json: String) {
+                let _ = self.0.send(event_json);
+            }
+        }
+        let sink = EventSink::new(Arc::new(Cb(tx)));
+        let router = HostCallRouter::new(sink, Duration::from_secs(60));
+
+        let ask_router = router.clone();
+        let ask_task = tokio::spawn(async move {
+            ask_router
+                .call("ask_user", &serde_json::json!({"v": 1}))
+                .await
+        });
+        let other_router = router.clone();
+        let other_task = tokio::spawn(async move {
+            other_router
+                .call("stuck", &serde_json::json!({}))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        router.fail_all("shutdown");
+
+        // 普通工具被 fail 解栈。
+        let err = other_task.await.unwrap().expect_err("普通工具被 fail");
+        assert!(err.contains("shutdown"));
+        // ask_user 未被 fail：调用仍在途（可继续 resolve）——问卷留给
+        // 持久化恢复，迟到答案有处补全。
+        let mut ask_task = ask_task;
+        assert!(
+            futures_poll_done(&mut ask_task).is_none(),
+            "fail_all 后 ask_user future 不应立即完成"
+        );
+        // 在途证明：resolve 仍能唤醒它（真实场景由 runtime 收束 drop）。
+        // 取信封 id（ask_user 是首个 allocate → id=1）。
+        let resolved = router.resolve(1, true, r#"{"outcome":"declined"}"#.to_owned());
+        assert!(resolved, "ask_user 仍可 resolve（未被 fail_all 杀掉）");
+        let result = ask_task.await.unwrap().expect("resolve 后正常返回");
+        assert_eq!(result["outcome"], "declined");
+    }
+
+    /// 辅助：future 是否已完成（不消费结果；None = 仍在等）。
+    fn futures_poll_done(
+        task: &mut tokio::task::JoinHandle<Result<Value, String>>,
+    ) -> Option<Result<Result<Value, String>, tokio::task::JoinError>> {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+        struct noop_waker;
+        impl std::task::Wake for noop_waker {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker: Waker = Arc::new(noop_waker).into();
+        let mut cx = Context::from_waker(&waker);
+        // JoinHandle: Unpin —— 无需 unsafe 固定。
+        match Pin::new(task).poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
     }
 }

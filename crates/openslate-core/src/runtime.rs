@@ -108,6 +108,19 @@ fn cancelled_tool_message(tc: &ToolCall) -> Message {
 /// executions). Without these, the partial transcript would end on an
 /// assistant message with dangling `tool_calls` — providers reject that, so
 /// neither the in-memory history nor a resumed run could continue.
+///
+/// **ask_user exemption** (ask-user r5 invariant, see `crate::ask_user`):
+/// a dangling `ask_user` call is deliberately LEFT DANGLING here. The token
+/// this path observes is cancelled for user stops on every ask_user-capable
+/// frontend (session dispatch `Cancel`); process interruption (runtime kill
+/// / process death) never runs this code at all, so the dangling call
+/// survives and a LATE answer can still complete it via
+/// [`crate::ask_user::append_late_tool_result`]. Closing the question
+/// instead happens through the three designed channels: the host resolving
+/// the pending call on user stop (best-effort), the pre-turn superseded
+/// repair (`repair_dangling_tool_calls`), or TTL expiry. Tool-name check is
+/// the same minimal dispatch seam the serial/parallel batch decision below
+/// uses for `call_agent` / `run_code`.
 async fn append_cancelled_tool_results(
     sink: Option<&dyn MessageSink>,
     messages: &mut Vec<Message>,
@@ -115,6 +128,9 @@ async fn append_cancelled_tool_results(
     from_index: usize,
 ) {
     for tc in &tool_calls[from_index..] {
+        if tc.name == crate::ask_user::ASK_USER_TOOL {
+            continue; // 悬挂保留给迟到答案（见上方注释）。
+        }
         let msg = cancelled_tool_message(tc);
         sink_append(sink, &msg).await;
         messages.push(msg);
@@ -746,6 +762,13 @@ pub async fn execute_run(
                         output
                     };
 
+                    // Secret masking (ask_user vault values): applied before the
+                    // `tool_end` preview, the tool result message and the tracing
+                    // preview are formed, so every model/log-visible surface sees
+                    // the masked content. No-op unless the host registered a
+                    // masker (see `ask_user::set_secret_masker`).
+                    let output = crate::ask_user::mask_tool_output(output);
+
                     let truncated = output.bytes > 80;
                     if let Some(cb) = progress.as_mut() {
                         cb.on_tool_end(
@@ -916,6 +939,9 @@ pub async fn execute_run(
                             } else {
                                 output
                             };
+                            // Secret masking — same point as the sequential
+                            // path above (before preview/history/tracing).
+                            let output = crate::ask_user::mask_tool_output(output);
                             let truncated = output.bytes > 80;
                             if let Some(cb) = progress.as_mut() {
                                 cb.on_tool_end(
@@ -955,7 +981,12 @@ pub async fn execute_run(
                         None => {
                             // Never answered (cancellation dropped the
                             // future in flight) — synthetic cancelled
-                            // result fills the call.
+                            // result fills the call. ask_user 例外：悬挂
+                            // 保留给迟到答案（r5 不变量，理由见
+                            // `append_cancelled_tool_results` 注释）。
+                            if tc.name == crate::ask_user::ASK_USER_TOOL {
+                                continue;
+                            }
                             let msg = cancelled_tool_message(tc);
                             sink_append(sink, &msg).await;
                             messages.push(msg);
@@ -1343,6 +1374,76 @@ mod tests {
         );
         assert_eq!(result.messages[3].role, MessageRole::Assistant);
         assert_eq!(result.messages[3].content, "Here are the files.");
+    }
+
+    /// 工具输出脱敏：注册 masker 后，工具结果进入消息历史前被替换
+    /// （ask_user secret 子系统的 core 消费点；未注册时恒等——其余测试
+    /// 全部不设 masker，即回归「无宿主注入零影响」）。
+    #[tokio::test]
+    async fn test_tool_output_masked_before_history() {
+        let _guard = crate::ask_user::MASKER_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct LeakyExecutor;
+        #[async_trait::async_trait]
+        impl crate::tool::ToolExecutor for LeakyExecutor {
+            async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
+                ToolOutput {
+                    content: "result: sk-core-mask-canary".to_owned(),
+                    bytes: 27,
+                    duration_ms: 1,
+                    status: ToolOutputStatus::Success,
+                }
+            }
+        }
+
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                reasoning_content: None,
+                content: Some("checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-m".into()),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "env"}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+
+        crate::ask_user::set_secret_masker(Some(Arc::new(|text: &str| {
+            text.replace("sk-core-mask-canary", "***")
+        })));
+        let result = execute_run(&provider, default_config(), "m1", &LeakyExecutor, None, None, None)
+            .await
+            .expect("run should succeed");
+        crate::ask_user::set_secret_masker(None);
+
+        let tool_msg = result
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool result present");
+        assert!(
+            !tool_msg.content.contains("sk-core-mask-canary"),
+            "密钥明文不得进历史: {}",
+            tool_msg.content
+        );
+        assert!(tool_msg.content.contains("***"), "{}", tool_msg.content);
+        assert!(
+            tool_msg.content.contains("<system-note>Output masked:"),
+            "实际发生替换 → 工具结果内追加内部提示（非独立 system 消息）: {}",
+            tool_msg.content
+        );
+        // 提示作为 tool result 内容的一部分（role=Tool，无新消息注入）。
+        assert_eq!(result.messages.len(), 4, "不注入独立消息");
     }
 
     #[tokio::test]
@@ -2870,6 +2971,170 @@ mod tests {
         assert_eq!(
             observed[1].content,
             "[tool call cancelled before completion]"
+        );
+    }
+
+    // ── ask_user 中断豁免（ask-user r5 迟到等价不变量）──────────────────
+    //
+    // 取消路径不得为悬挂的 ask_user 调用合成 cancelled 结果（否则迟到
+    // 答案无处补全）。上面的 test_cancel_during_tool_execution_aborts_tool
+    // 同时充当对照组：非 ask_user 工具照常合成 cancelled。
+
+    fn ask_user_tool_call_response(id: &str, name: &str) -> ModelResponse {
+        ModelResponse {
+            reasoning_content: None,
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: ToolCallId(id.into()),
+                name: name.into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_leaves_ask_user_dangling_serial() {
+        let executor = StuckExecutor {
+            started: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let provider = MockProvider::new(vec![ask_user_tool_call_response("tc-q", "ask_user")]);
+        let token = CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            let started = Arc::clone(&executor.started);
+            tokio::spawn(async move {
+                started.notified().await;
+                token.cancel();
+            })
+        };
+        let mut config = default_config();
+        config.parallel_tool_calls = false; // 强制串行 select! 路径。
+
+        let result = execute_run(
+            &provider,
+            config,
+            "m1",
+            &executor,
+            None,
+            None,
+            Some(&token),
+        )
+        .await
+        .expect("cancelled ask_user run returns Ok(Interrupted)");
+        canceller.abort();
+
+        assert_eq!(result.status, RunStatus::Interrupted);
+        // 悬挂保留：user + assistant(tool_calls)，无任何 tool result——
+        // 迟到答案经 append_late_tool_result 补全原调用的机会不被剥夺。
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[1].role, MessageRole::Assistant);
+        assert!(
+            crate::ask_user::dangling_tool_calls(&result.messages)
+                .contains(&("tc-q".into(), "ask_user".into())),
+            "ask_user call must stay dangling for a late answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_leaves_ask_user_dangling_parallel() {
+        // 并行批次的 drain 路径（None slot）同款豁免。
+        let executor = StuckExecutor {
+            started: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let provider = MockProvider::new(vec![ask_user_tool_call_response("tc-q", "ask_user")]);
+        let token = CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            let started = Arc::clone(&executor.started);
+            tokio::spawn(async move {
+                started.notified().await;
+                token.cancel();
+            })
+        };
+
+        let result = execute_run(
+            &provider,
+            default_config(), // parallel_tool_calls = true
+            "m1",
+            &executor,
+            None,
+            None,
+            Some(&token),
+        )
+        .await
+        .expect("cancelled ask_user run returns Ok(Interrupted)");
+        canceller.abort();
+
+        assert_eq!(result.status, RunStatus::Interrupted);
+        assert_eq!(result.messages.len(), 2, "no synthetic result appended");
+        assert!(crate::ask_user::dangling_tool_calls(&result.messages).len() == 1);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_mixed_batch_synthesizes_only_non_ask_user() {
+        // 串行批次 [echo, ask_user]：取消发生在 echo 执行中——echo 照常
+        // 合成 cancelled，ask_user 悬挂保留（含批次中部的悬挂形状，
+        // 由 repair/append 的插入位置逻辑兜底）。
+        let executor = StuckExecutor {
+            started: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let provider = MockProvider::new(vec![ModelResponse {
+            reasoning_content: None,
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: ToolCallId("tc-e".into()),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: ToolCallId("tc-q".into()),
+                    name: "ask_user".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+        }]);
+        let token = CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            let started = Arc::clone(&executor.started);
+            tokio::spawn(async move {
+                started.notified().await;
+                token.cancel();
+            })
+        };
+        let mut config = default_config();
+        config.parallel_tool_calls = false;
+
+        let result = execute_run(
+            &provider,
+            config,
+            "m1",
+            &executor,
+            None,
+            None,
+            Some(&token),
+        )
+        .await
+        .expect("cancelled mixed run returns Ok(Interrupted)");
+        canceller.abort();
+
+        assert_eq!(result.status, RunStatus::Interrupted);
+        assert_eq!(result.messages.len(), 3, "user + assistant + echo cancelled");
+        assert_eq!(result.messages[2].role, MessageRole::Tool);
+        assert_eq!(result.messages[2].tool_call_id, Some(ToolCallId("tc-e".into())));
+        assert_eq!(result.messages[2].content, "[tool call cancelled before completion]");
+        // ask_user 仍悬挂（补全机会保留）。
+        assert!(
+            crate::ask_user::dangling_tool_calls(&result.messages)
+                .contains(&("tc-q".into(), "ask_user".into()))
         );
     }
 

@@ -1705,6 +1705,7 @@ builtin_tool_name_template = ""
                 supports_reasoning: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
+                reasoning_effort: None,
             },
         );
         let (errors, warnings) = validate_strict(&config, &valid_agents());
@@ -2094,6 +2095,7 @@ path = ""
                 supports_reasoning: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
+                reasoning_effort: None,
             },
         );
         let result = validate_config_full(&config, &valid_agents());

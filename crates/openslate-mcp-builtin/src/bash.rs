@@ -9,7 +9,9 @@
 //!
 //! 执行语义（默认 30s / 上限 120s 超时、64KB 头尾字符边界安全截断、
 //! 敏感环境变量脱敏、exit_code + stdout/stderr 分节输出）全部复用
-//! [`crate::shell::run_shell_command`] 共享核心——不复制实现，防漂移。
+//! [`crate::shell::run_shell_command`] 共享核心——不复制实现，防漂移；
+//! 进程级环境注入（[`crate::shell::set_shell_env_source`]，ask_user
+//! secret 凭据）同样经共享核心对 `bash` 生效。
 
 use std::path::{Path, PathBuf};
 

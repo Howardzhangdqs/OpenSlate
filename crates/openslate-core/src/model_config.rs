@@ -81,6 +81,11 @@ pub struct ResolvedModel {
     pub input_price_per_mtok: Option<f64>,
     /// Standard output price, USD per million tokens (P2-3).
     pub output_price_per_mtok: Option<f64>,
+    /// Thinking effort（推理力度）：六档全集 `"minimal" | "low" | "medium"
+    /// | "high" | "xhigh" | "max"`，`None` = 跟随 provider 默认（wire 上
+    /// 不传该字段）。非法配置值已在 [`resolve_model`] 处 warn + 归一为
+    /// None，消费端拿到的恒为合法值或 None。
+    pub reasoning_effort: Option<String>,
 }
 
 impl ResolvedModel {
@@ -137,6 +142,27 @@ pub fn resolve_model(config: &OpenSlateConfig, alias: &str) -> Result<ResolvedMo
         ))
     })?;
 
+    // thinking effort 容忍归一：接受七档全集 none/minimal/low/medium/
+    // high/xhigh/max（契约钉死；各 provider 实际档位不一，存全集、由 UI
+    // 按模型能力裁剪）。"none" = 显式发 `reasoning_effort:"none"` 硬关闭
+    // 思考（GLM-5.2/Gemini 2.5 支持；GLM-5.3/DeepSeek 不支持），与缺省
+    // 的 Auto（不传参、跟随 provider 默认）是两种语义。其他值（手改
+    // TOML 拼错、大小写漂移等）warn 后按 None——配置瑕疵不应炸掉
+    // provider 构建或会话，请求少带该字段即回落 provider 默认（Auto）。
+    let reasoning_effort = match model.reasoning_effort.as_deref() {
+        Some(
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+        ) => model.reasoning_effort.clone(),
+        Some(invalid) => {
+            tracing::warn!(
+                "models entry '{entry_name}': invalid reasoning_effort '{invalid}' \
+                 (expected none/minimal/low/medium/high/xhigh/max); ignoring"
+            );
+            None
+        }
+        None => None,
+    };
+
     Ok(ResolvedModel {
         alias: alias.to_owned(),
         provider_name: model.provider.clone(),
@@ -147,6 +173,7 @@ pub fn resolve_model(config: &OpenSlateConfig, alias: &str) -> Result<ResolvedMo
         supports_reasoning: model.supports_reasoning,
         input_price_per_mtok: model.input_price_per_mtok,
         output_price_per_mtok: model.output_price_per_mtok,
+        reasoning_effort,
     })
 }
 
@@ -211,6 +238,56 @@ mod tests {
             result.unwrap_err(),
             ConfigError::MissingRequiredModel(_)
         ));
+    }
+
+    // ── reasoning effort（thinking effort）容忍归一 ─────────────────────
+
+    #[test]
+    fn resolve_reasoning_effort_passes_through_and_tolerates_invalid() {
+        // 七档全集逐档透传（契约：存全集、UI 按模型能力裁剪；"none" 是
+        // 显式硬关闭思考档，区别于缺省 Auto）。
+        for level in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ] {
+            let toml = format!(
+                r#"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "K"
+
+[models.m]
+provider = "p"
+model = "m1"
+reasoning_effort = "{level}"
+"#
+            );
+            let config = crate::config::parse_openslate_toml(&toml).unwrap();
+            assert_eq!(
+                resolve_model(&config, "m").unwrap().reasoning_effort,
+                Some(level.to_owned()),
+                "level '{level}' must pass through verbatim"
+            );
+        }
+
+        let toml = r#"
+[providers.p]
+base_url = "http://localhost"
+api_key_env = "K"
+
+[models.bad]
+provider = "p"
+model = "m2"
+reasoning_effort = "ultra"
+
+[models.unset]
+provider = "p"
+model = "m3"
+"#;
+        let config = crate::config::parse_openslate_toml(toml).unwrap();
+        // 非法值：warn + 归一 None（不 panic、不阻断解析）。
+        assert_eq!(resolve_model(&config, "bad").unwrap().reasoning_effort, None);
+        // 未配置 = None（Auto，跟随 provider 默认）。
+        assert_eq!(resolve_model(&config, "unset").unwrap().reasoning_effort, None);
     }
 
     // ── [levels] indirection (model-mgmt-1) ──────────────────────────────

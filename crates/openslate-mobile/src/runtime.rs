@@ -32,6 +32,10 @@ use openslate_session::state::{
     build_snapshot, AppState, ConfigPaths, CoreInner, MsgSink, ProviderFactory, SessionCore,
 };
 
+use crate::askuser::{
+    AskUserContext, AskUserExemptApproval, AskUserTool, MobileQuestionHandler,
+    startup_question_maintenance,
+};
 use crate::bootstrap::MobilePaths;
 use crate::events::{EventCallback, EventSink, MOBILE_CONN_ID};
 use crate::exec::{register_bash_tools, ExecSelection, ExecSelectionCell};
@@ -86,6 +90,11 @@ pub struct MobileRuntime {
     mcp_tool_names: std::sync::Mutex<Vec<String>>,
     /// 生效配置路径（热重载读最新落盘的 `[mcp]` 配置）。
     config_path: PathBuf,
+    /// ask_user 共享上下文（工具 / QuestionHandler / 快照回填共用）。
+    ask: Arc<AskUserContext>,
+    /// bash 工具的环境注入源（ask_user secret env 形态；热切换/重载
+    /// 重注册时随工具传递）。
+    bash_env: crate::exec::EnvSource,
     shutdown_flag: std::sync::atomic::AtomicBool,
 }
 
@@ -115,10 +124,30 @@ impl MobileRuntime {
         crate::alog!("create_with: event sink started");
         let host_router = HostCallRouter::new(sink.clone(), opts.host_call_timeout);
 
-        // host/本地工具集：mobile.ping（演示）+ bash 工具（按设置多选动
-        // 态注册：单选 → bash；双选 → bash=native + termux_bash）+ 注入项。
+        // ask_user secret 凭据库（会话内存 + store v4 持久层；装配完成后
+        // attach_store 加载镜像）。工具与注入源共用同一实例。
+        let vault = Arc::new(crate::secrets::PersistentSecretVault::new());
+
+        // ask_user 共享上下文：工具先构造（AppState 尚不存在），装配后
+        // wire 注入（Weak 防引用环，见 question.rs 模块文档）。
+        let ask_ctx = AskUserContext::new(host_router.clone(), vault.clone());
+
+        // env 注入源（ask_user secret env 形态）：
+        // - native bash（本 crate NativeShellTool）经 register_bash_tools
+        //   传入，spawn 时取最新值；
+        // - mcp-builtin shell/bash server（若启用；mobile 默认
+        //   `[builtin_tools] enabled = false`，此线为兜底）经进程级
+        //   `set_shell_env_source` 注册——shell.rs 共享执行核心统一消费，
+        //   值不打日志。
+        let env_source = crate::secrets::env_source(vault.clone());
+        openslate_mcp_builtin::set_shell_env_source(Some(env_source.clone()));
+
+        // host/本地工具集：mobile.ping（演示）+ ask_user（Agent 向用户
+        // 提问）+ bash 工具（按设置多选动态注册：单选 → bash；双选 →
+        // bash=native + termux_bash）+ 注入项。
         let exec_selection = ExecSelectionCell::new(ExecSelection::default());
         let mut extra_tools = opts.extra_tools;
+        extra_tools.push(Box::new(AskUserTool::new(ask_ctx.clone())));
         extra_tools.push(Box::new(HostTool::new(
             "mobile.ping",
             "Ping the OpenSlate mobile host bridge. Returns {'pong': true, 'runtime': 'rust'}. No parameters.",
@@ -156,7 +185,31 @@ impl MobileRuntime {
             extra_tools,
             opts.run_retention,
         ))?;
-        crate::alog!("create_with: state assembled, emitting first snapshot");
+        crate::alog!("create_with: state assembled, wiring approval + ask_user");
+        // ask_user 接线：上下文注入 store/配置 + QuestionHandler 装配
+        // （dispatch 的 question_reply / cancel 由此进 mobile 实现）。
+        ask_ctx.wire(&state);
+        state
+            .core
+            .set_question_handler(Arc::new(MobileQuestionHandler::new(ask_ctx.clone())));
+        // vault 持久层接线：加载 credentials 镜像（remember 凭据跨会话
+        // 可用——env 注入/lookup/脱敏值源全走镜像）。
+        if let Some(store) = state.core.lock().store.clone() {
+            rt.block_on(vault.attach_store(store));
+        }
+        // 输出脱敏接线：core 的进程级 masker 消费 vault 已知密钥值；
+        // `[ask_user] mask_secrets` 开关在闭包内读 context 的配置快照
+        // （默认 true = 开）。历史遗留：配置快照随装配固定，运行期改
+        // toml 需重启（或后续 lane 的 FFI 写入口顺带 refresh）。
+        {
+            let ctx = ask_ctx.clone();
+            openslate_core::ask_user::push_secret_masker(Arc::new(move |text| {
+                if !ctx.mask_enabled() {
+                    return text.to_owned();
+                }
+                ctx.mask(text)
+            }));
+        }
         // 拿到运行期注册表并按当前（默认）多选注册 bash 工具。
         let runtime_registry = state
             .core
@@ -179,6 +232,7 @@ impl MobileRuntime {
             exec_selection.get(),
             paths.workspace_dir.clone(),
             host_router.clone(),
+            env_source.clone(),
             &mcp_owned,
         );
         let runtime = Arc::new(Self {
@@ -194,6 +248,8 @@ impl MobileRuntime {
             mcp_external: std::sync::Mutex::new(mcp_external),
             mcp_tool_names: std::sync::Mutex::new(mcp_tool_names),
             config_path,
+            ask: ask_ctx,
+            bash_env: env_source,
             shutdown_flag: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -273,6 +329,7 @@ impl MobileRuntime {
             sel,
             self.workspace_dir.clone(),
             self.host_router.clone(),
+            self.bash_env.clone(),
             &mcp_owned,
         );
         crate::alog!(
@@ -471,6 +528,7 @@ impl MobileRuntime {
             self.exec_selection.get(),
             self.workspace_dir.clone(),
             self.host_router.clone(),
+            self.bash_env.clone(),
             &mcp_owned,
         );
         if !mcp_owned.is_empty() {
@@ -848,10 +906,25 @@ impl MobileRuntime {
     }
 
     fn emit_snapshot(&self) {
-        let snap = {
+        // ask_user 待答清单回填（重启恢复回放；build_snapshot 的 server
+        // 投影恒空，mobile 装配侧按问卷持久层回填——协议 §5）。关停后
+        // （rt 已收束）跳过查询，恒空。锁序对齐同文件其他 block_on 调
+        // 用点：先取 handle 放锁，再等异步（不持 rt 槽位锁跨 await）。
+        let pending_questions = {
+            let handle = {
+                let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+                guard.as_ref().map(|rt| rt.handle().clone())
+            };
+            match handle {
+                Some(handle) => handle.block_on(self.ask.snapshot_dtos()),
+                None => Vec::new(),
+            }
+        };
+        let mut snap = {
             let inner = self.state.core.lock();
             build_snapshot(&inner, &self.state.approval)
         };
+        snap.pending_questions = pending_questions;
         self.sink.send_to(
             MOBILE_CONN_ID,
             ServerMsg::Snapshot {
@@ -1227,7 +1300,11 @@ async fn assemble_state(
     apply_approval(&mut manager, &config, true, false);
     let policy = manager.approval.policy().clone();
     let approval_bridge = Arc::new(SessionApprovalBridge::new(sink.clone()));
-    manager.approval = ApprovalManager::new(policy).with_callback(approval_bridge.clone());
+    // ask_user 审批豁免（设计 §0）：Manual 全审模式下提问不触发审批
+    // （「问个问题还要先批准才能问」是体验灾难）；respond 通道照旧走
+    // 原 bridge（AppState.approval 不动）。
+    manager.approval = ApprovalManager::new(policy)
+        .with_callback(Arc::new(AskUserExemptApproval::new(approval_bridge.clone())));
 
     // 初始会话模型：capabilities.main（用户在设置页改的主对话模型）
     // 优先；无该节/代号不可解析时回退 root agent 的别名（旧配置行为）。
@@ -1292,8 +1369,13 @@ async fn assemble_state(
     if let Some(store) = store.clone() {
         match store.get_last_resumable_run().await {
             Ok(Some(run)) => {
-                match openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &run.id)
-                    .await
+                // 保留悬挂变体加载（ask-user r5）：尾部带未答 tool_calls 的
+                // assistant 消息不丢——pending 的 ask_user 问卷要靠它接受
+                // 迟到答案补全；无可恢复问卷时下方再执行经典丢弃。
+                match openslate_store_sqlite::recorder::RunRecorder::load_messages_keep_dangling(
+                    &store, &run.id,
+                )
+                .await
                 {
                     Ok(messages) if !messages.is_empty() => {
                         crate::alog!(
@@ -1303,8 +1385,10 @@ async fn assemble_state(
                             run.status
                         );
                         restored_cost = run.cost_usd;
-                        restored_transcript = messages_to_transcript(&messages);
                         restored_history = messages;
+                        // recorder 失败（无法续跑/续写）= 无迟到答案恢复能力
+                        // → 回落经典丢弃语义。
+                        let mut keep_dangling = false;
                         if let Ok(recorder) = openslate_store_sqlite::recorder::RunRecorder::resume(
                             store.clone(),
                             openslate_core::types::RunId(run.id.clone()),
@@ -1312,11 +1396,37 @@ async fn assemble_state(
                         )
                         .await
                         {
+                            let recorder = Arc::new(recorder);
+                            // ask_user 启动清扫：TTL 过期 → 合成 expired 补全
+                            // （先落库再进内存，重启重放同序）；已解决行 →
+                            // superseded 关卷；返回仍可恢复的悬挂 tool_call_id 集。
+                            let recoverable = startup_question_maintenance(
+                                &store,
+                                &mut restored_history,
+                                Some(&recorder),
+                            )
+                            .await;
+                            // 可恢复的 ask_user 悬挂在历史中 → 保留尾部悬挂
+                            // assistant（同批兄弟悬挂由下一 turn 前的
+                            // superseded 修复收口）。
+                            keep_dangling = !recoverable.is_empty();
                             restored_run = Some(openslate_session::state::SessionRun {
                                 run_id: openslate_core::types::RunId(run.id.clone()),
-                                recorder: Arc::new(recorder),
+                                recorder,
                             });
                         }
+                        // 无可恢复问卷且尾部仍是悬挂 assistant → 执行
+                        // load_messages 的经典丢弃（模型重新决策）。
+                        if !keep_dangling
+                            && matches!(
+                                restored_history.last(),
+                                Some(m) if m.role == MessageRole::Assistant
+                                    && m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
+                            )
+                        {
+                            restored_history.pop();
+                        }
+                        restored_transcript = messages_to_transcript(&restored_history);
                     }
                     Ok(_) => crate::alog!("restore: last run has no messages; fresh session"),
                     Err(e) => crate::alog!("restore: load_messages failed: {e}; fresh session"),
@@ -2330,6 +2440,458 @@ mod tests {
         assert_eq!(
             runtime.get_mcp_builtin_tool_name_template(),
             "{prefix}_{tool}"
+        );
+        runtime.shutdown();
+    }
+
+    // ── 8+. ask_user 工具（即时路径 / 重启恢复 / 首答者赢）────────────
+
+    fn ask_user_tool_call_response() -> Vec<ModelStreamEvent> {
+        vec![ModelStreamEvent::Done(ModelResponse {
+            content: None,
+            tool_calls: vec![openslate_core::types::ToolCall {
+                id: openslate_core::types::ToolCallId("call-ask-1".into()),
+                name: "ask_user".into(),
+                arguments: serde_json::json!({
+                    "questions": [{
+                        "id": "db",
+                        "header": "数据库",
+                        "question": "本地存储用 SQLite 还是 sled？",
+                        "type": "choice",
+                        "options": [
+                            {"label": "SQLite", "description": "零配置", "recommended": true},
+                            {"label": "sled", "description": "纯 Rust"}
+                        ]
+                    }]
+                }),
+            }],
+            reasoning_content: None,
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+        })]
+    }
+
+    /// 即时路径全链路：模型发 ask_user → 下发信封（Android 契约形状）→
+    /// resolve_host_call → 工具结果回填（自然语言 + 结构化）→ 续跑到
+    /// turn_ok → 问卷行 answered 落库。
+    #[test]
+    fn ask_user_immediate_path_roundtrip() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![
+                ask_user_tool_call_response(),
+                text_response("好，就用 SQLite。"),
+            ]),
+        )
+        .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        runtime
+            .send(r#"{"type":"submit","text":"帮我选本地存储"}"#)
+            .unwrap();
+        let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(20));
+        let req = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "host_call_requested" && e["tool"] == "ask_user")
+            .expect("ask_user host call 信封");
+
+        // 下发契约逐字段核对。
+        assert_eq!(req["args"]["v"], 1, "payload 版本字段 v=1");
+        assert_eq!(req["args"]["timeout"], -1, "默认永不超时（[ask_user] Never）");
+        let q = &req["args"]["questions"][0];
+        assert_eq!(q["id"], "db");
+        assert_eq!(q["header"], "数据库");
+        assert_eq!(q["question"], "本地存储用 SQLite 还是 sled？");
+        assert_eq!(q["type"], "choice");
+        assert_eq!(q["options"][0]["label"], "SQLite");
+        assert_eq!(q["options"][0]["description"], "零配置");
+        assert_eq!(q["options"][0]["recommended"], true);
+        assert_eq!(q["options"].as_array().unwrap().len(), 2);
+        assert_eq!(q["multi_select"], false);
+        assert_eq!(q["optional"], false);
+        let id = req["id"].as_u64().unwrap();
+
+        // Android resolve 契约形状（ok=true 业务负载）。
+        assert!(runtime.resolve_host_call(
+            id,
+            true,
+            r#"{"outcome":"answered","answers":[{"id":"db","selected":["SQLite"]}]}"#.into()
+        ));
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+        // 行状态 answered；工具结果与迟to路径同形地进了消息历史。
+        let run_id = runtime.current_run_id().expect("run 已打开");
+        let (srt, store) = scratch_store(&paths);
+        let (row, msgs) = srt.block_on(async {
+            let row = store
+                .get_pending_question(&id.to_string())
+                .await
+                .unwrap()
+                .expect("问卷行存在");
+            let msgs = openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &run_id)
+                .await
+                .unwrap();
+            (row, msgs)
+        });
+        assert_eq!(row.status, "answered");
+        assert_eq!(row.tool_call_id, "call-ask-1", "tool_call_id 关联悬挂调用");
+        assert!(
+            store_row_pending_empty(&srt, &store),
+            "answered 行不再出现在 pending 清单"
+        );
+        let tool_msg = msgs
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("工具结果已入历史");
+        assert!(
+            tool_msg.content.contains("User answered your questions"),
+            "自然语言段: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("- \"db\" → SQLite (Recommended)"),
+            "逐题行: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains(r#""outcome":"answered""#),
+            "结构化段: {}",
+            tool_msg.content
+        );
+        runtime.shutdown();
+    }
+
+    fn store_row_pending_empty(
+        srt: &tokio::runtime::Runtime,
+        store: &openslate_store_sqlite::store::SqliteStore,
+    ) -> bool {
+        srt.block_on(async { store.list_pending_questions().await.unwrap() })
+            .is_empty()
+    }
+
+    /// secret 子系统全链路：模型问 secret（env 形态）→ 用户提交（记住）
+    /// → 凭据入 vault/库 → 后续 bash 命令拿到注入的 env 值 → 工具输出
+    /// 对已知密钥值打码（明文不进历史）。native bash 经 set_exec_backends
+    /// 注册（默认装配不注册任何 bash 名）。
+    #[test]
+    fn ask_user_secret_env_injection_and_masking_roundtrip() {
+        let ask_secret = || {
+            vec![ModelStreamEvent::Done(ModelResponse {
+                content: None,
+                tool_calls: vec![openslate_core::types::ToolCall {
+                    id: openslate_core::types::ToolCallId("call-sec-1".into()),
+                    name: "ask_user".into(),
+                    arguments: serde_json::json!({
+                        "questions": [{
+                            "id": "tok",
+                            "header": "令牌",
+                            "question": "GitHub token？",
+                            "type": "secret",
+                            "storage": {"kind": "env", "name": "GITHUB_TOKEN"}
+                        }]
+                    }),
+                }],
+                reasoning_content: None,
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            })]
+        };
+        let bash_echo = || {
+            vec![ModelStreamEvent::Done(ModelResponse {
+                content: None,
+                tool_calls: vec![openslate_core::types::ToolCall {
+                    id: openslate_core::types::ToolCallId("call-bash-1".into()),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "printf 'token=%s' \"$GITHUB_TOKEN\""}),
+                }],
+                reasoning_content: None,
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            })]
+        };
+
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![
+                ask_secret(),
+                bash_echo(),
+                text_response("令牌可用。"),
+            ]),
+        )
+        .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        runtime.set_exec_backends("native");
+
+        runtime
+            .send(r#"{"type":"submit","text":"需要 GitHub token"}"#)
+            .unwrap();
+        let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(20));
+        let req = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "host_call_requested" && e["tool"] == "ask_user")
+            .expect("ask_user 信封");
+        // secret 题型下发契约：storage 透传。
+        assert_eq!(req["args"]["questions"][0]["type"], "secret");
+        assert_eq!(req["args"]["questions"][0]["storage"]["kind"], "env");
+        assert_eq!(req["args"]["questions"][0]["storage"]["name"], "GITHUB_TOKEN");
+        let id = req["id"].as_u64().unwrap();
+
+        // 用户提交明文（remember=true）。
+        assert!(runtime.resolve_host_call(
+            id,
+            true,
+            r#"{"outcome":"answered","answers":[{"id":"tok","value":"sk-e2e-canary-value","remember":true}]}"#.into()
+        ));
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(30));
+
+        let run_id = runtime.current_run_id().expect("run 已打开");
+        let (srt, store) = scratch_store(&paths);
+        let (creds, msgs) = srt.block_on(async {
+            let creds = store.list_credentials().await.unwrap();
+            let msgs =
+                openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &run_id)
+                    .await
+                    .unwrap();
+            (creds, msgs)
+        });
+
+        // 1) 持久凭据行（remember=true）。
+        assert_eq!(creds.len(), 1, "{creds:?}");
+        assert_eq!(creds[0].name, "GITHUB_TOKEN");
+        assert_eq!(creds[0].kind, "env");
+
+        // 2) ask_user 工具结果只含引用，不含明文（引用回填无替换 →
+        //    也不追加脱敏提示）。
+        let ask_msg = msgs
+            .iter()
+            .find(|m| m.role == MessageRole::Tool && m.tool_call_id.as_ref().unwrap().0 == "call-sec-1")
+            .expect("ask_user 结果");
+        assert!(ask_msg.content.contains("已存入凭据：环境变量 GITHUB_TOKEN"), "{}", ask_msg.content);
+        assert!(!ask_msg.content.contains("sk-e2e-canary-value"), "{}", ask_msg.content);
+        assert!(
+            !ask_msg.content.contains("<system-note>"),
+            "无替换的输出不追加提示（避免噪音）: {}",
+            ask_msg.content
+        );
+
+        // 3) bash 输出：env 注入生效（子进程可见）+ 历史中已打码 + 实际
+        //    发生替换 → 末尾追加内部提示（tool result 内容的一部分）。
+        let bash_msg = msgs
+            .iter()
+            .find(|m| m.role == MessageRole::Tool && m.tool_call_id.as_ref().unwrap().0 == "call-bash-1")
+            .expect("bash 结果");
+        assert!(
+            bash_msg.content.contains("token=***"),
+            "输出脱敏应把已知密钥值替换为 ***: {}",
+            bash_msg.content
+        );
+        assert!(!bash_msg.content.contains("sk-e2e-canary-value"), "{}", bash_msg.content);
+        assert!(
+            bash_msg.content.contains("<system-note>Output masked:"),
+            "发生替换 → 追加内部提示: {}",
+            bash_msg.content
+        );
+        assert!(
+            bash_msg.content.ends_with("</system-note>"),
+            "提示位于内容末尾: {}",
+            bash_msg.content
+        );
+
+        runtime.shutdown();
+    }
+
+    /// 重启恢复全链路（预置崩溃现场）：悬挂 ask_user 的 run + pending
+    /// 问卷行 → 快照 pending_questions 回放 → question_reply 迟到答案
+    /// 补全 tool result 并续跑 → turn_ok；重复应答首答者赢。
+    #[test]
+    fn ask_user_restart_recovery_and_first_answer_wins() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+
+        let run_id_str = "ask-recover-run";
+        let tool_call_id = "call-ask-9";
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        {
+            let (srt, store) = scratch_store(&paths);
+            srt.block_on(async {
+                store
+                    .insert_run(run_id_str, Some("提问恢复"), "root", "interrupted", "{}", now_ms - 60_000)
+                    .await
+                    .unwrap();
+                store
+                    .insert_execution_node(
+                        &format!("{run_id_str}-persist"),
+                        run_id_str,
+                        "root",
+                        None,
+                        None,
+                        "running",
+                        "{}",
+                        now_ms - 60_000,
+                    )
+                    .await
+                    .unwrap();
+                let user_msg = Message {
+                    role: MessageRole::User,
+                    content: "选个数据库".into(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                };
+                let assistant_msg = Message {
+                    role: MessageRole::Assistant,
+                    content: String::new(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: Some(vec![openslate_core::types::ToolCall {
+                        id: openslate_core::types::ToolCallId(tool_call_id.into()),
+                        name: "ask_user".into(),
+                        arguments: serde_json::json!({
+                            "questions": [{
+                                "id": "db",
+                                "question": "数据库？",
+                                "type": "choice",
+                                "options": [
+                                    {"label": "SQLite", "recommended": true},
+                                    {"label": "sled"}
+                                ]
+                            }]
+                        }),
+                    }]),
+                    reasoning_content: None,
+                };
+                store
+                    .insert_message(
+                        &format!("msg-{run_id_str}-1"),
+                        run_id_str,
+                        &format!("{run_id_str}-persist"),
+                        Some("root"),
+                        "user",
+                        &serde_json::to_string(&user_msg).unwrap(),
+                        1,
+                        now_ms - 59_000,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .insert_message(
+                        &format!("msg-{run_id_str}-2"),
+                        run_id_str,
+                        &format!("{run_id_str}-persist"),
+                        Some("root"),
+                        "assistant",
+                        &serde_json::to_string(&assistant_msg).unwrap(),
+                        2,
+                        now_ms - 58_000,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .insert_pending_question(
+                        "42",
+                        tool_call_id,
+                        r#"[{"id":"db","question":"数据库？","type":"choice","options":[{"label":"SQLite","recommended":true},{"label":"sled"}],"optional":false}]"#,
+                        1,
+                        now_ms - 58_000,
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![text_response("收到，就用 SQLite。")]),
+        )
+        .unwrap();
+
+        // 快照回放：pending_questions 从问卷表填充（重启恢复数据源）。
+        let events = collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        let snap = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "snapshot")
+            .expect("首份快照");
+        let pq = snap["session"]["pending_questions"]
+            .as_array()
+            .expect("pending_questions 数组");
+        assert_eq!(pq.len(), 1, "悬挂问卷回放: {snap}");
+        assert_eq!(pq[0]["request_id"], "42");
+        assert_eq!(pq[0]["tool_call_id"], tool_call_id);
+        assert_eq!(pq[0]["status"], "pending");
+        assert_eq!(pq[0]["version"], 1);
+        assert_eq!(pq[0]["questions"][0]["id"], "db", "问卷负载透传");
+
+        // 迟到答案：question_reply → 补全原 tool result → 续跑 → turn_ok。
+        runtime
+            .send(r#"{"type":"question_reply","request_id":"42","action":"accept","answers":[{"id":"db","selected":["SQLite"]}]}"#)
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+        // 首答者赢：重复应答 → 定向 notice，不二次续跑。
+        runtime
+            .send(r#"{"type":"question_reply","request_id":"42","action":"accept","answers":[{"id":"db","selected":["sled"]}]}"#)
+            .unwrap();
+        let events = collector.wait_for(&rx, "notice", Duration::from_secs(10));
+        let notice = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "notice")
+            .expect("notice 已发出");
+        assert!(
+            notice["text"].as_str().unwrap().contains("已被应答或已关闭"),
+            "首答者赢语义: {notice}"
+        );
+
+        // 行 answered；消息历史里迟到补全的 tool result 与即时路径同形。
+        let (srt, store) = scratch_store(&paths);
+        let (row, msgs) = srt.block_on(async {
+            let row = store
+                .get_pending_question("42")
+                .await
+                .unwrap()
+                .expect("问卷行存在");
+            let msgs = openslate_store_sqlite::recorder::RunRecorder::load_messages(
+                &store,
+                run_id_str,
+            )
+            .await
+            .unwrap();
+            (row, msgs)
+        });
+        assert_eq!(row.status, "answered");
+        let tool_msg = msgs
+            .iter()
+            .find(|m| m.role == MessageRole::Tool
+                && m.tool_call_id
+                    .as_ref()
+                    .map(|i| i.0.as_str())
+                    == Some(tool_call_id))
+            .expect("迟到答案已补全 tool result");
+        assert!(
+            tool_msg.content.contains("User answered your questions")
+                && tool_msg.content.contains("- \"db\" → SQLite (Recommended)"),
+            "与即时路径完全同形（迟到等价不变量）: {}",
+            tool_msg.content
+        );
+        assert!(
+            msgs.iter().any(|m| m.role == MessageRole::Assistant
+                && m.content.contains("收到，就用 SQLite。")),
+            "续跑后的最终回复已入库"
         );
         runtime.shutdown();
     }

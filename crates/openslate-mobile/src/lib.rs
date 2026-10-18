@@ -22,6 +22,7 @@
 //! 本 crate 无任何 Android 依赖，可在 desktop 上完整测试。
 
 pub mod alog;
+pub mod askuser;
 pub mod bootstrap;
 pub mod events;
 pub mod exec;
@@ -29,12 +30,14 @@ pub mod hostcall;
 pub mod provider;
 pub mod registry;
 pub mod runtime;
+pub mod secrets;
 
 pub use bootstrap::MobilePaths;
 pub use events::{EventCallback, EventSink, MOBILE_CONN_ID};
 pub use exec::{ExecSelection, ExecSelectionCell, NativeShellTool};
 pub use hostcall::{HostCallRouter, HostTool};
 pub use runtime::{MobileRuntime, RuntimeOptions};
+pub use secrets::PersistentSecretVault;
 
 /// 注入 MCP host 鉴权 token（进程级 HTTP `Authorization: Bearer` 覆盖）。
 ///

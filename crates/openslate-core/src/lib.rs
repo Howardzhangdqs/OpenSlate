@@ -1,5 +1,6 @@
 pub mod agent_tree;
 pub mod approval;
+pub mod ask_user;
 pub mod callable;
 pub mod config;
 pub mod context;

@@ -10,6 +10,12 @@
 //! 变化的是注册与否：未选中的名字直接从注册表注销，模型不可见；运行
 //! 中途切换时旧名字调用会得到 NotFound，模型可自纠。
 //!
+//! ## env 注入（ask_user secret 子系统）
+//!
+//! native bash（`NativeShellTool`）spawn 时从 [`EnvSource`] 取凭据库
+//! env 形态键值注入（脱敏之后应用，见工具文档）；termux HostTool 壳经
+//! Kotlin 宿主执行，注入不可达（已知边界）。
+//!
 //! ## MCP 接管（termux bash 降级阶梯的 host 侧半边）
 //!
 //! MCP 聚合 host 在线时其内置 bash server 以裸名 `bash` 列工具，经
@@ -32,6 +38,12 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use crate::hostcall::{HostCallRouter, HostTool};
+
+/// bash 执行环境的**有意注入**变量来源（ask_user secret 凭据库 env 形态；
+/// spawn 时取最新值）。与 mcp-builtin 的
+/// `openslate_mcp_builtin::ShellEnvSource` 结构同型（mobile 侧本地定义，
+/// 避免为单一类型别名引依赖）。
+pub type EnvSource = Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
 
 /// 默认命令超时。
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -164,15 +176,19 @@ impl ExecSelectionCell {
 /// 按多选结果（重新）注册 bash 工具：先清理全部旧名字，再按需注册。
 /// 切换后端时对同一 registry 重调即可热生效。
 ///
-/// `mcp_owned`（见 [`mcp_owned_bash_names`]）= MCP 已接管的 bash 名单：
-/// 这些名字是 MCP 工具的，本函数**不清理也不注册**（让位）——旧实现
-/// 无条件 unregister 全部 bash 名，会把 MCP 刚注册的 bash 工具一并拆
-/// 掉（降级阶梯在「切后端」处断裂）。
+/// `env` = 环境注入源（ask_user secret env 形态凭据；native 工具 spawn
+/// 时取最新值。termux HostTool 壳经 Kotlin 宿主执行，注入不可达——
+/// 见模块文档「注入边界」）。`mcp_owned`（见
+/// [`mcp_owned_bash_names`]）= MCP 已接管的 bash 名单：这些名字是 MCP
+/// 工具的，本函数**不清理也不注册**（让位）——旧实现无条件 unregister
+/// 全部 bash 名，会把 MCP 刚注册的 bash 工具一并拆掉（降级阶梯在
+/// 「切后端」处断裂）。
 pub fn register_bash_tools(
     registry: &ToolRegistry,
     sel: ExecSelection,
     workspace: PathBuf,
     router: std::sync::Arc<HostCallRouter>,
+    env: EnvSource,
     mcp_owned: &[String],
 ) {
     let owned = |n: &str| mcp_owned.iter().any(|o| o.as_str() == n);
@@ -187,6 +203,7 @@ pub fn register_bash_tools(
         registry.register_boxed(Box::new(NativeShellTool::new(
             BASH_TOOL.to_owned(),
             workspace,
+            env,
         )));
     }
     if sel.termux {
@@ -223,14 +240,22 @@ pub fn register_bash_tools(
 /// 进程内原生 shell 工具。cwd 固定到 workspace_dir（App 私有可写目录），
 /// 环境变量脱敏后继承，输出格式与桌面 builtin shell 一致（exit_code +
 /// stdout/stderr 分节）。
+///
+/// ## 环境注入（ask_user secret env 形态）
+///
+/// spawn 时先脱敏继承环境（敏感命名剔除），再应用 [`EnvSource`] 注入
+/// ——注入值（用户有意存入凭据库的 TOKEN 等）在脱敏**之后**生效；
+/// 注入值本身绝不进日志。termux HostTool 壳不经本进程执行（Kotlin 宿主
+/// RUN_COMMAND），env 注入不可达，是该形态的已知边界（见 ask-user 文档）。
 pub struct NativeShellTool {
     name: String,
     root: PathBuf,
+    env: EnvSource,
 }
 
 impl NativeShellTool {
-    pub fn new(name: String, root: PathBuf) -> Self {
-        Self { name, root }
+    pub fn new(name: String, root: PathBuf, env: EnvSource) -> Self {
+        Self { name, root, env }
     }
 }
 
@@ -305,6 +330,12 @@ impl Tool for NativeShellTool {
             if is_sensitive_env(&name) {
                 cmd.env_remove(&name);
             }
+        }
+
+        // 有意注入（ask_user secret 凭据库 env 形态）：在脱敏之后应用，
+        // 用户有意存入的 TOKEN 等命名得以进入子进程；值不打日志。
+        for (name, value) in (self.env)() {
+            cmd.env(&name, &value);
         }
 
         let mut child = match cmd.spawn() {
@@ -450,6 +481,11 @@ fn is_sensitive_env(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 测试默认 env 源（无注入）。
+    fn empty_env() -> EnvSource {
+        Arc::new(Vec::new)
+    }
+
     #[tokio::test]
     async fn native_only_bash_executes() {
         let dir = tempfile::tempdir().unwrap();
@@ -471,6 +507,7 @@ mod tests {
             },
             dir.path().to_path_buf(),
             router.clone(),
+            empty_env(),
             &[],
         );
         let names = reg.tool_names();
@@ -506,6 +543,7 @@ mod tests {
             },
             dir.path().to_path_buf(),
             router,
+            empty_env(),
             &[],
         );
         let names = reg.tool_names();
@@ -536,7 +574,7 @@ mod tests {
             native: true,
             termux: false,
         };
-        register_bash_tools(&reg, sel, dir.path().to_path_buf(), router.clone(), &[]);
+        register_bash_tools(&reg, sel, dir.path().to_path_buf(), router.clone(), empty_env(), &[]);
         assert!(reg.contains("bash"));
         assert!(!reg.contains("termux_bash"));
 
@@ -549,6 +587,7 @@ mod tests {
             },
             dir.path().to_path_buf(),
             router.clone(),
+            empty_env(),
             &[],
         );
         assert!(reg.contains("bash") && reg.contains("termux_bash"));
@@ -562,6 +601,7 @@ mod tests {
             },
             dir.path().to_path_buf(),
             router,
+            empty_env(),
             &[],
         );
         let names = reg.tool_names();
@@ -596,6 +636,7 @@ mod tests {
             },
             dir.path().to_path_buf(),
             router.clone(),
+            empty_env(),
             &[],
         );
         assert!(reg.contains("bash"));
@@ -605,6 +646,7 @@ mod tests {
             ExecSelection::default(),
             dir.path().to_path_buf(),
             router,
+            empty_env(),
             &[],
         );
         let names = reg.tool_names();
@@ -615,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn native_exec_basics() {
         let dir = tempfile::tempdir().unwrap();
-        let t = NativeShellTool::new("bash".to_owned(), dir.path().to_path_buf());
+        let t = NativeShellTool::new("bash".to_owned(), dir.path().to_path_buf(), empty_env());
 
         let out = t
             .execute(&serde_json::json!({"command": "echo hello-shell"}))
@@ -646,6 +688,37 @@ mod tests {
         assert_eq!(out.status, ToolOutputStatus::Error);
         assert!(out.content.contains("TIMEOUT"), "{}", out.content);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn native_exec_env_injection_survives_scrub() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("OPSLATE_TEST_MB_INHERITED_TOKEN", "mb-inherited-leak");
+        let env: EnvSource = Arc::new(|| {
+            vec![
+                ("OPSLATE_TEST_MB_TOKEN".to_owned(), "mb-vault-value".to_owned()),
+                // 覆盖被脱敏的继承名：注入值胜出。
+                ("OPSLATE_TEST_MB_INHERITED_TOKEN".to_owned(), "mb-override".to_owned()),
+            ]
+        });
+        let t = NativeShellTool::new("bash".to_owned(), dir.path().to_path_buf(), env);
+
+        let out = t
+            .execute(&serde_json::json!(
+                {"command": "printf '%s %s' \"$OPSLATE_TEST_MB_TOKEN\" \"$OPSLATE_TEST_MB_INHERITED_TOKEN\""}
+            ))
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("mb-vault-value") && out.content.contains("mb-override"),
+            "{}", out.content
+        );
+        assert!(
+            !out.content.contains("mb-inherited-leak"),
+            "继承敏感变量仍被脱敏: {}",
+            out.content
+        );
+        std::env::remove_var("OPSLATE_TEST_MB_INHERITED_TOKEN");
     }
 
     #[test]
@@ -834,6 +907,7 @@ mod tests {
             },
             dir.path().to_path_buf(),
             router.clone(),
+            empty_env(),
             &["termux_bash".to_owned()],
         );
         let after = reg.get("termux_bash").expect("MCP 工具仍在场");
@@ -849,6 +923,7 @@ mod tests {
             ExecSelection::default(),
             dir.path().to_path_buf(),
             router,
+            empty_env(),
             &["termux_bash".to_owned()],
         );
         assert!(reg.contains("termux_bash"), "全不选不清 MCP 接管名");

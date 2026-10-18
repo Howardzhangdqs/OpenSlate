@@ -164,6 +164,8 @@ impl SqliteStore {
             match version {
                 0 => schema::migrate_v0_to_v1(&mut tx).await?,
                 1 => schema::migrate_v1_to_v2(&mut tx).await?,
+                2 => schema::migrate_v2_to_v3(&mut tx).await?,
+                3 => schema::migrate_v3_to_v4(&mut tx).await?,
                 v => {
                     return Err(StoreError::MigrationError(format!(
                         "未知的 schema 版本步进起点: v{v}"
@@ -260,7 +262,7 @@ mod tests {
         let mut actual: Vec<String> = tables;
         actual.sort();
 
-        assert_eq!(actual, expected, "all 7 tables should exist");
+        assert_eq!(actual, expected, "all expected tables should exist");
     }
 
     #[tokio::test]
@@ -309,7 +311,7 @@ mod tests {
         .await
         .expect("query sqlite_master");
 
-        assert_eq!(tables.len(), 7, "should still have exactly 7 tables");
+        assert_eq!(tables.len(), schema::TABLE_NAMES.len(), "should still have exactly the expected number of tables");
     }
 
     #[tokio::test]
@@ -326,7 +328,7 @@ mod tests {
         .await
         .expect("query sqlite_master");
 
-        assert_eq!(tables.len(), 7, "should still have exactly 7 tables");
+        assert_eq!(tables.len(), schema::TABLE_NAMES.len(), "should still have exactly the expected number of tables");
 
         let indexes: Vec<String> = query_scalar(
             "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -819,7 +821,7 @@ mod tests {
         store.run_migrations().await.expect("migrate to v2");
 
         // user_version 正确
-        assert_eq!(store.user_version().await.expect("version"), 2);
+        assert_eq!(store.user_version().await.expect("version"), schema::SCHEMA_VERSION);
 
         // title 列存在且数据完好
         let run = store.get_run("legacy-run").await.expect("get").expect("run");
@@ -926,7 +928,7 @@ mod tests {
         let store = SqliteStore::new(path_str).await.expect("open store");
         store.run_migrations().await.expect("migrate");
 
-        assert_eq!(store.user_version().await.expect("version"), 2);
+        assert_eq!(store.user_version().await.expect("version"), schema::SCHEMA_VERSION);
 
         let columns: Vec<String> =
             query_scalar("SELECT name FROM pragma_table_info('runs') ORDER BY name")
@@ -994,7 +996,7 @@ mod tests {
             .await
             .expect("重复 seq 只能导致索引跳过，不能阻断迁移");
 
-        assert_eq!(store.user_version().await.expect("version"), 2);
+        assert_eq!(store.user_version().await.expect("version"), schema::SCHEMA_VERSION);
         let uq: Option<String> = query_scalar(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_run_seq_uq'",
         )

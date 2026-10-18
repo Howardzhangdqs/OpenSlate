@@ -150,7 +150,7 @@ mod tests {
     fn explicit_value_bypasses_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let local = tmp.path().join(".openslate");
-        write_info(&local, "ws://127.0.0.1:1/api/ws", 1, Some("file-token"));
+        write_info(&local, "ws://127.0.0.1:1/api/ws", PROTOCOL_VERSION, Some("file-token"));
         let config = local.join("openslate.toml").to_string_lossy().into_owned();
 
         let spec = resolve_server(
@@ -169,7 +169,7 @@ mod tests {
     fn discovers_via_explicit_config_parent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let local = tmp.path().join(".openslate");
-        write_info(&local, "ws://127.0.0.1:7800/api/ws", 1, Some("file-token"));
+        write_info(&local, "ws://127.0.0.1:7800/api/ws", PROTOCOL_VERSION, Some("file-token"));
         let config = local.join("openslate.toml").to_string_lossy().into_owned();
 
         let spec = resolve_server(None, None, Some(&config)).unwrap();
@@ -194,8 +194,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
-        write_info(&a, "ws://127.0.0.1:1/api/ws", 1, None);
-        write_info(&b, "ws://127.0.0.1:2/api/ws", 1, None);
+        write_info(&a, "ws://127.0.0.1:1/api/ws", PROTOCOL_VERSION, None);
+        write_info(&b, "ws://127.0.0.1:2/api/ws", PROTOCOL_VERSION, None);
         let spec = discover_in(&[a.clone(), b]).unwrap();
         assert_eq!(spec.url, "ws://127.0.0.1:1/api/ws", "第一个目录优先");
 

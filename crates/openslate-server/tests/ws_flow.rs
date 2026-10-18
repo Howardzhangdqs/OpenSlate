@@ -231,7 +231,7 @@ async fn next_msg(ws: &mut ClientWs) -> ServerMsg {
 
 /// hello 握手并断言 snapshot 到达。
 async fn hello(ws: &mut ClientWs, token: Option<String>) -> ServerMsg {
-    send_msg(ws, &ClientMsg::Hello { proto: 1, token }).await;
+    send_msg(ws, &ClientMsg::Hello { proto: openslate_protocol::PROTOCOL_VERSION, token }).await;
     next_msg(ws).await
 }
 
@@ -300,7 +300,7 @@ async fn full_turn_with_streaming_tool_and_approval() {
     // hello → snapshot（会话空态自足校验）
     match hello(&mut ws, None).await {
         ServerMsg::Snapshot { session } => {
-            assert_eq!(session.proto, 1);
+            assert_eq!(session.proto, openslate_protocol::PROTOCOL_VERSION);
             assert!(!session.running);
             assert!(session.transcript.is_empty());
             assert_eq!(session.model_alias, "main");
@@ -681,7 +681,7 @@ async fn auth_token_enforced_on_ws_and_rest() {
     send_msg(
         &mut ws,
         &ClientMsg::Hello {
-            proto: 1,
+            proto: openslate_protocol::PROTOCOL_VERSION,
             token: Some("wrong".into()),
         },
     )
@@ -746,7 +746,7 @@ async fn rest_readonly_endpoints() {
         .await
         .unwrap();
     assert_eq!(health["status"], "ok");
-    assert_eq!(health["proto"], 1);
+    assert_eq!(health["proto"], openslate_protocol::PROTOCOL_VERSION);
 
     // config
     let config: serde_json::Value = reqwest::get(format!("{base}/config"))

@@ -22,7 +22,10 @@ use std::sync::Arc;
 use openslate_app::wiring::load_config_layered;
 use openslate_core::config::persist;
 use openslate_core::config::validation::validate_config;
-use openslate_protocol::{ClientMsg, ModelDto, NoticeLevel, ProviderDto, ServerMsg};
+use openslate_protocol::{
+    AskUserTimeoutDto, ClientMsg, ModelDto, NoticeLevel, ProviderDto, ServerMsg,
+};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::state::{build_config_view, AppState};
 
@@ -39,19 +42,43 @@ fn suggest_env_key(name: &str) -> String {
 
 /// 单条 CRUD 变更（从 ClientMsg 提取）。
 pub enum ConfigChange {
-    UpsertProvider { name: String, provider: ProviderDto },
-    DeleteProvider { name: String },
-    UpsertModel { entry: String, model: ModelDto },
-    DeleteModel { entry: String },
-    SetLevel { level: String, entry: String },
-    DeleteLevel { level: String },
-    SetCapability { capability: String, alias: String },
+    UpsertProvider {
+        name: String,
+        provider: ProviderDto,
+    },
+    DeleteProvider {
+        name: String,
+    },
+    UpsertModel {
+        entry: String,
+        model: ModelDto,
+    },
+    DeleteModel {
+        entry: String,
+    },
+    SetLevel {
+        level: String,
+        entry: String,
+    },
+    DeleteLevel {
+        level: String,
+    },
+    SetCapability {
+        capability: String,
+        alias: String,
+    },
+    SetAskUserConfig {
+        default_timeout: AskUserTimeoutDto,
+        mask_secrets: bool,
+    },
     UpsertMcpServer {
         name: String,
         url: String,
         headers: Option<std::collections::HashMap<String, String>>,
     },
-    RemoveMcpServer { name: String },
+    RemoveMcpServer {
+        name: String,
+    },
 }
 
 impl ConfigChange {
@@ -68,15 +95,16 @@ impl ConfigChange {
             ClientMsg::SetCapability { capability, alias } => {
                 Some(Self::SetCapability { capability, alias })
             }
-            ClientMsg::UpsertMcpServer {
-                name,
-                url,
-                headers,
-            } => Some(Self::UpsertMcpServer {
-                name,
-                url,
-                headers,
+            ClientMsg::SetAskUserConfig {
+                default_timeout,
+                mask_secrets,
+            } => Some(Self::SetAskUserConfig {
+                default_timeout,
+                mask_secrets,
             }),
+            ClientMsg::UpsertMcpServer { name, url, headers } => {
+                Some(Self::UpsertMcpServer { name, url, headers })
+            }
             ClientMsg::RemoveMcpServer { name } => Some(Self::RemoveMcpServer { name }),
             _ => None,
         }
@@ -93,6 +121,19 @@ impl ConfigChange {
             ConfigChange::DeleteLevel { level } => format!("delete_level {level}"),
             ConfigChange::SetCapability { capability, alias } => {
                 format!("set_capability {capability} → {alias}")
+            }
+            ConfigChange::SetAskUserConfig {
+                default_timeout,
+                mask_secrets,
+            } => {
+                let timeout = match default_timeout {
+                    AskUserTimeoutDto::Never => "never".to_owned(),
+                    AskUserTimeoutDto::Seconds(s) => format!("{s}s"),
+                };
+                format!(
+                    "set_ask_user_config timeout={timeout} mask={}",
+                    if *mask_secrets { "on" } else { "off" }
+                )
             }
             ConfigChange::UpsertMcpServer { name, .. } => {
                 format!("upsert_mcp_server {name}")
@@ -261,10 +302,7 @@ pub fn apply_config_change(
                     notice(
                         state,
                         conn_id,
-                        format!(
-                            "未知代号 '{alias}'（可用：{}）",
-                            available.join(", ")
-                        ),
+                        format!("未知代号 '{alias}'（可用：{}）", available.join(", ")),
                         NoticeLevel::Error,
                     );
                     return None;
@@ -309,15 +347,23 @@ pub fn apply_config_change(
                 persist::set_capability(&active, &capability, &alias)
                     .map(|_| format!("capabilities.{capability} → {alias}"))
             }
-            ConfigChange::UpsertMcpServer {
-                name,
-                url,
-                headers,
-            } => persist::upsert_mcp_server(&active, &name, &url, headers.as_ref())
-                .map(|_| format!("MCP server {name}（重启会话后生效）")),
-            ConfigChange::RemoveMcpServer { name } => {
-                persist::remove_mcp_server(&active, &name).map(|_| format!("删除 MCP server {name}"))
+            ConfigChange::SetAskUserConfig {
+                default_timeout,
+                mask_secrets,
+            } => {
+                let t = match default_timeout {
+                    AskUserTimeoutDto::Never => "never".to_owned(),
+                    AskUserTimeoutDto::Seconds(s) => format!("{s}s"),
+                };
+                set_ask_user(&active, default_timeout, mask_secrets)
+                    .map(|_| format!("[ask_user] timeout={t} mask_secrets={mask_secrets}"))
             }
+            ConfigChange::UpsertMcpServer { name, url, headers } => {
+                persist::upsert_mcp_server(&active, &name, &url, headers.as_ref())
+                    .map(|_| format!("MCP server {name}（重启会话后生效）"))
+            }
+            ConfigChange::RemoveMcpServer { name } => persist::remove_mcp_server(&active, &name)
+                .map(|_| format!("删除 MCP server {name}")),
         };
     let what = match what {
         Ok(w) => w,
@@ -347,12 +393,19 @@ pub fn apply_config_change(
         // 两句）。此处 `what` 对 DeleteModel 即 "删除模型条目 {entry}"。
         let level_part = (!dangling.is_empty())
             .then(|| format!("代号 {} 现已悬空，请到「模型」页改绑", dangling.join("、")));
-        let cap_part = (!cap_dangling.is_empty())
-            .then(|| format!("功能 {} 现已悬空，请到「会话」页改绑", cap_dangling.join("、")));
+        let cap_part = (!cap_dangling.is_empty()).then(|| {
+            format!(
+                "功能 {} 现已悬空，请到「会话」页改绑",
+                cap_dangling.join("、")
+            )
+        });
         match (level_part, cap_part) {
-            (Some(l), Some(c)) => {
-                notice(state, conn_id, format!("已{what}；{l}；{c}"), NoticeLevel::Info)
-            }
+            (Some(l), Some(c)) => notice(
+                state,
+                conn_id,
+                format!("已{what}；{l}；{c}"),
+                NoticeLevel::Info,
+            ),
             (Some(l), None) => notice(state, conn_id, format!("已{what}；{l}"), NoticeLevel::Info),
             (None, Some(c)) => notice(state, conn_id, format!("已{what}；{c}"), NoticeLevel::Info),
             (None, None) => {}
@@ -360,6 +413,78 @@ pub fn apply_config_change(
         crate::session_event!("config: {stdout_label}");
     }
     result
+}
+
+/// `[ask_user]` 节写回（toml_edit 原地编辑，同 core persist 层约定：
+/// 注释零扰动、幂等、拒绝踩非表节点；既有表保留 decor 与位置，表体
+/// 两键整体重建——本节仅 `default_timeout` / `mask_secrets` 两个合法键
+/// （deny_unknown_fields），无 stale 残留问题）。
+///
+/// 放 session 侧的原因：core persist 层未收录 `[ask_user]` 写回（config
+/// 模块头「写回由 persist.rs 手拼 TOML」约定），本 lane 不动 core。
+/// 写 **active**：merge 规则中 ask_user 取 local verbatim（local 全胜）。
+fn set_ask_user(
+    path: &std::path::Path,
+    default_timeout: AskUserTimeoutDto,
+    mask_secrets: bool,
+) -> anyhow::Result<()> {
+    let mut doc: DocumentMut = if path.exists() {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {e}", path.display()))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Failed to parse TOML '{}': {e}", path.display()))?
+    } else {
+        DocumentMut::new()
+    };
+    if let Some(item) = doc.as_table().get("ask_user") {
+        anyhow::ensure!(
+            item.is_table(),
+            "config section [ask_user] is not a standard TOML table; refusing to rewrite it"
+        );
+    }
+    let existed = doc.as_table().get("ask_user").is_some_and(|i| i.is_table());
+    let has_content = !doc.to_string().is_empty();
+    let table = doc
+        .as_table_mut()
+        .entry("ask_user")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[ask_user] is not a table"))?;
+    if !existed && has_content {
+        // 新建节与既有内容之间留一空行（同 persist::upsert_sub_table）。
+        table.decor_mut().set_prefix("\n");
+    }
+    // serde 形状镜像 core `AskTimeout`（外部标签）：
+    // `default_timeout = "never"` / `default_timeout = { seconds = 300 }`。
+    let timeout_item = match default_timeout {
+        AskUserTimeoutDto::Never => value("never"),
+        AskUserTimeoutDto::Seconds(s) => {
+            let mut inline = toml_edit::InlineTable::new();
+            // u64 → i64 饱和（TOML 整数为 i64；超界秒数无实际意义）。
+            inline.insert(
+                "seconds",
+                toml_edit::Value::from(i64::try_from(s).unwrap_or(i64::MAX)),
+            );
+            Item::Value(toml_edit::Value::InlineTable(inline))
+        }
+    };
+    for key in ["default_timeout", "mask_secrets"] {
+        table.remove(key);
+    }
+    table.insert("default_timeout", timeout_item);
+    table.insert("mask_secrets", value(mask_secrets));
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create config directory '{}': {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("Failed to write config file '{}': {e}", path.display()))
 }
 
 /// set_api_key：派生 `<NAME>_API_KEY` 写 `.env`（0600，persist 层负责
@@ -478,7 +603,7 @@ mod tests {
     use crate::approval::SessionApprovalBridge;
     use crate::state::{ConfigPaths, CoreInner, MsgSink, SessionCore};
     use openslate_core::agent_tree::AgentTree;
-    use openslate_core::config::{parse_openslate_toml, AgentsConfig};
+    use openslate_core::config::{parse_openslate_toml, AgentsConfig, AskTimeout};
     use openslate_core::types::{AgentConfig, AgentId};
 
     /// 最小可验证配置：zhipu + main(glm-5) / fast(glm-5-air)，自指
@@ -621,7 +746,82 @@ fast = "fast"
             supports_reasoning: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn set_ask_user_config_persists_hot_swaps_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (state, sink) = test_state(tmp.path(), FIXTURE_TOML);
+        // fixture 无 [ask_user] 节 → 首写新建节。
+        let r = apply_config_change(
+            &state,
+            1,
+            ConfigChange::SetAskUserConfig {
+                default_timeout: AskUserTimeoutDto::Seconds(300),
+                mask_secrets: false,
+            },
+        );
+        assert!(r.is_some(), "set_ask_user_config must succeed");
+
+        // 落盘：TOML 形状与 core serde 对齐（{ seconds = 300 }）。
+        let on_disk = std::fs::read_to_string(tmp.path().join("openslate.toml")).unwrap();
+        assert!(on_disk.contains("[ask_user]"), "section created: {on_disk}");
+        let reloaded = parse_openslate_toml(&on_disk).expect("re-parses");
+        assert_eq!(
+            reloaded.ask_user.default_timeout,
+            AskTimeout::Seconds(300),
+            "default_timeout parses back as core AskTimeout: {on_disk}"
+        );
+        assert!(!reloaded.ask_user.mask_secrets);
+
+        // 热替换：AppState 内存镜像即时更新（引擎下回合可见）。
+        {
+            let inner = state.core.lock();
+            assert_eq!(
+                inner.config.ask_user.default_timeout,
+                AskTimeout::Seconds(300)
+            );
+            assert!(!inner.config.ask_user.mask_secrets);
+        }
+        // 确认事件：config_changed 广播（与其余配置 CRUD 同款语义）。
+        assert!(
+            sink.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMsg::ConfigChanged { .. })),
+            "successful change broadcasts config_changed"
+        );
+
+        // 幂等：同值重写，文件字节不变（toml_edit 原地编辑约定）。
+        let r2 = apply_config_change(
+            &state,
+            1,
+            ConfigChange::SetAskUserConfig {
+                default_timeout: AskUserTimeoutDto::Seconds(300),
+                mask_secrets: false,
+            },
+        );
+        assert!(r2.is_some());
+        let second = std::fs::read_to_string(tmp.path().join("openslate.toml")).unwrap();
+        assert_eq!(on_disk, second, "idempotent rewrite must be byte-stable");
+
+        // never 形态：字符串 "never"。
+        let r3 = apply_config_change(
+            &state,
+            1,
+            ConfigChange::SetAskUserConfig {
+                default_timeout: AskUserTimeoutDto::Never,
+                mask_secrets: true,
+            },
+        );
+        assert!(r3.is_some());
+        let third = std::fs::read_to_string(tmp.path().join("openslate.toml")).unwrap();
+        let reloaded3 = parse_openslate_toml(&third).expect("re-parses");
+        assert_eq!(reloaded3.ask_user.default_timeout, AskTimeout::Never);
+        assert!(reloaded3.ask_user.mask_secrets);
     }
 
     #[test]
@@ -693,7 +893,11 @@ fast = "fast"
             Some("glm-5-air-v3"),
             "persist writes the new model id: {on_disk}"
         );
-        assert_eq!(reloaded.models.len(), 2, "no new entries created: {on_disk}");
+        assert_eq!(
+            reloaded.models.len(),
+            2,
+            "no new entries created: {on_disk}"
+        );
         // 热替换成功 → ConfigChanged 广播。
         assert!(
             sink.sent
@@ -781,7 +985,10 @@ title = "premium"
                 entry: "premium".into(),
             },
         );
-        assert!(r.is_some(), "level + capability referenced deletion must pass");
+        assert!(
+            r.is_some(),
+            "level + capability referenced deletion must pass"
+        );
         let infos = info_notices(&sink);
         assert!(
             infos.iter().any(|t| t.contains("已删除模型条目 premium")

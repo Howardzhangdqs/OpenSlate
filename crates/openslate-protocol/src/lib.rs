@@ -18,11 +18,15 @@ use std::collections::BTreeMap;
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::approval::ApprovalRequest;
-use openslate_core::config::{LimitsConfig, ModelConfig, ProviderConfig};
+use openslate_core::config::{AskTimeout, LimitsConfig, ModelConfig, ProviderConfig};
 use openslate_core::types::{Message, RunId, RunStatus, Usage};
 
 /// 当前协议版本。`hello.proto` 不等即拒连。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2（ask-user r4/r5）：新增 `ClientMsg::QuestionReply` 与
+/// `SnapshotDto.pending_questions`（问卷持久化 / 重启恢复 / 迟到答案）；
+/// 未发布期间追补 `ClientMsg::SetAskUserConfig`（`[ask_user]` 设置同步）。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // DTO：审批
@@ -87,6 +91,83 @@ pub enum ApprovalAnswerChoice {
     Deny,
     /// 本会话后续审批自动放行（写工具白名单）。
     ApproveAll,
+}
+
+// ---------------------------------------------------------------------------
+// DTO：ask_user 问卷（Agent 向用户提问；docs/proposals/ask-user-tool-design.md）
+// ---------------------------------------------------------------------------
+
+/// 客户端问卷应答动作（对齐 MCP Elicitation 的 accept / decline；cancel
+/// 不在此表达——用户打断会话走现有回合取消通道）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionReplyAction {
+    /// 提交答案（`answers` 为答案负载，结构由 mobile 层定义、协议透传）。
+    Accept,
+    /// 整卡拒绝作答（模型收到「用户未作答，请自行判断」类文案后继续）。
+    Decline,
+}
+
+/// 问卷生命周期状态（`request_id` 幂等主键的当前阶段）。`cancelled`
+/// 不在本枚举——用户停止由回合取消通道表达，问卷侧随 Tool 消息折叠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionStatus {
+    Pending,
+    Answered,
+    Declined,
+    /// 新 turn 开始前被悬挂修复合成结果关卷（r5）。
+    Superseded,
+    /// TTL 过期（默认 24h，mobile 持久层判定）。
+    Expired,
+}
+
+/// 待答问卷条目（snapshot 内嵌；重启恢复回放用）。`tool_call_id` 关联
+/// 消息历史中的悬挂 tool call——迟到答案按 r5 语义补全该调用的
+/// tool result 并从该点续跑，**不注入新用户消息**。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingQuestionDto {
+    /// 幂等主键（host call id）；重复应答首答者赢。
+    pub request_id: String,
+    /// 关联的 tool call id（assistant 消息 `tool_calls[].id`）。
+    pub tool_call_id: String,
+    /// 问卷负载（§2 的 `questions` 数组；结构由下发侧定义，协议透传
+    /// 不解释）。
+    pub questions: serde_json::Value,
+    pub status: QuestionStatus,
+    /// 负载版本号（防回答已撤销/已改的问题）。
+    pub version: u32,
+}
+
+/// ask_user 默认等待时限（core `AskTimeout` 的协议镜像；DTO 原则见
+/// 模块头——core 类型 Deserialize-only，不能直接进 `ClientMsg`）。
+/// serde 形状与 core **逐字节一致**（外部标签 + snake_case）：`"never"`
+/// 或 `{"seconds": n}`——同一份 JSON 双侧可互换解析。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskUserTimeoutDto {
+    /// 永不超时（默认；移动端等人场景）。
+    Never,
+    /// 阈值秒数（`0` 由消费端容忍为立即过期）。
+    Seconds(u64),
+}
+
+impl From<AskUserTimeoutDto> for AskTimeout {
+    fn from(t: AskUserTimeoutDto) -> Self {
+        match t {
+            AskUserTimeoutDto::Never => Self::Never,
+            AskUserTimeoutDto::Seconds(s) => Self::Seconds(s),
+        }
+    }
+}
+
+impl From<AskTimeout> for AskUserTimeoutDto {
+    fn from(t: AskTimeout) -> Self {
+        match t {
+            AskTimeout::Never => Self::Never,
+            AskTimeout::Seconds(s) => Self::Seconds(s),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +290,11 @@ pub struct SnapshotDto {
     pub tool_calls_cur: u32,
     pub model_alias: String,
     pub pending_approval: Option<PendingApprovalDto>,
+    /// 待答问卷（ask_user 重启恢复回放）。`serde(default)`：旧客户端
+    /// 反序列化新快照安全。server 投影恒为空——问卷持久化状态在宿主
+    /// （mobile）持久层，由其装配侧在快照上回填。
+    #[serde(default)]
+    pub pending_questions: Vec<PendingQuestionDto>,
     pub config: ConfigViewDto,
     /// 会话累计统计（GAP-3）：server 是真相源，重连/新客户端 attach
     /// 不清零；`turn_ok` 后由 server 更新。`new_session` 归零。
@@ -301,6 +387,14 @@ pub struct ModelDto {
     pub input_price_per_mtok: Option<f64>,
     #[serde(default)]
     pub output_price_per_mtok: Option<f64>,
+    /// Thinking effort（推理力度）：七档全集 `"none" | "minimal" | "low"
+    /// | "medium" | "high" | "xhigh" | "max"`；`None` = Auto（不传该
+    /// 字段，跟随 provider 默认），`"none"` = 显式硬关闭思考——两种
+    /// 语义互不等价。命名沿用本 DTO 的 snake_case 习惯；序列化沿用
+    /// `ProviderDto::title` 的后加可选字段先例——None 跳键，保证既有
+    /// 线格式样例字节不变（旧端点/旧客户端零感知）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl From<&ModelConfig> for ModelDto {
@@ -315,6 +409,7 @@ impl From<&ModelConfig> for ModelDto {
             supports_reasoning: m.supports_reasoning,
             input_price_per_mtok: m.input_price_per_mtok,
             output_price_per_mtok: m.output_price_per_mtok,
+            reasoning_effort: m.reasoning_effort.clone(),
         }
     }
 }
@@ -331,6 +426,7 @@ impl From<ModelDto> for ModelConfig {
             supports_reasoning: m.supports_reasoning,
             input_price_per_mtok: m.input_price_per_mtok,
             output_price_per_mtok: m.output_price_per_mtok,
+            reasoning_effort: m.reasoning_effort,
         }
     }
 }
@@ -510,6 +606,14 @@ pub enum ClientMsg {
         id: u64,
         choice: ApprovalAnswerChoice,
     },
+    /// ask_user 问卷应答（即时或迟到，首答者赢——语义同
+    /// `approval_answer`）。`answers` 结构由 mobile 层定义，协议透传
+    /// 不解释；decline 时负载由客户端自定（通常为 `null` 或空对象）。
+    QuestionReply {
+        request_id: String,
+        action: QuestionReplyAction,
+        answers: serde_json::Value,
+    },
     /// 取消当前回合（复用 TUI Ctrl-C 语义：引擎侧 cancel）。
     Cancel,
     /// 新会话：历史/转写清空，session_id 更新，广播 session_reset。
@@ -546,6 +650,14 @@ pub enum ClientMsg {
     SetCapability {
         capability: String,
         alias: String,
+    },
+    /// ask_user 工具行为（`[ask_user]` 节）：默认超时 + 输出脱敏开关。
+    /// server 写 **active** 配置落盘（merge 规则：ask_user 取 local
+    /// verbatim）并广播 config_changed。mobile 设置页「内置工具」的
+    /// 同步入口——openslate.toml 为生效真值，本地偏好仅 UI 显示源。
+    SetAskUserConfig {
+        default_timeout: AskUserTimeoutDto,
+        mask_secrets: bool,
     },
     /// 新增/更新 MCP server（Streamable HTTP 条目；手机端 mcp-host 场景）。
     /// headers 如 `{ "Authorization": "Bearer <token>" }`，可选。

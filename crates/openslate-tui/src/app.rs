@@ -3118,6 +3118,7 @@ max_output_bytes = 10_000
             tool_calls_cur: 0,
             model_alias: model_alias.into(),
             pending_approval: None,
+            pending_questions: Vec::new(),
             config: view,
             session_stats: Default::default(),
         }))))

@@ -284,6 +284,7 @@ mod tests {
             tool_calls_cur: 0,
             model_alias: "main".into(),
             pending_approval: None,
+            pending_questions: Vec::new(),
             config: snapshot_test_config(),
             session_stats: Default::default(),
         };

@@ -48,6 +48,7 @@ fn model_dto() -> ModelDto {
         supports_reasoning: true,
         input_price_per_mtok: Some(0.5),
         output_price_per_mtok: Some(2.0),
+        reasoning_effort: None,
     }
 }
 
@@ -109,7 +110,7 @@ fn summary_dto() -> ApprovalSummaryDto {
     }
 }
 
-// ---- ClientMsg：13 个变体 ------------------------------------------------
+// ---- ClientMsg：18 个变体 ------------------------------------------------
 
 #[test]
 fn client_hello() {
@@ -153,6 +154,28 @@ fn client_approval_answer() {
             &format!(r#"{{"type":"approval_answer","id":7,"choice":"{lit}"}}"#),
         );
     }
+}
+
+#[test]
+fn client_question_reply() {
+    // accept：answers 为 mobile 层定义的答案负载，协议透传不解释。
+    assert_wire(
+        ClientMsg::QuestionReply {
+            request_id: "q-42".into(),
+            action: QuestionReplyAction::Accept,
+            answers: serde_json::json!({"answers":[{"id":"db_choice","selected":["SQLite"]}]}),
+        },
+        r#"{"type":"question_reply","request_id":"q-42","action":"accept","answers":{"answers":[{"id":"db_choice","selected":["SQLite"]}]}}"#,
+    );
+    // decline：整卡不答（负载可为 null）。
+    assert_wire(
+        ClientMsg::QuestionReply {
+            request_id: "q-43".into(),
+            action: QuestionReplyAction::Decline,
+            answers: serde_json::Value::Null,
+        },
+        r#"{"type":"question_reply","request_id":"q-43","action":"decline","answers":null}"#,
+    );
 }
 
 #[test]
@@ -225,6 +248,33 @@ fn client_upsert_model() {
 }
 
 #[test]
+fn client_upsert_model_reasoning_effort() {
+    // thinking effort（推理力度）：Some → snake_case 键 `reasoning_effort`
+    // 出现在 model 对象；None → 整键跳过（上面 client_upsert_model 的
+    // 样例字节不含该键即为此语义，旧端点零感知）。
+    let mut dto = model_dto();
+    dto.reasoning_effort = Some("high".into());
+    assert_wire(
+        ClientMsg::UpsertModel {
+            entry: "main".into(),
+            model: dto,
+        },
+        r#"{"type":"upsert_model","entry":"main","model":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0,"reasoning_effort":"high"}}"#,
+    );
+    // 旧格式（无该键）反序列化 → None。
+    let de: ClientMsg = serde_json::from_str(
+        r#"{"type":"upsert_model","entry":"m","model":{"provider":"p","model":"g","reasoning_effort":"low"}}"#,
+    )
+    .unwrap();
+    match de {
+        ClientMsg::UpsertModel { model, .. } => {
+            assert_eq!(model.reasoning_effort, Some("low".to_owned()));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
 fn client_delete_model() {
     assert_wire(
         ClientMsg::DeleteModel {
@@ -258,6 +308,46 @@ fn client_set_capability() {
         },
         r#"{"type":"set_capability","capability":"compact","alias":"fast"}"#,
     );
+}
+
+#[test]
+fn client_set_ask_user_config() {
+    // never：与 core AskTimeout 的 serde 形状对齐（外部标签 unit 变体
+    // = 裸字符串 "never"）。
+    assert_wire(
+        ClientMsg::SetAskUserConfig {
+            default_timeout: AskUserTimeoutDto::Never,
+            mask_secrets: true,
+        },
+        r#"{"type":"set_ask_user_config","default_timeout":"never","mask_secrets":true}"#,
+    );
+    // seconds：newtype 形状 {"seconds": n}（落盘 toml 即
+    // default_timeout = { seconds = 300 }）。
+    assert_wire(
+        ClientMsg::SetAskUserConfig {
+            default_timeout: AskUserTimeoutDto::Seconds(300),
+            mask_secrets: false,
+        },
+        r#"{"type":"set_ask_user_config","default_timeout":{"seconds":300},"mask_secrets":false}"#,
+    );
+    // 形状对齐的机制化钉死：DTO 序列化 JSON 可直接反序列化为 core
+    // `AskTimeout`（Deserialize-only，无法反向 to_value——从 DTO 侧单向
+    // 验证即可），值经 From 往返不丢。
+    for (dto, core_expect) in [
+        (
+            AskUserTimeoutDto::Never,
+            openslate_core::config::AskTimeout::Never,
+        ),
+        (
+            AskUserTimeoutDto::Seconds(600),
+            openslate_core::config::AskTimeout::Seconds(600),
+        ),
+    ] {
+        let json = serde_json::to_value(dto).unwrap();
+        let core: openslate_core::config::AskTimeout = serde_json::from_value(json).unwrap();
+        assert_eq!(core, core_expect);
+        assert_eq!(AskUserTimeoutDto::from(core), dto);
+    }
 }
 
 #[test]
@@ -305,6 +395,7 @@ fn server_snapshot() {
             id: 3,
             summary: summary_dto(),
         }),
+        pending_questions: Vec::new(),
         config: config_view(),
         session_stats: SessionStatsDto {
             turns: 2,
@@ -317,8 +408,84 @@ fn server_snapshot() {
         ServerMsg::Snapshot {
             session: Box::new(snap),
         },
-        r#"{"type":"snapshot","session":{"proto":1,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
+        r#"{"type":"snapshot","session":{"proto":2,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
     );
+}
+
+#[test]
+fn server_snapshot_pending_questions() {
+    // ask-user（r4/r5）：重启恢复回放——快照携带待答问卷（含 tool_call_id
+    // 关联）。server 投影恒空；本样例钉死 mobile 装配侧回填后的线格式。
+    let mut snap = SnapshotDto {
+        proto: PROTOCOL_VERSION,
+        pending_approval: None,
+        pending_questions: vec![PendingQuestionDto {
+            request_id: "q-42".into(),
+            tool_call_id: "tc-9".into(),
+            questions: serde_json::json!({"questions":[{"id":"db_choice","header":"数据库","question":"SQLite 还是 sled？","type":"choice"}]}),
+            status: QuestionStatus::Pending,
+            version: 1,
+        }],
+        ..pending_questions_empty_snapshot()
+    };
+    assert_wire_server(
+        ServerMsg::Snapshot {
+            session: Box::new(snap.clone()),
+        },
+        r#"{"type":"snapshot","session":{"proto":2,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
+    );
+    // status 全集（生命周期 pending → answered | declined | superseded | expired）。
+    for (status, lit) in [
+        (QuestionStatus::Pending, "pending"),
+        (QuestionStatus::Answered, "answered"),
+        (QuestionStatus::Declined, "declined"),
+        (QuestionStatus::Superseded, "superseded"),
+        (QuestionStatus::Expired, "expired"),
+    ] {
+        snap.pending_questions[0].status = status;
+        let ser = serde_json::to_string(&snap.pending_questions[0]).unwrap();
+        assert!(
+            ser.contains(&format!(r#""status":"{lit}""#)),
+            "{ser} must pin status {lit}"
+        );
+        let de: PendingQuestionDto = serde_json::from_str(&ser).unwrap();
+        assert_eq!(de.status, status);
+    }
+}
+
+/// 最小可序列化快照（server_snapshot_pending_questions 的基底）。
+fn pending_questions_empty_snapshot() -> SnapshotDto {
+    SnapshotDto {
+        proto: PROTOCOL_VERSION,
+        session_id: "s-a1b2c3d4".into(),
+        session_label: "openslate 会话".into(),
+        transcript: vec![],
+        running: false,
+        depth_cur: 0,
+        agents_running: 0,
+        tool_calls_cur: 0,
+        model_alias: "main".into(),
+        pending_approval: None,
+        pending_questions: Vec::new(),
+        config: ConfigViewDto {
+            providers: Default::default(),
+            models: Default::default(),
+            levels: Default::default(),
+            capabilities: Default::default(),
+            limits: LimitsDto::from(&openslate_core::config::LimitsConfig::default()),
+            agents: AgentNodeDto {
+                id: "root".into(),
+                name: "Root".into(),
+                model: "main".into(),
+                children: vec![],
+            },
+            skills: vec![],
+            active_config: "/dev/null".into(),
+            global_config: None,
+            local_config: None,
+        },
+        session_stats: SessionStatsDto::default(),
+    }
 }
 
 #[test]
@@ -621,6 +788,7 @@ fn provider_model_dto_roundtrip_with_core() {
         supports_reasoning: false,
         input_price_per_mtok: None,
         output_price_per_mtok: None,
+        reasoning_effort: None,
     });
     let back = ModelConfig::from(m);
     assert_eq!(back.model, "g");
@@ -629,7 +797,8 @@ fn provider_model_dto_roundtrip_with_core() {
 
 #[test]
 fn protocol_version_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 1);
+    // v2：ask_user 问卷（question_reply + snapshot.pending_questions）。
+    assert_eq!(PROTOCOL_VERSION, 2);
 }
 
 #[test]

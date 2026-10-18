@@ -241,6 +241,7 @@ pub fn config_from_view(view: &ConfigViewDto) -> openslate_core::config::OpenSla
         ptc: Default::default(),
         approval: None,
         tui: Default::default(),
+        ask_user: Default::default(),
     }
 }
 
@@ -328,6 +329,7 @@ pub fn snapshot_from_config(
         tool_calls_cur: 0,
         model_alias: model_alias.into(),
         pending_approval: None,
+        pending_questions: Vec::new(),
         config: view_from_config(config),
         session_stats: Default::default(),
     }

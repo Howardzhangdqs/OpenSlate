@@ -85,6 +85,7 @@ async fn fixture_app() -> (App, Arc<MemLink>) {
             tool_calls_cur: 0,
             model_alias: "main".into(),
             pending_approval: None,
+            pending_questions: Vec::new(),
             config: view_from_toml(&fixture_toml()),
             session_stats: Default::default(),
         }),

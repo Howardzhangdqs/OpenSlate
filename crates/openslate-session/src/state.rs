@@ -34,6 +34,7 @@ use openslate_store_sqlite::store::SqliteStore;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::SessionApprovalBridge;
+use crate::question::QuestionHandler;
 
 /// 测试接缝：per-turn provider 构造器。生产 = `build_provider_for_model`；
 /// 集成测试注入 ScriptedProvider（与 TUI 的 ProviderFactory 同构）。
@@ -131,18 +132,42 @@ impl CoreInner {
 /// 共享单会话核心。
 pub struct SessionCore {
     inner: Mutex<CoreInner>,
+    /// ask_user 应答通道（见 question.rs 模块文档：注入点在此而非
+    /// AppState 字段，避免破坏 server/mobile 的结构体字面量装配）。
+    /// `None` = 提问通道未接入（dispatch 收到 question_reply 时定向
+    /// notice）。锁方向遵守模块头不变量：core 锁内只做非阻塞短临界
+    /// 区操作（clone Arc），handler 本身由宿主在 core 锁外调用。
+    questions: Mutex<Option<Arc<dyn QuestionHandler>>>,
 }
 
 impl SessionCore {
     pub fn new(inner: CoreInner) -> Self {
         Self {
             inner: Mutex::new(inner),
+            questions: Mutex::new(None),
         }
     }
 
     /// 毒化容忍锁（引擎回调里 panic 不能把整个会话锁死）。
     pub fn lock(&self) -> MutexGuard<'_, CoreInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 注入 ask_user 应答处理器（装配层在构造 AppState 之后调用；
+    /// 宿主实现建议持 `Weak<AppState>` 防引用环，见 question.rs）。
+    pub fn set_question_handler(&self, handler: Arc<dyn QuestionHandler>) {
+        *Self::lock_questions(&self.questions) = Some(handler);
+    }
+
+    /// 当前处理器快照（`None` = 提问通道未接入）。
+    pub fn question_handler(&self) -> Option<Arc<dyn QuestionHandler>> {
+        Self::lock_questions(&self.questions).clone()
+    }
+
+    fn lock_questions(
+        m: &Mutex<Option<Arc<dyn QuestionHandler>>>,
+    ) -> std::sync::MutexGuard<'_, Option<Arc<dyn QuestionHandler>>> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -234,6 +259,10 @@ pub fn build_snapshot(inner: &CoreInner, approval: &SessionApprovalBridge) -> Sn
         tool_calls_cur: inner.tool_calls_cur,
         model_alias: inner.model_alias.clone(),
         pending_approval,
+        // ask_user 待答清单：问卷持久化状态在宿主（mobile）持久层，
+        // server 投影恒空；mobile 装配侧（emit_snapshot）按持久层
+        // 回填后再下发——重启恢复回放走这条通路。
+        pending_questions: Vec::new(),
         config: build_config_view(inner),
         session_stats: inner.stats,
     }

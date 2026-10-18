@@ -2434,6 +2434,7 @@ dependencies = [
  "genai",
  "openslate-app",
  "openslate-core",
+ "openslate-mcp-builtin",
  "openslate-model-genai",
  "openslate-protocol",
  "openslate-session",
@@ -2542,6 +2543,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml_edit",
  "tracing",
  "uuid",
 ]

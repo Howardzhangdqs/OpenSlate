@@ -127,7 +127,11 @@ impl ProgressCallback for SessionProgressBridge {
             name: name.to_owned(),
             bytes,
             truncated,
-            preview: if preview.is_empty() { None } else { Some(preview.to_owned()) },
+            preview: if preview.is_empty() {
+                None
+            } else {
+                Some(preview.to_owned())
+            },
         });
     }
 
@@ -436,7 +440,12 @@ pub(crate) async fn generate_title(
 pub(crate) fn sanitize_title(raw: Option<&str>) -> Option<String> {
     let first_line = raw?.lines().map(str::trim).find(|l| !l.is_empty())?;
     let stripped = first_line
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '“' | '”' | '「' | '」' | '『' | '』' | '《' | '》'))
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '“' | '”' | '「' | '」' | '『' | '』' | '《' | '》'
+            )
+        })
         .trim();
     if stripped.is_empty() {
         return None;
@@ -569,11 +578,7 @@ mod tests {
                 req: openslate_core::provider::GenerateRequest,
             ) -> Result<openslate_core::types::ModelResponse, openslate_core::error::ProviderError>
             {
-                self.recorder
-                    .models_used
-                    .lock()
-                    .unwrap()
-                    .push(req.model_id);
+                self.recorder.models_used.lock().unwrap().push(req.model_id);
                 Ok(openslate_core::types::ModelResponse {
                     content: Some(STUB_SUMMARY.into()),
                     reasoning_content: None,
@@ -752,7 +757,10 @@ max_context_messages = 10
                 "summary must come from the stub provider (session model): {}",
                 history[0].content
             );
-            assert!(!history[0].content.contains("msg-0"), "not mechanical concat");
+            assert!(
+                !history[0].content.contains("msg-0"),
+                "not mechanical concat"
+            );
         }
 
         #[tokio::test]

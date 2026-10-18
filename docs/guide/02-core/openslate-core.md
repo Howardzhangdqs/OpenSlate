@@ -26,6 +26,7 @@
 | 18 | `prompt.rs` | 提示词解析（profile 体系） |
 | 19 | `paths.rs` | 路径发现 |
 | 20 | `trace.rs` + `error.rs` | Chrome Trace 导出 / 错误类型 |
+| 21 | `ask_user.rs` | ask_user 消息历史手术与合成文案（迟到答案/悬挂修复） |
 
 ---
 
@@ -86,6 +87,7 @@ pub struct RunManager {
 - `new`（:66）：`RuntimeLimits::from_config` + `ApprovalConfig::to_policy()` 派生 approval。
 - `new_run_id()`（:94）：UUID v4。
 - `execute_with_run_id(run_id, provider, prior_messages, cancel, progress) -> Result<ManagedRunResult>`（:118）：resolve root agent → TraceCollector 开 run span → 组 `AgentRunner`（快照 approval/sink/cancel）→ `run_root`。`prior_messages` 直接作 initial_messages（当前用户消息必须已在其中，不追加）；入口前已取消的 token 报 `RuntimeError::Cancelled`。
+- `resume_from_tool_result(run_id, provider, prior_messages, tool_call_id, result_content, cancel, progress)`（ask-user r5）：**迟到答案续跑入口**——先 `ask_user::append_late_tool_result` 补全悬挂 tool call 的 tool result（经 message_sink 先落盘），再走同一 `execute_with_run_id` 从该点重进模型循环；对模型与「答案即时返回」完全等价（迟到等价不变量）。幂等：已答/未知 id 报 `OpenSlateError::Validation`。
 - `execute_with_history`（:187）/`execute`（:207）：便捷包装。
 - `ManagedRunResult`（:46）：run_id/status/messages/total_steps/total_input_tokens/total_output_tokens/total_cost_usd（各层按各自模型计价后聚合）/execution_tree/model/trace。
 
@@ -108,7 +110,7 @@ pub struct RunManager {
 
 - `DEFAULT_MAX_EMPTY_TURNS = 3`（:30）。
 - `MessageSink` trait（:47）+ `sink_append` 辅助（:53）。
-- 取消辅助：`interrupted_result`（:64，Interrupted + 部分转写）、`token_cancelled`（:86，None → pending 永不触发）、`cancelled_tool_message`（:95，`"[tool call cancelled before completion]"`）、`append_cancelled_tool_results`（:111，补合成 Tool 消息防悬空 tool_calls）。
+- 取消辅助：`interrupted_result`（:64，Interrupted + 部分转写）、`token_cancelled`（:86，None → pending 永不触发）、`cancelled_tool_message`（:95，`"[tool call cancelled before completion]"`）、`append_cancelled_tool_results`（:111，补合成 Tool 消息防悬空 tool_calls；**ask_user 豁免**——按工具名跳过，悬挂保留给迟到答案，ask-user r5 不变量，并行批 drain 的 None slot 同款豁免）。
 - `RuntimeLimits`（:126）：max_steps/max_depth/max_tool_calls/max_child_agent_calls/**timeout_ms**（回合级纯 LLM 时间预算，fix-21）/max_context_bytes/max_output_bytes/max_empty_turns/**parallel_tool_calls**。`Default`（:150）：steps=0(不限)/depth=4/tool_calls=20/child_calls=8/timeout=60s/ctx=64KB/out=64KB/empty=3/parallel=true。
 - `check_limits`（:167）：步/深/工具/子调用四闸。
 - `CostSpec`（:206）：`from_prices(in, out)` / `is_configured` / `cost_of(&Usage) -> f64`（per-mtok 计价；cached/reasoning additive 字段刻意忽略）。
@@ -120,7 +122,8 @@ pub struct RunManager {
 
 ### mod.rs
 
-- `OpenSlateConfig`（:57）：project?/database?/prompts?/limits?/providers/models/**levels: HashMap<String,String>**（:78）/trace?/mcp?/builtin_tools/skills/ptc/approval?/tui。
+- `OpenSlateConfig`（:57）：project?/database?/prompts?/limits?/providers/models/**levels: HashMap<String,String>**（:78）/trace?/mcp?/builtin_tools/skills/ptc/approval?/tui/**ask_user**（ask-user：`[ask_user]` 段）。
+- `AskUserConfig`（default_timeout: `AskTimeout` + mask_secrets: bool——**已消费**：mobile 装配期注入 core 脱敏器闭包的开关短路（默认 Never/true，deny_unknown_fields））/ `AskTimeout`（`Never | Seconds(u64)`，serde 外部标签：`"never"` / `{ seconds = 300 }`）。
 - `ProviderConfig`（:197）/ `ModelConfig`（:223）/ `LimitsConfig`（:147，`#[serde(default)]` 整段缺省）/ `TraceConfig`（:249）/ `McpConfig`+`McpServerConfig`（:270/:281）+ `TransportConfig`（:295，stdio/HTTP）/ `AgentsConfig`（:320）/ `BuiltinToolsConfig`（:332）/ `SkillsConfig`（:360）/ `TuiConfig`+`TuiIconsConfig`（:381/:395）/ `PtcConfig`（:403）/ `ApprovalPolicySetting`（:456）+ `ApprovalConfig`（:473，`to_policy()` :485）。
 - 解析函数：`parse_openslate_toml`（:525）/ `AgentFrontmatter`（:544）/ `derive_id_from_filename`（:562，agent id 缺省从文件名派生）/ `parse_agent_markdown`（:591，YAML frontmatter + 正文=default_prompt）/ `parse_agents_dir`（:636）。
 - **注意**：config 类型只 derive Deserialize（协议侧镜像 DTO 是为了不给 core 加 Serialize）。
@@ -234,6 +237,18 @@ pub struct RunManager {
 ### error.rs（529 行）
 
 - 错误体系（thiserror）：`OpenSlateError`（:5，top）/ `ConfigError`（:41）/ `ProviderError`（:74）/ `RuntimeError`（:104，含 `MaxStepsExceeded`/`Timeout`/`Cancelled`…）/ `StoreError`（:198，含 `MigrationError`/`ConnectionError`/`WriteError`/`QueryError`）/ `ToolError`（:214，含 `NotFound`/`ExecutionError`…）。
+
+## 21. ask_user.rs —— ask_user 历史手术与合成文案（ask-user r5）
+
+设计真相源 `docs/proposals/ask-user-tool-design.md`；工具本体与 host call 通道在 openslate-mobile（后续 lane），core 只承载引擎/会话共享的纯函数：
+
+- 常量：`ASK_USER_TOOL = "ask_user"`（runtime 取消豁免按名判定，与 `run_code`/`call_agent` 串行判定同模式）；合成文案 `SUPERSEDED_RESULT`（"Question superseded by a new user message."）/ `EXPIRED_RESULT`（"Question expired unanswered (TTL)."）/ `INTERRUPTED_RESULT`（同批非 ask_user 兄弟兜底）。
+- **悬挂定义**：assistant 声明 `tool_calls` 但其后**连续 Tool 结果段**缺对应 `tool_call_id`（合法消息序里批次结果必连续，扫描即完整判定）。
+- `dangling_tool_calls(&[Message]) -> Vec<(id, name)>`：悬挂清单。
+- `append_late_tool_result(&mut Vec<Message>, tool_call_id, content) -> Result<Message, AskUserError>`：**迟到答案补全**——插入位置 = 声明处 assistant 之后的连续结果段末尾（常态即尾部）；幂等（已答 → `AlreadyAnswered` 首答者赢；未知 id → `ToolCallNotFound`）。
+- `repair_dangling_tool_calls(&mut Vec<Message>, DanglingClosure::{Superseded, Expired}) -> Vec<Message>`：**悬挂修复**——ask_user 按关卷原因取文案、兄弟兜底 `INTERRUPTED_RESULT`，全部插入合法位置；返回合成消息供落库；修复后无悬挂（测试钉死）。
+- `AskUserError`（thiserror）：ToolCallNotFound / AlreadyAnswered；经 `OpenSlateError::Validation` 映射进引擎错误面。
+- **工具输出脱敏注册表**（ask_user secret 子系统的 core 消费点；`SecretMasker` 类型）：`set_secret_masker(Option)` 整体替换（测试复位）/ `push_secret_masker` 追加（mobile 装配期，多 runtime 并行叠加安全）/ `mask_secrets(&str)` 依次应用全部已注册脱敏器 / `mask_tool_output(ToolOutput)`（content 替换 + **实际发生替换时追加 `MASKED_NOTE` 内部提示**（`<system-note>Output masked: …</system-note>`，tool result 内容的一部分、不注入独立 system 消息）+ bytes 重算）。消费点在 runtime.rs 工具结果形成处（顺序/并行两路径，output-size 上限之后、`tool_end` preview / 消息历史 / tracing preview 之前）；无注册恒等（桌面零影响）。值源与 `[ask_user] mask_secrets` 开关由宿主注入的闭包负责（与 `mcp::set_mcp_auth_override` 同款进程级接缝模式）。
 
 ## 跨模块注意事项
 

@@ -361,7 +361,7 @@ secret 题的答案 chip 特例：`(Key) GITHUB_TOKEN · 已存入凭据`（成�
 | 全屏标题 / 进度 | 待回答问题 ／ 第 n 题，共 N 题 |
 | 滑动提示（一次性） | 左右滑动切换题目 |
 | secret：记住勾选 | 记住此凭据 ／ 勾选后以后会话也能用；默认仅本会话有效 |
-| secret：落地形态 | 环境变量 · 本会话的命令自动生效 ／ 写入文件 · 路径见下方 |
+| secret：落地形态 | 环境变量 · 本会话的命令自动生效 ／ 写入文件 |
 | secret：安全说明 | 明文不会出现在对话和日志里 |
 | secret：答案 chip | 已存入凭据 |
 | 终态行 | 未作答 —— 已告知 Agent 自行判断继续 ／ 提问已取消 ／ 提问已被新消息取代 ／ 提问已过期 |
@@ -375,6 +375,7 @@ secret 题的答案 chip 特例：`(Key) GITHUB_TOKEN · 已存入凭据`（成�
 | 问卷标识 / 提醒 pill / 全屏标题旁 | `Icons.Outlined.HelpOutline` |
 | 全屏进入 / （无需退出图标，退出走返回） | `Icons.Filled.OpenInFull` |
 | 全屏返回 | `Icons.AutoMirrored.Filled.ArrowBack` |
+| 滑动提示（全屏一次性提示） | `Icons.Outlined.Swipe` |
 | 已答 / 已提交 / confirm 正面 | `Icons.Filled.Check` |
 | confirm 反面 | `Icons.Filled.Close` |
 | 推荐徽章 | `Icons.Outlined.Recommend` |

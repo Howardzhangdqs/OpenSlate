@@ -126,6 +126,74 @@ edit_file）对模型是 opt-in（root.md 不含即不可见）。
 接管后从顶层工具变为 `tools.termux.bash` 组（server_alias = 前缀
 termux），HostTool 兜底形态保持顶层。
 
+### 3.2 ask_user（Agent 向用户提问，UI 全链路）
+
+Rust 侧工具本体在 `crates/openslate-mobile/src/askuser.rs`（`AskUserTool`
++ `AskUserContext` + `MobileQuestionHandler`；设计真相源
+`docs/proposals/ask-user-tool-design.md`，工具文档见
+[04-tools/ask-user.md](../04-tools/ask-user.md)）；Kotlin 侧按下列契约接线
+（UI 设计规范：`docs/proposals/ask-user-ui-design.md`）：
+
+```text
+模型 tool call ask_user
+  → AskUserTool::execute → HostCallRouter::allocate_id + call_with_id   [Rust]
+      （自定义超时：[ask_user] default_timeout，never → 信封 timeout=-1）
+      （先落库问卷行 pending_questions：request_id=host call id、
+        tool_call_id=消息历史中的悬挂声明，再发信封——崩溃窗口内行必在）
+  → emit {"type":"host_call_requested","id":42,"tool":"ask_user",
+          "args":{"v":1,"questions":[…],"timeout":-1}}
+  → RuntimeBridge.handleEvent → handleHostCall → handleAskUser
+      解析 questions[]（1~4 题；type=choice|text|confirm|secret，未知 type
+      UI 按 text 兜底）→ UiState.pendingQuestion（requestId=id + 每题草稿 +
+      argsKey=最近 running ask_user ToolCall 条目的 fullArgs 关联）
+  → ChatScreen：groupEntries 对 name=="ask_user" 的 ToolCall 条目单独成条
+      → QuestionCardHost（内联问卷卡 ui/QuestionCard.kt；分段条 + 题区横滑
+        Pager + 全屏按钮）；PendingNudgePill（滚出视口时输入区上方提醒）
+  → 全屏作答：NavHost 路由 "question-fullscreen"（竖直滑入 280ms；
+      ui/QuestionFullScreen.kt；草稿挂 UiState，进出不丢）
+  → 用户提交 → RuntimeBridge.submitQuestionAnswers
+      resolveHostCall(id, true, {"outcome":"answered","answers":[…]})（FFI 直传；
+        secret 明文仅在此 payload，不进日志/不落盘）
+      + 把脱敏快照写回关联 ToolCall 条目 output（摘要卡与转写同源，重启可恢复）
+      → Rust：工具格式化结果（自然语言 + 结构化 JSON）→ 行 answered
+        → runner 并入 tool result → 回合继续（与普通工具结果同路径）
+  → 整卡 decline → resolveHostCall(id, true, {"outcome":"declined"})
+      → 条目 output 记 {"outcome":"declined"} → 终态轻摘要行
+  → turn 离开 running 态（turn_ok/turn_error）→ finalizeAskUserOnTurnEnd：
+      已答/已拒只清 pendingQuestion；仍 pending/submitting（用户点停止）→
+      写 {"outcome":"cancelled"} 终态。迟到 resolve 对失效 id 无害（幂等首答赢）。
+```
+
+**重启恢复（迟到答案）**：进程被杀时 pending 问卷留在
+`pending_questions` 表（shutdown 的 `fail_all` 对 ask_user 豁免，见 §4.3）。
+重启后 `assemble_state` 用 keep-dangling 变体加载最近 run（悬挂的 ask_user
+assistant 消息不丢）→ `startup_question_maintenance`（TTL 24h 过期合成
+expired、已解决行关卷、其余保留可恢复）→ 快照 `pending_questions` 回放
+（`AskUserContext::snapshot_dtos`）→ UI 重现问卷卡。用户作答走
+`{"type":"question_reply","request_id":…,"action":"accept|decline","answers":…}`
+→ `MobileQuestionHandler`：在途 host call 先 resolve（即时路径）；否则原子
+关卷（首答者赢）→ 与即时路径**同一格式化函数**生成结果 →
+`RunManager::resume_from_tool_result` 补全原 tool call 的 tool result 并从该
+点续跑（迟到等价不变量：模型无法区分答案即时返回还是迟到补全）。
+
+**设置同步**（默认超时 / 输出脱敏）：设置页「内置工具」变更 →
+`RuntimeBridge.pushAskUserConfig` 发
+`{"type":"set_ask_user_config","default_timeout":"never"|{"seconds":N},
+"mask_secrets":bool}` → session config_ops 写 active openslate.toml
+`[ask_user]` 落盘 + 热替换 + 广播 config_changed；启动时
+（`RuntimeBridge.start` → `syncAskUserConfig`）推送一次本地偏好做同步
+（toml 为生效真值，本地 SharedPreferences 仅 UI 显示源）。
+`AskUserContext` 的配置快照随装配固定——新值重启后生效（见
+[04-tools/ask-user.md](../04-tools/ask-user.md) §8.5）。
+
+resolve payload 的 answers[] 每题形态：`{id,selected:[label…]}`（choice，
+「其他」说明文字并入 selected 尾部）｜`{id,value}`（text）｜
+`{id,confirm:bool,selected:[label]}`（confirm）｜`{id,value,remember}`（secret）｜
+`{id,skipped:true}`（optional 跳过）｜`{id,declined:true}`（逐题不答）。
+转写 output JSON 同形但带 `header` 字段且 secret 只留引用
+`{secret:{name,kind,remember}}`。Rust 侧对 payload 形状宽容（selected/value/
+skipped/declined 逐题识别，secret 明文入会话凭据表后只回填引用）。
+
 ## 4. 生命周期
 
 ### 4.1 启动
@@ -165,7 +233,8 @@ AgentService.onDestroy
       【宁可短暂阻塞主线程也要同步等——lifecycleScope 协程会被 DESTROYED
         竞态截断，Rust 收尾做一半 = run 僵尸 + SQLite 撕裂】
   → OpenSlateRuntime.shutdown() → MobileRuntime::shutdown（幂等）
-      1. host_router.fail_all（在途 host call 全失败）
+      1. host_router.fail_all（在途 host call 全失败；**ask_user 豁免**——
+         在途问卷不 fail，留给持久化恢复，重启后经 question_reply 迟到补全）
       2. approval.deny_all（审批全拒）
       3. sink.close_all（丢 sender；泵线程 drain 完余量退出，已入队事件仍送达）
       4. run.recorder.finish("interrupted", None, cost)   【先于 runtime 收束落库】

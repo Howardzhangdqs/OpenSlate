@@ -21,15 +21,17 @@ Kotlin (UniFFI callback)◄──EventSink(单队列+泵线程)──┐
 MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ──► LLM
 ```
 
-## 2. 模块一览（8 个模块 + lib.rs）
+## 2. 模块一览（9 个模块 + lib.rs）
 
 | 模块 | 行数 | 关键导出 | 职责 |
 |------|------|---------|------|
 | `src/runtime.rs` | 1514 | `MobileRuntime`、`RuntimeOptions` | FFI 边界的组合根；create/send/shutdown/会话管理/registry 查询全部入口 |
 | `src/bootstrap.rs` | 396 | `MobilePaths` | 宿主注入的 4 个路径；首启目录脚手架 + 默认配置；DB 路径归位 |
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
-| `src/hostcall.rs` | 310 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底 |
-| `src/exec.rs` | 857 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具 + MCP 接管判定（见 §7.1） |
+| `src/hostcall.rs` | 310 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`fail_all` 对 ask_user 豁免（持久化恢复） |
+| `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`AskUserExemptApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、Manual 审批豁免（见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
+| `src/secrets.rs` | — | `PersistentSecretVault`、`env_source`、`mask_with_known_values` | ask_user secret 子系统：会话内存 + store v4 `credentials` 持久镜像两级凭据库、env 注入源、file 写入（0600）、脱敏值源（见 [04-tools/ask-user.md §8](../04-tools/ask-user.md)） |
+| `src/exec.rs` | 857 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1） |
 | `src/provider.rs` | 88 | `mobile_provider_factory`、`MobileSecrets` | provider 工厂：内存 key 注入 + env 兜底 |
 | `src/registry.rs` | 541 | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
@@ -58,7 +60,7 @@ pub fn set_mcp_host_token(token: &str) {
 
 ### 3.2 `MobileRuntime` 结构与装配链（runtime.rs:61-174）
 
-字段：`rt: Mutex<Option<tokio::Runtime>>`（shutdown_timeout 要消费所有权，单次取用）、`state: Arc<AppState>`、`sink: Arc<EventSink>`、`secrets: Arc<MobileSecrets>`、`host_router: Arc<HostCallRouter>`、`registry: Arc<ToolRegistry>`（bash 工具热换名）、`model_registry: Arc<RegistryStore>`、`workspace_dir: PathBuf`、`exec_selection: ExecSelectionCell`、`shutdown_flag: AtomicBool`。
+字段：`rt: Mutex<Option<tokio::Runtime>>`（shutdown_timeout 要消费所有权，单次取用）、`state: Arc<AppState>`、`sink: Arc<EventSink>`、`secrets: Arc<MobileSecrets>`、`host_router: Arc<HostCallRouter>`、`registry: Arc<ToolRegistry>`（bash 工具热换名）、`model_registry: Arc<RegistryStore>`、`workspace_dir: PathBuf`、`exec_selection: ExecSelectionCell`、`bash_env: EnvSource`（ask_user secret env 注入源，热切换/重载随工具传递）、`ask: Arc<AskUserContext>`、`shutdown_flag: AtomicBool`。
 
 `create_with()`（runtime.rs:90-174）装配顺序，**不要打乱**：
 
@@ -66,13 +68,13 @@ pub fn set_mcp_host_token(token: &str) {
 2. `MobilePaths::ensure_layout()` → 返回生效配置路径；
 3. `MobilePaths::realign_database_path()`（best-effort，失败仅告警，见 §4.3）；
 4. `EventSink::new(callback)`（泵线程已启动）；
-5. `HostCallRouter::new(sink, timeout)`；
+5. `HostCallRouter::new(sink, timeout)`；**`PersistentSecretVault` + `AskUserContext::new(router, vault)`**（工具先于 AppState 构造）+ **env 注入源注册**（`env_source(vault)` → mcp-builtin `set_shell_env_source` 进程级注册 + native bash 经 `register_bash_tools` 传入）；
 6. 组装工具集：`opts.extra_tools` + 追加 `HostTool("mobile.ping")`（schema 为空 object，`additionalProperties:false`）；**bash 工具不进 extra_tools**（命名随设置变化），装配完成后由 `register_bash_tools` 按当前多选注册；
 7. `MobileSecrets` + `mobile_provider_factory`（或注入 factory）；
 8. `RegistryStore::new(&paths.config_dir)`；
 9. 构建 tokio runtime：**multi_thread、worker_threads=2、线程名 `openslate-mobile`**（runtime.rs:133-138）；
-10. `rt.block_on(assemble_state(...))`（见 §3.6）；
-11. 从 state 取出运行期 `ToolRegistry` → **重算 MCP bash 接管**（统一谓词，MCP 已接管的名字 HostTool/native 让位）→ `register_bash_tools(默认 native-only, mcp_owned)`；
+10. `rt.block_on(assemble_state(...))`（见 §3.6）；随后 `ask_ctx.wire(&state)` + QuestionHandler 装配 + **`vault.attach_store(store)`**（加载持久凭据镜像）+ **`push_secret_masker`**（输出脱敏闭包：`[ask_user] mask_secrets` 短路 + vault 已知值打码，见 ask-user.md §8.4）；
+11. 从 state 取出运行期 `ToolRegistry` → **重算 MCP bash 接管**（统一谓词，MCP 已接管的名字 HostTool/native 让位）→ `register_bash_tools(默认 native-only, env, mcp_owned)`；
 12. `emit_snapshot()` —— **create 即握手**：进程内单客户端（`MOBILE_CONN_ID=1`），创建即推首份 snapshot。
 
 ### 3.3 各方法语义（含行号）
@@ -208,9 +210,10 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 ```
 
 - `HOST_CALL_TIMEOUT = Duration::from_secs(120)`（hostcall.rs:48）——宿主 UI 自动化/系统调用可能较慢，给足余量；**超时视为工具失败（回合可继续），不是 runtime 失败**。
-- `call()`（hostcall.rs:71-100）：oneshot 注册 → 信封经 `sink.emit_raw`（与 ServerMsg 同一条事件流，全局保序）→ `tokio::time::timeout` 等应答；三种结局：应答 / 发送端 drop（fail_all 或关停 → `"host call aborted (runtime shutting down)"`）/ 超时（移除 pending，报 `"host call timeout after {}ms (host did not resolve)"`）。
-- `resolve(id, ok, payload)`（hostcall.rs:104-123）：`ok=true` 时 payload 必须是合法 JSON 文本（解析失败转为 Err）；`ok=false` 时 payload 是错误说明；false = 无此在途调用（超时/已答/关停）。
-- `fail_all(reason)`（hostcall.rs:126-134）：关停兜底，drain 全部 pending 立刻失败（引擎解栈）。
+- `call()`：oneshot 注册 → 信封经 `sink.emit_raw`（与 ServerMsg 同一条事件流，全局保序）→ `tokio::time::timeout` 等应答；三种结局：应答 / 发送端 drop（fail_all 或关停 → `"host call aborted (runtime shutting down)"`）/ 超时（移除 pending，报 `"host call timeout after {}ms (host did not resolve)"`）。
+- `allocate_id()` + `call_with_id(id, tool, args, timeout)`：ask_user 用——id 预取（问卷行要在发信封前落库，request_id = id）+ 每调用自定义超时（永不超时配置取近似无限的极长时长）。
+- `resolve(id, ok, payload)`：`ok=true` 时 payload 必须是合法 JSON 文本（解析失败转为 Err）；`ok=false` 时 payload 是错误说明；false = 无此在途调用（超时/已答/关停）——**对失效 id 无害 no-op**。
+- `fail_all(reason)`：关停兜底，drain 全部 pending 立刻失败（引擎解栈）；**ask_user 豁免**（放回待答，问卷留给持久化恢复——若 fail 会把错误结果并入历史、行被迫关卷，迟到答案无处补全）。
 - `HostTool`（hostcall.rs:139-196）：由宿主执行的 `Tool` 壳——name/description/schema 进注册表，execute 转发 router；Err 也返回 `Ok(ToolOutput{status: Error})`（工具失败，不炸回合）。
 
 ## 7. `exec.rs` 详解（bash 后端多选 × MCP 接管）

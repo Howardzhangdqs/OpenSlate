@@ -6,9 +6,10 @@
 
 ```rust
 // lib.rs:25
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 ```
 
+- **v2**（ask-user r4/r5）：新增 `ClientMsg::QuestionReply` 与 `SnapshotDto.pending_questions`。
 - `hello.proto` 不等即拒连（server 侧发 `Error{code:"proto_mismatch"}` 后断开）。
 - **线格式**：每 WS text frame = 一个 JSON 对象，tagged enum（`{"type":"..."}`；`EntryDto` 用 `"kind"`；`ToolStatusDto` 用 `"state"`），字段名 snake_case。
 - mobile FFI 复用同一语义：上行 `send(ClientMsg JSON)`，下行 `on_event(ServerMsg JSON)`。**不发明第二套 onToken/onTool 接口**。
@@ -20,7 +21,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 - core 已有 serde derive 的类型（`Message`/`Usage`/`RunId`/`RunStatus`）→ **直接嵌入**协议。
 - core 仅 Deserialize 的 config 类型（`ProviderConfig`/`ModelConfig`）→ 协议侧定义**镜像 DTO + `From` 双向转换**——避免给 core 加 Serialize 耦合。
 
-## 3. 上行 ClientMsg（16 变体，lib.rs:497-568）
+## 3. 上行 ClientMsg（17 变体，lib.rs:497-568）
 
 | 变体 | 字段 | 语义/约束 |
 |------|------|-----------|
@@ -40,6 +41,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 | `UpsertMcpServer` | `name`, `url`, `headers?: HashMap` | Streamable HTTP 条目（手机端 mcp-host 场景） |
 | `RemoveMcpServer` | `name` | 不存在静默成功（幂等） |
 | `SetApiKey` | `provider`, `value` | 派生 `<NAME>_API_KEY` 写 `.env`（0600），不回显不广播。**mobile 上不走此路径**（FFI `set_api_key` 内存注入 + Keystore，PLAN §18） |
+| `QuestionReply` | `request_id`, `action: QuestionReplyAction`, `answers: serde_json::Value` | ask_user 问卷应答（即时/迟到，首答者赢同 approval_answer）。`action` ∈ accept/decline（对齐 MCP Elicitation）；`answers` 结构由 mobile 层定义、协议透传 |
 
 `ApprovalAnswerChoice`（:85）= `approve` / `deny` / `approve_all`（snake_case，本会话后续审批自动放行）。
 
@@ -77,7 +79,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 ### SnapshotDto（:200）
 
-hello 成功后定向发送的全量快照：`proto`/`session_id`/`session_label`/`transcript: Vec<EntryDto>`/`running`/`depth_cur`/`agents_running`/`tool_calls_cur`/`model_alias`/`pending_approval?`/`config: ConfigViewDto`/`session_stats: SessionStatsDto`（:220——server 是统计真相源，重连/新客户端 attach 不清零；`new_session` 归零）。
+hello 成功后定向发送的全量快照：`proto`/`session_id`/`session_label`/`transcript: Vec<EntryDto>`/`running`/`depth_cur`/`agents_running`/`tool_calls_cur`/`model_alias`/`pending_approval?`/`pending_questions: Vec<PendingQuestionDto>`（v2，`serde(default)` 向后兼容；server 投影恒空，mobile 装配层按持久层回填——重启恢复回放通路）/`config: ConfigViewDto`/`session_stats: SessionStatsDto`（:220——server 是统计真相源，重连/新客户端 attach 不清零；`new_session` 归零）。
 
 ### EntryDto（:128，tag "kind"）
 
@@ -109,6 +111,12 @@ hello 成功后定向发送的全量快照：`proto`/`session_id`/`session_label
 
 - `ApprovalSummaryDto`（:34）：tool_name/arguments（单行化 + 120 字符截断）/agent_id/risk_level（"low"/"medium"/"high"）。`From<&ApprovalRequest>` :61。
 - `PendingApprovalDto`（:77）：id + summary（snapshot 内嵌）。
+
+### ask_user 问卷 DTO（v2，ask-user r4/r5）
+
+- `QuestionReplyAction`（snake_case）：`accept` / `decline`（cancel 不在此表达——用户打断走回合取消通道）。
+- `QuestionStatus`（snake_case）：`pending` / `answered` / `declined` / `superseded` / `expired`（cancelled 随 Tool 消息折叠，不进枚举）。
+- `PendingQuestionDto`：`request_id`（幂等主键，host call id）/ `tool_call_id`（关联悬挂 tool call——迟到答案按 r5 补全其 tool result 并续跑，**不注入新用户消息**）/ `questions: serde_json::Value`（透传）/ `status` / `version`（防回答已撤销/已改的问题）。
 
 ### REST 辅助
 

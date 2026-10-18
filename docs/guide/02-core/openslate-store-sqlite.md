@@ -8,13 +8,15 @@
 
 ```rust
 // :26
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 ```
 
 - **v1 基线**：7 张表 + 索引（等价旧无版本机制的最终形态；基线 DDL 已含 CHECK 约束、不含 `runs.cwd`）。
 - **v2**：`runs.title` 列 + `messages(run_id, seq)` 唯一索引 + 清理死列 `runs.cwd`/死索引 `idx_runs_cwd`（后两步 best-effort，失败仅告警）。
+- **v3**：新增 `pending_questions` 表 + `idx_pending_questions_status`（ask_user 问卷持久化，ask-user 设计 r4/r5）。
+- **v4**：新增 `credentials` 表（ask_user secret 持久凭据库，见下）。
 
-### 7 张表
+### 9 张表
 
 | 表 | DDL 常量 | 关键列与约束 |
 |----|----------|--------------|
@@ -25,6 +27,8 @@ pub const SCHEMA_VERSION: i64 = 2;
 | `prompt_snapshots` | :127 | id PK / run_id FK / execution_node_id FK / agent_id / profile_name / source_kind / source_path? / content_hash / rendered_prompt / created_at |
 | `audit_log` | :144 | id PK / run_id?（无 FK——审计行可先于 run）/ agent_id? / event_type / event_json / created_at |
 | `trace_events` | :155 | id PK / run_id FK→runs / execution_node_id? / step_id? / agent_id? / event_name / event_kind / ts_ns / dur_ns? / track / args_json? |
+| `pending_questions` | v3（`DDL_PENDING_QUESTIONS`） | request_id TEXT PK（host call id，幂等主键）/ tool_call_id（关联消息历史悬挂调用；**无 FK**——行按 request_id 寻址且随 TTL 24h 过期，孤儿行无害）/ questions_json（归一化负载）/ **status CHECK IN ('pending','answered','declined','superseded','expired')** / version / created_at |
+| `credentials` | v4（`DDL_CREDENTIALS`） | name TEXT PK（凭据键：env 变量名或 `file:<path>`）/ **kind CHECK IN ('env','file')** / target（变量名/路径）/ value（**明文**——加密边界与威胁模型见 DDL 注释：app 私有 sqlite + Android 沙箱，防意外泄漏不防 root/备份提取；升级路径 Android Keystore via FFI）/ created_at / updated_at（upsert 刷新，created 首写固定）。**无 FK**——凭据跨会话存续，与 run 无从属。读写方法刻意分层：`list_credentials()`/`CredentialRecord` **无明文**（管理面），`get_credential_value()`/`load_credentials_with_values()` 明文仅 vault 消费 |
 
 建表顺序有意义：被外键引用的表先建（`ddl_statements()` :31 返回序即此序）。
 
@@ -38,7 +42,7 @@ pub const SCHEMA_VERSION: i64 = 2;
 - `PRAGMA user_version` 记录当前版本；目标 = `SCHEMA_VERSION`。
 - **每版本步进独立事务**：`user_version` 与 DDL 同事务提交——崩溃后重跑不会出现半迁移。
 - v0 兼容：DDL 全部 `IF NOT EXISTS`；`ALTER TABLE` 前先经 `pragma_table_info` 列存在检查（`column_exists` :274——**不靠错误文案字符串匹配**；表名只来自内部常量，无注入风险）。
-- 步进函数：`migrate_v0_to_v1`（:292：DDL → `BASELINE_ALTER_STEPS`（:180，runs.cost_usd / messages.seq / steps.seq 三列补齐）→ 索引）/ `migrate_v1_to_v2`（:316）。
+- 步进函数：`migrate_v0_to_v1`（:292：DDL → `BASELINE_ALTER_STEPS`（:180，runs.cost_usd / messages.seq / steps.seq 三列补齐）→ 索引）/ `migrate_v1_to_v2`（:316）/ `migrate_v2_to_v3`（`pending_questions` 表 + 状态索引，全部 IF NOT EXISTS 幂等）/ `migrate_v3_to_v4`（`credentials` 表，IF NOT EXISTS 幂等，无附加索引——name 主键即全部访问路径）。
 - 高版本库报 `MigrationError`（"请先升级程序"）。
 - 测试常量：`TABLE_NAMES`（:243）/ `INDEX_NAMES`（:254）+ CHECK 约束防漂移测试（:376）。
 
@@ -77,9 +81,27 @@ pub struct SqliteStore { pool: SqlitePool }
 
 执行树/steps/trace/audit 的整树写入发生在 **run 结束后由 CLI 侧**调用（不在 recorder 路径上）。
 
+ask_user 问卷持久化（v3）：
+
+| 函数 | 语义 |
+|------|------|
+| `insert_pending_question(request_id, tool_call_id, questions_json, version, created_at)` | 插 pending 行（request_id = host call id 幂等主键） |
+| `transition_pending_question(request_id, from, to) -> bool` | **原子状态迁移（幂等首答者赢）**：仅当当前状态 = `from` 才改 `to`；返回 false = 状态不匹配/不存在。任何状态对可表达（含 answered→pending 回滚重开） |
+
+ask_user 持久凭据（v4）：
+
+| 函数 | 语义 |
+|------|------|
+| `upsert_credential(name, kind, target, value, now_ms)` | name 主键 upsert（remember=true 的 secret 提交落这里；updated_at 刷新、created_at 首写固定） |
+| `delete_credential(name) -> bool` | 幂等删除（不存在 false）；会话内存条目/已写文件由 vault 侧联动清理 |
+
 ## 4. query.rs —— 只读查询 + 记录类型（1259 行）
 
-记录类型（serde derive，REST/CLI 消费）：`RunRecord`（:18，含 title?/cost_usd）/ `ExecutionNodeRecord`（:33）/ `StepRecord`（:48）/ `MessageRecord`（:65——**seq 字段注释钉死语义**：per-run 单调、readers 按 it 排序、`created_at` 无法排同批插入、provider 拒绝乱序 tool_calls 对）/ `PromptSnapshotRecord`（:81）/ `AuditLogRecord`（:96）/ `TraceEventRecord`（:107）。
+记录类型（serde derive，REST/CLI 消费）：`RunRecord`（:18，含 title?/cost_usd）/ `ExecutionNodeRecord`（:33）/ `StepRecord`（:48）/ `MessageRecord`（:65——**seq 字段注释钉死语义**：per-run 单调、readers 按 it 排序、`created_at` 无法排同批插入、provider 拒绝乱序 tool_calls 对）/ `PromptSnapshotRecord`（:81）/ `AuditLogRecord`（:96）/ `TraceEventRecord`（:107）/ `PendingQuestionRecord`（v3，ask_user 问卷行——status 小写词表与协议 `QuestionStatus` 的映射由 mobile 装配层负责）/ `CredentialRecord`（v4，**无明文**——name/kind/target/created_at/updated_at，设置页管理面用）。
+
+问卷查询：`list_pending_questions()`（status='pending' 按 created_at 升序——快照回填/迟到校验数据源）/ `get_pending_question(request_id)`（单条任意状态）。
+
+凭据查询：`list_credentials()`（无明文清单，按 name 字典序）/ `get_credential_value(name)`（单条明文，vault 注入/取值用）/ `load_credentials_with_values()`（全部行含明文——**仅 vault 启动镜像加载消费**，结果不进日志/Debug）。
 
 查询 API：
 
@@ -119,6 +141,7 @@ pub struct RunRecorder {
 | 落盘 | `impl MessageSink::append`（:246） | 调 write_message 但**吞错 warn**（持久化永不杀死 run） |
 | 终态 | `finish(status, output_json?, cost_usd)`（:199） | status/output/finished_at/cost 四项**单事务**落库（避免"已 completed 但成本缺失"半状态）；status 用小写词汇 |
 | 读回 | `load_messages(store, run_id)`（:214） | 按 seq 读回 → 解码 core Message；**尾部悬空 tool_calls 的 assistant 消息被丢弃**（:229-241——provider 拒绝，模型重新决策） |
+| 读回（保留悬挂） | `load_messages_keep_dangling(store, run_id)` | 同上但**不丢**尾部悬挂 assistant 消息——ask_user 重启恢复用（悬挂调用要留给迟到答案补全，ask-user r5）；调用方（mobile 装配层）自行决定丢弃或悬挂修复 |
 
 ### 关键设计点
 

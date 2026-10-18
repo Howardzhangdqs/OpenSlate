@@ -9,6 +9,7 @@
 | `state.rs`（472 行） | 共享状态 + 事件出口 + 转写镜像 | `SessionCore`/`CoreInner`/`MsgSink`/`AppState`/`ConfigPaths`/`SessionRun`/视图与镜像辅助函数 |
 | `engine.rs`（530 行） | 引擎回合任务 | `SessionProgressBridge`/`spawn_engine_turn`/`engine_turn`/`run_auto_compact`/`generate_title` |
 | `approval.rs`（164 行） | 会话审批桥 | `SessionApprovalBridge` |
+| `question.rs` | ask_user 应答接缝 | `QuestionHandler` |
 | `config_ops.rs`（835 行） | 配置 CRUD 写回链 | `ConfigChange`/`apply_config_change`/`apply_set_api_key` |
 | `session.rs`（449 行） | ClientMsg 派发 | `dispatch`/`handle_submit`/`open_session_run`/`generate_session_title` |
 
@@ -102,6 +103,14 @@ pre-turn 摘要。history 整体搬出（std Mutex 守卫不能跨 await）→ `
 - `generate_title(provider, model_id, first_prompt)`（:392）：`max_tokens: Some(48)` 小请求；失败/空白 → None（占位标题已在库）。
 - `sanitize_title`（:427）：首行 → 去包裹引号/书名号/反引号（中英文都剥）→ 按字符截断；空/纯标点 → None。
 
+## 3.5 question.rs —— ask_user 应答接缝（ask-user r5）
+
+- `QuestionHandler` trait（宿主注入，默认未注入 = 通道关闭）：
+  - `on_reply(request_id, action, answers) -> bool`：转发 `ClientMsg::QuestionReply`；`true` = 首答生效。宿主（mobile lane）职责：标记问卷状态 → `ask_user::append_late_tool_result` 补全原 tool call → `RunManager::resume_from_tool_result` 续跑。
+  - `on_cancel_all()`（默认 no-op）：用户显式取消时关卷悬挂问题（best-effort）。
+- **注入点**：`SessionCore::set_question_handler`（私有 `questions: Mutex<Option<Arc<dyn QuestionHandler>>>` 槽，`new()` 初始化）——刻意**不加 AppState/CoreInner 字段**（server/mobile 侧结构体字面量装配会破），`SessionCore` 仅经 `new` 构造零破坏；宿主实现持 `Weak<AppState>` 防引用环。
+- 快照 `pending_questions` 由宿主持久层回填（server 投影恒空，见 state.rs `build_snapshot`）。
+
 ## 3. approval.rs —— SessionApprovalBridge
 
 （时序图见 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1。）
@@ -134,8 +143,8 @@ pub struct SessionApprovalBridge {
 
 ## 5. session.rs —— dispatch
 
-- `dispatch(state, conn_id, msg)`（:18）：WS 读任务与 mobile FFI `send()` 共用的同一状态机。分支：重复 Hello 忽略 / Submit → `handle_submit` / ApprovalAnswer（**先 bridge 后 core**，锁序）/ Cancel（有 token 则 cancel，否则 notice）/ NewSession（busy 守卫 → 清空 → 异步关旧 run 行 `finish("completed")` → 广播 reset → 逐连接补 snapshot）/ SetModel（可解析性校验 → 广播）/ SetApiKey / 其余 → ConfigChange 家族。
-- `handle_submit`（:165）：九步全流程（逐步注释见 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §1）。
+- `dispatch(state, conn_id, msg)`（:18）：WS 读任务与 mobile FFI `send()` 共用的同一状态机。分支：重复 Hello 忽略 / Submit → `handle_submit` / ApprovalAnswer（**先 bridge 后 core**，锁序）/ **QuestionReply → `SessionCore::question_handler()` 转发**（桥在 core 锁外调用；首答者赢，迟到/未知 → 定向 notice；未注入 handler → 定向 notice「提问通道未接入」）/ Cancel（**先 `QuestionHandler::on_cancel_all`（ask_user 关卷 best-effort）再有 token 则 cancel**，否则 notice）/ NewSession（busy 守卫 → 清空 → 异步关旧 run 行 `finish("completed")` → 广播 reset → 逐连接补 snapshot）/ SetModel（可解析性校验 → 广播）/ SetApiKey / 其余 → ConfigChange 家族。
+- `handle_submit`（:165）：九步全流程（逐步注释见 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §1）。step 1 起（用户消息入 history 之前）先做 **ask_user 悬挂修复**（`ask_user::repair_dangling_tool_calls`，superseded）——新 turn 前为所有悬挂 tool call 合成结果保证消息序合法；合成消息在 step 3 先于用户消息经 recorder 落库。
 - `open_session_run`（:326）：lazy 建 run；title_hint（prompt 40 字符摘要）作占位标题落库（历史列表免 N+1）；begin 失败 → None（本会话不落库照常对话）。
 - `generate_session_title`（:384）：capability=title 计划（alias → resolve → factory）任一步失败静默返回（占位已就位，**降级可用永不报错**）；成功 → `update_run_title` + 广播 RunTitle；usage 计入会话累计；run 可能已被删（UPDATE 零行也成功，广播无目标自然丢弃）。
 

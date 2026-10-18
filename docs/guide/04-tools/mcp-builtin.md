@@ -108,6 +108,13 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);  // 超时 kill 后的
   "PASSWORD","PASSWD","CREDENTIAL","PRIVATE_KEY"]`，对 env 变量名**大小写不敏感**子串匹配；
   命中的变量 `env_remove`——模型驱动的子进程不能 `env | grep -i key` 把宿主注入的
   `.env` 密钥读进上下文。普通变量（PATH/HOME/LANG…）放行（白名单会弄坏正常命令）。
+- **环境注入**（ask_user secret 子系统；`ShellEnvSource` + `set_shell_env_source`）：
+  进程级注入源注册表（默认 `None`——桌面行为不变），mobile 装配期注册 vault 的
+  env 形态凭据，命令 spawn 时取最新键值**在脱敏之后**应用——用户有意存入的
+  TOKEN 等命名得以进入子进程（继承环境照旧脱敏；注入值覆盖同名被脱敏变量）。
+  与 core `set_mcp_auth_override` 同款进程级接缝模式（`ShellServer`/`BashServer`
+  由 openslate-app 装配链构造，签名扩展会波及所有装配层）。注入值绝不打日志。
+  `shell` 与 `bash` 共享执行核心，两工具同时生效。
 - **超时路径**（L222-250）：kill + reap 后各给 200ms 排水宽限读已缓冲的管道数据；
   返回 `TIMEOUT: command killed after {N}ms` + `format_output(-1, …)`，超长再截断。
 - **非零退出码** = error result 但**携带完整输出**（L258-264）——LLM 能看到失败原因自纠。

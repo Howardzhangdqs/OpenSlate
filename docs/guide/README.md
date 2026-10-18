@@ -21,7 +21,7 @@
 | [openslate-core.md](02-core/openslate-core.md) | core 全部 20 个模块：类型、API、边界条件 |
 | [openslate-protocol.md](02-core/openslate-protocol.md) | 线格式、ClientMsg/ServerMsg 全变体、DTO 原则、契约测试红线 |
 | [openslate-session.md](02-core/openslate-session.md) | session 五模块、CoreInner、锁序不变量、测试接缝 |
-| [openslate-store-sqlite.md](02-core/openslate-store-sqlite.md) | 7 张表逐表 DDL、迁移机制、连接策略、RunRecorder 生命周期 |
+| [openslate-store-sqlite.md](02-core/openslate-store-sqlite.md) | 8 张表逐表 DDL、迁移机制、连接策略、RunRecorder 生命周期 |
 
 ### 03-models/ — 模型接入层
 
@@ -37,6 +37,7 @@
 |------|------|
 | [mcp-host.md](04-tools/mcp-host.md) | Termux 聚合宿主：连接管理、token 鉴权、重连策略 |
 | [mcp-builtin.md](04-tools/mcp-builtin.md) | 内置工具 server（fs/shell/edit/skill）与各限额 |
+| [ask-user.md](04-tools/ask-user.md) | ask_user 提问工具：schema/下发契约、问卷持久化与 TTL、迟到答案等价不变量、secret 凭据接缝 |
 | [ptc.md](04-tools/ptc.md) | QuickJS 沙箱、ToolCallMode/Disclosure、PtcLimits、安全模型 |
 | [adding-a-tool.md](04-tools/adding-a-tool.md) | 手把手新增内置工具（含测试模板与检查清单） |
 

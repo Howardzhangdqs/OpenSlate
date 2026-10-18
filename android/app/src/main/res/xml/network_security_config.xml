@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 仅放行回环地址明文 HTTP（targetSdk ≥ 28 系统默认全局禁明文，Java
+     HttpURLConnection 对 http://127.0.0.1:8765（McpHostManager.HOST_URL，
+     Termux 内 MCP 聚合 host）会直接拒绝 "Cleartext HTTP traffic not
+     permitted"，而 Rust 原生客户端不受此限）。回环不出网、无中间人
+     暴露面，明文可接受；HOST_URL 恒用 127.0.0.1，::1 无需单列。其余
+     域名维持系统默认（禁明文）——绝不放宽到全局
+     usesCleartextTraffic="true"。 -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

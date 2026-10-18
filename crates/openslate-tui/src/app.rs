@@ -2748,6 +2748,9 @@ fn client_msgs_for_change(change: &ModelsChange) -> (String, Vec<ClientMsg>) {
                     supports_reasoning: cfg.supports_reasoning,
                     input_price_per_mtok: cfg.input_price_per_mtok,
                     output_price_per_mtok: cfg.output_price_per_mtok,
+                    // thinking effort 原样镜像：TUI 编辑表单暂无该控件，
+                    // 透传保证经由 TUI 的 upsert 不丢既有配置。
+                    reasoning_effort: cfg.reasoning_effort.clone(),
                 },
             }],
         ),
@@ -4252,6 +4255,7 @@ model = "mock-model"
                         supports_reasoning: false,
                         input_price_per_mtok: None,
                         output_price_per_mtok: None,
+                        reasoning_effort: None,
                     },
                 )
             })

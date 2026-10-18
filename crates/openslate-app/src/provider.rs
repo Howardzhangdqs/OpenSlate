@@ -79,6 +79,9 @@ pub fn build_genai_provider(
         timeout_ms,
         max_attempts: resolved.provider.max_attempts,
         retry_base_ms: resolved.provider.retry_base_ms,
+        // 条目级 thinking effort：resolve_model 已容忍归一（非法值 →
+        // None），这里原样下传，由 GenaiProvider 映射进默认 ChatOptions。
+        reasoning_effort: resolved.reasoning_effort.clone(),
     };
 
     let provider = openslate_model_genai::GenaiProvider::new(cfg).map_err(|e| {

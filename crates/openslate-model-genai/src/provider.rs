@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatOptions, ChatStreamEvent};
+use genai::chat::{ChatOptions, ChatStreamEvent, ReasoningEffort};
 use genai::resolver::{AuthData, Endpoint};
 use genai::Headers;
 use genai::{Client, ModelIden, ServiceTarget};
@@ -49,6 +49,29 @@ fn stream_idle_timeout_error(idle: Duration) -> ProviderError {
         "stream idle timeout after {}ms (no stream data received within the idle budget)",
         idle.as_millis()
     ))
+}
+
+/// 条目级 thinking effort 字符串 → genai `ReasoningEffort`。七档全集
+/// 一一映射（契约钉死，vendor 变体名 None/Minimal/Low/Medium/High/
+/// XHigh/Max，openai adapter wire 关键字与档位名同形）。注意两处
+/// 语义区分：`Option::None`（Auto）= 不传该字段、跟随 provider 默认；
+/// `Some("none")` = 显式发 `"reasoning_effort":"none"` 硬关闭思考
+/// （GLM-5.2 默认 max 重思考，用户需要显式关闭；Gemini 2.5 系同样
+/// 接受 none；GLM-5.3 / DeepSeek 不支持该档——支持矩阵由 UI 裁剪）。
+/// genai 仅剩的 `Budget(u32)` 变体不在此列（非字符串档位）。其他值按
+/// None 兜底：上游 `resolve_model` 已对非法配置 warn 过，这里只做防御
+/// 性映射，不再重复告警。
+fn reasoning_effort_from_str(s: &str) -> Option<ReasoningEffort> {
+    match s {
+        "none" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::XHigh),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    }
 }
 
 /// Configuration for constructing a [`GenaiProvider`].
@@ -95,6 +118,18 @@ pub struct GenaiConfig {
     /// `retry_base_ms * 2^(attempt-1) + jitter`, single sleep capped at 10s.
     /// Maps to `[providers.X].retry_base_ms` (default 500).
     pub retry_base_ms: u64,
+    /// Thinking effort hint（`[models.X].reasoning_effort` 条目级配置）：
+    /// 七档全集 `"none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    /// | "max"`（各 provider 实际支持的档位不一，存全集、由 UI 按模型
+    /// 能力裁剪），一一映射 genai `ChatOptions::reasoning_effort`（openai
+    /// adapter wire 字段 `reasoning_effort`，anthropic/gemini 各自的
+    /// budget/thinking 映射由 genai adapter 承担）；`None` 不设置
+    /// （Auto），跟随 provider 默认——注意与 `Some("none")` 的显式硬关闭
+    /// 思考是两种语义。effort 是模型条目属性而非单请求属性，故烘进
+    /// provider 的默认 ChatOptions，对经由本 provider 的所有请求（含
+    /// 标题生成/compact 摘要）生效。上游 `resolve_model` 已 warn 过滤
+    /// 非法值；此处对未知字符串仍按 None 兜底（容忍，不 panic）。
+    pub reasoning_effort: Option<String>,
 }
 
 /// A genai-backed implementation of [`ModelProvider`].
@@ -217,6 +252,12 @@ impl GenaiProvider {
             capture_content: Some(true),
             capture_tool_calls: Some(true),
             capture_usage: Some(true),
+            // 条目级 thinking effort（推理力度）：见 `GenaiConfig::
+            // reasoning_effort`——烘进默认 options，随每次请求发出。
+            reasoning_effort: config
+                .reasoning_effort
+                .as_deref()
+                .and_then(reasoning_effort_from_str),
             // genai's streaming path drops the reqwest client's default
             // headers, so the UA must ALSO travel as an explicit per-request
             // header — `extra_headers` is merged in both exec_chat and
@@ -496,6 +537,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reasoning_effort_string_maps_to_genai_variants() {
+        // 七档一一映射；wire 关键字（`variant_name`，openai adapter
+        // `insert_openai_reasoning_effort` 同款表）与配置字符串同形——
+        // 「存什么发什么」，逐档钉死。含 "none"：显式硬关闭思考
+        // （wire 发 `"reasoning_effort":"none"`），与 Option::None 的
+        // Auto（不传参）是两种语义。
+        for (s, wire) in [
+            ("none", "none"),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+        ] {
+            let effort = reasoning_effort_from_str(s)
+                .unwrap_or_else(|| panic!("'{s}' must map to a genai variant"));
+            assert_eq!(effort.variant_name(), wire);
+        }
+        // "none" 必须映射到 genai 的 `None` 变体（显式关闭档）。
+        assert!(matches!(
+            reasoning_effort_from_str("none"),
+            Some(ReasoningEffort::None)
+        ));
+        // 越界值 → None 兜底（不 panic；Auto 语义走 Option::None，
+        // 不是字符串档位）。
+        assert!(reasoning_effort_from_str("ultra").is_none());
+        assert!(reasoning_effort_from_str("auto").is_none());
+        assert!(reasoning_effort_from_str("").is_none());
+    }
+
+    #[test]
     fn default_chat_options_have_capture_flags() {
         // G2 guard: without these flags the streaming Done event is empty.
         let cfg = GenaiConfig {
@@ -508,6 +581,7 @@ mod tests {
             timeout_ms: 60_000,
             max_attempts: 3,
             retry_base_ms: 500,
+            reasoning_effort: None,
         };
         let provider = GenaiProvider::new(cfg).expect("constructs");
         assert_eq!(provider.default_chat_options.capture_content, Some(true));
@@ -527,6 +601,7 @@ mod tests {
             timeout_ms: 60_000,
             max_attempts: 3,
             retry_base_ms: 500,
+            reasoning_effort: None,
         };
         match GenaiProvider::new(cfg) {
             Ok(_) => panic!("expected an error for an unknown adapter"),
@@ -585,6 +660,7 @@ mod tests {
             timeout_ms: 30_000,
             max_attempts: 3,
             retry_base_ms: 500,
+            reasoning_effort: None,
         })
         .expect("constructs");
 
@@ -599,6 +675,66 @@ mod tests {
             })
             .await
             .expect("request matched the mock (UA + Bearer present)");
+
+        assert_eq!(res.content.as_deref(), Some("hi"));
+
+        _mock.assert_async().await;
+    }
+
+    /// E2E：条目级 thinking effort 经 default_chat_options → genai openai
+    /// adapter 落到 wire——请求体必须含扩展档位 `"reasoning_effort":
+    /// "xhigh"`（七档全集以 xhigh 为代表钉真实 wire；其余档位（含 none
+    /// 硬关闭）的键名/关键字同形由上面
+    /// reasoning_effort_string_maps_to_genai_variants 逐档覆盖）。
+    /// mockito 只在 body 含该字段时才放行请求，字段缺失即失败。
+    #[tokio::test]
+    async fn model_request_carries_reasoning_effort_on_wire() {
+        use openslate_core::provider::GenerateRequest;
+
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::PartialJsonString(
+                serde_json::json!({"reasoning_effort": "xhigh"}).to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"chatcmpl-1","object":"chat.completion","created":0,
+                    "model":"test-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},
+                    "finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+            )
+            .create_async()
+            .await;
+
+        let cfg = GenaiConfig {
+            provider_name: "test".into(),
+            model: "test-model".into(),
+            api_key: Some("test-key".into()),
+            base_url: Some(server.url()),
+            proxy: None,
+            adapter: Some("openai".into()),
+            timeout_ms: 30_000,
+            max_attempts: 3,
+            retry_base_ms: 500,
+            reasoning_effort: Some("xhigh".into()),
+        };
+        let provider = GenaiProvider::new(cfg).expect("constructs");
+
+        let res = provider
+            .generate(GenerateRequest {
+                model_id: "test-model".into(),
+                system_prompt: None,
+                messages: vec![],
+                tools: vec![],
+                max_tokens: None,
+                temperature: None,
+            })
+            .await
+            .expect("request matched the mock (reasoning_effort on wire)");
 
         assert_eq!(res.content.as_deref(), Some("hi"));
 
@@ -634,6 +770,7 @@ mod tests {
                 timeout_ms: 30_000,
                 max_attempts: 1,
                 retry_base_ms: 500,
+                reasoning_effort: None,
             })
             .expect("constructs");
 
@@ -703,6 +840,7 @@ mod tests {
                 timeout_ms: 30_000,
                 max_attempts,
                 retry_base_ms,
+                reasoning_effort: None,
             }
         }
 

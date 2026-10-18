@@ -15,11 +15,12 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -39,9 +40,16 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
@@ -92,11 +100,37 @@ internal data class GlassDropdownItem(
     val label: String,
     val subtitle: String? = null,
     val selected: Boolean = false,
+    /** 可选前置图标（Material ImageVector；null = 无——既有调用方零变化，
+     *  上下文菜单等场景传入以强化条目语义）。 */
+    val leadingIcon: ImageVector? = null,
 )
 
 /** 弹层离锚点的间距 + 面板最大高度（超出内部滚动）。 */
 private val GlassMenuMargin = 8.dp
 private val GlassMenuMaxHeight = 360.dp
+
+/**
+ * 面板宽度（内容自适应）：最终宽 = max(条目实测单行宽) 收口到
+ * [GlassMenuMinWidth, 上限]，Modifier.width 显式钉在玻璃面（Box）上。
+ *
+ * 为什么实测而不用 IntrinsicSize.Min：条目文字列挂 weight(1f)，Compose
+ * intrinsic 遍历中 weighted 子项不贡献主轴宽（其主轴尺寸由剩余空间定义，
+ * intrinsic 查询时不可知）→ 列 minIntrinsic ≈ 图标+Check+padding ≈ 74dp，
+ * 被 widthIn(min) 钉死成常宽、文字全截断（2026-10 真机翻车记录）。文字宽
+ * 改用 TextMeasurer 按渲染同款样式实测（同 EnhancedMarkdownTable 列宽思路）。
+ */
+private val GlassMenuMinWidth = 120.dp
+
+/** 屏宽推算上限时两侧各留的安全边距。 */
+private val GlassMenuScreenMargin = 16.dp
+
+/** 绝对上限兜底：平板/分屏等大屏场景菜单不无限跟屏宽。 */
+private val GlassMenuAbsoluteMaxWidth = 420.dp
+
+/** 条目行内固定件规格（布局与 TextMeasurer 实测共用，保证两侧一致）。 */
+private val GlassItemIconSize = 18.dp
+private val GlassItemIconGap = 10.dp
+private val GlassItemPaddingHorizontal = 14.dp
 
 /** 真实模糊半径：18dp 局部磨砂（与 GlassPanel 的 12dp 同族、弹层面略重）。 */
 private val GlassMenuBlurRadius = 18.dp
@@ -156,6 +190,20 @@ private fun rememberGlassMenuStyle(): HazeBlurStyle {
  * 状态（ChatScreen / SettingsScreen 各自持有并传入）。空 items 不弹（调用
  * 方一般已禁用触发行）。[labelFontFamily] 可选注入条目主文字字体（如模型
  * 菜单传 MonoFont 等宽子集），null = 默认字体，行为不变。
+ *
+ * 宽度内容自适应：面板宽 = 最宽条目的实测单行自然宽（TextMeasurer，条目
+ * 行全体等宽对齐），上限随屏宽收口、下限 [GlassMenuMinWidth] 只兜极短菜单
+ * ——上限之内文字完整显示（最宽条目天然贴边），超上限才 Ellipsis。见常量
+ * 定义处注释。
+ *
+ * [focusable]（默认 true，既有调用方零变化）：Popup 是否抢窗口焦点。
+ * 抢焦点的副作用——底层输入框失焦，系统**瞬间无动画**收起 IME（composer
+ * 面板整体在 imePadding 之上，键盘一塌面板跟着跳）。传 false 弹层不持
+ * 焦点、键盘保持；代价是非聚焦窗口收不到 BACK 键（dismissOnBackPress
+ * 失效，返回键作用于底层界面——先收 IME 再走导航，弹层保持打开）；
+ * 点外部 dismiss（dismissOnClickOutside 不依赖窗口焦点）与菜单项点击
+ * （Compose clickable 不需要窗口焦点）均正常。composer 双下拉场景
+ * 可接受该取舍。
  */
 @Composable
 internal fun GlassDropdownMenu(
@@ -168,6 +216,7 @@ internal fun GlassDropdownMenu(
     maxHeight: Dp = GlassMenuMaxHeight,
     labelFontFamily: FontFamily? = null,
     alignEnd: Boolean = false,
+    focusable: Boolean = true,
     onSelect: (GlassDropdownItem) -> Unit,
 ) {
     // 退场动画期间保持 Popup 组合（currentState 在退场结束前仍为 true）。
@@ -177,10 +226,35 @@ internal fun GlassDropdownMenu(
         val density = LocalDensity.current
         val marginPx = with(density) { GlassMenuMargin.toPx().roundToInt() }
         val style = rememberGlassMenuStyle()
+        // 宽度上限 = 屏宽 − 两侧安全边距，再夹绝对上限（平板/分屏兜底）；
+        // screenWidthDp 异常为 0 时兜回下限，防 coerceIn 反向区间崩溃。
+        val menuMaxWidth = minOf(
+            LocalConfiguration.current.screenWidthDp.dp - GlassMenuScreenMargin * 2,
+            GlassMenuAbsoluteMaxWidth,
+        ).coerceAtLeast(GlassMenuMinWidth)
+        // 实测内容宽：主/副行按渲染同款样式量单行自然宽取大者，加
+        // leadingIcon/Check/行水平 padding（见 measuredWidthDp）；
+        // 清单刷新 → items 变化触发 recomposition → 宽度天然重算。
+        val labelStyle = MaterialTheme.typography.bodyMedium.let {
+            if (labelFontFamily != null) it.copy(fontFamily = labelFontFamily) else it
+        }
+        val textMeasurer = rememberTextMeasurer()
+        val menuWidth = (
+            items.maxOfOrNull {
+                it.measuredWidthDp(
+                    textMeasurer = textMeasurer,
+                    labelStyle = labelStyle,
+                    subtitleStyle = MaterialTheme.typography.labelSmall,
+                    density = density,
+                )
+            } ?: 0.dp
+            ).coerceIn(GlassMenuMinWidth, menuMaxWidth)
         Popup(
             onDismissRequest = onDismissRequest,
             properties = PopupProperties(
-                focusable = true,
+                // 默认 true（弹层菜单语义：抢焦点、BACK 关弹层）；composer
+                // 双下拉传 false 保住键盘，取舍见上方 KDoc。
+                focusable = focusable,
                 dismissOnBackPress = true,
                 dismissOnClickOutside = true,
             ),
@@ -213,7 +287,10 @@ internal fun GlassDropdownMenu(
             ) {
                 Box(
                     modifier = modifier
-                        .widthIn(max = 320.dp)
+                        // 宽随内容：实测宽已在上文钉好（menuWidth）。上限之内
+                        // 文字完整显示（最宽条目天然贴边），只有超过屏宽上限
+                        // 的极端长文才 Ellipsis；各行 fillMaxWidth → 等宽对齐。
+                        .width(menuWidth)
                         .shadow(elevation = 2.dp, shape = shape, clip = false)
                         .graphicsLayer {
                             this.shape = shape
@@ -249,6 +326,42 @@ internal fun GlassDropdownMenu(
     }
 }
 
+/**
+ * 条目单行自然宽（dp）：主/副行按渲染同款样式 TextMeasurer 实测取大者
+ * （px→dp），加行内固定件——leadingIcon（18 + 间距 10）、选中 Check
+ * （间距 10 + 18；勾前 Spacer 与此处同款常量，量画同源，改一处必改另一
+ * 处）、行水平 padding（14×2）。softWrap=false + maxLines=1 + 无约束宽 →
+ * 不换行单行布局，宽 = 该文本完整单行渲染宽（样式/字体与条目行实际渲染
+ * 一致）。
+ */
+private fun GlassDropdownItem.measuredWidthDp(
+    textMeasurer: TextMeasurer,
+    labelStyle: TextStyle,
+    subtitleStyle: TextStyle,
+    density: Density,
+): Dp {
+    val textWidthPx = maxOf(
+        textMeasurer.measure(
+            AnnotatedString(label),
+            style = labelStyle,
+            softWrap = false,
+            maxLines = 1,
+        ).size.width,
+        subtitle?.let {
+            textMeasurer.measure(
+                AnnotatedString(it),
+                style = subtitleStyle,
+                softWrap = false,
+                maxLines = 1,
+            ).size.width
+        } ?: 0,
+    )
+    var width = with(density) { textWidthPx.toDp() } + GlassItemPaddingHorizontal * 2
+    if (leadingIcon != null) width += GlassItemIconSize + GlassItemIconGap
+    if (selected) width += GlassItemIconGap + GlassItemIconSize
+    return width
+}
+
 /** 弹层条目行：主文字（+可选副行）居左，选中带 Check 图标（ui.md 基线）。
  *  [labelFontFamily] 由菜单级注入（null = 默认字体），仅作用于主文字。 */
 @Composable
@@ -260,10 +373,24 @@ private fun GlassDropdownMenuItem(
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
+            // 面板宽已实测钉死（见 measuredWidthDp）：fillMaxWidth = 各行等宽
+            // 对齐 + 等宽点击区，不参与宽度决定。
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(
+                horizontal = GlassItemPaddingHorizontal,
+                vertical = 10.dp,
+            ),
     ) {
+        item.leadingIcon?.let {
+            Icon(
+                it,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(GlassItemIconSize),
+            )
+            Spacer(Modifier.width(GlassItemIconGap))
+        }
         Column(Modifier.weight(1f)) {
             Text(
                 item.label,
@@ -288,11 +415,15 @@ private fun GlassDropdownMenuItem(
             }
         }
         if (item.selected) {
+            // 勾与文字间的固定间距（与左侧图标同族 10dp 节奏）：文字列
+            // weight(1f) 会吸掉全部富余宽，不设这个 Spacer，最宽选中条目
+            // 的文字会贴死勾位（2026-10 真机反馈）。
+            Spacer(Modifier.width(GlassItemIconGap))
             Icon(
                 Icons.Filled.Check,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(GlassItemIconSize),
             )
         }
     }

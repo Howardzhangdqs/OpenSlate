@@ -1,6 +1,5 @@
 package dev.openslate.mobile.ui
 
-import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
@@ -58,7 +57,6 @@ import androidx.lifecycle.LifecycleEventObserver
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.TermuxDiagnostics
-import dev.openslate.mobile.bridge.TermuxExec
 import dev.openslate.mobile.bridge.ToolInfoUi
 import dev.openslate.mobile.bridge.ToolParamUi
 import dev.openslate.mobile.bridge.ToolVisibilityUi
@@ -84,19 +82,8 @@ private fun toolGroupLabel(name: String): String = when {
     else -> "内置"
 }
 
-/** Termux 依赖工具的可用状态；检测中/正常不产生警示标识（避免闪烁）。 */
-private sealed interface TermuxStatus {
-    /** 检测进行中（含重入重置后的过渡态）：不显示任何标识。 */
-    object Checking : TermuxStatus
-    /** 通道 echo 往返通过：无需警示。 */
-    object Ready : TermuxStatus
-    /** Termux 未安装。 */
-    object NotInstalled : TermuxStatus
-    /** RUN_COMMAND 权限未授予。 */
-    object NoPermission : TermuxStatus
-    /** 通道探测失败；stopped = Termux 处于停止态（首装未打开/被强停）。 */
-    data class ChannelDown(val summary: String, val stopped: Boolean) : TermuxStatus
-}
+/** Termux 状态阶梯（[TermuxStatus] / [detectTermuxStatus]）已上提至
+ *  ComposerMcpStatus.kt（internal，本包直引），此处不再持有私有副本。 */
 
 /** 后端 CSV 是否启用了 termux（解析同 ExecBackendSection：逗号分隔 + trim）。 */
 private fun termuxBackendEnabled(backendsCsv: String?): Boolean =
@@ -117,36 +104,6 @@ private fun dependsOnTermux(name: String, backendsCsv: String?): Boolean {
     }
     return false
 }
-
-/**
- * Termux 依赖工具的可用性检测阶梯（权威检测，无副作用、不自动拉起）：
- * **MCP host 健康（探活通过）→ 直接可用**（bash 经 MCP over HTTP 执行，
- * 与 RUN_COMMAND 无关）；host 不在线时才走 RUN_COMMAND 阶梯：未安装 →
- * 无权限 → `echo ok` 通道往返（通过 = RUN_COMMAND 兜底可用）。全程
- * IO 线程（PackageManager 查询、HTTP 探活与 RUN_COMMAND 派发都不该
- * 压主线程）。
- */
-private suspend fun detectTermuxStatus(
-    context: Context,
-    onStall: (() -> Unit)? = null,
-): TermuxStatus =
-    withContext(Dispatchers.IO) {
-        // 主路径：MCP host 探活通过 → bash 走 MCP，RUN_COMMAND 无关紧要。
-        val hostAlive = runCatching { McpHostManager.isHostAlive(context) }.getOrDefault(false)
-        if (hostAlive) return@withContext TermuxStatus.Ready
-        when {
-            !TermuxExec.isTermuxInstalled(context) -> TermuxStatus.NotInstalled
-            !TermuxExec.hasPermission(context) -> TermuxStatus.NoPermission
-            else -> when (
-                val r = TermuxDiagnostics.ensureTermuxUp(context, log = { }, onStall = onStall)
-            ) {
-                is TermuxDiagnostics.ChannelResult.Ok -> TermuxStatus.Ready
-                is TermuxDiagnostics.ChannelResult.NoResponse ->
-                    TermuxStatus.ChannelDown(TermuxDiagnostics.describe(r), stopped = r.stopped)
-                else -> TermuxStatus.ChannelDown(TermuxDiagnostics.describe(r), stopped = false)
-            }
-        }
-    }
 
 /** 不可用提示文案；Ready/检测中返回 null → 不警示。警示只在「host
  *  不在线 且 RUN_COMMAND 阶梯失败」时出现（可用性判定 = RUN_COMMAND

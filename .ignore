@@ -1,3 +1,7 @@
 # Let OpenCode read deepwork session state (gitignored but tool-readable)
 !.slim/deepwork/
 !.slim/deepwork/**
+
+# Let OpenCode read reference repos (gitignored but tool-readable)
+!.ref/
+!.ref/**

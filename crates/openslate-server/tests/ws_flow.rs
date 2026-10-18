@@ -579,6 +579,7 @@ async fn crud_upsert_hot_swap_and_config_changed() {
                 supports_reasoning: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
+                reasoning_effort: None,
             },
         },
     )

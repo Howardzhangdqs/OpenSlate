@@ -54,7 +54,7 @@ pub trait ModelProvider: Send + Sync {
 
 | 文件 | 行数 | 内容 |
 |------|------|------|
-| `src/provider.rs` | 1277 | `GenaiConfig`（L56-98，9 字段）、`GenaiProvider`（L104）+ 构造 + trait 实现；`retry_behaviour` 测试模块（L687 起） |
+| `src/provider.rs` | 1277 | `GenaiConfig`（L56-126，10 字段，含 `reasoning_effort`）、`GenaiProvider` + 构造 + trait 实现；`retry_behaviour` 测试模块（L687 起） |
 | `src/convert.rs` | 704 | `to_chat_request` / `from_chat_response` / `from_stream_end`（OpenSlate 消息 ↔ genai ChatRequest/Response/StreamEnd） |
 | `src/error.rs` | 119 | `GenaiBuildError`（L5-16，含 `UnknownAdapter`）、`map_error` → `ProviderError`（L31-76） |
 | `src/retry.rs` | 298 | `RetryPolicy`（L49）、`is_retryable`（L91）、`exhausted_error`（L143）、`backoff_or_consumer_gone`（L152） |
@@ -74,6 +74,13 @@ pub struct GenaiConfig {
     pub timeout_ms: u64,         // 双语义预算，见 §5
     pub max_attempts: u32,       // 总尝试次数（含首次），默认 3；0 被钳到 1
     pub retry_base_ms: u64,      // 指数退避基数，默认 500
+    pub reasoning_effort: Option<String>, // thinking effort（条目级 [models.X].reasoning_effort）：
+    //                          七档 none/minimal/low/medium/high/xhigh/max，None=Auto 不传参。
+    //                          none=显式关闭思考（GLM-5.2/Gemini 2.5 等支持的家族），
+    //                          与 Auto（跟随 provider 默认）语义不同。
+    //                          烘进默认 ChatOptions（§3 第 7 步），映射 genai ReasoningEffort
+    //                          同名变体；各 provider 实际档位不一（GLM-5.3 仅 low/high/max），
+    //                          存全集、UI 按模型能力裁剪（家族能力表见 06-mobile）。
 }
 ```
 
@@ -102,7 +109,10 @@ pub struct GenaiConfig {
    拼服务 URL，按 RFC 3986，`.../v1` + `chat/completions` 会**替换**掉 `v1`
    （得到 `.../chat/completions`——错的）；`.../v1/` 才是追加。
 7. **默认 ChatOptions**（L216-226）：`capture_content/capture_tool_calls/capture_usage = Some(true)` +
-   `extra_headers: user-agent`。单测 `default_chat_options_have_capture_flags`（L499）守着。
+   `extra_headers: user-agent`；`reasoning_effort`（若 GenaiConfig 配置）在此一并烘进
+   （`reasoning_effort_from_str` 六档映射，wire 键 `reasoning_effort` 与档位名同形，
+   单测 `reasoning_effort_string_maps_to_genai_variants` 钉死）。单测
+   `default_chat_options_have_capture_flags`（L499）守着。
 
 ### 3.1 必须知道的行为约定（改这里之前先读 `src/lib.rs` crate 文档）
 
@@ -147,6 +157,7 @@ pub struct ResolvedModel {
     pub supports_reasoning: bool,
     pub input_price_per_mtok: Option<f64>,   // P2-3 计价
     pub output_price_per_mtok: Option<f64>,
+    pub reasoning_effort: Option<String>,    // thinking effort 七档（none=显式关闭）；resolve_model 容忍归一
 }
 ```
 

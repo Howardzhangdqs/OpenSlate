@@ -1135,6 +1135,9 @@ impl ModelsComponent {
             supports_reasoning: reasoning,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
+            // 表单无 thinking effort 控件：新存条目不带该字段（跟随
+            // provider 默认）。既有条目经 server 端编辑时不经过本构造。
+            reasoning_effort: None,
         };
         self.form = None;
         self.mode = Mode::List;

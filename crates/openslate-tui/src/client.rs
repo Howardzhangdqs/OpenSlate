@@ -974,6 +974,7 @@ mod tests {
                     supports_reasoning: false,
                     input_price_per_mtok: Some(1.0),
                     output_price_per_mtok: None,
+                    reasoning_effort: None,
                 },
             )]
             .into_iter()

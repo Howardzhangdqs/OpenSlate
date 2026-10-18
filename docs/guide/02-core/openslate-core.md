@@ -144,7 +144,7 @@ pub struct RunManager {
 - 常量：`CAP_MAIN`/`CAP_COMPACT`/`CAP_TITLE`（:20-24）+ `CAPABILITIES`（:27）。
 - `capability_title`（:30）/ `capability_alias(config, cap) -> String`（:46，缺省回退 main→"main"、title→"fast"；compact 的 "fast" 缺省仅保留函数兼容——session 引擎未绑定时继承会话当前模型，不消费该缺省）。
 - `ResolvedModel`（:61）：解析结果（model_id + 计价等）；`cost_spec()`（:86）→ `CostSpec`。
-- `resolve_model(config, alias) -> Result<ResolvedModel, ConfigError>`（:111）：levels 映射优先，无 levels 段直接查 models（legacy 保持）。
+- `resolve_model(config, alias) -> Result<ResolvedModel, ConfigError>`（:111）：levels 映射优先，无 levels 段直接查 models（legacy 保持）。`reasoning_effort` 容忍归一（:145-162）：七档全集 none/minimal/low/medium/high/xhigh/max 白名单透传——**none = 显式关闭思考**（wire 发 `"reasoning_effort":"none"`，与缺省不传参的 Auto 语义不同；仅支持的家族有效，GLM-5.2 / Gemini 2.5）；非法值 warn 后按 None（配置瑕疵不炸 provider 构建，wire 少带字段回落 provider 默认）。
 - `resolve_all_models`（:158）：批量。
 
 ## 10. model_registry.rs —— LLM 元数据 registry 纯逻辑（573 行）

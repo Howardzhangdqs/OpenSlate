@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         timeout_ms: 60_000,
         max_attempts: 1,
         retry_base_ms: 500,
+        reasoning_effort: None,
     };
     let provider = GenaiProvider::new(cfg)?;
 

@@ -42,6 +42,9 @@ ca-certificates.crt
 # Deepwork session state
 .slim/deepwork/
 
+# 参考项目源码（浅克隆，不入库；scripts/update-ref-repos.sh 维护）
+.ref/
+
 # Android 构建产物
 target-android/
 android/.gradle/

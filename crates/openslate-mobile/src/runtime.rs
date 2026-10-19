@@ -95,6 +95,9 @@ pub struct MobileRuntime {
     /// bash 工具的环境注入源（ask_user secret env 形态；热切换/重载
     /// 重注册时随工具传递）。
     bash_env: crate::exec::EnvSource,
+    /// MCP host 死亡自愈共享上下文（所有 RecoveringMcpTool 装饰器共用：
+    /// 单飞恢复闩 + 冷却 + 注册表弱引用；reload_mcp 迁移新工具时复用）。
+    mcp_recovery: Arc<crate::mcp_recovery::RecoveryCtx>,
     shutdown_flag: std::sync::atomic::AtomicBool,
 }
 
@@ -235,6 +238,22 @@ impl MobileRuntime {
             env_source.clone(),
             &mcp_owned,
         );
+        // MCP host 死亡自愈：装配期包装点——外部 MCP 工具名册整体包上
+        // RecoveringMcpTool（连接失败签名 → 单飞恢复 host call → 注册表
+        // 同名重发一次，见 mcp_recovery.rs）。bash 域被 MCP 接管的名字也
+        // 在名册内（名册里的都是 McpTool 本体，让位判定按名不按身份）；
+        // HostTool 壳 / native bash 不在名册内不会被包。
+        let mcp_recovery = crate::mcp_recovery::RecoveryCtx::new(
+            host_router.clone(),
+            &runtime_registry,
+        );
+        crate::mcp_recovery::wrap_mcp_tools(&runtime_registry, &mcp_tool_names, &mcp_recovery);
+        if !mcp_tool_names.is_empty() {
+            crate::alog!(
+                "create_with: {} 个外部 MCP 工具已包恢复装饰器（host 死亡自愈）",
+                mcp_tool_names.len()
+            );
+        }
         let runtime = Arc::new(Self {
             rt: std::sync::Mutex::new(Some(rt)),
             state,
@@ -250,6 +269,7 @@ impl MobileRuntime {
             config_path,
             ask: ask_ctx,
             bash_env: env_source,
+            mcp_recovery,
             shutdown_flag: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -472,13 +492,21 @@ impl MobileRuntime {
         }
 
         // 4) 注册新工具（从 scratch 取 Arc 包装迁移；此处撞名只可能是
-        //    与 builtin/host 等非 MCP 工具冲突——装配期同样致命）。
+        //    与 builtin/host 等非 MCP 工具冲突——装配期同样致命）。迁移时
+        //    逐工具包恢复装饰器（reload 期包装点，见 mcp_recovery.rs）：
+        //    旧装饰器持有的 inner 是旧 McpTool，失败 → 恢复 → registry
+        //    重发拿到的就是这里的新装饰器/新连接。回滚路径装回的旧 Arc
+        //    本就是已包装的装饰器，不会双层包装。
         let mut registered: Vec<String> = Vec::with_capacity(new_names.len());
         for name in &new_names {
             let Some(tool) = scratch.get(name) else {
                 continue;
             };
-            if let Err(e) = self.registry.try_register(SharedTool(tool)) {
+            let wrapped = Arc::new(crate::mcp_recovery::RecoveringMcpTool::new(
+                tool,
+                self.mcp_recovery.clone(),
+            ));
+            if let Err(e) = self.registry.try_register(SharedTool(wrapped)) {
                 for n in &registered {
                     self.registry.unregister(n);
                 }

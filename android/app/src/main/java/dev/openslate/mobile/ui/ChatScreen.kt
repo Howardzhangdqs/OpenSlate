@@ -67,6 +67,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.Autorenew
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
@@ -118,6 +119,8 @@ import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
+import dev.openslate.mobile.bridge.McpRecoverPhase
+import dev.openslate.mobile.bridge.McpRecoverStep
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
@@ -195,6 +198,17 @@ fun ChatScreen(
         while (true) {
             TermuxStallTracker.refresh(context)
             delay(2_500)
+        }
+    }
+    // MCP 恢复激活期间周期重探（沿用 TermuxStallTracker 范式：CAS 单飞
+    // 防抖、探测结论喂恢复面板的「Termux 运行」行）；恢复完成
+    // （mcpRecovering 变 null）即停。
+    LaunchedEffect(state.mcpRecovering) {
+        if (state.mcpRecovering == null) return@LaunchedEffect
+        TermuxStallTracker.refresh(context)
+        while (true) {
+            delay(2_500)
+            TermuxStallTracker.refresh(context)
         }
     }
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -506,6 +520,21 @@ fun ChatScreen(
                             termuxStall.status !is TermuxStatus.Ready,
                         stallSince = state.termuxStallSince,
                         status = termuxStall.status,
+                        glass = glass,
+                        rootCoords = { rootCoords },
+                    )
+                    // MCP host 恢复面板：mcp.recover_host 在途（mcpRecovering
+                    // 非 null）时显示恢复阶梯（Termux 运行 → host 进程 →
+                    // 工具注册）；恢复协程完成即收起——成功路径 Rust 装饰器
+                    // 同名重发、结果无感回填；失败路径原因已并入工具错误。
+                    // 与 TermuxStallBanner 独立并存（HostTool 兜底停滞与 MCP
+                    // 死亡自愈分属两条链路，极端并存时两面板堆叠）。
+                    val mcpRecover by RuntimeBridge.mcpRecoverPhase.collectAsState()
+                    McpRecoverBanner(
+                        visible = state.mcpRecovering != null,
+                        since = state.mcpRecovering,
+                        phase = mcpRecover,
+                        termux = termuxStall.status,
                         glass = glass,
                         rootCoords = { rootCoords },
                     )
@@ -1985,6 +2014,141 @@ private fun TermuxStallBanner(
                             modifier = Modifier.padding(top = 2.dp),
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * MCP host 恢复面板：mcp.recover_host 在途（mcpRecovering 非 null）时
+ * 悬浮在输入区上方（与 TermuxStallBanner 同列同语言：磨砂玻璃面板 +
+ * StatusChecklist 检查清单）。行集合 = MCP 恢复阶梯（Termux 运行 →
+ * host 进程 → 工具注册）：
+ * - 「Termux 运行」行融合 TermuxStallTracker 的周期探测结论（恢复期间
+ *   聊天页 2.5s 重探，沿用 stall 面板范式——卡点/引导文案复用其状态）；
+ * - 「host 进程」「工具注册」行由恢复协程的 [McpRecoverPhase] 阶梯驱动。
+ * 恢复完成（成功或失败）mcpRecovering 清零 → AnimatedVisibility 自动
+ * 收起：成功路径 Rust 装饰器经注册表同名重发、结果无感回填；失败路径
+ * 原因已并入工具错误（工具卡片与模型可见）。
+ */
+@Composable
+private fun McpRecoverBanner(
+    visible: Boolean,
+    since: Long?,
+    phase: McpRecoverPhase,
+    termux: TermuxStatus,
+    glass: Glass,
+    rootCoords: () -> LayoutCoordinates?,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
+        exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
+    ) {
+        // 已等待秒数（每秒跳一次；恢复起始时刻换新则重算）。
+        var waitedSec by remember(since) { mutableStateOf(0) }
+        LaunchedEffect(since) {
+            if (since == null) return@LaunchedEffect
+            while (true) {
+                waitedSec =
+                    ((System.currentTimeMillis() - since) / 1000).toInt().coerceAtLeast(0)
+                delay(1_000)
+            }
+        }
+        // 检查记录行集合：恢复阶梯三行（阶梯短路语义 = 前置项通过才轮到
+        // 当前步；未轮到的行保持 Pending 不抢注意力）。
+        val rows = buildList {
+            add(
+                StatusCheckRow(
+                    state = when {
+                        // 阶梯已过 Termux 步（进入 host/重载）= 通道已确认。
+                        phase.step == McpRecoverStep.HOST || phase.step == McpRecoverStep.RELOAD ->
+                            StatusCheckState.Done
+                        phase.step == McpRecoverStep.TERMUX -> when (termux) {
+                            is TermuxStatus.NotInstalled, is TermuxStatus.NoPermission ->
+                                StatusCheckState.Failed
+                            else -> StatusCheckState.InProgress
+                        }
+                        // 探活中：spinner 占位（host 活着则直接跳过本步）。
+                        else -> StatusCheckState.InProgress
+                    },
+                    title = "Termux 运行",
+                    summary = when (termux) {
+                        is TermuxStatus.ChannelDown -> "${termux.summary}；正在自动拉起"
+                        is TermuxStatus.NotInstalled ->
+                            "MCP host 依赖 Termux；安装后经设置页一键安装 host"
+                        is TermuxStatus.NoPermission ->
+                            "系统设置 → 应用 → OpenSlate → 权限，或经 Shizuku 授予"
+                        else -> null
+                    },
+                ),
+            )
+            add(
+                StatusCheckRow(
+                    state = when (phase.step) {
+                        McpRecoverStep.PROBE, McpRecoverStep.TERMUX -> StatusCheckState.Pending
+                        McpRecoverStep.HOST -> StatusCheckState.InProgress
+                        McpRecoverStep.RELOAD -> StatusCheckState.Done
+                    },
+                    title = "host 进程",
+                    summary = if (phase.step == McpRecoverStep.HOST) phase.detail else null,
+                ),
+            )
+            add(
+                StatusCheckRow(
+                    state = when (phase.step) {
+                        McpRecoverStep.RELOAD -> StatusCheckState.InProgress
+                        else -> StatusCheckState.Pending
+                    },
+                    title = "工具注册（热重载）",
+                    summary = if (phase.step == McpRecoverStep.RELOAD) phase.detail else null,
+                ),
+            )
+        }
+        Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+            GlassPanel(
+                glass = glass,
+                rootCoords = rootCoords,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .shadow(elevation = 2.dp, shape = RoundedCornerShape(16.dp), clip = false),
+                shape = RoundedCornerShape(16.dp),
+                tint = MaterialTheme.colorScheme.surfaceVariant.copy(
+                    alpha = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0.6f else 0.92f,
+                ),
+                border = true,
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                ) {
+                    // 标题行：面板身份 + 已等待计数（阶梯无关的不变量）。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Outlined.Autorenew,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.tertiary,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("MCP host 恢复", style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "已等待 ${waitedSec}s",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
+                    // 检查记录主体：三行恢复阶梯映射（见上方 rows 构建）。
+                    StatusChecklist(rows = rows, modifier = Modifier.padding(top = 8.dp))
+                    Text(
+                        "正在恢复 MCP 服务，完成后工具调用将自动继续…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
                 }
             }
         }

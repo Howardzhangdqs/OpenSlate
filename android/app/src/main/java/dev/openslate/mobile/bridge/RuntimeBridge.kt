@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.openslate.mobile.EventCallback
@@ -332,6 +333,12 @@ data class RuntimeUiState(
     /** termux 命令发出 0.5s 仍无应答的最早时刻（null = 无 stall）。非 null
      *  时聊天页显示"Termux 未响应"横幅，UI 可据此换算已等待秒数。 */
     val termuxStallSince: Long? = null,
+    /** MCP host 恢复中：本轮恢复起始时刻（null = 无恢复）。非 null 时
+     *  聊天页显示「MCP host 恢复」面板（Termux 运行 → host 进程 → 工具
+     *  注册阶梯，见 RuntimeBridge.handleMcpRecoverHost；与 termuxStallSince
+     *  独立字段互不打架——前者覆盖 HostTool 兜底路径的 RUN_COMMAND 停滞，
+     *  本字段覆盖 MCP 路径的 host 死亡自愈，极端并存时两面板堆叠展示）。 */
+    val mcpRecovering: Long? = null,
     /** run 标题异步生成完成的版本号（run_title 事件递增）。历史会话页
      *  观察它做增量刷新——LLM 标题通常在首条消息后几秒到达，此时
      *  列表里的占位标题需要原位替换。 */
@@ -404,6 +411,15 @@ data class RegistryEntryUi(
 /** registry 搜索结果：total = 匹配总数，results 截断到 limit。 */
 data class RegistrySearchUi(val total: Int, val results: List<RegistryEntryUi>)
 
+/** MCP 恢复阶梯当前步（恢复面板行渲染；驱动方 = RuntimeBridge 恢复协程）。 */
+internal enum class McpRecoverStep { PROBE, TERMUX, HOST, RELOAD }
+
+/** MCP 恢复快照：step = 当前步；detail = 该步说明（面板副文本）。 */
+internal data class McpRecoverPhase(
+    val step: McpRecoverStep = McpRecoverStep.PROBE,
+    val detail: String? = null,
+)
+
 object RuntimeBridge {
 
     private const val TAG = "OpenSlateBridge"
@@ -447,6 +463,16 @@ object RuntimeBridge {
      *  原子，交错会让 HostTool 交接序列短暂纠缠（下次 reload 可自愈，
      *  此处串行化消除放大）。 */
     private val reloadMcpMutex = Mutex()
+
+    /** MCP host 恢复单飞（Kotlin 侧，与 Rust 侧单飞闩 + 冷却互补）：
+     *  mcp.recover_host 请求串行化——排队期间已有一轮完成的等待者只做
+     *  轻量复检后直接 resolve（不重走拉起阶梯）。round 由本闩守卫。 */
+    private val mcpRecoverMutex = Mutex()
+    private var mcpRecoverRound = 0L
+
+    /** 恢复面板阶梯快照（ChatScreen 订阅；恢复协程驱动，非探测驱动）。 */
+    private val _mcpRecoverPhase = MutableStateFlow(McpRecoverPhase())
+    internal val mcpRecoverPhase: StateFlow<McpRecoverPhase> = _mcpRecoverPhase.asStateFlow()
 
     private fun recordToolOutput(name: String, output: String) {
         pendingToolOutputs.getOrPut(name) { java.util.concurrent.ConcurrentLinkedDeque() }.add(output)
@@ -2286,7 +2312,8 @@ object RuntimeBridge {
      * 壳）经 RUN_COMMAND intent 在 Termux 执行、结果 PendingIntent 回传。
      * 工具名三种形态：termux.run（历史）/ termux_bash（双选）/ bash
      * （仅选 termux 时 HostTool 顶替名——MCP 接管后同名工具走 MCP
-     * 路径，不会到这）。其余显式 unsupported。
+     * 路径，不会到这）。mcp.recover_host = MCP host 死亡自愈通道（Rust
+     * 装饰器发起）。其余显式 unsupported。
      */
     private fun handleHostCall(obj: JSONObject) {
         val id = obj.optLong("id")
@@ -2303,6 +2330,7 @@ object RuntimeBridge {
             "termux.run", "termux_bash", "bash" ->
                 runInTermux(runtime, id, tool, obj.optJSONObject("args")?.optString("command") ?: "")
             "ask_user" -> handleAskUser(id, obj)
+            "mcp.recover_host" -> handleMcpRecoverHost(runtime, id, obj)
             else -> runtime.resolveHostCall(
                 id.toULong(), false,
                 "host tool '$tool' not implemented in Phase 1",
@@ -2348,6 +2376,130 @@ object RuntimeBridge {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * mcp.recover_host：MCP host 死亡自愈的宿主侧阶梯（Rust 装饰器
+     * RecoveringMcpTool 在 MCP 工具连接失败签名后单飞发起）。
+     *
+     * 阶梯：点亮恢复面板（mcpRecovering）→ hostAliveDetail 探活 →
+     * 不活则确保 Termux 通道（probeTermux；通道死先 startTermuxApp
+     * 前台拉起再复检，参照 prewarm 的复检节奏）→ restartHost（kill 旧
+     * 进程 + nohup 拉起 + 端口轮询）→ reloadMcpServers 热换工具 →
+     * resolve(true, {reloaded, message})。彻底失败（Termux 未装 /
+     * host 未安装 / 通道无应答 / reload 失败）resolve(false, reason)，
+     * Rust 侧把原因并进工具错误（模型可见，非死端）。
+     *
+     * 单飞（mcpRecoverMutex，与 Rust 侧单飞闩互补）：恢复中再来的请求
+     * 排队等同一轮完成后只做轻量复检（host 在线即 resolve ok）直接
+     * resolve，不重走拉起阶梯。全程 IO 线程；恢复面板在 finally 收起。
+     */
+    private fun handleMcpRecoverHost(runtime: OpenSlateRuntime, id: Long, obj: JSONObject) {
+        val ctx = appContext
+        if (ctx == null) {
+            runtime.resolveHostCall(id.toULong(), false, "mcp.recover_host: no app context")
+            return
+        }
+        val failingTool = obj.optJSONObject("args")?.optString("failing_tool").orEmpty()
+        scope.launch(Dispatchers.IO) {
+            val entryRound = mcpRecoverMutex.withLock { mcpRecoverRound }
+            val (ok, message) = mcpRecoverMutex.withLock {
+                val sharedRound = mcpRecoverRound > entryRound
+                runMcpRecoveryLadder(ctx, failingTool, sharedRound)
+                    .also { mcpRecoverRound += 1 }
+            }
+            if (ok) {
+                runtime.resolveHostCall(
+                    id.toULong(), true,
+                    JSONObject().put("reloaded", true).put("message", message).toString(),
+                )
+            } else {
+                runtime.resolveHostCall(id.toULong(), false, message)
+            }
+        }
+    }
+
+    /**
+     * 恢复阶梯本体（IO；mcpRecoverMutex 内调用）。返回 (ok, message)；
+     * ok=true 时 Rust 装饰器将经注册表无感重发原工具调用。面板点亮/
+     * 收起在本函数 try/finally 内闭环（失败也收起——原因已并入工具
+     * 错误，模型与工具卡片可见）。
+     */
+    private suspend fun runMcpRecoveryLadder(
+        ctx: Context,
+        failingTool: String,
+        sharedRound: Boolean,
+    ): Pair<Boolean, String> {
+        val appCtx = ctx.applicationContext
+        mutate { copy(mcpRecovering = System.currentTimeMillis()) }
+        try {
+            if (sharedRound) {
+                // 排队期间已有一轮完成：注册表已被那轮 reload 刷新（或那轮
+                // 已失败），轻量复检后直接 resolve，不重走拉起阶梯。
+                val (alive, detail) = McpHostManager.hostAliveDetail(appCtx)
+                return if (alive) {
+                    Log.i(TAG, "mcp.recover_host: 共享恢复轮（host 在线，$detail）")
+                    true to "shared recovery round (host alive, $detail)"
+                } else {
+                    false to "MCP host 仍不在线（$detail）；上一轮恢复未奏效"
+                }
+            }
+            _mcpRecoverPhase.value = McpRecoverPhase(
+                McpRecoverStep.PROBE,
+                if (failingTool.isEmpty()) "探活 MCP host…"
+                else "探活 MCP host（${failingTool} 调用失败触发）…",
+            )
+            val (alive, detail) = McpHostManager.hostAliveDetail(appCtx)
+            if (alive) {
+                Log.i(TAG, "mcp.recover_host: host 在线（$detail），直接热重载")
+            } else {
+                Log.i(TAG, "mcp.recover_host: host 不在线（$detail），进入恢复阶梯")
+                // ── 阶梯 1：Termux 运行 ──
+                _mcpRecoverPhase.value = McpRecoverPhase(McpRecoverStep.TERMUX, "确认 Termux 通道…")
+                if (!TermuxExec.isTermuxInstalled(appCtx)) {
+                    return false to "Termux 未安装：MCP host 依赖 Termux 运行（设置页 → MCP 一键安装）"
+                }
+                var probe = withTimeoutOrNull(20_000) { McpHostManager.probeTermux(appCtx) }
+                    ?: Triple(false, false, "通道 20s 无应答")
+                if (!probe.first) {
+                    // 通道死：先拉起 Termux 应用（前台冷启动最稳；RUN_COMMAND
+                    // 在进程被杀但非 stopped 时也能自动冷启，这里统一先拉前台
+                    // 再复检一次）。
+                    McpHostManager.startTermuxApp(appCtx)
+                    probe = withTimeoutOrNull(20_000) { McpHostManager.probeTermux(appCtx) }
+                        ?: Triple(false, false, "拉起后通道仍 20s 无应答")
+                }
+                val (allowed, hostInstalled, probeDetail) = probe
+                if (!allowed) {
+                    return false to "Termux 通道无应答（$probeDetail）：请手动打开 Termux 后重试"
+                }
+                if (!hostInstalled) {
+                    return false to "MCP host 未安装（~/.openslate/mcp-host 缺失）：请到设置页「MCP」一键安装"
+                }
+                // ── 阶梯 2：host 进程 ──
+                _mcpRecoverPhase.value = McpRecoverPhase(McpRecoverStep.HOST, "重启 MCP host…")
+                try {
+                    McpHostManager.restartHost(appCtx) { Log.i(TAG, "mcp.recover_host｜$it") }
+                } catch (t: Throwable) {
+                    return false to "host 重启失败：${t.message ?: t.javaClass.simpleName}"
+                }
+            }
+            // ── 阶梯 3：工具注册（热重载）──
+            _mcpRecoverPhase.value = McpRecoverPhase(McpRecoverStep.RELOAD, "热重载 MCP 工具…")
+            val reload = reloadMcpServers()
+                ?: return false to "runtime 未就绪，无法热重载 MCP 工具"
+            val envelope = runCatching { JSONObject(reload) }.getOrNull()
+            return if (envelope?.optBoolean("ok", false) == true) {
+                val tools = envelope.optInt("tools", 0)
+                Log.i(TAG, "mcp.recover_host: 恢复完成，重载 $tools 个工具")
+                true to "host 已恢复，$tools 个 MCP 工具已重载"
+            } else {
+                false to "热重载失败：${envelope?.optString("error")?.take(200) ?: reload.take(200)}"
+            }
+        } finally {
+            _mcpRecoverPhase.value = McpRecoverPhase()
+            mutate { copy(mcpRecovering = null) }
         }
     }
 

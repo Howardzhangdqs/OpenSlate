@@ -21,7 +21,7 @@ Kotlin (UniFFI callback)◄──EventSink(单队列+泵线程)──┐
 MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ──► LLM
 ```
 
-## 2. 模块一览（9 个模块 + lib.rs）
+## 2. 模块一览（10 个模块 + lib.rs）
 
 | 模块 | 行数 | 关键导出 | 职责 |
 |------|------|---------|------|
@@ -29,6 +29,7 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/bootstrap.rs` | 396 | `MobilePaths` | 宿主注入的 4 个路径；首启目录脚手架 + 默认配置；DB 路径归位 |
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
 | `src/hostcall.rs` | 447 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`call_with_id`（自定义超时，ask_user 先例）；`HostTool::with_timeout`（超时覆盖 builder——termux 壳用，见 exec.rs）；`fail_all` 对 ask_user 豁免（持久化恢复） |
+| `src/mcp_recovery.rs` | — | `RecoveringMcpTool`、`RecoveryCtx`、`MCP_RECOVER_HOST_TOOL`、`is_mcp_connection_failure` | MCP host 死亡自愈：外部 MCP 工具的恢复装饰器（连接失败签名 → 单飞恢复 host call `mcp.recover_host` → 注册表同名重发一次）；`RecoveryCtx` = 单飞闩 + 完成代数 + 冷却窗口（10s）+ 注册表弱引用；重试预算 = 1（task-local 重入标记）；包装点两处（create_with 装配期 `wrap_mcp_tools` / reload_mcp scratch 迁移期），见 call-chains.md §3.1.2 |
 | `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`AskUserExemptApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、Manual 审批豁免（见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
 | `src/secrets.rs` | — | `PersistentSecretVault`、`env_source`、`mask_with_known_values` | ask_user secret 子系统：会话内存 + store v4 `credentials` 持久镜像两级凭据库、env 注入源、file 写入（0600）、脱敏值源（见 [04-tools/ask-user.md §8](../04-tools/ask-user.md)） |
 | `src/exec.rs` | 940 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1）；termux HostTool 壳专用超时 `TERMUX_HOST_CALL_TIMEOUT` = **900s**（停滞期间 Kotlin 侧等待连接 + 重发续跑，见 android-app.md / call-chains.md §3.1.1；配套 Kotlin `HARD_WAIT_TIMEOUT_MS` = 880s） |
@@ -60,7 +61,7 @@ pub fn set_mcp_host_token(token: &str) {
 
 ### 3.2 `MobileRuntime` 结构与装配链（runtime.rs:61-174）
 
-字段：`rt: Mutex<Option<tokio::Runtime>>`（shutdown_timeout 要消费所有权，单次取用）、`state: Arc<AppState>`、`sink: Arc<EventSink>`、`secrets: Arc<MobileSecrets>`、`host_router: Arc<HostCallRouter>`、`registry: Arc<ToolRegistry>`（bash 工具热换名）、`model_registry: Arc<RegistryStore>`、`workspace_dir: PathBuf`、`exec_selection: ExecSelectionCell`、`bash_env: EnvSource`（ask_user secret env 注入源，热切换/重载随工具传递）、`ask: Arc<AskUserContext>`、`shutdown_flag: AtomicBool`。
+字段：`rt: Mutex<Option<tokio::Runtime>>`（shutdown_timeout 要消费所有权，单次取用）、`state: Arc<AppState>`、`sink: Arc<EventSink>`、`secrets: Arc<MobileSecrets>`、`host_router: Arc<HostCallRouter>`、`registry: Arc<ToolRegistry>`（bash 工具热换名）、`model_registry: Arc<RegistryStore>`、`workspace_dir: PathBuf`、`exec_selection: ExecSelectionCell`、`bash_env: EnvSource`（ask_user secret env 注入源，热切换/重载随工具传递）、`ask: Arc<AskUserContext>`、`mcp_recovery: Arc<mcp_recovery::RecoveryCtx>`（host 死亡自愈共享上下文：单飞闩 + 冷却 + 注册表弱引用，reload_mcp 迁移新工具时复用）、`shutdown_flag: AtomicBool`。
 
 `create_with()`（runtime.rs:90-174）装配顺序，**不要打乱**：
 
@@ -74,7 +75,7 @@ pub fn set_mcp_host_token(token: &str) {
 8. `RegistryStore::new(&paths.config_dir)`；
 9. 构建 tokio runtime：**multi_thread、worker_threads=2、线程名 `openslate-mobile`**（runtime.rs:133-138）；
 10. `rt.block_on(assemble_state(...))`（见 §3.6）；随后 `ask_ctx.wire(&state)` + QuestionHandler 装配 + **`vault.attach_store(store)`**（加载持久凭据镜像）+ **`push_secret_masker`**（输出脱敏闭包：`[ask_user] mask_secrets` 短路 + vault 已知值打码，见 ask-user.md §8.4）；
-11. 从 state 取出运行期 `ToolRegistry` → **重算 MCP bash 接管**（统一谓词，MCP 已接管的名字 HostTool/native 让位）→ `register_bash_tools(默认 native-only, env, mcp_owned)`；
+11. 从 state 取出运行期 `ToolRegistry` → **重算 MCP bash 接管**（统一谓词，MCP 已接管的名字 HostTool/native 让位）→ `register_bash_tools(默认 native-only, env, mcp_owned)` → **MCP 名册包恢复装饰器**（`RecoveryCtx::new(router, registry)` + `wrap_mcp_tools`：host 死亡自愈，见 mcp_recovery.rs / call-chains.md §3.1.2）；
 12. `emit_snapshot()` —— **create 即握手**：进程内单客户端（`MOBILE_CONN_ID=1`），创建即推首份 snapshot。
 
 ### 3.3 各方法语义（含行号）
@@ -247,10 +248,10 @@ MCP 聚合 host 在线时，其内置 BashServer 以裸名 `bash` 列工具，�
 | 选择点 | 行为 |
 |--------|------|
 | 装配期（`create_with`） | assemble_state 注册外部 MCP 后重算 → `register_bash_tools(…, mcp_owned)` 让位 |
-| `reload_mcp` | **先让位再 swap**：新名册含 bash 域名且注册表正被 host bash 工具占着 → 备份 Arc 后先卸载，再 try_register（修掉撞名整体回滚死锁——否则 MCP 永远接管不了）；swap 成功后重算（接管保持 / MCP 缺席 HostTool 回装兜底）；撞真冲突（bash 域外，如 `mobile.ping`）回滚时让位的工具原样装回；全败保旧路径注册表不动 → 兜底天然在场 |
+| `reload_mcp` | **先让位再 swap**：新名册含 bash 域名且注册表正被 host bash 工具占着 → 备份 Arc 后先卸载，再 try_register（修掉撞名整体回滚死锁——否则 MCP 永远接管不了）；swap 成功后重算（接管保持 / MCP 缺席 HostTool 回装兜底）；撞真冲突（bash 域外，如 `mobile.ping`）回滚时让位的工具原样装回；全败保旧路径注册表不动 → 兜底天然在场；scratch 迁移的新工具逐个**包恢复装饰器**（`SharedTool(Arc<RecoveringMcpTool>)`，host 死亡自愈的 reload 期包装点） |
 | `set_exec_backends` | 切后端前重算（名册 = `mcp_tool_names` 快照，模板读最新落盘）——修掉旧实现「切后端 = 无条件 unregister 全部 bash 名」对 MCP bash 工具的误杀 |
 
-运行期 host 死亡**不做工具热切换**（模型工具列表已进上下文）：`McpTool::execute` 失败语义 = `ExecutionError` 带工具名（回合可继续），修复入口是显式 `reload_mcp`。接管/兜底的交接只在上述三个选择点发生。
+运行期 host 死亡**不做工具热切换**（模型工具列表已进上下文）：`McpTool::execute` 失败语义 = `ExecutionError` 带工具名（回合可继续）。但连接失败签名（`call failed: Transport send error` / `Transport closed`）会被 **mcp_recovery 的恢复装饰器**接管：单飞 `mcp.recover_host` host call → Kotlin 恢复阶梯（拉起 Termux/host + `reload_mcp`）→ 注册表同名重发一次（预算 1），模型无感（见 call-chains.md §3.1.2）；reload 迁移的新工具同样重新包上装饰器。接管/兜底的交接只在上述三个选择点发生。
 
 termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`（RUN_COMMAND 兜底），MCP 注册名 = builtin 模板展开（默认 `termux_bash`、自定义如 `{prefix}.{tool}` → `termux.bash`）——白名单 `bash` / `termux_bash` 两者在默认模板下都有实体，历史配置零变动。
 

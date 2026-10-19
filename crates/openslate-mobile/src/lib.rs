@@ -27,6 +27,7 @@ pub mod bootstrap;
 pub mod events;
 pub mod exec;
 pub mod hostcall;
+pub mod mcp_recovery;
 pub mod provider;
 pub mod registry;
 pub mod runtime;
@@ -36,6 +37,7 @@ pub use bootstrap::MobilePaths;
 pub use events::{EventCallback, EventSink, MOBILE_CONN_ID};
 pub use exec::{ExecSelection, ExecSelectionCell, NativeShellTool};
 pub use hostcall::{HostCallRouter, HostTool};
+pub use mcp_recovery::{RecoveryCtx, RecoveringMcpTool, MCP_RECOVER_HOST_TOOL};
 pub use runtime::{MobileRuntime, RuntimeOptions};
 pub use secrets::PersistentSecretVault;
 

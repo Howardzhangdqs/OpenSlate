@@ -100,8 +100,8 @@ ChatScreen Composer
   → MCP over HTTP（127.0.0.1:8765，Authorization: Bearer token）
   → host 路由裸名 → BashServer 在 Termux 内执行（$PREFIX/bin/bash）
   → CallToolResult → ToolOutput（连接失败 = ExecutionError 带工具名，
-    回合可继续；运行期 host 死亡不做工具热切换——工具列表已进上下文，
-    修复入口 = 设置页「重载 MCP」/ 健康态门控自动触发 reloadMcpServers）
+    回合可继续；运行期 host 死亡经装饰器自动自愈 + 无感重试——见
+    §3.1.2「MCP host 死亡自愈」，工具列表不热换、模型无感）
 
 兜底路径（HostTool 壳，host 缺席时）
   即 §3 的 host call 往返（RUN_COMMAND Intent 逐命令桥接）
@@ -182,15 +182,86 @@ Termux 未启动/被冻结/停止态时，RUN_COMMAND 的结果 PendingIntent �
 
 边界与现状：
 
-- **MCP 路径不在此链路**：host 在线时 bash 走 MCP over HTTP，host 死亡
-  = ExecutionError 直回模型（回合可继续），无停滞面板/重发——运行期
-  host 死亡不做工具热切换（见 §3.1），修复入口 = 设置页「重载 MCP」/
-  健康态门控自动 reloadMcpServers。停滞面板只覆盖 HostTool 兜底路径
-  （host 缺席时的 RUN_COMMAND 桥接）。
+- **MCP 路径不在此链路**：host 在线时 bash 走 MCP over HTTP；host 死亡
+  由 §3.1.2 的自愈装饰器接管（连接失败签名 → 单飞恢复 → 无感重试），
+  无停滞面板/重发。停滞面板只覆盖 HostTool 兜底路径（host 缺席时的
+  RUN_COMMAND 桥接）。
 - 跨进程重启的停滞挂起**不持久化**（二期限定）：App 进程被杀则等待中的
   命令随 deferred 消失，重启后无续跑。
 - turn 取消 / runtime 关停照旧：`TermuxExec.cancelAll`（等待模式一并
   清理）+ Rust `fail_all`。
+
+### 3.1.2 MCP host 死亡自愈（装饰器 → 单飞 host call → Kotlin 恢复阶梯 → 无感重试）
+
+MCP host（Termux 聚合 host，HTTP 127.0.0.1:8765）中途被杀时，原行为是
+`McpTool::execute` 向模型返回「call failed: Transport …」死端错误。现由
+`crates/openslate-mobile/src/mcp_recovery.rs` 的 `RecoveringMcpTool` 装饰器
+把这条错误变成一次自愈循环，**模型看不到死端错误，体感与 host 一直在线
+一致**：
+
+```text
+错误签名分类（mcp_recovery::is_mcp_connection_failure）
+  McpTool Err(ExecutionError) 文案含「call failed: Transport send error」
+  /「call failed: Transport closed」= 连接层失败（host 进程死的确定性信号）
+  → 进入自愈；「timed out after 300s」有意不纳入（挂死型超时与合法慢
+    调用无法区分，误重启会杀掉在途合法工作）；MCP 业务失败走
+    Ok(status=Error) 不经此路径（装饰器原样透传）
+
+自愈循环（RecoveringMcpTool::execute）
+  inner.execute(args)                    [旧 McpTool，连接已死，Err 且命中签名]
+  → RecoveryCtx::run_recovery            [单飞闩 + 冷却，所有装饰器共享一份 ctx]
+      └ HostCallRouter::call_with_id(id, "mcp.recover_host",
+            {failing_tool, reason}, 900s)     [照 exec.rs / ask_user 超时先例]
+  → Kotlin RuntimeBridge.handleHostCall → handleMcpRecoverHost（IO 线程，
+      mcpRecoverMutex 单飞，与 Rust 侧互补）
+      1. 点亮恢复面板（UiState.mcpRecovering + mcpRecoverPhase 阶梯：
+         PROBE → TERMUX → HOST → RELOAD；聊天页 McpRecoverBanner，行集 =
+         Termux 运行 → host 进程 → 工具注册，恢复期间沿用 TermuxStallTracker
+         2.5s 周期重探范式喂「Termux 运行」行）
+      2. hostAliveDetail 探活 → 活着直接跳 reload（传输层瞬时断裂场景）
+      3. 不活：Termux 通道确认（probeTermux，20s 截断；通道死先
+         startTermuxApp 前台拉起再复检一次）→ restartHost（kill 旧进程 →
+         nohup/setsid 拉起 → ~8s 端口轮询 → wake-lock）
+      4. reloadMcpServers()（既有 reloadMcpMutex 串行；热重载 = Rust 侧
+         reload_mcp，新工具经 scratch 迁移时**重新包上恢复装饰器**）
+      5. resolve(id, ok, {reloaded, tools} / reason)；面板收起
+  → 恢复 Ok → registry.execute(同名同参) 重发一次
+      [reload 后注册表里是新装饰器/新 McpTool；未换新时重入被 task-local
+        标记（RETRY_INVOCATION）挡回原始错误，预算不超]
+  → 结果无感回填：tool_call↔result 配对不破、审计一次执行（duration 含
+    恢复等待）、模型零感知
+```
+
+状态机三要素（并行批 / 冷却 / 预算）：
+
+| 机制 | 实现位置 | 语义 |
+|------|---------|------|
+| **单飞恢复闩** | `RecoveryCtx.latch`（tokio Mutex）+ `generation`（仅成功 +1） | 同一时刻至多一轮恢复在途；并行批多个 MCP 工具同时失败时后到者排队，拿到闩时代数已前进即**共享**该轮（不发自己的 host call），直接进入重试 |
+| **冷却窗口** | `last_finished`（无论成败）+ 10s | 一轮完成后窗口内的后续失败不再发起 host call（`Suppressed`），但仍给一次注册表重试（上一轮成功刷新过的注册表值得再试） |
+| **重试预算 = 1** | `RETRY_INVOCATION` task-local 标记 | 每次用户可见调用至多经注册表重发一次；重发期间的重入（reload 未换新装饰器）直接上抛原始错误，附「recovery attempted」指引文案 |
+
+失败兜底：恢复 host call 被 resolve false（如 Termux 未安装 / host 未装 /
+reload 失败）/ 超时 / `fail_all` → 返回**原始错误**并附一行恢复动作说明
+（模型可据此换路径，而非死端）。
+
+包装点两处（与 `SharedTool`/备份回滚语义正交）：
+
+- 装配期：`create_with` 在 `register_bash_tools` 后对 MCP 名册整体包一层
+  （`wrap_mcp_tools`，register 覆盖式原子换入，对在途调用零影响）；
+- reload 期：`reload_mcp` 第 4 步 scratch 迁移时逐工具包
+  （`SharedTool(Arc<RecoveringMcpTool>)`；回滚装回的旧 Arc 本就是已包装
+  装饰器，不双层包装）。
+
+边界：
+
+- **300s 挂死型超时不自愈**（签名取舍，见上）；此类仍走原超时错误。
+- **跨进程重启不持久化**：App 进程被杀则挂起的恢复/重试随 future 消失
+  （host call 通道已不存在）；重启后由装配期重连自愈。
+- Kotlin 侧单飞（`mcpRecoverMutex` + round 计数）：恢复中再来的请求排队
+  等同一轮完成后只做轻量复检（host 在线即 resolve ok）直接 resolve，
+  不重走拉起阶梯。
+- 语义兼容：挂起期间 LLM 预算不计 tool 时间、turn 取消 drop future、
+  host call 有 900s 超时 + `fail_all` 兜底。
 
 ### 3.2 ask_user（Agent 向用户提问，UI 全链路）
 

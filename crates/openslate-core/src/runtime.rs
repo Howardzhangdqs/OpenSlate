@@ -716,7 +716,7 @@ pub async fn execute_run(
                     let args_display = truncate_str(&args_str, 120);
 
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_start(&tc.name, args_display);
+                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str));
                     } else {
                         tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                     }
@@ -849,7 +849,7 @@ pub async fn execute_run(
                     let args_str = tc.arguments.to_string();
                     let args_display = truncate_str(&args_str, 120);
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_start(&tc.name, args_display);
+                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str));
                     } else {
                         tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                     }
@@ -1059,6 +1059,18 @@ pub async fn execute_run(
                 },
             ));
         }
+    }
+}
+
+/// tool_start 事件携带的参数：ask_user 全量下发（Android 已答回看页凭
+/// tool_start args 重建完整问卷结构；该工具经 schema 校验 ≤4 题、体积有
+/// 界），其余工具维持 120 字符预览（write 等大参数工具防事件洪泛）。日
+/// 志路径仍用截断预览。
+fn tool_args_for_event<'a>(name: &str, args_str: &'a str) -> &'a str {
+    if name == "ask_user" {
+        args_str
+    } else {
+        truncate_str(args_str, 120)
     }
 }
 

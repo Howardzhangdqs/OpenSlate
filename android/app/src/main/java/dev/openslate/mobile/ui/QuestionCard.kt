@@ -124,7 +124,7 @@ import kotlinx.coroutines.launch
 
 /**
  * 题目是否「已处理」：choice ≥1 选中（选「其他」时说明非空）；text 非空白；
- * confirm 已选定一侧；secret 非空白；跳过 / 逐题不答视为已处理。
+ * confirm 已选定一侧；secret 非空白；跳过此题（optional→skipped，必答→declined）视为已处理。
  * 未知题型按 text 兜底（不崩、不吞题）。
  */
 internal fun isQuestionProcessed(q: QuestionUi, d: QuestionDraft): Boolean = when {
@@ -266,6 +266,18 @@ internal fun QuestionCardHost(
     ) {
         AnimatedContent(
             targetState = view,
+            // contentKey 必须是稳定身份（requestId / 终态种类），绝不能是含 drafts
+            // 的数据类本身：否则每次草稿更新（勾选/输入/跳过）都被视为换目标 →
+            // 整棵问卷子树拆掉重建 + 交叉淡替（闪一下），BasicTextField 失焦丢
+            // 输入、Pager/滚动状态全重置。Interactive 期间草稿变化只重组不换树。
+            contentKey = { v ->
+                when (v) {
+                    is AskCardView.Interactive -> "interactive-${v.p.requestId}"
+                    is AskCardView.Answered -> "answered"
+                    is AskCardView.Terminal -> "terminal-${v.kind}"
+                    AskCardView.Waiting -> "waiting"
+                }
+            },
             transitionSpec = { (fadeIn(tween(200)) togetherWith fadeOut(tween(200))) },
             label = "askCard",
         ) { v ->
@@ -622,6 +634,10 @@ private fun QuestionHeaderRow(
  * 题区 Pager（内联 / 全屏共用）。页内容统一包一层 Box：底缘渐隐条需
  * [Alignment.BottomCenter] 贴页底（平铺在页 scope 会叠到页顶）。
  *
+ * [modifier] 作用于 Pager 本体：全屏传 `fillMaxSize()` 保证题区吃满 weight
+ * 给定的高度（页视口约束确定，首帧即组合页面）；内联缺省保持包裹语义
+ * （题区高度随内容、上限由外层 heightIn 控制）。
+ *
  * [onBodyOverflow] 上报各页内容是否超出可视高（内容变化时重报）；内联卡用其
  * 加重全屏按钮描边，全屏页不限高、用默认 no-op。
  */
@@ -633,8 +649,9 @@ internal fun AskQuestionPager(
     minLines: Int,
     onDraftChange: (Int, QuestionDraft) -> Unit,
     onBodyOverflow: (page: Int, overflows: Boolean) -> Unit = { _, _ -> },
+    modifier: Modifier = Modifier,
 ) {
-    HorizontalPager(state = pagerState, pageSpacing = 12.dp) { page ->
+    HorizontalPager(state = pagerState, modifier = modifier, pageSpacing = 12.dp) { page ->
         val q = p.questions[page]
         val draft = p.drafts[page]
         val scroll = rememberSaveable(q.id, saver = ScrollState.Saver) { ScrollState(0) }
@@ -687,10 +704,10 @@ private fun QuestionBody(
         "secret" -> SecretInputSection(q, draft, enabled, minLines = 1, onChange)
         else -> TextInputSection(q, draft, enabled, minLines, onChange) // text + 未知兜底
     }
-    // 逐题状态提示（跳过 / 不答后控件禁用，动作按钮变为撤销，见 Footer）。
+    // 逐题状态提示（跳过后控件禁用，动作按钮变为取消跳过，见 Footer）。
     if (draft.skipped || draft.declined) {
         Text(
-            if (draft.skipped) "已跳过此题" else "已选择不答此题",
+            "已跳过此题",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline,
         )
@@ -1120,27 +1137,24 @@ internal fun AskCardFooter(
     val submitting = p.phase == "submitting"
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        // 次要动作行：跳过（仅 optional）/ 此题不答（仅多题）。
+        // 次要动作行：跳过此题（多题时每题可跳；单题卡仅可选 题可跳——必答单题走整卡动作）。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (q.optional) {
+            if (p.questions.size > 1 || q.optional) {
+                val skippedAny = d.skipped || d.declined
                 TextAction(
-                    text = if (d.skipped) "取消跳过" else "跳过",
+                    text = if (skippedAny) "取消跳过" else "跳过此题",
                     onClick = {
                         RuntimeBridge.updateQuestionDraft(p.requestId, cur) {
-                            it.copy(skipped = !it.skipped, declined = false)
-                        }
-                    },
-                )
-            }
-            if (p.questions.size > 1) {
-                TextAction(
-                    text = if (d.declined) "撤销不答" else "此题不答",
-                    onClick = {
-                        RuntimeBridge.updateQuestionDraft(p.requestId, cur) {
-                            it.copy(declined = !it.declined, skipped = false)
+                            if (skippedAny) {
+                                it.copy(skipped = false, declined = false)
+                            } else if (q.optional) {
+                                it.copy(skipped = true, declined = false)
+                            } else {
+                                it.copy(declined = true, skipped = false)
+                            }
                         }
                     },
                 )
@@ -1148,7 +1162,7 @@ internal fun AskCardFooter(
             Spacer(Modifier.weight(1f))
             // 整卡 decline（labelMedium outline 色，点后二次确认）。
             TextAction(
-                text = "不回答",
+                text = "全部跳过",
                 onClick = { confirmDecline = true },
             )
         }
@@ -1219,14 +1233,14 @@ private fun TextAction(text: String, onClick: () -> Unit) {
 /** 整卡 decline 二次确认（AppDialog 骨架；确认键 error tint）。 */
 @Composable
 private fun DeclineConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    AppDialog(onDismiss = onDismiss, title = "不回答这组问题？") {
+    AppDialog(onDismiss = onDismiss, title = "全部跳过这组问题？") {
         Text(
             "Agent 会自行判断并继续，这组问题不再等待你作答。",
             style = MaterialTheme.typography.bodyMedium,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
             SoftButton(onClick = onDismiss) { Text("继续回答") }
-            SoftButton(onClick = onConfirm, tint = MaterialTheme.colorScheme.error) { Text("不回答") }
+            SoftButton(onClick = onConfirm, tint = MaterialTheme.colorScheme.error) { Text("全部跳过") }
         }
     }
 }

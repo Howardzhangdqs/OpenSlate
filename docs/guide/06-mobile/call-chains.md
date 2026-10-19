@@ -168,13 +168,58 @@ Rust 侧工具本体在 `crates/openslate-mobile/src/askuser.rs`（`AskUserTool`
 `pending_questions` 表（shutdown 的 `fail_all` 对 ask_user 豁免，见 §4.3）。
 重启后 `assemble_state` 用 keep-dangling 变体加载最近 run（悬挂的 ask_user
 assistant 消息不丢）→ `startup_question_maintenance`（TTL 24h 过期合成
-expired、已解决行关卷、其余保留可恢复）→ 快照 `pending_questions` 回放
-（`AskUserContext::snapshot_dtos`）→ UI 重现问卷卡。用户作答走
-`{"type":"question_reply","request_id":…,"action":"accept|decline","answers":…}`
-→ `MobileQuestionHandler`：在途 host call 先 resolve（即时路径）；否则原子
-关卷（首答者赢）→ 与即时路径**同一格式化函数**生成结果 →
-`RunManager::resume_from_tool_result` 补全原 tool call 的 tool result 并从该
-点续跑（迟到等价不变量：模型无法区分答案即时返回还是迟到补全）。
+expired；已解决行关卷——判定证据是恢复 history 里确有该 tool_call_id 的
+结果消息；其余保留可恢复，**含属于其它 run 的行**——恢复 history 查无其
+调用不构成「被取代」证据，不误关，迟到答案可补全、TTL 过期兜底）→ 无
+可恢复问卷时对尾部悬挂 assistant 执行经典 pop 丢弃，但以 store 为权威
+守卫（`may_pop_dangling_tail`）：尾部声明的 tool_call 仍有 pending 行引用
+则保留（补全点不可逆）；查询失败保守保留 → 快照 `pending_questions` 回放
+（`AskUserContext::snapshot_dtos`）。
+
+**Kotlin 消费端回放**（`RuntimeBridge.applySnapshot`）：
+
+- 转写解析时顺带收集 ask_user `tool_call` 条目的 `call_id`（仅 DB 重建
+  条目携带，live 恒缺省）→ `fullArgs` 关联表；
+- `pending_questions[]` 取**首个** `status=="pending"` 且可解析的行，经
+  `buildRestoredPendingQuestion`（internal 纯函数）重建
+  `PendingQuestionUi(restored=true)`：题目解析复用 host call 信封路径的
+  `parseAskUserQuestions`（DTO `questions` 即归一化题目数组，两处同构）、
+  `request_id`→requestId（= 原 host call id）、argsKey 按 `tool_call_id`
+  从关联表取（`QuestionCardHost` 凭 `argsKey==fullArgs` 出交互卡，查无则
+  退化等待行、提交仍可用）；
+- 回放**与 running 无关**（恢复场景 running 恒 false，旧代码的 running
+  门控正是漏回放的断点）；live 卡在场时优先保留——UI 单卡槽，新 host
+  call 到达时 `handleAskUser` 无条件覆写，恢复卡自然让位；多行 pending
+  （同 turn 并发提问）取最早一张，兄弟悬挂由 Rust 下一 turn 前的
+  superseded 修复收口。
+
+**恢复卡的提交路径**（`submitQuestionAnswers` / `declineQuestionCard` 的
+`restored` 分支）：不走 `resolveHostCall`（进程重启后 host call 通道已不
+存在，id 打到失效信道），改 `send` 协议上行
+`{"type":"question_reply","request_id":"<id>","action":"accept|decline",
+"answers":…}`（accept 的 answers 与 live resolve payload 的 answers 数组
+同构，Rust `reply_payload` 再包 outcome 外壳；decline 负载 null）。发送
+成功即写脱敏转写 output 并出卡（恢复态无 live turn 锚定
+submitting→answered 相位，续跑的 turn 事件走常规链路；迟到被拒时 Rust
+广播 notice）；发送失败回滚 pending 允许重试。同会话 live 卡仍走
+resolveHostCall，行为不变。新 turn（`request_start`）出清仍 pending 的
+恢复卡并记 cancelled 终态——Rust 悬挂修复已将其 superseded，且重启后
+host call id 从 1 复位、恢复卡的数字 request_id 可能撞上新在途调用
+（`MobileQuestionHandler` 先按 id resolve 在途通路，出清防误投）。
+
+**转写恢复仲裁**：`tryRestoreLocalTranscript` 弃用「条目总数多者胜」——
+本地文件只落盘到上个完成 turn，多出的装饰条目（⚡meta/step）会让旧文件
+总数压过含中断 turn 条目的 DB 权威镜像（悬挂的 user / ask_user 条目被
+抹掉）。新规则 `shouldRestoreLocalTranscript`（internal 纯函数）：本地在
+durable 条目（user/assistant/reasoning/tool/delegate/approval，两侧同源
+持久化）上不落后且总数更多才覆盖；DB 转写为空时本地兜底。live 会话的
+落盘逻辑（turn 结束写文件）不变。
+
+**Rust 侧迟到处理**：`MobileQuestionHandler` 双通路——在途 host call 先
+resolve（即时路径）；否则原子关卷（首答者赢）→ 与即时路径**同一格式化
+函数**生成结果 → `RunManager::resume_from_tool_result` 补全原 tool call
+的 tool result 并从该点续跑（迟到等价不变量：模型无法区分答案即时返回
+还是迟到补全）。
 
 **设置同步**（默认超时 / 输出脱敏）：设置页「内置工具」变更 →
 `RuntimeBridge.pushAskUserConfig` 发

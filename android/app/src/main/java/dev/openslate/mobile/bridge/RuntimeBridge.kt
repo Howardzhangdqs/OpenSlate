@@ -125,7 +125,127 @@ data class PendingQuestionUi(
     val current: Int = 0,
     /** host call 到达时刻（S2 超时文案预留；不驱动任何自动 resolve）。 */
     val createdAtMs: Long = System.currentTimeMillis(),
+    /** 重启恢复卡（snapshot `pending_questions` 回放）：提交/decline 不走
+     *  resolveHostCall（进程重启后 host call 通道已不存在——id 打到失效
+     *  信道），改发协议上行 question_reply（request_id 即原 host call id，
+     *  Rust 侧 MobileQuestionHandler 双通路兜底）。live 卡（host call 到达
+     *  路径建立）恒 false，行为不变。 */
+    val restored: Boolean = false,
 )
+
+// ── ask_user 解析 / 回放 + 转写恢复仲裁（internal 纯函数，便于补测）────
+
+/**
+ * ask_user `questions[]` 数组 → 题目列表。host call 信封（args.questions）
+ * 与 snapshot `pending_questions[].questions`（归一化题目数组，两处同构）
+ * 共用同一解析。null / 无可解析题 → 空表，失败语义由调用方决定
+ * （live 路径 resolve 失败；回放路径跳过该行）。
+ */
+internal fun parseAskUserQuestions(questionsArr: JSONArray?): List<QuestionUi> {
+    if (questionsArr == null) return emptyList()
+    val questions = mutableListOf<QuestionUi>()
+    for (i in 0 until questionsArr.length()) {
+        val q = questionsArr.optJSONObject(i) ?: continue
+        val storage = q.optJSONObject("storage")
+        questions.add(
+            QuestionUi(
+                id = q.optString("id").ifBlank { "q${i + 1}" },
+                header = q.optString("header").ifBlank { "问题 ${i + 1}" },
+                question = q.optString("question"),
+                type = q.optString("type", "choice").ifBlank { "choice" },
+                options = buildList {
+                    val os = q.optJSONArray("options") ?: return@buildList
+                    for (j in 0 until os.length()) {
+                        val o = os.optJSONObject(j) ?: continue
+                        val label = o.optString("label")
+                        if (label.isEmpty()) continue
+                        add(QuestionOptionUi(label, o.optString("description"), o.optBoolean("recommended")))
+                    }
+                },
+                multiSelect = q.optBoolean("multi_select"),
+                placeholder = if (q.has("placeholder") && !q.isNull("placeholder")) {
+                    q.optString("placeholder")
+                } else null,
+                optional = q.optBoolean("optional"),
+                storageKind = storage?.optString("kind")?.takeIf { it == "env" || it == "file" },
+                storageName = when (storage?.optString("kind")) {
+                    "env" -> storage.optString("name")
+                    "file" -> storage.optString("path").ifBlank { storage.optString("name") }
+                    else -> null
+                },
+            )
+        )
+    }
+    return questions
+}
+
+/**
+ * snapshot `pending_questions[]` → 恢复卡（重启回放）。取**首个**
+ * `status=="pending"` 且可解析的行——多行 = 同 turn 并发提问，UI 单卡槽
+ * 展示最早一张，兄弟悬挂由 Rust 侧下一 turn 前的 superseded 修复收口。
+ *
+ * - `questions` 为归一化题目数组（与 host call 信封 args.questions 同构），
+ *   复用 [parseAskUserQuestions]；
+ * - `request_id` 必须可解析为数字（= 原 host call id，提交路径以 Long 路由），
+ *   非数字行跳过（协议 String 承载，实际恒为数字字符串）；
+ * - `argsKey` 按 `tool_call_id` 从快照 tool_call 条目的 call_id 关联其
+ *   fullArgs——QuestionCardHost 凭 `argsKey == fullArgs` 出交互卡；查无
+ *   （理论不可达：DTO 仅收录当前 history 声明过的调用）置空，卡片退化为
+ *   等待行、提交仍可用（无转写回写）；
+ * - DTO 不含 timeout（恢复卡按永不；timeoutSec 仅 S2 展示位预留）。
+ */
+internal fun buildRestoredPendingQuestion(
+    pendingArr: JSONArray?,
+    argsByCallId: Map<String, String>,
+): PendingQuestionUi? {
+    if (pendingArr == null) return null
+    for (i in 0 until pendingArr.length()) {
+        val row = pendingArr.optJSONObject(i) ?: continue
+        if (row.optString("status") != "pending") continue
+        val requestId = row.optString("request_id").toLongOrNull() ?: continue
+        val questions = parseAskUserQuestions(row.optJSONArray("questions"))
+        if (questions.isEmpty()) continue
+        return PendingQuestionUi(
+            requestId = requestId,
+            questions = questions,
+            drafts = List(questions.size) { QuestionDraft() },
+            timeoutSec = -1L,
+            argsKey = row.optString("tool_call_id").let { argsByCallId[it] ?: "" },
+            restored = true,
+        )
+    }
+    return null
+}
+
+/**
+ * 转写恢复仲裁：本地 transcript 文件（只在上个**完成** turn 落盘）何时允许
+ * 覆盖 DB 重建的镜像。durable = 两侧同源持久化的条目（user / assistant /
+ * reasoning / tool / delegate / approval）；装饰条目（⚡meta 行 / step）
+ * 仅本地有。旧「总数多者胜」会让旧文件凭多余装饰条目压过**含中断 turn
+ * 条目**的 DB 权威镜像（悬挂的 user / ask_user 调用被抹掉）。新规则：
+ * 本地 durable 不落后 **且** 总数更多（装饰更丰富）才覆盖；DB 转写为空时
+ * 本地兜底（0 ≥ 0 恒过）。正常完成场景的丰富装饰恢复保持不变。
+ */
+internal fun shouldRestoreLocalTranscript(
+    localTotal: Int,
+    localDurable: Int,
+    dbTotal: Int,
+    dbDurable: Int,
+): Boolean = localDurable >= dbDurable && localTotal > dbTotal
+
+/** 镜像条目的 durable 计数（排除 Meta / StepBreak 装饰条目）。 */
+internal fun durableUiEntryCount(entries: List<UiEntry>): Int =
+    entries.count { it !is UiEntry.Meta && it !is UiEntry.StepBreak }
+
+/** 本地文件条目（"t" 短键格式）的 durable 计数（排除 meta / step）。 */
+internal fun localTranscriptDurableCount(arr: JSONArray): Int {
+    var n = 0
+    for (i in 0 until arr.length()) {
+        val t = arr.optJSONObject(i)?.optString("t") ?: continue
+        if (t != "meta" && t != "step") n++
+    }
+    return n
+}
 
 /** 配置视图（snapshot/config_changed 的投影）。 */
 data class ProviderUi(
@@ -1092,45 +1212,10 @@ object RuntimeBridge {
         val args = obj.optJSONObject("args")
         val questionsArr = args?.optJSONArray("questions") ?: obj.optJSONArray("questions")
         val timeout = args?.optLong("timeout", -1L) ?: obj.optLong("timeout", -1L)
-        if (questionsArr == null || questionsArr.length() == 0) {
-            runtimeRef.get()?.resolveHostCall(id.toULong(), false, "ask_user: empty questions payload")
-            return
-        }
-        val questions = mutableListOf<QuestionUi>()
-        for (i in 0 until questionsArr.length()) {
-            val q = questionsArr.optJSONObject(i) ?: continue
-            val storage = q.optJSONObject("storage")
-            questions.add(
-                QuestionUi(
-                    id = q.optString("id").ifBlank { "q${i + 1}" },
-                    header = q.optString("header").ifBlank { "问题 ${i + 1}" },
-                    question = q.optString("question"),
-                    type = q.optString("type", "choice").ifBlank { "choice" },
-                    options = buildList {
-                        val os = q.optJSONArray("options") ?: return@buildList
-                        for (j in 0 until os.length()) {
-                            val o = os.optJSONObject(j) ?: continue
-                            val label = o.optString("label")
-                            if (label.isEmpty()) continue
-                            add(QuestionOptionUi(label, o.optString("description"), o.optBoolean("recommended")))
-                        }
-                    },
-                    multiSelect = q.optBoolean("multi_select"),
-                    placeholder = if (q.has("placeholder") && !q.isNull("placeholder")) {
-                        q.optString("placeholder")
-                    } else null,
-                    optional = q.optBoolean("optional"),
-                    storageKind = storage?.optString("kind")?.takeIf { it == "env" || it == "file" },
-                    storageName = when (storage?.optString("kind")) {
-                        "env" -> storage.optString("name")
-                        "file" -> storage.optString("path").ifBlank { storage.optString("name") }
-                        else -> null
-                    },
-                )
-            )
-        }
+        // 解析与 snapshot pending_questions 回放共用（parseAskUserQuestions）。
+        val questions = parseAskUserQuestions(questionsArr)
         if (questions.isEmpty()) {
-            runtimeRef.get()?.resolveHostCall(id.toULong(), false, "ask_user: no parseable questions")
+            runtimeRef.get()?.resolveHostCall(id.toULong(), false, "ask_user: empty questions payload")
             return
         }
         // 关联最近的 running ask_user ToolCall 条目（tool_start 先于 host call
@@ -1239,6 +1324,11 @@ object RuntimeBridge {
         }
         val payload = JSONObject().put("outcome", "answered").put("answers", answers).toString()
         val transcript = JSONObject().put("outcome", "answered").put("answers", display).toString()
+        if (p.restored) {
+            // 重启恢复卡：host call 通道已不存在，迟到答案走 question_reply 上行。
+            submitRestoredQuestionAnswer(requestId, p.argsKey, answers, transcript)
+            return
+        }
         mutate {
             val cur = pendingQuestion ?: return@mutate this
             if (cur.requestId != requestId) return@mutate this
@@ -1277,10 +1367,67 @@ object RuntimeBridge {
         }
     }
 
+    /**
+     * 恢复卡提交（[PendingQuestionUi.restored]）：改走协议上行
+     * `{"type":"question_reply","request_id":"<id>","action":"accept",
+     * "answers":[…]}`（request_id 即原 host call id；answers 与 live resolve
+     * payload 的 answers 数组同构，Rust 侧 reply_payload 会再包
+     * outcome 外壳）。发送成功即写脱敏转写 output 并出卡——恢复态没有
+     * live turn 锚定 submitting→answered 相位（续跑由 Rust 侧
+     * resume_from_tool_result 驱动，其 turn 事件走常规链路），迟到被拒时
+     * Rust 广播 notice、卡不回滚；发送失败（runtime 亡 / FFI 异常）回滚
+     * pending 允许重试。
+     */
+    private fun submitRestoredQuestionAnswer(requestId: Long, argsKey: String, answers: JSONArray, transcript: String) {
+        mutate {
+            val cur = pendingQuestion ?: return@mutate this
+            if (cur.requestId != requestId) return@mutate this
+            copy(pendingQuestion = cur.copy(phase = "submitting"))
+        }
+        val sent = sendJson(
+            JSONObject()
+                .put("type", "question_reply")
+                .put("request_id", requestId.toString())
+                .put("action", "accept")
+                .put("answers", answers)
+                .toString()
+        )
+        if (!sent) {
+            Log.w(TAG, "ask_user: late submit send failed (id=$requestId)")
+            mutate {
+                val cur = pendingQuestion
+                if (cur != null && cur.requestId == requestId && cur.phase == "submitting") {
+                    copy(pendingQuestion = cur.copy(phase = "pending"))
+                } else this
+            }
+            return
+        }
+        writeAskUserOutcome(argsKey, transcript)
+        mutate { copy(pendingQuestion = pendingQuestion?.takeIf { it.requestId != requestId }) }
+        Log.i(TAG, "ask_user: late answer sent (id=$requestId)")
+    }
+
     /** 整卡 decline（「不回答」，UI 层已二次确认）。 */
     fun declineQuestionCard(requestId: Long) {
         val p = _state.value.pendingQuestion ?: return
         if (p.requestId != requestId || p.phase != "pending") return
+        if (p.restored) {
+            // 恢复卡 decline 同走 question_reply（decline 负载协议透传，null 即可；
+            // Rust 侧与 accept 同一迟到通路——告知模型用户未作答后续跑）。
+            val sent = sendJson(
+                JSONObject()
+                    .put("type", "question_reply")
+                    .put("request_id", requestId.toString())
+                    .put("action", "decline")
+                    .put("answers", JSONObject.NULL)
+                    .toString()
+            )
+            if (!sent) return // 发送失败保留卡允许重试（send 失败 = 确定未达）
+            writeAskUserOutcome(p.argsKey, """{"outcome":"declined"}""")
+            mutate { copy(pendingQuestion = pendingQuestion?.takeIf { it.requestId != requestId }) }
+            Log.i(TAG, "ask_user: late decline sent (id=$requestId)")
+            return
+        }
         scope.launch(Dispatchers.Default) {
             val runtime = runtimeRef.get() ?: return@launch
             runtime.resolveHostCall(requestId.toULong(), true, """{"outcome":"declined"}""")
@@ -1506,15 +1653,28 @@ object RuntimeBridge {
                     }
                 }
             }
-            "request_start" -> mutate {
-                val turnBegan = !running
-                copy(
-                    running = true,
-                    step = obj.optInt("step", step),
-                    toolCalls = if (turnBegan) 0 else toolCalls,
-                    awaitingFirstToken = true,
-                )
-            }.also { stepStartTs = System.currentTimeMillis() }
+            "request_start" -> {
+                // 恢复卡失效出清：新 turn 开启前 Rust 侧悬挂修复已把 pending 行
+                // superseded 关卷（迟到通道关闭）；且重启后 host call id 计数器
+                // 从 1 复位，恢复卡的数字 request_id 可能撞上新在途调用——
+                // question_reply 的在途通路（MobileQuestionHandler 先按 id resolve）
+                // 会误投。出清并记 cancelled 终态（与停止回合同语义）。live 卡
+                // 不受影响（restored=false；恢复卡自身触发的续跑在提交时已出卡）。
+                _state.value.pendingQuestion?.takeIf { it.restored }?.let { stale ->
+                    writeAskUserOutcome(stale.argsKey, """{"outcome":"cancelled"}""")
+                    mutate { copy(pendingQuestion = pendingQuestion?.takeIf { it.requestId != stale.requestId }) }
+                    Log.i(TAG, "ask_user: restored card superseded by new turn (id=${stale.requestId})")
+                }
+                mutate {
+                    val turnBegan = !running
+                    copy(
+                        running = true,
+                        step = obj.optInt("step", step),
+                        toolCalls = if (turnBegan) 0 else toolCalls,
+                        awaitingFirstToken = true,
+                    )
+                }.also { stepStartTs = System.currentTimeMillis() }
+            }
             "turn_ok" -> mutate {
                 copy(running = false, awaitingFirstToken = false)
             }.also { finalizeAskUserOnTurnEnd(); persistTranscriptAsync() }
@@ -1984,6 +2144,10 @@ object RuntimeBridge {
     private fun applySnapshot(session: JSONObject?) {
         if (session == null) return
         val transcript = session.optJSONArray("transcript") ?: return
+        // ask_user 恢复关联表：tool_call 条目的 call_id（仅 DB 重建条目携带，
+        // live 条目恒缺省）→ fullArgs。pending_questions 回放按 tool_call_id
+        // 取 argsKey——QuestionCardHost 凭 argsKey==fullArgs 判定出交互卡。
+        val askArgsByCallId = mutableMapOf<String, String>()
         val entries = buildList {
             for (i in 0 until transcript.length()) {
                 val e = transcript.optJSONObject(i) ?: continue
@@ -1995,16 +2159,21 @@ object RuntimeBridge {
                     "tool_call" -> {
                         val statusObj = e.optJSONObject("status")
                         val detail = e.optJSONObject("detail")
+                        val name = e.optString("name")
+                        val fullArgs = detail?.optString("args") ?: e.optString("args")
+                        if (name == ASK_USER_TOOL && e.has("call_id") && !e.isNull("call_id")) {
+                            askArgsByCallId[e.optString("call_id")] = fullArgs
+                        }
                         add(
                             UiEntry.ToolCall(
-                                name = e.optString("name"),
+                                name = name,
                                 argsPreview = e.optString("args"),
                                 status = if (statusObj != null) {
                                     when (statusObj.optString("state", statusObj.optString("type", "done"))) {
                                         "running" -> "running"; "failed" -> "failed"; else -> "done"
                                     }
                                 } else "done",
-                                fullArgs = detail?.optString("args") ?: e.optString("args"),
+                                fullArgs = fullArgs,
                                 output = detail?.takeIf { it.has("output") && !it.isNull("output") }?.optString("output"),
                             )
                         )
@@ -2017,6 +2186,25 @@ object RuntimeBridge {
         }
         val pending = session.optJSONObject("pending_approval")
         val config = session.optJSONObject("config")?.let { parseConfig(it) } ?: _state.value.config
+        // ask_user pending 卡：live 卡跨 snapshot 保留（同会话刷新，running
+        // 门控——host call 阻塞 turn，非 running 快照不可能有活问卷）；无
+        // live 卡时回放 snapshot 的 pending_questions（重启恢复，**与 running
+        // 无关**——恢复场景 running 恒 false，迟到答案走 question_reply 上行，
+        // 见 [submitRestoredQuestionAnswer]。新 host call 到达时 handleAskUser
+        // 无条件覆写单卡槽，恢复卡自然让位）。
+        val livePending = _state.value.pendingQuestion.takeIf { session.optBoolean("running") }
+        val restoredPending = if (livePending == null) {
+            buildRestoredPendingQuestion(session.optJSONArray("pending_questions"), askArgsByCallId)
+        } else {
+            null
+        }
+        restoredPending?.let {
+            Log.i(
+                TAG,
+                "ask_user: restored pending card (id=${it.requestId}, ${it.questions.size} question(s)" +
+                    ", argsKey hit=${it.argsKey.isNotEmpty()})",
+            )
+        }
         _state.value = RuntimeUiState(
             ready = true,
             running = session.optBoolean("running"),
@@ -2034,11 +2222,12 @@ object RuntimeBridge {
                     reason = it.optJSONObject("summary")?.optString("reason") ?: "",
                 )
             },
-            // ask_user pending 卡跨 snapshot 保留（同会话刷新）；turn 未运行时
-            // 的快照不可能有活问卷（host call 阻塞 turn），按 running 门控丢弃。
-            pendingQuestion = _state.value.pendingQuestion.takeIf { session.optBoolean("running") },
+            // ask_user pending 卡：live 卡优先（running 门控），否则回放
+            // pending_questions（重启恢复，与 running 无关，见上方注释）。
+            pendingQuestion = livePending ?: restoredPending,
         )
-        // 本地 transcript（含思维链/⚡meta）若存在则整体覆盖镜像版。
+        // 本地 transcript（含思维链/⚡meta）按 durable 仲裁尝试覆盖镜像版
+        //（DB 含恢复条目时不再让旧文件遮蔽，见 shouldRestoreLocalTranscript）。
         tryRestoreLocalTranscript()
         // 模型条目键迁移第二段：config 已入 state → 完成校验（幂等，无待
         // 校验则 no-op；先于第一段，首个 snapshot 时待校验必为空）。
@@ -2403,11 +2592,14 @@ object RuntimeBridge {
     }
 
     /**
-     * snapshot 到达后与本地 transcript 仲裁：仅当本地条目数 **大于** 当前内存
-     * 条目数（applySnapshot 刚写入的 DB 快照）时才用本地版本整体覆盖——本地
-     * 含思维链/⚡meta，通常更丰富；本地更旧（DB 已推进更多对话）则忽略之，
-     * 避免旧文件遮蔽新数据。本函数只被 applySnapshot 末尾调用，比较时两者
-     * 均已可见，无先到后到问题。
+     * snapshot 到达后与本地 transcript 仲裁（重启恢复场景 DB 镜像为权威）。
+     * 旧规则「条目总数多者胜」有洞：本地文件只落盘到上个**完成** turn，
+     * 但它多出的装饰条目（⚡meta / step）能让**旧**文件在总数上压过含
+     * 中断 turn 条目（悬挂 user / ask_user 调用）的 DB 镜像、整体覆盖抹掉
+     * 恢复条目。新规则见 [shouldRestoreLocalTranscript]：本地须在 durable
+     * 条目（两侧同源持久化的种类）上不落后才允许以其更丰富的装饰覆盖；
+     * DB 转写为空时本地兜底。live 会话的落盘逻辑（turn 结束写文件）不变。
+     * 本函数只被 applySnapshot 末尾调用，比较时两者均已可见。
      */
     private fun tryRestoreLocalTranscript() {
         val runtime = runtimeRef.get() ?: return
@@ -2426,11 +2618,13 @@ object RuntimeBridge {
                 o.optInt("n", arr.length()) to arr
             }
             val memCount = _state.value.entries.size
-            if (localCount <= memCount) {
+            val memDurable = durableUiEntryCount(_state.value.entries)
+            val localDurable = localTranscriptDurableCount(entriesArr)
+            if (!shouldRestoreLocalTranscript(localCount, localDurable, memCount, memDurable)) {
                 Log.d(
                     TAG,
-                    "transcript restore skipped: local=$localCount <= snapshot=$memCount" +
-                        "（DB 快照更新或相同，忽略本地文件）",
+                    "transcript restore skipped: local=$localCount ($localDurable durable) vs" +
+                        " snapshot=$memCount ($memDurable durable)（DB 快照含恢复条目或更新，本地文件不覆盖）",
                 )
                 return
             }

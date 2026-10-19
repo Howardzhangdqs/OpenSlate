@@ -161,7 +161,14 @@ internal fun QuestionFullScreen(onBack: () -> Unit) {
                             current = p.current,
                             processed = processed,
                             onSelect = { i ->
-                                scope.launch { pagerState.scrollToPage(i) }
+                                // tween(250ms, FastOutSlowInEasing)：与反向同步同曲线，
+                                // 点分段与按钮/横滑动画语言统一。
+                                scope.launch {
+                                    pagerState.animateScrollToPage(
+                                        i,
+                                        animationSpec = tween(250, easing = FastOutSlowInEasing),
+                                    )
+                                }
                             },
                             tall = true,
                             modifier = Modifier.padding(horizontal = 16.dp),
@@ -192,7 +199,9 @@ internal fun QuestionFullScreen(onBack: () -> Unit) {
                     }
                     // 题区（全屏不限高；输入框放宽到 minLines 5）。Pager 传
                     // fillMaxSize 吃满 weight 高度：页视口约束确定（有界），
-                    // 首帧即组合当前页，不依赖内容反推的包裹高度。
+                    // 首帧即组合当前页，不依赖内容反推的包裹高度。每页 = 页级
+                    // 题头（chip + 题干）+ 控件（AskQuestionPager 内置），横向
+                    // 16dp 缩进与分段条/滑动提示对齐。
                     AskQuestionPager(
                         p = p,
                         pagerState = pagerState,
@@ -201,7 +210,10 @@ internal fun QuestionFullScreen(onBack: () -> Unit) {
                         onDraftChange = { idx, d ->
                             RuntimeBridge.updateQuestionDraft(p.requestId, idx) { d }
                         },
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
                     )
                     Spacer(Modifier.height(4.dp))
                     // 底部操作栏（同内联 CardFooter，imePadding 随键盘上浮）。

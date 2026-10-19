@@ -69,10 +69,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -87,8 +89,10 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.SpanStyle
@@ -99,14 +103,18 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp
 import dev.openslate.mobile.bridge.PendingQuestionUi
 import dev.openslate.mobile.bridge.QuestionDraft
 import dev.openslate.mobile.bridge.QuestionUi
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
+import kotlin.math.ceil
+import kotlin.math.floor
 
 /**
  * ask_user 问卷 UI（设计规范：docs/proposals/ask-user-ui-design.md）。
@@ -391,7 +399,8 @@ private fun InteractiveQuestionCard(
     val processed = p.questions.indices.map { isQuestionProcessed(p.questions[it], p.drafts[it]) }
     val cardShape = RoundedCornerShape(16.dp)
 
-    // 4 题满配：题区内部滚动 + 高度上限（屏幕高的 60%）。LazyColumn item 内
+    // 4 题满配：题区内部滚动 + 高度上限（屏幕高的 60%）。上限作用于整个
+    // Pager 区域（含每页题头：chip + 题干 + 控件同页滚动）。LazyColumn item 内
     // 约束无界（BoxWithConstraints.maxHeight = Infinity，×0.6 仍无界，heightIn
     // 形同虚设），上限必须取真实视口（screenHeightDp）。
     val bodyCap = LocalConfiguration.current.screenHeightDp.dp * 0.6f
@@ -418,30 +427,37 @@ private fun InteractiveQuestionCard(
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (n > 1) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+            // 卡片级头部行：分段条（多题）+ 等待指示 + 全屏按钮。等待指示是
+            // 卡片级状态（不随题走），安家在分段条行右端、全屏按钮左侧；单题
+            // 卡无分段条，同一组指示/按钮右对齐，避免留空行。每题的标签 chip
+            // 与题干已移入题区 Pager 页内（随页整体横向滚动，见 AskQuestionPager）。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (n > 1) {
                     SegmentBar(
                         count = n,
                         current = p.current,
                         processed = processed,
                         onSelect = { i ->
-                            scope.launch { pagerState.scrollToPage(i) }
+                            // tween(250ms, FastOutSlowInEasing)：与反向同步同曲线，
+                            // 点分段与按钮/横滑动画语言统一。
+                            scope.launch {
+                                pagerState.animateScrollToPage(
+                                    i,
+                                    animationSpec = tween(250, easing = FastOutSlowInEasing),
+                                )
+                            }
                         },
                         modifier = Modifier.weight(1f),
                     )
-                    Spacer(Modifier.width(6.dp))
-                    FullScreenButton(onOpenFullScreen, emphasized = emphasized)
+                } else {
+                    Spacer(Modifier.weight(1f))
                 }
+                Spacer(Modifier.width(8.dp))
+                FullScreenButton(onOpenFullScreen, emphasized = emphasized)
             }
-            // 当前题头部（单题卡把全屏按钮留在此行右侧）。
-            QuestionHeaderRow(
-                q = p.questions[p.current.coerceIn(0, n - 1)],
-                submitting = submitting,
-                timeoutSec = p.timeoutSec,
-                createdAtMs = p.createdAtMs,
-                trailing = { if (n == 1) FullScreenButton(onOpenFullScreen, emphasized = emphasized) },
-            )
-            // 题区横滑 Pager（与点分段等效；草稿在 UiState 不丢）。
+            // 题区横滑 Pager（与点分段等效；草稿在 UiState 不丢）。每页 = 页级
+            // 题头（chip + 题干）+ 题型控件，整体横向滚动；下方 bodyCap 限高
+            // 作用于整个 Pager 区域（含每页题头）。
             Box(Modifier.fillMaxWidth().heightIn(max = bodyCap)) {
                 AskQuestionPager(
                     p = p,
@@ -560,69 +576,43 @@ internal fun SegmentBar(
     }
 }
 
-// ── 题头 ────────────────────────────────────────────────────────────
+// ── 题头：页级（随 Pager 滚动）/ 等待指示（卡片级）──────────────────
 
-/** 标签 chip + 等待指示（spinner + 「等待回答」/「提交中」；超时预留第三种文案）。 */
+/**
+ * 页级题头（随 Pager 页整体横向滚动）：标签 chip + 题干。规格沿用原
+ * QuestionHeaderRow（chip：secondaryContainer@40% 底 + 0.5dp secondary@40% 边；
+ * 题干 bodyLarge），仅位置移入页内——切题过渡时 chip/题干/控件同页横移，
+ * 不再出现「旧题干 + 新选项」错配。
+ */
 @Composable
-private fun QuestionHeaderRow(
-    q: QuestionUi,
-    submitting: Boolean,
-    timeoutSec: Long,
-    createdAtMs: Long,
-    trailing: @Composable () -> Unit = {},
-) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        // 标签 chip：secondaryContainer@40% 底 + 0.5dp secondary@40% 边（§3.1）。
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .clip(RoundedCornerShape(50))
-                .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f))
-                .border(
-                    0.5.dp,
-                    MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f),
-                    RoundedCornerShape(50),
-                )
-                .padding(horizontal = 8.dp, vertical = 3.dp),
-        ) {
-            Icon(
-                Icons.Outlined.HelpOutline,
-                contentDescription = null,
-                modifier = Modifier.size(12.dp),
-                tint = MaterialTheme.colorScheme.secondary,
+private fun QuestionPageHeader(q: QuestionUi) {
+    // 标签 chip：secondaryContainer@40% 底 + 0.5dp secondary@40% 边（§3.1）。
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f))
+            .border(
+                0.5.dp,
+                MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f),
+                RoundedCornerShape(50),
             )
-            Spacer(Modifier.width(4.dp))
-            Text(
-                q.header,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        Spacer(Modifier.weight(1f))
-        trailing()
-        Spacer(Modifier.width(6.dp))
-        // 等待指示：13dp/1.5dp spinner + labelSmall（与工具 chip「执行中」同款）。
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            CircularProgressIndicator(strokeWidth = 1.5.dp, modifier = Modifier.size(13.dp))
-            Spacer(Modifier.width(4.dp))
-            val timedOut = timeoutSec > 0 &&
-                (System.currentTimeMillis() - createdAtMs) / 1000L > timeoutSec
-            Text(
-                when {
-                    submitting -> "提交中"
-                    timedOut -> "已超时，仍可补答" // S2 预留文案位
-                    else -> "等待回答"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = if (timedOut && !submitting) {
-                    MaterialTheme.colorScheme.outline
-                } else {
-                    MaterialTheme.colorScheme.primary
-                },
-            )
-        }
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+    ) {
+        Icon(
+            Icons.Outlined.HelpOutline,
+            contentDescription = null,
+            modifier = Modifier.size(12.dp),
+            tint = MaterialTheme.colorScheme.secondary,
+        )
+        Spacer(Modifier.width(4.dp))
+        Text(
+            q.header,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSecondaryContainer,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
     Spacer(Modifier.height(2.dp))
     Text(q.question, style = MaterialTheme.typography.bodyLarge)
@@ -631,7 +621,9 @@ private fun QuestionHeaderRow(
 // ── 题区 Pager（内联 / 全屏共用）────────────────────────────────────
 
 /**
- * 题区 Pager（内联 / 全屏共用）。页内容统一包一层 Box：底缘渐隐条需
+ * 题区 Pager（内联 / 全屏共用）。每页 = 页级题头（QuestionPageHeader：标签
+ * chip + 题干）+ 题型控件（QuestionBody），**作为整体横向滚动**——切题过渡
+ * 不会出现题头钉顶、只滚选项的错配。页内容统一包一层 Box：底缘渐隐条需
  * [Alignment.BottomCenter] 贴页底（平铺在页 scope 会叠到页顶）。
  *
  * [modifier] 作用于 Pager 本体：全屏传 `fillMaxSize()` 保证题区吃满 weight
@@ -651,27 +643,115 @@ internal fun AskQuestionPager(
     onBodyOverflow: (page: Int, overflows: Boolean) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
-    HorizontalPager(state = pagerState, modifier = modifier, pageSpacing = 12.dp) { page ->
+    // 反向同步：UiState current → 本地 Pager。footer「上一题/下一题」只写
+    // UiState（setCurrentQuestion），题区真正翻页靠这里；顺向（Pager 滑动 →
+    // UiState）由两侧调用方的 snapshotFlow 负责，同值 no-op，不构成循环。
+    // rememberUpdatedState 取最新 p.current（p 随草稿更新换新对象，闭包不能
+    // 捕获旧值）；内联卡与全屏共用本组件，一处同步两处生效。
+    // drop(1) 跳过初始 emission：恢复/首次组合不播动画直接落位（initialPage
+    // 已是当前题）；后续变化经 animateScrollToPage 横向滚动动画。动画曲线用
+    // tween(250ms, FastOutSlowInEasing) 对齐项目动效家族（默认 spring 的位移
+    // 过冲在小屏横移上易观感掉帧）。
+    val currentQuestion = rememberUpdatedState(p.current)
+    LaunchedEffect(pagerState) {
+        snapshotFlow { currentQuestion.value }
+            .drop(1)
+            .collect { page ->
+                // 自反馈守卫：滚动进行中且本次滚动已在去往目标页
+                // （targetPage == page，含动画中途 currentPage 翻转引发的回写）
+                // 时跳过——否则动画途中重启动画自激励，观感掉帧；目标不同则
+                // 照常改向（连点「下一题」仍逐次生效，不会被吞）。
+                val headingThere = pagerState.isScrollInProgress && pagerState.targetPage == page
+                if (page != pagerState.currentPage &&
+                    page in 0 until pagerState.pageCount &&
+                    !headingThere
+                ) {
+                    pagerState.animateScrollToPage(
+                        page,
+                        animationSpec = tween(250, easing = FastOutSlowInEasing),
+                    )
+                }
+            }
+    }
+    // ── 页高自适应 + 插值过渡 ─────────────────────────────────────────
+    // 每页上报自然高（onGloballyPositioned 挂在 scroll 视口内的内容节点上，
+    // 报的是内容高而非视口高 → 与容器高度无反馈回路）；容器高 = 按连续页坐标
+    // pagePos = currentPage + currentPageOffsetFraction 在 floor/ceil 两页的
+    // 自然高之间线性插值。pagePos 在翻页中途（currentPage ±1 跳变、offsetFraction
+    // 从 ±0.5 回绕）仍连续，手势滑动与 animateScrollToPage 共用此路径，高度
+    // 天然跟手/跟动画，不叠 animateDpAsState（会双重动画）。约束胁迫分流两处
+    // 形态：内联卡外层 heightIn(max = bodyCap) 把 height 截到 60% 上限（回归
+    // 红线保持）；全屏 weight(1f) 给定固定高，height 被收编 → 保持填充布局
+    // （内容不足时维持原留白，不收紧——全屏本就该稳定占满）。下限 160dp 防
+    // 0 高闪跳；越界/未测量页高度缺失时退化为已测值，不跳变。
+    val density = LocalDensity.current
+    val heights = remember(p.requestId) { mutableStateMapOf<Int, Int>() }
+    val pagePos = pagerState.currentPage + pagerState.currentPageOffsetFraction
+    val lowerPage = floor(pagePos).toInt()
+    val upperPage = ceil(pagePos).toInt()
+    val lowerH = heights[lowerPage]
+    val upperH = heights[upperPage]
+    val minHeightPx = with(density) { 160.dp.toPx() }.toInt()
+    val heightModifier = if (lowerH != null || upperH != null) {
+        val a = lowerH ?: upperH!!
+        val b = upperH ?: a
+        val hPx = maxOf(lerp(a, b, pagePos - lowerPage), minHeightPx)
+        Modifier.height(with(density) { hPx.toDp() })
+    } else {
+        Modifier // 首帧未测量：保持包裹语义，邻页/当前页布局完成后收紧
+    }
+    // beyondViewportPageCount = 1：预组合左右邻页（旧名 beyondBoundsPageCount，
+    // 本版 foundation 已更名），消除滑动/切题动画途中邻页首次组合的帧开销
+    // （掉帧主源之一）；顺带邻页高度就绪，插值起步即有目标值。
+    HorizontalPager(
+        state = pagerState,
+        modifier = modifier.then(heightModifier),
+        pageSpacing = 12.dp,
+        beyondViewportPageCount = 1,
+    ) { page ->
         val q = p.questions[page]
         val draft = p.drafts[page]
         val scroll = rememberSaveable(q.id, saver = ScrollState.Saver) { ScrollState(0) }
-        // 内容是否超出可视高（maxValue 不随滚动位置变化，是稳定的「超高」信号）。
+        // 超高信号防抖：插值过渡期视口瞬态小于内容（250ms 内恢复）不上报、
+        // 不出渐隐条；稳定超高（被 bodyCap 截断）延迟 250ms 后才上报。改观
+        // 原「maxValue > 0 即上报」是因为自适应高度下过渡期会短暂亏空。
+        var overflows by remember(q.id) { mutableStateOf(false) }
         LaunchedEffect(scroll) {
-            snapshotFlow { scroll.maxValue > 0 }.collect { onBodyOverflow(page, it) }
+            snapshotFlow { scroll.maxValue }
+                .collectLatest { max ->
+                    if (max > 0) delay(250)
+                    overflows = max > 0
+                    onBodyOverflow(page, max > 0)
+                }
         }
         Box(Modifier.fillMaxWidth()) {
+            // 每页 = 页级题头（chip + 题干）+ 题型控件，作为整体横向滚动
+            // （10dp 间距沿用原卡片级 QuestionHeader↔题区间距）。外层 Column
+            // 只做视口滚动；内层 Column 是自然高上报节点（在 scroll 内、不
+            // 被视口 coerce，onGloballyPositioned 报的恒为内容高）。
             Column(Modifier.fillMaxWidth().verticalScroll(scroll)) {
-                QuestionBody(
-                    q = q,
-                    draft = draft,
-                    enabled = enabled && !draft.skipped && !draft.declined,
-                    minLines = minLines,
-                    onChange = { onDraftChange(page, it) },
-                )
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .onGloballyPositioned {
+                            val h = it.size.height
+                            if (heights[page] != h) heights[page] = h
+                        },
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    QuestionPageHeader(q)
+                    QuestionBody(
+                        q = q,
+                        draft = draft,
+                        enabled = enabled && !draft.skipped && !draft.declined,
+                        minLines = minLines,
+                        onChange = { onDraftChange(page, it) },
+                    )
+                }
             }
-            // 底缘渐隐：内容高出可视区（可继续下滚）时提示还有更多
-            // （transparent→solid 朝下，贴底缘）。
-            if (scroll.canScrollForward) {
+            // 底缘渐隐：内容稳定高出可视区（可继续下滚）时提示还有更多
+            // （transparent→solid 朝下，贴底缘；防抖见 overflows）。
+            if (overflows) {
                 Box(
                     Modifier
                         .align(Alignment.BottomCenter)
@@ -808,34 +888,14 @@ private fun OptionRow(
         Column(Modifier.weight(1f, fill = false)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    label,
+                    stripRecommendedSuffix(label),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.weight(1f, fill = false),
                 )
                 if (recommended) {
                     Spacer(Modifier.width(8.dp))
-                    // 推荐徽章：Recommend 12dp + labelSmall，primaryContainer 底。
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(MaterialTheme.colorScheme.primaryContainer)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    ) {
-                        Icon(
-                            Icons.Outlined.Recommend,
-                            contentDescription = null,
-                            modifier = Modifier.size(12.dp),
-                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                        )
-                        Spacer(Modifier.width(2.dp))
-                        Text(
-                            "推荐",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        )
-                    }
+                    RecommendBadge()
                 }
             }
             if (description.isNotEmpty()) {
@@ -847,6 +907,50 @@ private fun OptionRow(
             }
         }
     }
+}
+
+/**
+ * 推荐徽章（OptionRow / ConfirmPair 共用，保证完全同款）：Recommend 12dp +
+ * labelSmall「推荐」，primaryContainer 底、onPrimaryContainer 字、全圆角 chip、
+ * 水平 6dp / 垂直 2dp padding。
+ */
+@Composable
+private fun RecommendBadge() {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(MaterialTheme.colorScheme.primaryContainer)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Icon(
+            Icons.Outlined.Recommend,
+            contentDescription = null,
+            modifier = Modifier.size(12.dp),
+            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+        Spacer(Modifier.width(2.dp))
+        Text(
+            "推荐",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+    }
+}
+
+/**
+ * 剥掉模型按工具 description 写进选项 label 尾部的推荐后缀："(Recommended)"、
+ * "(recommended)"、"（推荐）"、"(推荐)" 等变体——大小写不敏感、允许前后空白、
+ * 半/全角括号可混用。仅渲染层过滤（OptionRow 与 ConfirmPair 统一过它）；
+ * 推荐标识本身由 options[].recommended 布尔驱动徽章，不依赖 label 文本。
+ * 剥完为空（label 整个就是后缀）时保留原文，避免渲染出空按钮。
+ */
+private fun stripRecommendedSuffix(label: String): String {
+    val stripped = label.replace(
+        Regex("""\s*[（(]\s*(recommended|推荐)\s*[)）]\s*$""", RegexOption.IGNORE_CASE),
+        "",
+    ).trimEnd()
+    return stripped.ifBlank { label }
 }
 
 /** 「其他」说明输入框（选中「其他」才展开）。 */
@@ -961,26 +1065,30 @@ private fun ConfirmPair(
     enabled: Boolean,
     onChange: (QuestionDraft) -> Unit,
 ) {
-    val positive = q.options.getOrNull(0)?.label ?: "是"
-    val negative = q.options.getOrNull(1)?.label ?: "否"
+    // label 过 stripRecommendedSuffix（模型可能把 "(Recommended)" 写进 label，
+    // 直接当按钮主文本会变成巨大文字按钮）；推荐侧徽章由 recommended 字段驱动。
+    val positive = q.options.getOrNull(0)
+    val negative = q.options.getOrNull(1)
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         ConfirmSideButton(
-            label = positive,
+            label = stripRecommendedSuffix(positive?.label ?: "是"),
             icon = Icons.Filled.Check,
             selected = draft.confirm == true,
             tint = MaterialTheme.colorScheme.primary,
             enabled = enabled,
             onClick = { onChange(draft.copy(confirm = true, skipped = false, declined = false)) },
             modifier = Modifier.weight(1f),
+            recommended = positive?.recommended == true,
         )
         ConfirmSideButton(
-            label = negative,
+            label = stripRecommendedSuffix(negative?.label ?: "否"),
             icon = Icons.Filled.Close,
             selected = draft.confirm == false,
             tint = MaterialTheme.colorScheme.secondary,
             enabled = enabled,
             onClick = { onChange(draft.copy(confirm = false, skipped = false, declined = false)) },
             modifier = Modifier.weight(1f),
+            recommended = negative?.recommended == true,
         )
     }
 }
@@ -995,6 +1103,7 @@ private fun ConfirmSideButton(
     enabled: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    recommended: Boolean = false,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -1024,11 +1133,17 @@ private fun ConfirmSideButton(
             tint = if (selected) tint else MaterialTheme.colorScheme.outline,
         )
         Spacer(Modifier.width(6.dp))
+        // weight(fill=false)：徽章在场时长 label 限剩余宽内换行，不把徽章挤出按钮。
         Text(
             label,
             style = MaterialTheme.typography.labelLarge,
             color = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f, fill = false),
         )
+        if (recommended) {
+            Spacer(Modifier.width(6.dp))
+            RecommendBadge()
+        }
     }
 }
 
@@ -1135,14 +1250,17 @@ internal fun AskCardFooter(
     var confirmDecline by remember(p.requestId) { mutableStateOf(false) }
     val unanswered = unansweredQuestionCount(p)
     val submitting = p.phase == "submitting"
+    val n = p.questions.size
+    val last = cur == n - 1
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        // 次要动作行：跳过此题（多题时每题可跳；单题卡仅可选 题可跳——必答单题走整卡动作）。
+        // 次要动作行：跳过此题（多题时每题可跳；单题卡仅可选 题可跳——必答
+        // 单题走整卡动作）。切题按钮在主操作区（向导式），见下方。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (p.questions.size > 1 || q.optional) {
+            if (n > 1 || q.optional) {
                 val skippedAny = d.skipped || d.declined
                 TextAction(
                     text = if (skippedAny) "取消跳过" else "跳过此题",
@@ -1166,8 +1284,9 @@ internal fun AskCardFooter(
                 onClick = { confirmDecline = true },
             )
         }
-        // 必填校验提示（提交按钮上方右侧）。
-        if (unanswered > 0) {
+        // 必填校验提示（提交按钮上方右侧；仅提交按钮在场（单题卡/末题）时显示，
+        // 中间题的 [上一题|下一题] 不带提交语义，不提示）。
+        if (unanswered > 0 && (n == 1 || last)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 Text(
                     "还有 $unanswered 题未作答",
@@ -1176,32 +1295,51 @@ internal fun AskCardFooter(
                 )
             }
         }
-        // 主按钮：SoftButton 放大变体（全宽、最小高 48dp、primary）。
+        // 主操作行（向导式，SoftButton 放大变体规格：min 48dp、10dp 圆角、
+        // labelLarge，两钮间距 10dp；上一题/下一题/提交统一 primary 淡底，无灰色态）：
+        //   单题卡        → 全宽「提交」（原状）；
+        //   多题 · 非末题  → [上一题(weight1)] [下一题(weight2)]，均为 primary；
+        //                    第 1 题隐藏上一题不占位，下一题独占全宽；下一题始终
+        //                    可点（允许未作答浏览，与分段条/横滑自由导航语义一致，
+        //                    校验只在提交口把关）；
+        //   多题 · 末题   → [上一题(weight1)] [提交(weight2, 沿用未答禁用态)]。
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 48.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(
-                    MaterialTheme.colorScheme.primary.copy(
-                        alpha = if (enabled && unanswered == 0) 0.12f else 0.05f,
-                    ),
-                )
-                .clickable(enabled = enabled && unanswered == 0 && !submitting, onClick = onSubmit),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.fillMaxWidth(),
         ) {
-            if (submitting) {
-                CircularProgressIndicator(strokeWidth = 1.5.dp, modifier = Modifier.size(13.dp))
-                Spacer(Modifier.width(6.dp))
+            if (n > 1 && cur > 0) {
+                AskPrimaryButton(
+                    text = "上一题",
+                    tint = MaterialTheme.colorScheme.primary,
+                    enabled = true,
+                    onClick = { RuntimeBridge.setCurrentQuestion(p.requestId, cur - 1) },
+                    modifier = Modifier.weight(1f),
+                )
             }
-            Text(
-                if (submitting) "提交中" else "提交",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.primary.copy(
-                    alpha = if (enabled && unanswered == 0) 1f else 0.45f,
-                ),
-            )
+            if (n == 1 || last) {
+                AskPrimaryButton(
+                    text = if (submitting) "提交中" else "提交",
+                    tint = MaterialTheme.colorScheme.primary,
+                    enabled = enabled && unanswered == 0 && !submitting,
+                    onClick = onSubmit,
+                    modifier = if (n > 1) Modifier.weight(2f) else Modifier.fillMaxWidth(),
+                    leading = {
+                        if (submitting) {
+                            CircularProgressIndicator(strokeWidth = 1.5.dp, modifier = Modifier.size(13.dp))
+                            Spacer(Modifier.width(6.dp))
+                        }
+                    },
+                )
+            } else {
+                AskPrimaryButton(
+                    text = "下一题",
+                    tint = MaterialTheme.colorScheme.primary,
+                    enabled = true,
+                    onClick = { RuntimeBridge.setCurrentQuestion(p.requestId, cur + 1) },
+                    modifier = Modifier.weight(2f),
+                )
+            }
         }
     }
 
@@ -1212,6 +1350,41 @@ internal fun AskCardFooter(
                 confirmDecline = false
                 RuntimeBridge.declineQuestionCard(p.requestId)
             },
+        )
+    }
+}
+
+/**
+ * 主操作区按钮（[SoftButton] 放大变体，向导式主操作行 / 提交共用）：
+ * 语义 tint 12% 底（禁用 5%）+ 同色 labelLarge 文字（禁用 45% alpha）、
+ * 10dp 圆角、最小高 48dp、内容居中。与 SoftButton 的差异仅几何放大
+ * （34dp → 48dp、无水平内边距、内容整体居中），配色机制一致。
+ * 「上一题」「下一题」「提交」统一 primary tint（SoftButton 机制下即淡主题
+ * 底 + 同色字，恒无灰色态；权重差异表达主次，不用颜色表达）。
+ */
+@Composable
+private fun AskPrimaryButton(
+    text: String,
+    tint: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    leading: @Composable () -> Unit = {},
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+        modifier = modifier
+            .heightIn(min = 48.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(tint.copy(alpha = if (enabled) 0.12f else 0.05f))
+            .clickable(enabled = enabled, onClick = onClick),
+    ) {
+        leading()
+        Text(
+            text,
+            style = MaterialTheme.typography.labelLarge,
+            color = tint.copy(alpha = if (enabled) 1f else 0.45f),
         )
     }
 }

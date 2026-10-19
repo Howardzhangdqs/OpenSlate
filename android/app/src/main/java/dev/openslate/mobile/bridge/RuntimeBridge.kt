@@ -134,6 +134,18 @@ data class PendingQuestionUi(
     val restored: Boolean = false,
 )
 
+/**
+ * 已答问卷的只读回看投影（摘要卡点击 → 全屏只读还原页）。题目结构来自
+ * 关联 ToolCall 条目的 **args JSON**（与 pending 卡同源解析），答案按
+ * **output JSON**（提交时的脱敏快照）逐题回填为只读 [QuestionDraft]；
+ * secret 只保留引用描述（name/kind/remember），明文永不出现（transcript
+ * 本就不含明文）。
+ */
+data class ReviewedQuestionUi(
+    val questions: List<QuestionUi>,
+    val drafts: List<QuestionDraft>,
+)
+
 // ── ask_user 解析 / 回放 + 转写恢复仲裁（internal 纯函数，便于补测）────
 
 /**
@@ -216,6 +228,70 @@ internal fun buildRestoredPendingQuestion(
         )
     }
     return null
+}
+
+/**
+ * 已答问卷还原（internal 纯函数）：ToolCall 条目的 args + output →
+ * [ReviewedQuestionUi]。args 的 `questions[]` 出题目结构（复用
+ * [parseAskUserQuestions]）；output 的 `answers[]` 按 id 对齐逐题回填只读
+ * 草稿（映射规则与 [RuntimeBridge.submitQuestionAnswers] 写回的 display
+ * JSON 一一对应）：
+ *
+ * - `skipped` / `declined` → 对应布尔（只读页控件禁用 +「已跳过此题」提示）；
+ * - `secret{name,remember}` → 只留 remember 与引用描述，**明文不回填**
+ *   （transcript 快照本就脱敏，只读页渲染「已存入凭据」引用行）；
+ * - `confirm` 布尔 → draft.confirm（confirm 答案同时带 selected，须先于
+ *   通用 selected 分支判定）；
+ * - `selected[]`（choice）→ 命中 options[].label 的进 selected，未命中的
+ *   （「其他」说明，提交时以自由文本并入 selected）回填 otherChecked/otherText；
+ * - `value`（text/未知题型兜底）→ draft.text。
+ *
+ * null = 无法还原（args 缺失 / 题目解析为空 / 无 answered outcome / answers
+ * 为空），调用方退回旧答案弹窗兜底。
+ */
+internal fun buildReviewedQuestion(args: String?, output: String?): ReviewedQuestionUi? {
+    val questionsArr = runCatching { JSONObject(args ?: "") }.getOrNull()
+        ?.optJSONArray("questions") ?: return null
+    val questions = parseAskUserQuestions(questionsArr)
+    if (questions.isEmpty()) return null
+    val o = runCatching { JSONObject(output ?: "") }.getOrNull() ?: return null
+    if (o.optString("outcome") != "answered") return null
+    val answersArr = o.optJSONArray("answers") ?: return null
+    if (answersArr.length() == 0) return null
+    val byId = HashMap<String, JSONObject>()
+    for (i in 0 until answersArr.length()) {
+        val a = answersArr.optJSONObject(i) ?: continue
+        byId[a.optString("id")] = a
+    }
+    val drafts = questions.map { q ->
+        val a = byId[q.id] ?: return@map QuestionDraft()
+        when {
+            a.optBoolean("skipped") -> QuestionDraft(skipped = true)
+            a.optBoolean("declined") -> QuestionDraft(declined = true)
+            a.has("secret") -> QuestionDraft(
+                remember = a.optJSONObject("secret")?.optBoolean("remember") ?: false,
+            )
+            q.type == "confirm" && a.has("confirm") -> QuestionDraft(confirm = a.optBoolean("confirm"))
+            a.has("selected") -> {
+                var selected = emptyList<String>()
+                var other = ""
+                val sa = a.optJSONArray("selected")
+                for (j in 0 until (sa?.length() ?: 0)) {
+                    val s = sa!!.optString(j).trim()
+                    when {
+                        s.isEmpty() -> Unit
+                        q.options.any { it.label == s } -> selected = selected + s
+                        // 未命中选项的自由文本 = 「其他」说明（提交时并入 selected）
+                        other.isEmpty() -> other = s
+                    }
+                }
+                QuestionDraft(selected = selected, otherChecked = other.isNotEmpty(), otherText = other)
+            }
+            a.has("value") -> QuestionDraft(text = a.optString("value"))
+            else -> QuestionDraft() // 未知形态：留空（只读页显示未填状态，不吞题）
+        }
+    }
+    return ReviewedQuestionUi(questions, drafts)
 }
 
 /**
@@ -321,6 +397,8 @@ data class RuntimeUiState(
     val pendingApproval: PendingApprovalUi? = null,
     /** ask_user 待答问卷（含草稿）；null = 无待答卡。 */
     val pendingQuestion: PendingQuestionUi? = null,
+    /** ask_user 已答问卷只读回看（摘要卡 → 全屏还原页）；null = 不在回看。 */
+    val questionReview: ReviewedQuestionUi? = null,
     val sessionId: String = "",
     val lastError: String? = null,
     val config: ConfigUi = ConfigUi(),
@@ -1505,6 +1583,26 @@ object RuntimeBridge {
         mutate { copy(pendingQuestion = null) }
     }
 
+    // ── ask_user 已答问卷只读回看 ───────────────────────────────────────
+
+    /**
+     * 打开已答问卷回看（摘要卡点击入口）：取关联条目的 fullArgs + output，
+     * 经 [buildReviewedQuestion] 装配只读投影写入 UiState（NavHost 路由
+     * `question-review` 由 UI 层随后导航）。解析失败（args 缺失的老条目 /
+     * 非 answered outcome）返回 false 且**不动 state**，调用方退回旧答案
+     * 弹窗兜底。
+     */
+    fun openQuestionReview(fullArgs: String, output: String?): Boolean {
+        val review = buildReviewedQuestion(fullArgs, output) ?: return false
+        mutate { copy(questionReview = review) }
+        return true
+    }
+
+    /** 关闭回看（回看页退出时清态，避免陈旧投影跨场景残留）。 */
+    fun closeQuestionReview() {
+        if (_state.value.questionReview != null) mutate { copy(questionReview = null) }
+    }
+
     // ── ask_user 行为偏好（本地 SharedPreferences = UI 显示源；生效真值
     //    在 Rust 侧 openslate.toml 的 [ask_user] 节——每次变更经协议
     //    set_ask_user_config 推送落盘，启动时同步一次本地值）──
@@ -1736,7 +1834,14 @@ object RuntimeBridge {
                 }
             }
             "approval_resolved" -> mutate { copy(pendingApproval = null) }
-            "session_reset" -> mutate { copy(entries = emptyList(), pendingApproval = null, pendingQuestion = null) }
+            "session_reset" -> mutate {
+                copy(
+                    entries = emptyList(),
+                    pendingApproval = null,
+                    pendingQuestion = null,
+                    questionReview = null, // 回看页在场时随 null 自动 pop（页内 LaunchedEffect）
+                )
+            }
             "model_changed" -> mutate { copy(modelAlias = obj.optString("alias")) }
             // run 标题生成完成：只递增版本号，历史页观察到后自行刷新
             // （会话列表不在全局 state 里，拉取式投影）。

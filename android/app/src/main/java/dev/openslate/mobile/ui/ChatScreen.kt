@@ -164,6 +164,7 @@ fun ChatScreen(
     onOpenHistory: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenAskUser: () -> Unit = {},
+    onOpenReviewAskUser: () -> Unit = {},
 ) {
     val state by RuntimeBridge.state.collectAsState()
     val listState = rememberLazyListState()
@@ -428,6 +429,7 @@ fun ChatScreen(
                                     onTapWhileFocused = { if (composerFocused) collapseComposer() },
                                     pendingQuestion = state.pendingQuestion,
                                     onOpenAskUser = onOpenAskUser,
+                                    onOpenReview = onOpenReviewAskUser,
                                 )
                                 is RenderItem.ToolGroup -> ToolGroupCard(
                                     item.parts,
@@ -640,6 +642,7 @@ private fun EntryRow(
     onTapWhileFocused: () -> Unit = {},
     pendingQuestion: PendingQuestionUi? = null,
     onOpenAskUser: () -> Unit = {},
+    onOpenReview: () -> Unit = {},
 ) {
     when (entry) {
         is UiEntry.User -> Bubble(entry.text, mine = true)
@@ -658,6 +661,7 @@ private fun EntryRow(
                 tc = entry,
                 pending = pendingQuestion,
                 onOpenFullScreen = onOpenAskUser,
+                onOpenReview = onOpenReview,
             )
             else -> ToolGroupCard(listOf(entry), onOpenTool)
         }

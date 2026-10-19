@@ -48,6 +48,7 @@ import dev.openslate.mobile.ui.HistoryScreen
 import dev.openslate.mobile.ui.KeysScreen
 import dev.openslate.mobile.ui.ModelRegistrySourceScreen
 import dev.openslate.mobile.ui.QuestionFullScreen
+import dev.openslate.mobile.ui.QuestionReviewScreen
 import dev.openslate.mobile.ui.SettingsScreen
 
 class MainActivity : ComponentActivity() {
@@ -98,6 +99,7 @@ private fun AppNavHost(
                 onOpenHistory = { nav.navigate("history") { launchSingleTop = true } },
                 onOpenSettings = { nav.navigate("settings") { launchSingleTop = true } },
                 onOpenAskUser = { nav.navigate("question-fullscreen") { launchSingleTop = true } },
+                onOpenReviewAskUser = { nav.navigate("question-review") { launchSingleTop = true } },
             )
         }
         // ask_user 全屏问卷：竖直滑入压在聊天上（「任务」而非「层级页」），
@@ -116,6 +118,24 @@ private fun AppNavHost(
             },
         ) {
             QuestionFullScreen(onBack = { nav.popBackStack() })
+        }
+        // ask_user 已答问卷只读回看：与 question-fullscreen 同转场家族（竖直
+        // 滑入/原路滑出）；入口 = 已答摘要卡点击（RuntimeBridge.openQuestionReview
+        // 先装配投影、成功才导航），页内投影被清时自动 pop。
+        composable(
+            "question-review",
+            enterTransition = {
+                slideInVertically(tween(280, easing = FastOutSlowInEasing)) { it } +
+                    fadeIn(tween(280, easing = FastOutSlowInEasing))
+            },
+            exitTransition = { fadeOut(tween(280, easing = FastOutSlowInEasing)) },
+            popEnterTransition = { fadeIn(tween(280, easing = FastOutSlowInEasing)) },
+            popExitTransition = {
+                slideOutVertically(tween(280, easing = FastOutSlowInEasing)) { it } +
+                    fadeOut(tween(280, easing = FastOutSlowInEasing))
+            },
+        ) {
+            QuestionReviewScreen(onBack = { nav.popBackStack() })
         }
         // 二级页面：从右侧滑入、按返回时原路滑出（原生推入语义）。
         composable(

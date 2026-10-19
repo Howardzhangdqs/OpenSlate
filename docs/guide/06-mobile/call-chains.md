@@ -376,6 +376,22 @@ resolve payload 的 answers[] 每题形态：`{id,selected:[label…]}`（choice
 `{secret:{name,kind,remember}}`。Rust 侧对 payload 形状宽容（selected/value/
 skipped/declined 逐题识别，secret 明文入会话凭据表后只回填引用）。
 
+**已答问卷只读回看**（2026-10）：摘要卡点击 →
+`RuntimeBridge.openQuestionReview(fullArgs, output)`（internal 纯函数
+`buildReviewedQuestion` 装配：args 的 `questions[]` 经
+`parseAskUserQuestions` 出题目结构，output 的 `answers[]` 按 id 对齐逐题
+回填只读 `QuestionDraft`——choice 的「其他」自由文本按「未命中
+options[].label」回填 otherChecked/otherText，confirm 取 `confirm` 布尔
+（须先于通用 selected 分支），secret 只留 remember、明文永不回填）→
+`UiState.questionReview` → NavHost 路由 `question-review`（转场同
+`question-fullscreen` 家族；ui/QuestionReviewScreen.kt）。页内以与待答全屏
+页同视觉语言还原（顶栏+SegmentBar+`AskQuestionPager(enabled=false,
+readOnly=true)`），secret 题出「已存入凭据」引用行，页脚仅向导式导航 +
+只读状态条（无提交/跳过动作）。解析失败（args 缺失的老条目 / 非 answered
+outcome / answers 空）`openQuestionReview` 返回 false 不动 state，摘要卡
+退回旧 AskAnswersDialog 兜底。投影退出即清（DisposableEffect）、
+session_reset 一并清除（页内 LaunchedEffect 自动 pop）。
+
 ## 4. 生命周期
 
 ### 4.1 启动

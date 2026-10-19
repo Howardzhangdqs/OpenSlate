@@ -240,6 +240,7 @@ internal fun QuestionCardHost(
     tc: UiEntry.ToolCall,
     pending: PendingQuestionUi?,
     onOpenFullScreen: () -> Unit,
+    onOpenReview: () -> Unit = {},
 ) {
     val matches = pending != null && pending.argsKey == tc.fullArgs
     val view: AskCardView = when {
@@ -291,7 +292,13 @@ internal fun QuestionCardHost(
         ) { v ->
             when (v) {
                 is AskCardView.Interactive -> InteractiveQuestionCard(v.p, v.submitting, onOpenFullScreen)
-                is AskCardView.Answered -> SummaryCard(v.o, v.feedback)
+                is AskCardView.Answered -> SummaryCard(
+                    outcome = v.o,
+                    feedback = v.feedback,
+                    args = tc.fullArgs,
+                    output = tc.output,
+                    onOpenReview = onOpenReview,
+                )
                 is AskCardView.Terminal -> AskTerminalLine(v.kind)
                 AskCardView.Waiting -> AskWaitingLine()
             }
@@ -644,6 +651,9 @@ internal fun AskQuestionPager(
     minLines: Int,
     onDraftChange: (Int, QuestionDraft) -> Unit,
     onBodyOverflow: (page: Int, overflows: Boolean) -> Unit = { _, _ -> },
+    /** 只读回看态（question-review 页）：控件禁用之外，secret 题渲染「已存入
+     *  凭据」引用行替代输入框（transcript 快照无明文，空输入框会误导）。 */
+    readOnly: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     // 反向同步：UiState current → 本地 Pager。footer「上一题/下一题」只写
@@ -750,6 +760,7 @@ internal fun AskQuestionPager(
                         draft = draft,
                         enabled = enabled && !draft.skipped && !draft.declined,
                         minLines = minLines,
+                        readOnly = readOnly,
                         onChange = { onDraftChange(page, it) },
                     )
                 }
@@ -781,12 +792,15 @@ private fun QuestionBody(
     draft: QuestionDraft,
     enabled: Boolean,
     minLines: Int,
+    readOnly: Boolean = false,
     onChange: (QuestionDraft) -> Unit,
 ) {
     when (q.type) {
         "choice" -> ChoiceGroup(q, draft, enabled, onChange)
         "confirm" -> ConfirmPair(q, draft, enabled, onChange)
-        "secret" -> SecretInputSection(q, draft, enabled, minLines = 1, onChange)
+        "secret" ->
+            if (readOnly) SecretReviewReference(q, draft)
+            else SecretInputSection(q, draft, enabled, minLines = 1, onChange)
         else -> TextInputSection(q, draft, enabled, minLines, onChange) // text + 未知兜底
     }
     // 逐题状态提示（跳过后控件禁用，动作按钮变为取消跳过，见 Footer）。
@@ -1240,6 +1254,81 @@ private fun SecretInputSection(
     }
 }
 
+/**
+ * secret 题只读引用块（question-review 回看页专用，替代 [SecretInputSection]）：
+ * transcript 快照只含脱敏引用、无明文——渲染空输入框会误导「可作答/曾输入为空」，
+ * 故改为「已存入凭据」引用行（成功绿 container，与摘要卡 secret chip 同语言）
+ * + 落地形态行（与作答态同款：MonoFont 变量名/路径）+ 记住状态说明。
+ */
+@Composable
+private fun SecretReviewReference(q: QuestionUi, draft: QuestionDraft) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // 引用描述行（永不出现明文）。
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(successGreenContainer())
+                .border(0.5.dp, successGreen().copy(alpha = 0.4f), RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Icon(
+                Icons.Outlined.Key,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = successGreen(),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "已存入凭据 · 明文不再展示",
+                style = MaterialTheme.typography.bodySmall,
+                color = successGreen(),
+            )
+        }
+        // 落地形态行（与作答态同款；变量名/路径 MonoFont）。
+        val isFile = q.storageKind == "file"
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
+                .border(
+                    0.5.dp,
+                    MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                    RoundedCornerShape(10.dp),
+                )
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Icon(
+                if (isFile) Icons.Outlined.Description else Icons.Outlined.Terminal,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.secondary,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                buildAnnotatedString {
+                    withStyle(SpanStyle(fontFamily = MonoFont)) {
+                        append(q.storageName ?: if (isFile) "文件" else "环境变量")
+                    }
+                    append(if (isFile) " · 已写入文件" else " · 环境变量 · 已在本会话生效")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (draft.remember) {
+            Text(
+                "提交时勾选了「记住此凭据」，后续会话也可使用",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+    }
+}
+
 // ── 底部：次要动作 + 整卡 decline + 提交（内联 / 全屏共用）──────────
 
 @Composable
@@ -1366,9 +1455,10 @@ internal fun AskCardFooter(
  * （34dp → 48dp、无水平内边距、内容整体居中），配色机制一致。
  * 「上一题」「下一题」「提交」统一 primary tint（SoftButton 机制下即淡主题
  * 底 + 同色字，恒无灰色态；权重差异表达主次，不用颜色表达）。
+ * internal：question-review 只读回看页的向导导航行复用同款几何/配色。
  */
 @Composable
-private fun AskPrimaryButton(
+internal fun AskPrimaryButton(
     text: String,
     tint: Color,
     enabled: Boolean,
@@ -1425,9 +1515,20 @@ private fun DeclineConfirmDialog(onDismiss: () -> Unit, onConfirm: () -> Unit) {
 
 // ── answered 折叠摘要卡 ─────────────────────────────────────────────
 
+/**
+ * 已答摘要卡。整卡可点 → 全屏只读还原页（[RuntimeBridge.openQuestionReview]
+ * 装配 args 题目结构 + output 答案快照成功时经 [onOpenReview] 导航）；
+ * args 缺失 / 解析失败的老条目退回完整答案弹窗（[AskAnswersDialog] 兜底）。
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun SummaryCard(outcome: AskOutcomeUi.Answered, feedback: Boolean) {
+internal fun SummaryCard(
+    outcome: AskOutcomeUi.Answered,
+    feedback: Boolean,
+    args: String = "",
+    output: String? = null,
+    onOpenReview: () -> Unit = {},
+) {
     var showDetail by remember { mutableStateOf(false) }
     // 提交成功反馈：淡入 4s 后淡出收矮（从 resolve 成功起算）。
     var feedbackVisible by remember(outcome) { mutableStateOf(feedback) }
@@ -1445,7 +1546,10 @@ internal fun SummaryCard(outcome: AskOutcomeUi.Answered, feedback: Boolean) {
             .clip(shape)
             .background(MaterialTheme.colorScheme.surfaceContainerLowest)
             .border(0.5.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f), shape)
-            .clickable { showDetail = true }
+            .clickable {
+                if (RuntimeBridge.openQuestionReview(args, output)) onOpenReview()
+                else showDetail = true
+            }
             .padding(horizontal = 12.dp, vertical = 10.dp)
             .animateContentSize(tween(200, easing = FastOutSlowInEasing)),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -1529,7 +1633,9 @@ private fun AnswerChip(a: AskAnswerDisplay) {
     }
 }
 
-/** 完整答案弹窗（ToolDetailDialog 容器语言：16dp Surface + 可滚动 + 关闭钮）。 */
+/** 完整答案弹窗（ToolDetailDialog 容器语言：16dp Surface + 可滚动 + 关闭钮）。
+ *  已答摘要卡的**兜底**视图：仅当条目 args 缺失/解析失败（无法还原问卷结构
+ *  走全屏只读页）时经 SummaryCard 点击到达。 */
 @Composable
 private fun AskAnswersDialog(outcome: AskOutcomeUi.Answered, onDismiss: () -> Unit) {
     androidx.compose.ui.window.Dialog(

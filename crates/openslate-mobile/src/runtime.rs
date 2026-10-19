@@ -1270,6 +1270,33 @@ impl MobileRuntime {
 /// 返回 `(AppState, 外部 MCP guard, 外部 MCP 工具名)`——后两者由
 /// `MobileRuntime` 接手（热重载整体替换），builtin 句柄留在
 /// `AppState._mcp` 保活。
+/// 重启恢复 pop 兜底的守卫：尾部悬挂 assistant（带未答 `tool_calls` 的
+/// 最后一条消息）只有在**没有任何 pending 问卷行引用其声明的
+/// tool_call** 时才允许丢弃（经典「模型重新决策」语义）。
+///
+/// 判定以 store 的 pending 行为准，而非调用方（ask_user 启动清扫）返回
+/// 的 recoverable 分类——两者可能存在偏差（行属于本 run 却未被认作
+/// recoverable 的细节场景）。有引用时必须保留尾部悬挂：那是迟到答案
+/// （question_reply → `append_late_tool_result`）与 TTL 过期合成收尾
+/// 的补全点，pop 即不可逆摧毁。
+fn may_pop_dangling_tail(history: &[Message], pending_tool_call_ids: &[String]) -> bool {
+    let Some(last) = history.last() else {
+        return false;
+    };
+    if last.role != MessageRole::Assistant {
+        return false;
+    }
+    let Some(tool_calls) = last.tool_calls.as_ref() else {
+        return false;
+    };
+    if tool_calls.is_empty() {
+        return false;
+    }
+    !tool_calls
+        .iter()
+        .any(|tc| pending_tool_call_ids.contains(&tc.id.0))
+}
+
 async fn assemble_state(
     config_path: std::path::PathBuf,
     sink: Arc<EventSink>,
@@ -1416,15 +1443,27 @@ async fn assemble_state(
                             });
                         }
                         // 无可恢复问卷且尾部仍是悬挂 assistant → 执行
-                        // load_messages 的经典丢弃（模型重新决策）。
-                        if !keep_dangling
-                            && matches!(
-                                restored_history.last(),
-                                Some(m) if m.role == MessageRole::Assistant
-                                    && m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
-                            )
-                        {
-                            restored_history.pop();
+                        // load_messages 的经典丢弃（模型重新决策）；但以
+                        // store 为权威守卫（may_pop_dangling_tail）：尾部
+                        // 声明的 tool_call 仍有 pending 行引用时保留悬挂
+                        // （迟到答案 / TTL 过期合成收尾的补全点，pop 不可
+                        // 逆）。查询失败保守保留——多留的悬挂由下一 turn
+                        // 前的修复收口，安全；误 pop 则无法挽回。
+                        if !keep_dangling {
+                            match store.list_pending_questions().await {
+                                Ok(pending) => {
+                                    let pending_ids: Vec<String> = pending
+                                        .into_iter()
+                                        .map(|row| row.tool_call_id)
+                                        .collect();
+                                    if may_pop_dangling_tail(&restored_history, &pending_ids) {
+                                        restored_history.pop();
+                                    }
+                                }
+                                Err(e) => crate::alog!(
+                                    "restore: pending question guard failed, keep dangling (non-fatal): {e}"
+                                ),
+                            }
                         }
                         restored_transcript = messages_to_transcript(&restored_history);
                     }
@@ -2892,6 +2931,227 @@ mod tests {
             msgs.iter().any(|m| m.role == MessageRole::Assistant
                 && m.content.contains("收到，就用 SQLite。")),
             "续跑后的最终回复已入库"
+        );
+        runtime.shutdown();
+    }
+
+    // ── 重启恢复 pop 兜底守卫（may_pop_dangling_tail）────────────────
+
+    #[test]
+    fn may_pop_dangling_tail_guard_semantics() {
+        fn tail(ids: &[&str]) -> Message {
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: Some(
+                    ids.iter()
+                        .map(|i| openslate_core::types::ToolCall {
+                            id: openslate_core::types::ToolCallId((*i).into()),
+                            name: "ask_user".into(),
+                            arguments: serde_json::json!({}),
+                        })
+                        .collect(),
+                ),
+                reasoning_content: None,
+            }
+        }
+        fn user() -> Message {
+            Message {
+                role: MessageRole::User,
+                content: "go".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }
+        }
+        // 空历史 / 尾部非悬挂 assistant → 无事可 pop。
+        assert!(!may_pop_dangling_tail(&[], &[]));
+        assert!(!may_pop_dangling_tail(&[user()], &[]));
+        // 尾部悬挂 assistant + 无任何 pending 引用 → 允许 pop（经典
+        // 「模型重新决策」语义回归）。
+        assert!(may_pop_dangling_tail(&[user(), tail(&["tc-1"])], &[]));
+        assert!(may_pop_dangling_tail(
+            &[user(), tail(&["tc-1"])],
+            &["tc-other".to_owned()]
+        ));
+        // 尾部声明的 tool_call 被 pending 行引用（哪怕只引用其一）→
+        // 禁止 pop：迟到答案 / TTL 过期的补全点不可逆。
+        assert!(!may_pop_dangling_tail(
+            &[user(), tail(&["tc-1"])],
+            &["tc-1".to_owned()]
+        ));
+        assert!(!may_pop_dangling_tail(
+            &[user(), tail(&["tc-1", "tc-2"])],
+            &["tc-2".to_owned()]
+        ));
+    }
+
+    /// 种子数据：interrupted run，消息 = user + 尾部悬挂 assistant
+    /// （ask_user 声明）；可选插入引用该 tool_call 的 pending 问卷行。
+    fn seed_run_with_dangling_tail(
+        paths: &MobilePaths,
+        run_id: &str,
+        tool_call_id: &str,
+        with_row: bool,
+    ) {
+        let (srt, store) = scratch_store(paths);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        srt.block_on(async {
+            store
+                .insert_run(run_id, Some("pop 守卫"), "root", "interrupted", "{}", now_ms - 60_000)
+                .await
+                .unwrap();
+            store
+                .insert_execution_node(
+                    &format!("{run_id}-persist"),
+                    run_id,
+                    "root",
+                    None,
+                    None,
+                    "running",
+                    "{}",
+                    now_ms - 60_000,
+                )
+                .await
+                .unwrap();
+            let user_msg = Message {
+                role: MessageRole::User,
+                content: "选个数据库".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            };
+            let assistant_msg = Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: Some(vec![openslate_core::types::ToolCall {
+                    id: openslate_core::types::ToolCallId(tool_call_id.into()),
+                    name: "ask_user".into(),
+                    arguments: serde_json::json!({
+                        "questions": [{
+                            "id": "db",
+                            "question": "数据库？",
+                            "type": "choice",
+                            "options": [{"label": "SQLite"}, {"label": "sled"}]
+                        }]
+                    }),
+                }]),
+                reasoning_content: None,
+            };
+            store
+                .insert_message(
+                    &format!("msg-{run_id}-1"),
+                    run_id,
+                    &format!("{run_id}-persist"),
+                    Some("root"),
+                    "user",
+                    &serde_json::to_string(&user_msg).unwrap(),
+                    1,
+                    now_ms - 59_000,
+                )
+                .await
+                .unwrap();
+            store
+                .insert_message(
+                    &format!("msg-{run_id}-2"),
+                    run_id,
+                    &format!("{run_id}-persist"),
+                    Some("root"),
+                    "assistant",
+                    &serde_json::to_string(&assistant_msg).unwrap(),
+                    2,
+                    now_ms - 58_000,
+                )
+                .await
+                .unwrap();
+            if with_row {
+                store
+                    .insert_pending_question(
+                        "77",
+                        tool_call_id,
+                        r#"[{"id":"db","question":"数据库？","type":"choice","options":[{"label":"SQLite"},{"label":"sled"}],"optional":false}]"#,
+                        1,
+                        now_ms - 58_000,
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
+    fn transcript_has_tool_call(snap: &serde_json::Value, call_id: &str) -> bool {
+        snap["session"]["transcript"]
+            .as_array()
+            .map(|ts| {
+                ts.iter().any(|e| {
+                    e["kind"] == "tool_call"
+                        && e["call_id"].as_str() == Some(call_id)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// 本 run 尾部悬挂被 pending 行引用 → 重启恢复不得 pop（补全点
+    /// 保留，迟到答案 / TTL 过期收尾依赖它）。
+    #[test]
+    fn restart_keeps_dangling_tail_when_pending_row_references_it() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        seed_run_with_dangling_tail(&paths, "pop-guard-keep", "call-guard-keep", true);
+
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![text_response("收到。")]),
+        )
+        .unwrap();
+        let events = collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        let snap = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "snapshot")
+            .expect("首份快照");
+        assert!(
+            transcript_has_tool_call(snap, "call-guard-keep"),
+            "pending 行引用尾部 tool_call → 悬挂 assistant 不被 pop: {snap}"
+        );
+        runtime.shutdown();
+    }
+
+    /// 无 pending 引用 → 经典丢弃语义照常（尾部悬挂 assistant 被 pop，
+    /// 模型重新决策）。
+    #[test]
+    fn restart_pops_dangling_tail_without_pending_reference() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        seed_run_with_dangling_tail(&paths, "pop-guard-drop", "call-guard-drop", false);
+
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![text_response("收到。")]),
+        )
+        .unwrap();
+        let events = collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        let snap = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "snapshot")
+            .expect("首份快照");
+        assert!(
+            !transcript_has_tool_call(snap, "call-guard-drop"),
+            "无 pending 引用 → 尾部悬挂 assistant 照常 pop（经典语义）: {snap}"
         );
         runtime.shutdown();
     }

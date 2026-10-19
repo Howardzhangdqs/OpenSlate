@@ -76,12 +76,12 @@ id 的 resolve 是无害 no-op（`HostCallRouter::resolve` 返回 false）。
 
 | 事件 | 路径 |
 |------|------|
-| 工具发起 | 落库 pending 行（request_id=host call id、tool_call_id=**当前 run 持久化消息中悬挂的 ask_user 声明**——runner 在执行工具前已落盘 assistant 消息；`find_call_id` 读 store 而非 `inner.history`，后者回合中是旧副本）→ 发信封 → 自定义超时等待 |
+| 工具发起 | 落库 pending 行（request_id=host call id、tool_call_id=**当前 run 持久化消息中悬挂的 ask_user 声明**——runner 在执行工具前已落盘 assistant 消息；`find_call_id` 读 store 而非 `inner.history`，后者回合中是旧副本；args 匹配用 `args_equivalent` 宽松等价——容忍 provider/持久化 round-trip 的 `120` vs `120.0` 数值表示漂移，唯一悬挂时兜底取之，尽量保证行必落库）→ 发信封 → 自定义超时等待 |
 | 提交/整卡拒绝（在途） | `resolve_host_call` → 工具格式化回填 → 行 answered/declined |
 | 超时 | 业务结果回填 timeout 文案；行 expired |
 | 用户取消回合 | 引擎 select! 合成 cancelled 结果；`on_cancel_all` 把全部 pending 行关 superseded（仅在有进行中回合时；无回合的取消不误杀重启恢复的问卷） |
 | 新 turn 抢答 | session `handle_submit` 的 superseded 修复关卷 tool call；行由快照自愈（`snapshot_dtos` 发现历史已解决 → superseded） |
-| 进程被杀 | `fail_all` **豁免 ask_user**（不 fail，问卷留在持久层）；重启后 `assemble_state` keep-dangling 加载 + `startup_question_maintenance`（过期→合成 EXPIRED_RESULT 补全并落库；已解决→关卷；其余保留） |
+| 进程被杀 | `fail_all` **豁免 ask_user**（不 fail，问卷留在持久层）；重启后 `assemble_state` keep-dangling 加载 + `startup_question_maintenance`（过期→合成 EXPIRED_RESULT 补全并落库；**已解决→关卷**——判定证据是恢复 history 里**确有该 tool_call_id 的结果消息**；其余保留。**属于其它 run 的行（恢复 history 查无其调用）同样保留 pending**——不构成「被取代」证据，最终由 TTL 过期兜底）。尾部悬挂 assistant 的经典 pop 丢弃以 store 为权威守卫（`may_pop_dangling_tail`）：尾部声明的 tool_call 仍有 pending 行引用时不 pop（保住迟到答案/TTL 补全点） |
 | 重启后作答 | 快照 `pending_questions` 回放（`AskUserContext::snapshot_dtos` 回填，server 投影恒空）→ UI 重现问卷卡 |
 
 ## 6. 迟到答案（question_reply）与等价不变量

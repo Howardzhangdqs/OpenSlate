@@ -820,6 +820,31 @@ impl AskUserContext {
         crate::secrets::mask_with_known_values(&self.vault.known_secret_values(), text)
     }
 
+    /// args 宽松等价（精确比较的兜底）：结构相等，或仅**数值表示形式**
+    /// 不同——模型 args 经 provider / 持久化 round-trip 后可能出现
+    /// `120` 与 `120.0` 这类 int/float 漂移，逐层递归比较（键序无关）。
+    /// 让更多悬挂声明能按 tool_call_id 精确对上，减少「无行可恢复」
+    /// （args 不匹配且非唯一悬挂时 find_call_id 只能放弃）的路径。
+    fn args_equivalent(a: &Value, b: &Value) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+                (Some(x), Some(y)) => x == y,
+                _ => false,
+            },
+            (Value::Object(x), Value::Object(y)) => {
+                x.len() == y.len()
+                    && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| Self::args_equivalent(v, w)))
+            }
+            (Value::Array(x), Value::Array(y)) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(v, w)| Self::args_equivalent(v, w))
+            }
+            _ => false,
+        }
+    }
+
     /// 当前悬挂 ask_user 调用的定位：读**当前 run 的持久化消息**（runner
     /// 在执行工具前已把带 `tool_calls` 的 assistant 消息落盘——
     /// runtime.rs「assistant 消息先于任何工具运行进持久存储」契约）。
@@ -855,7 +880,7 @@ impl AskUserContext {
             for tc in tool_calls {
                 if tc.name == ASK_USER_TOOL
                     && ask_dangling.contains(&tc.id.0)
-                    && tc.arguments == *args
+                    && Self::args_equivalent(&tc.arguments, args)
                 {
                     return Some(tc.id.0.clone());
                 }
@@ -1506,10 +1531,16 @@ async fn resume_turn(
 ///
 /// - **过期**（created_at 早于 now-TTL）且悬挂 → `append_late_tool_result`
 ///   合成 [`EXPIRED_RESULT`] 补全（消息经 recorder 落盘，与内存同序——
-///   悬挂只会出现在尾部，append 即尾序）；行 → expired。
-/// - **已解决**（tool_call_id 在恢复的 history 里已有结果——崩溃发生在
-///   结果落地与行更新之间）→ 行 → superseded。
-/// - 其余 pending 保持（可恢复：快照回放 + 迟到答案续跑）。
+///   悬挂只会出现在尾部，append 即尾序）；行 → expired。声明不在本
+///   history 的过期行无补全点，同样 expired 关卷（TTL 兜底语义）。
+/// - **已解决**（恢复的 history 里**确有该 tool_call_id 的结果消息**——
+///   崩溃发生在结果落地与行更新之间）→ 行 → superseded。
+/// - **其余 pending 保持**：悬挂者可恢复（快照回放 + 迟到答案续跑）；
+///   **结果与声明均不在本 history 者**（属于其它 run——如状态 failed
+///   被恢复逻辑排除的 run、或提问后用户开过更新的会话）**同样保持
+///   pending**：「本 history 查无此调用」不构成「已被取代」的证据——
+///   误关会让该问卷永久丢失回放；迟到答案仍可经 question_reply 补全
+///   （若其 run 恰被恢复），最终由 TTL 过期兜底关卷。
 ///
 /// 返回仍可恢复（保持 pending 且当前 history 中悬挂）的 tool_call_id 集。
 pub async fn startup_question_maintenance(
@@ -1531,6 +1562,15 @@ pub async fn startup_question_maintenance(
     let mut dangling: HashSet<String> = dangling_tool_calls(history)
         .into_iter()
         .map(|(id, _)| id)
+        .collect();
+    // 本 history 中**确有结果落地**的 tool_call_id（Tool 消息直接证据）。
+    // 「已解决关卷」的可验证前提：结果就写在本 run 的 history 里；查无
+    // 结果 = 行属于其它 run（本 history 没有它的补全点）→ 保持 pending
+    // （见 fn 文档），不能因「不在 dangling 集」就推定被取代。
+    let resolved_here: HashSet<String> = history
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .filter_map(|m| m.tool_call_id.as_ref().map(|id| id.0.clone()))
         .collect();
 
     for row in rows {
@@ -1558,13 +1598,16 @@ pub async fn startup_question_maintenance(
             let _ = store
                 .transition_pending_question(&row.request_id, "pending", "expired")
                 .await;
-        } else if !is_dangling {
+        } else if is_dangling {
+            recoverable.push(row.tool_call_id.clone());
+        } else if resolved_here.contains(&row.tool_call_id) {
             // 结果已在但行还 pending（崩溃窗口）→ 关卷。
             let _ = store
                 .transition_pending_question(&row.request_id, "pending", "superseded")
                 .await;
         } else {
-            recoverable.push(row.tool_call_id.clone());
+            // 声明与结果均不在本 history（行属于其它 run / 会话）：保持
+            // pending，不误关——迟到答案补全或 TTL 过期兜底（见 fn 文档）。
         }
     }
     recoverable
@@ -2035,6 +2078,126 @@ mod tests {
             .collect();
         assert!(dangling.contains(&"tc-fresh".to_owned()));
         assert!(!dangling.contains(&"tc-old".to_owned()));
+    }
+
+    /// 行属于非恢复 run（如 failed 被排除 / 提问后开过更新的会话）：
+    /// 恢复 history 查无该调用的声明与结果 → 不构成「被取代」证据，
+    /// 保持 pending（迟到答案仍可补全）；过期者由 TTL 兜底关卷。
+    #[tokio::test]
+    async fn startup_maintenance_keeps_rows_of_other_runs_pending() {
+        let store = openslate_store_sqlite::store::SqliteStore::new_in_memory()
+            .await
+            .unwrap();
+        store.run_migrations().await.unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // 「外来」行：属于其它 run（本 history 查无 tc-foreign）。
+        store
+            .insert_pending_question("foreign", "tc-foreign", "[]", 1, now)
+            .await
+            .unwrap();
+        // 「外来」且过期：TTL 兜底照常关卷（expired），不受新判定影响。
+        store
+            .insert_pending_question(
+                "foreign-old",
+                "tc-foreign-old",
+                "[]",
+                1,
+                now - QUESTION_TTL_MS - 1,
+            )
+            .await
+            .unwrap();
+        // 对照组：本 history 悬挂（可恢复）+ 结果已落地（崩溃窗口关卷）。
+        store
+            .insert_pending_question("mine", "tc-mine", "[]", 1, now)
+            .await
+            .unwrap();
+        store
+            .insert_pending_question("gone", "tc-gone", "[]", 1, now)
+            .await
+            .unwrap();
+
+        let mut history = vec![
+            Message {
+                role: MessageRole::User,
+                content: "go".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            assistant_with_ask("tc-mine"),
+            tool_result_msg("tc-gone", "already answered elsewhere"),
+        ];
+
+        let recoverable = startup_question_maintenance(&store, &mut history, None).await;
+        assert_eq!(recoverable, vec!["tc-mine".to_owned()]);
+
+        // 外来新鲜行：保持 pending（不误关 superseded）。
+        assert_eq!(
+            store.get_pending_question("foreign").await.unwrap().unwrap().status,
+            "pending",
+            "属于非恢复 run 的行不得被误关"
+        );
+        // 外来过期行：TTL 兜底 expired（且无声明处 → 不合成补全）。
+        assert_eq!(
+            store
+                .get_pending_question("foreign-old")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "expired"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.tool_call_id.as_ref().map(|id| id.0.as_str()) == Some("tc-foreign-old")),
+            "无声明处不合成 expired 补全"
+        );
+        // 对照组语义不变。
+        assert_eq!(
+            store.get_pending_question("gone").await.unwrap().unwrap().status,
+            "superseded"
+        );
+        assert_eq!(
+            store.get_pending_question("mine").await.unwrap().unwrap().status,
+            "pending"
+        );
+    }
+
+    /// args 宽松等价：int/float 表示形式漂移（provider / 持久化 round-trip）
+    /// 不影响 find_call_id 的精确匹配路径。
+    #[test]
+    fn args_equivalent_tolerates_numeric_representation_drift() {
+        use serde_json::json;
+        let exact = json!({"questions": [{"question": "db?", "timeout": 120}]});
+        assert!(AskUserContext::args_equivalent(
+            &exact,
+            &json!({"questions": [{"question": "db?", "timeout": 120}]})
+        ));
+        // 120 vs 120.0：结构不等但数值等价。
+        assert!(AskUserContext::args_equivalent(
+            &exact,
+            &json!({"questions": [{"question": "db?", "timeout": 120.0}]})
+        ));
+        // 键序无关。
+        assert!(AskUserContext::args_equivalent(
+            &json!({"timeout": 60, "questions": []}),
+            &json!({"questions": [], "timeout": 60.0})
+        ));
+        // 数值不同 / 结构不同 → 不等价。
+        assert!(!AskUserContext::args_equivalent(
+            &exact,
+            &json!({"questions": [{"question": "db?", "timeout": 121}]})
+        ));
+        assert!(!AskUserContext::args_equivalent(
+            &exact,
+            &json!({"questions": [{"question": "别的?", "timeout": 120}]})
+        ));
     }
 
     // ── 审批豁免 ─────────────────────────────────────────────────────

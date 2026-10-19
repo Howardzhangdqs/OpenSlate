@@ -64,6 +64,7 @@ JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**�
 | `registrySearch(sourceId, query, limit: Int): String` | 232-237 | 纯本地，首次读盘解压，**建议 IO 线程**；`limit<=0` 按 50 |
 | `lookupModelMeta(modelId): String` | 240-243 | 本地优先；miss 在线兜底（10s），**IO 线程调用** |
 | `currentRunId(): String?` | 246-248 | 无进行中会话返回 null |
+| `toolOutputByCallId(callId): String?` | — | 按 call_id 拉工具调用**完整输出**（详情弹窗懒加载）：内存 history 直读（锁内 clone，无网络/磁盘）；null = 未命中（id 未知 / history 被压缩 / 子代理工具），调用方回退 preview |
 | `openSession(runId)` | 251-258 | 切换历史会话；失败抛 `MobileError.SendFailed`（reason 带 `open_session:` 前缀） |
 | `deleteSession(runId): Boolean` | 264-267 | false = 拒绝/失败（活动会话不可删等）；Kotlin 负责同步删自己的 transcript 文件 |
 | `shutdown()` | 270-272 | 优雅关停，幂等 |

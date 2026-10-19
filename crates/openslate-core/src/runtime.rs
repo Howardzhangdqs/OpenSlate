@@ -716,7 +716,7 @@ pub async fn execute_run(
                     let args_display = truncate_str(&args_str, 120);
 
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str));
+                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str), &tc.id.0);
                     } else {
                         tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                     }
@@ -776,6 +776,7 @@ pub async fn execute_run(
                             output.bytes,
                             truncated,
                             &truncate_str(&output.content, 512),
+                            &tc.id.0,
                         );
                     } else {
                         let result_preview = truncate_str(&output.content, 80);
@@ -849,7 +850,7 @@ pub async fn execute_run(
                     let args_str = tc.arguments.to_string();
                     let args_display = truncate_str(&args_str, 120);
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str));
+                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str), &tc.id.0);
                     } else {
                         tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                     }
@@ -945,11 +946,12 @@ pub async fn execute_run(
                             let truncated = output.bytes > 80;
                             if let Some(cb) = progress.as_mut() {
                                 cb.on_tool_end(
-                            &tc.name,
-                            output.bytes,
-                            truncated,
-                            &truncate_str(&output.content, 512),
-                        );
+                                    &tc.name,
+                                    output.bytes,
+                                    truncated,
+                                    &truncate_str(&output.content, 512),
+                                    &tc.id.0,
+                                );
                             } else {
                                 let result_preview = truncate_str(&output.content, 80);
                                 tracing::info!(
@@ -2761,8 +2763,8 @@ mod tests {
         fn on_delta(&mut self, _text: &str) {}
         fn on_usage(&mut self, _usage: crate::types::Usage) {}
         fn on_request_end(&mut self) {}
-        fn on_tool_start(&mut self, _name: &str, _args: &str) {}
-        fn on_tool_end(&mut self, _name: &str, _bytes: usize, _truncated: bool, _preview: &str) {}
+        fn on_tool_start(&mut self, _name: &str, _args: &str, _call_id: &str) {}
+        fn on_tool_end(&mut self, _name: &str, _bytes: usize, _truncated: bool, _preview: &str, _call_id: &str) {}
     }
 
     /// Provider that streams a scripted first turn (Delta + Done with a
@@ -3415,13 +3417,13 @@ mod tests {
         fn on_delta(&mut self, _text: &str) {}
         fn on_usage(&mut self, _usage: crate::types::Usage) {}
         fn on_request_end(&mut self) {}
-        fn on_tool_start(&mut self, name: &str, _args: &str) {
+        fn on_tool_start(&mut self, name: &str, _args: &str, _call_id: &str) {
             self.0
                 .lock()
                 .expect("progress poisoned")
                 .push(format!("start:{name}"));
         }
-        fn on_tool_end(&mut self, name: &str, _bytes: usize, _truncated: bool, _preview: &str) {
+        fn on_tool_end(&mut self, name: &str, _bytes: usize, _truncated: bool, _preview: &str, _call_id: &str) {
             self.0
                 .lock()
                 .expect("progress poisoned")

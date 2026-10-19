@@ -219,8 +219,8 @@ pub enum EntryDto {
     ToolCall {
         name: String,
         args: String,
-        /// live 条目恒为 `None`（core 的 on_tool_start 不传 id）；
-        /// 客户端从 TurnSummaryDto.messages 重建折叠时可回填。
+        /// 工具调用 id：live 事件（on_tool_start）与 DB 重建条目均携带；
+        /// 旧版本 live 条目为 `None`（按名字 + FIFO 配对的兜底路径）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
         status: ToolStatusDto,
@@ -721,20 +721,27 @@ pub enum ServerMsg {
     RequestEnd,
     /// 步进（step+1 / step=N）。
     StepEnd,
-    /// 工具调用开始（镜像 TuiEvent::ToolStart；live 不带 call_id）。
+    /// 工具调用开始（镜像 TuiEvent::ToolStart）。`call_id` 为 provider
+    /// 分配的工具调用 id（客户端按其精确配对条目 / 懒加载全量输出）；
+    /// 旧版本事件不带（None），客户端按名字 + FIFO 兜底。
     ToolStart {
         name: String,
         args: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     /// 工具调用结束（镜像 TuiEvent::ToolEnd；失败与否由回合结束的
     /// Tool 消息折叠判定，事件本身只带字节数/截断位）。
     /// `preview` 为输出前若干字符（UI 投影兜底；None = 无输出或未携带）。
+    /// `call_id` 同 [`ServerMsg::ToolStart`]。
     ToolEnd {
         name: String,
         bytes: usize,
         truncated: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
     ApprovalRequested {
         id: u64,

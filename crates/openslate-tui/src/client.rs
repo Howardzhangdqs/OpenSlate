@@ -78,7 +78,9 @@ pub fn to_tui(msg: ServerMsg) -> Vec<TuiEvent> {
         ServerMsg::Usage { usage } => TuiEvent::Usage(usage),
         ServerMsg::RequestEnd => TuiEvent::RequestEnd,
         ServerMsg::StepEnd => TuiEvent::StepEnd,
-        ServerMsg::ToolStart { name, args } => TuiEvent::ToolStart { name, args },
+        // `call_id` 在 TuiEvent 层无对应字段（TUI 折叠走名字 + FIFO，
+        // 且 DB 重建条目本就带 call_id）；`..` 显式忽略保持兼容。
+        ServerMsg::ToolStart { name, args, .. } => TuiEvent::ToolStart { name, args },
         ServerMsg::ToolEnd {
             name,
             bytes,

@@ -60,8 +60,8 @@ pub const PROTOCOL_VERSION: u32 = 2;
 | `Usage` | `usage: Usage` | 单次请求精确 usage（core 类型直嵌） |
 | `RequestEnd` | — | |
 | `StepEnd` | — | 步进分隔 |
-| `ToolStart` | `name`, `args` | **live 不带 call_id**（core 的 on_tool_start 不传） |
-| `ToolEnd` | `name`, `bytes`, `truncated`, `preview?` | 失败与否由回合结束的 Tool 消息折叠判定；preview None = 无输出 |
+| `ToolStart` | `name`, `args`, `call_id?` | live 携带 provider 分配的 call_id（客户端精确配对条目 / 懒加载全量输出）；旧版本事件无此字段（None，客户端按名字 + FIFO 兜底） |
+| `ToolEnd` | `name`, `bytes`, `truncated`, `preview?`, `call_id?` | 失败与否由回合结束的 Tool 消息折叠判定；preview None = 无输出；call_id 同 `ToolStart` |
 | `ApprovalRequested` | `id: u64`, `summary: ApprovalSummaryDto` | |
 | `ApprovalResolved` | `id`, `choice: String`（approve/deny/approve_all） | 首答后广播，所有客户端清横幅 |
 | `TurnOk` | `summary: Box<TurnSummaryDto>` | 回合终态 |
@@ -87,7 +87,7 @@ hello 成功后定向发送的全量快照：`proto`/`session_id`/`session_label
 
 - `User{text}` / `Assistant{text}` / `Reasoning{text}` / `StepBreak` / `Meta{text}`（usage 行）
 - `ToolCall{name, args, call_id?, status: ToolStatusDto, detail: ToolEntryDetailDto}`
-  - `call_id` live 期恒 None；客户端从 `TurnSummaryDto.messages` 重建折叠时可回填（:141-144）
+  - `call_id`：live 事件（`on_tool_start`）与 DB 重建条目均携带；旧版本 live 条目为 None（折叠配对回退名字 + FIFO）
   - `ToolStatusDto`（:101，tag "state"）：`running` / `done{bytes, truncated, elapsed_ms?}` / `failed{summary}`。**live 迁移仅 Running→Done；`failed` 只由回合结束的折叠启发式产生**（:97-98）
   - `ToolEntryDetailDto`（:117）：`args`（完整调用参数 pretty JSON）+ `output?`（live 期为 None，回合结束从 Tool 消息回填，8KB 留存上限）
 - `Approval{tool_name, decision}`：decision ∈ "approved"/"denied"/"approve-all"

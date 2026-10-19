@@ -971,6 +971,28 @@ impl MobileRuntime {
             .map(|r| r.run_id.0.clone())
     }
 
+    /// 按 call_id 取该工具调用的完整输出（内存 history 直读，纯同步）。
+    ///
+    /// 数据流：ToolDetailDialog 打开时 Kotlin 经 FFI 调用此函数，把 UI
+    /// 里的多层截断 preview（tool_end 事件 512 字符 / 恢复 2000 字符 /
+    /// 折叠 8KB）替换为 DB/内存 history 里 max_output_bytes 上限内的
+    /// 全量版本。命中条件：history 中存在 `role==Tool` 且
+    /// `tool_call_id == call_id` 的消息。
+    /// `None`（miss）场景与降级：call_id 为空/未知；history 被
+    /// auto_compact 换成摘要；call_agent 子代理的工具（子代理 history
+    /// 不在顶层会话）——调用方回退显示原 preview。
+    pub fn tool_output_by_call_id(&self, call_id: String) -> Option<String> {
+        if call_id.is_empty() {
+            return None;
+        }
+        let inner = self.state.core.lock();
+        inner
+            .history
+            .iter()
+            .find(|m| m.role == MessageRole::Tool && m.tool_call_id.as_ref().is_some_and(|id| id.0 == call_id))
+            .map(|m| m.content.clone())
+    }
+
     // ── Provider 模型自动检测（设置页 Provider 域）────────────────
 
     /// 数据源列表（含各源本地状态：条目数 / 更新时间 / 体积）。
@@ -2772,6 +2794,52 @@ mod tests {
             bash_msg.content
         );
 
+        runtime.shutdown();
+    }
+
+    /// `tool_output_by_call_id`（懒加载全量显示的 FFI 后端）：跑一个
+    /// native bash 回合 → 内存 history 命中返回完整输出；未知 id / 空
+    /// id 返回 None（调用方回退 preview）。
+    #[test]
+    fn tool_output_by_call_id_hit_and_miss() {
+        let bash = || {
+            vec![ModelStreamEvent::Done(ModelResponse {
+                content: None,
+                tool_calls: vec![openslate_core::types::ToolCall {
+                    id: openslate_core::types::ToolCallId("call-lazy-1".into()),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "printf 'lazy-full-output'"}),
+                }],
+                reasoning_content: None,
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            })]
+        };
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![bash(), text_response("完成")]),
+        )
+        .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        runtime.set_exec_backends("native");
+
+        runtime
+            .send(r#"{"type":"submit","text":"跑一下"}"#)
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(30));
+
+        // 命中：内存 history 直读完整输出（tool_end preview 只有 512
+        // 字符截断版，此处应拿到全文格式化输出）。
+        let out = runtime
+            .tool_output_by_call_id("call-lazy-1".into())
+            .expect("命中已知 call_id");
+        assert!(out.contains("lazy-full-output"), "输出: {out}");
+        // 未命中：未知 id / 空串 → None（UI 回退条目自带 preview）。
+        assert!(runtime.tool_output_by_call_id("call-unknown".into()).is_none());
+        assert!(runtime.tool_output_by_call_id(String::new()).is_none());
         runtime.shutdown();
     }
 

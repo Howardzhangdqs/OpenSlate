@@ -457,3 +457,37 @@ Rust 侧装配期经 core::mcp 连接该地址，Authorization: Bearer <token>
 ```
 
 改 mcp-host 二进制 → 重跑 `scripts/build-mcp-host.sh` + 重编 APK（assets 重新打包）。
+
+## 6. 工具输出懒加载全量显示（call_id 直读 history）
+
+聊天流保持轻量 preview（tool_end 事件 512 字符 / 重启恢复 2000 字符 / 会话折叠 8KB），完整版本
+（`max_output_bytes` 上限内，默认 64KB）常驻 DB/内存 history——详情弹窗打开时按 call_id 现取：
+
+```text
+core runtime 发射 on_tool_start/on_tool_end（带 &tc.id.0）
+  → SessionProgressBridge（engine.rs）
+      条目落 call_id（state.rs tool_start_entry / tool_end_entry 精确配对）
+      ServerMsg::ToolStart/ToolEnd 携带 call_id（Option，serde 向后兼容）
+  → Kotlin RuntimeBridge.handleEvent
+      tool_start: UiEntry.ToolCall(callId = obj.optString("call_id"))   【blank → null】
+      tool_end:   callId 精确匹配条目优先，任一侧缺失 → 名字 + running FIFO（历史行为）
+      本地镜像 entryToJson/entryFromJson 落 "c" 键（旧镜像自然 null）
+  → ToolDetailDialog 打开（ChatScreen.kt）
+      LaunchedEffect(tc.callId, tc.status)：有 callId 且非 running 且非 ask_user
+        → RuntimeBridge.fetchToolOutput(callId)
+            → withContext(IO) OpenSlateRuntime.toolOutputByCallId(callId)  【uniffi】
+            → MobileRuntime::tool_output_by_call_id（mobile/runtime.rs）
+                锁 state.core → 扫 CoreInner.history
+                role==Tool && tool_call_id==Some(call_id) → clone content（纯内存，不碰 store）
+      取更长者显示：longerOf(fullOut, tc.output)——host 工具的 Kotlin 缓存可能比
+      DB 版更长且未截断，DB 版有 secret 打码，两者都安全，任何一边都不丢
+      加载中显示极轻进度行（13dp CircularProgressIndicator + 「载入完整输出」），到货即隐
+```
+
+降级边界（均静默回退 preview，渐进增强）：
+
+- 旧事件 / 旧本地镜像无 call_id → null → 跳过懒加载，维持现状显示。
+- FFI 未命中（call_id 未知 / history 被 auto_compact 换摘要 / call_agent 子代理工具——子代理
+  history 不在顶层会话）→ 返回 None → 回退 preview。
+- **ask_user 条目绝不懒加载替换**：其条目输出是提交时写入的权威脱敏终态 JSON。
+- pendingToolOutputs 按名队列的同名并发错配是既有行为（host_call 信封带 call_id 列为后续改进）。

@@ -107,21 +107,22 @@ impl ProgressCallback for SessionProgressBridge {
         self.state.sink.broadcast(ServerMsg::RequestEnd);
     }
 
-    fn on_tool_start(&mut self, name: &str, args: &str) {
+    fn on_tool_start(&mut self, name: &str, args: &str, call_id: &str) {
         {
             let mut inner = self.state.core.lock();
-            tool_start_entry(&mut inner, name, args);
+            tool_start_entry(&mut inner, name, args, Some(call_id));
         }
         self.state.sink.broadcast(ServerMsg::ToolStart {
             name: name.to_owned(),
             args: args.to_owned(),
+            call_id: if call_id.is_empty() { None } else { Some(call_id.to_owned()) },
         });
     }
 
-    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, preview: &str) {
+    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, preview: &str, call_id: &str) {
         {
             let mut inner = self.state.core.lock();
-            tool_end_entry(&mut inner, name, bytes, truncated);
+            tool_end_entry(&mut inner, name, bytes, truncated, Some(call_id));
         }
         self.state.sink.broadcast(ServerMsg::ToolEnd {
             name: name.to_owned(),
@@ -132,6 +133,7 @@ impl ProgressCallback for SessionProgressBridge {
             } else {
                 Some(preview.to_owned())
             },
+            call_id: if call_id.is_empty() { None } else { Some(call_id.to_owned()) },
         });
     }
 

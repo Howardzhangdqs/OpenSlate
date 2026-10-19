@@ -373,8 +373,9 @@ pub fn flush_pending_step_meta(inner: &mut CoreInner) {
 }
 
 /// live 工具开始（call_agent 走 Delegate 标记，spec D2：子代理内容
-/// 不进转写）。
-pub fn tool_start_entry(inner: &mut CoreInner, name: &str, args: &str) {
+/// 不进转写）。`call_id` 落进 ToolCall 条目（精确配对 / 客户端懒加载
+/// 全量输出的键）；旧链路不传时为 `None`。
+pub fn tool_start_entry(inner: &mut CoreInner, name: &str, args: &str, call_id: Option<&str>) {
     flush_stream(inner);
     inner.tool_calls_cur = inner.tool_calls_cur.saturating_add(1);
     if name == "call_agent" {
@@ -390,7 +391,7 @@ pub fn tool_start_entry(inner: &mut CoreInner, name: &str, args: &str) {
     inner.transcript.push(EntryDto::ToolCall {
         name: name.to_owned(),
         args: args_preview(args),
-        call_id: None,
+        call_id: call_id.map(str::to_owned),
         status: ToolStatusDto::Running,
         detail: ToolEntryDetailDto {
             args: cap_stored_text(args, ARGS_STORE_CAP),
@@ -400,9 +401,16 @@ pub fn tool_start_entry(inner: &mut CoreInner, name: &str, args: &str) {
     inner.tool_timers.insert(index, Instant::now());
 }
 
-/// live 工具结束：最后一条同名 Running 条目转 Done（call_agent 额外
-/// 完成最老的未完成 Delegate 标记，FIFO 配对）。
-pub fn tool_end_entry(inner: &mut CoreInner, name: &str, bytes: usize, truncated: bool) {
+/// live 工具结束：目标条目转 Done。配对优先 `call_id` 精确匹配；
+/// 任一侧缺失 call_id 时回退「最后一条同名 Running」（FIFO，历史
+/// 行为）。call_agent 额外完成最老的未完成 Delegate 标记（FIFO 配对）。
+pub fn tool_end_entry(
+    inner: &mut CoreInner,
+    name: &str,
+    bytes: usize,
+    truncated: bool,
+    call_id: Option<&str>,
+) {
     if name == "call_agent" {
         inner.depth_cur = inner.depth_cur.saturating_sub(1);
         inner.agents_running = inner.agents_running.saturating_sub(1);
@@ -415,65 +423,121 @@ pub fn tool_end_entry(inner: &mut CoreInner, name: &str, bytes: usize, truncated
             }
         }
     }
-    for (index, entry) in inner.transcript.iter_mut().enumerate().rev() {
-        if let EntryDto::ToolCall {
-            name: n, status, ..
-        } = entry
-        {
-            if n == name && matches!(status, ToolStatusDto::Running) {
-                let elapsed = inner
-                    .tool_timers
-                    .remove(&index)
-                    .map(|t| t.elapsed().as_millis() as u64);
-                *status = ToolStatusDto::Done {
-                    bytes,
-                    truncated,
-                    elapsed_ms: elapsed,
-                };
-                break;
-            }
+    // 精确匹配目标下标：call_id 优先（身份匹配，不受状态限制——重复
+    // end 事件只会重写同一条目，不会错配到其它同名调用），任一侧缺失
+    // call_id 时回退「最后一条同名 Running」（FIFO，历史行为）。
+    let target = call_id
+        .and_then(|cid| {
+            inner
+                .transcript
+                .iter()
+                .position(|e| matches!(e, EntryDto::ToolCall { call_id: Some(c), .. } if c == cid))
+        })
+        .or_else(|| {
+            // 兼容旧事件（无 call_id）：最后一条同名 Running。
+            inner
+                .transcript
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, e)| {
+                    matches!(
+                        e,
+                        EntryDto::ToolCall {
+                            name: n,
+                            status: ToolStatusDto::Running,
+                            ..
+                        } if n == name
+                    )
+                    .then_some(i)
+                })
+        });
+    if let Some(index) = target {
+        let elapsed = inner
+            .tool_timers
+            .remove(&index)
+            .map(|t| t.elapsed().as_millis() as u64);
+        if let EntryDto::ToolCall { status, .. } = &mut inner.transcript[index] {
+            *status = ToolStatusDto::Done {
+                bytes,
+                truncated,
+                elapsed_ms: elapsed,
+            };
         }
     }
 }
 
 /// 回合结束的 Tool 消息折叠（TUI `fold_tool_outcomes_merge` 的简化镜像：
-/// live 条目无 call_id，按名字 + FIFO 游标配对；成功精化保住 live
-/// elapsed；失败标记翻转 Failed；输出全文留存 8KB）。
+/// call_id 精确配对优先，任一侧缺失时按名字 + FIFO 游标配对；成功精化
+/// 保住 live elapsed；失败标记翻转 Failed；输出全文留存 8KB）。
 pub fn fold_tool_outcomes(inner: &mut CoreInner, messages: &[Message]) {
     use openslate_core::types::MessageRole;
     let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut cursors: HashMap<&str, usize> = HashMap::new();
 
     for msg in messages.iter().filter(|m| m.role == MessageRole::Tool) {
-        // live 条目没有 call_id → 名字 + FIFO 游标（第 N 个结果配第 N 条）。
-        let Some(name) = msg.name.as_deref() else {
-            continue;
-        };
-        let cursor = cursors.entry(name).or_insert(0);
-        let target = inner
-            .transcript
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                !consumed.contains(i) && {
-                    if let EntryDto::ToolCall {
-                        name: n, status, ..
-                    } = e
-                    {
-                        n == name
-                            && matches!(status, ToolStatusDto::Running | ToolStatusDto::Done { .. })
-                    } else {
-                        false
-                    }
-                }
+        // 配对优先级：① msg.tool_call_id == entry.call_id（两侧都有时，
+        // 身份精确匹配，并发同名也零错配）；② 任一侧缺失 call_id →
+        // 名字 + FIFO 游标（第 N 个结果配第 N 条，历史行为）。
+        let target = msg
+            .tool_call_id
+            .as_ref()
+            .and_then(|cid| {
+                inner
+                    .transcript
+                    .iter()
+                    .enumerate()
+                    .find(|(i, e)| {
+                        // 身份匹配：call_id 全局唯一，不限状态（回合重放
+                        // 幂等——Failed 条目再次折合同一条目而非错位到
+                        // 后续同名条目），仅排除本轮已消费。
+                        if let EntryDto::ToolCall { call_id: Some(c), .. } = e {
+                            c == &cid.0 && !consumed.contains(i)
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|(i, _)| i)
             })
-            .nth(*cursor)
-            .map(|(i, _)| i);
+            .or_else(|| {
+                let Some(name) = msg.name.as_deref() else {
+                    return None;
+                };
+                // 游标 = 扫描起点（上次命中下标 + 1，TUI
+                // fold_tool_outcomes_merge 同款语义）：从起点向后找首个
+                // 未消费同名条目。旧实现的「过滤后 nth(count)」双重计数
+                // 会把同名第 2 个及以后的结果当孤儿丢弃（既有 bug，随
+                // 本轮配对升级修正）。
+                let start = cursors.entry(name).or_insert(0);
+                let target = inner
+                    .transcript
+                    .iter()
+                    .enumerate()
+                    .skip(*start)
+                    .find(|(i, e)| {
+                        !consumed.contains(i) && {
+                            if let EntryDto::ToolCall {
+                                name: n, status, ..
+                            } = e
+                            {
+                                n == name
+                                    && matches!(status, ToolStatusDto::Running | ToolStatusDto::Done { .. })
+                            } else {
+                                false
+                            }
+                        }
+                    })
+                    .map(|(i, _)| i);
+                if let Some(i) = target {
+                    *start = i + 1;
+                }
+                target
+            });
         let Some(index) = target else {
+            let name = msg.name.as_deref().unwrap_or("(unnamed)");
             tracing::debug!("orphan tool result for '{name}' dropped (no matching entry)");
             continue;
         };
-        *cursor += 1;
         consumed.insert(index);
         let failure = tool_failure_summary(&msg.content);
         if let EntryDto::ToolCall { status, detail, .. } = &mut inner.transcript[index] {
@@ -502,4 +566,236 @@ pub fn fold_tool_outcomes(inner: &mut CoreInner, messages: &[Message]) {
 /// ApprovalSummaryDto 直转（state 侧无额外逻辑，转接 protocol 的 From）。
 pub fn approval_summary(req: &openslate_core::approval::ApprovalRequest) -> ApprovalSummaryDto {
     ApprovalSummaryDto::from(req)
+}
+
+#[cfg(test)]
+mod tests {
+    //! 工具条目配对单元测试：tool_end / fold 两处的「call_id 精确匹配
+    //! 优先、缺失回退名字 + FIFO」双分支（懒加载全量显示的配对基础）。
+
+    use super::*;
+    use openslate_core::config::{parse_openslate_toml, AgentsConfig};
+    use openslate_core::types::{AgentConfig, AgentId, MessageRole, ToolCallId};
+
+    fn test_inner() -> CoreInner {
+        let config = parse_openslate_toml(
+            r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#,
+        )
+        .expect("fixture parses");
+        let agents = AgentsConfig {
+            agents: vec![AgentConfig {
+                hidden_tools: Vec::new(),
+                id: AgentId("root".into()),
+                name: "Root".into(),
+                model: "main".into(),
+                children: vec![],
+                tools: vec![],
+                default_prompt: "root prompt".into(),
+            }],
+        };
+        CoreInner {
+            session_id: "test-session".into(),
+            session_label: "test".into(),
+            history: Vec::new(),
+            transcript: Vec::new(),
+            running: false,
+            compacting: false,
+            depth_cur: 0,
+            agents_running: 0,
+            tool_calls_cur: 0,
+            model_alias: "main".into(),
+            cancel: None,
+            config,
+            agents_cfg: agents.clone(),
+            agent_tree: AgentTree::from_configs(&agents.agents).expect("tree builds"),
+            skills: Vec::new(),
+            store: None,
+            session_run: None,
+            manager: None,
+            engine_task: None,
+            paths: ConfigPaths {
+                active: std::path::PathBuf::from("/dev/null"),
+                global: None,
+                local: None,
+            },
+            stats: Default::default(),
+            stream: Default::default(),
+            tool_timers: Default::default(),
+            pending_step_meta: None,
+        }
+    }
+
+    fn tool_call_entry(call_id: Option<&str>) -> EntryDto {
+        EntryDto::ToolCall {
+            name: "bash".into(),
+            args: "{}".into(),
+            call_id: call_id.map(str::to_owned),
+            status: ToolStatusDto::Running,
+            detail: ToolEntryDetailDto {
+                args: "{}".into(),
+                output: None,
+            },
+        }
+    }
+
+    fn tool_msg(call_id: &str, name: &str, content: &str) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(ToolCallId(call_id.into())),
+            name: Some(name.into()),
+            tool_calls: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// 新链路：并发同名 running 条目按 call_id 精确关闭（旧名字配对
+    /// 会错关最后一条 running）。
+    #[test]
+    fn tool_end_pairs_by_call_id_exact() {
+        let mut inner = test_inner();
+        tool_start_entry(&mut inner, "bash", "{}", Some("tc-a"));
+        tool_start_entry(&mut inner, "bash", "{}", Some("tc-b"));
+        // 先结束 a：名字 FIFO（rev 找最后一条 running）会错关 b。
+        tool_end_entry(&mut inner, "bash", 10, false, Some("tc-a"));
+        match (&inner.transcript[0], &inner.transcript[1]) {
+            (
+                EntryDto::ToolCall { status: a, .. },
+                EntryDto::ToolCall { status: b, .. },
+            ) => {
+                assert!(matches!(a, ToolStatusDto::Done { .. }), "tc-a 应已结束");
+                assert!(matches!(b, ToolStatusDto::Running), "tc-b 应仍运行");
+            }
+            other => panic!("transcript 形状不符: {other:?}"),
+        }
+        tool_end_entry(&mut inner, "bash", 20, false, Some("tc-b"));
+        assert!(
+            matches!(
+                &inner.transcript[1],
+                EntryDto::ToolCall { status: ToolStatusDto::Done { .. }, .. }
+            ),
+            "tc-b 随后结束"
+        );
+    }
+
+    /// 旧链路回退：事件与条目都没有 call_id 时维持名字 + FIFO（最后
+    /// 一条同名 Running）。
+    #[test]
+    fn tool_end_falls_back_to_name_fifo_without_call_id() {
+        let mut inner = test_inner();
+        tool_start_entry(&mut inner, "bash", "{}", None);
+        tool_start_entry(&mut inner, "bash", "{}", None);
+        tool_end_entry(&mut inner, "bash", 10, false, None);
+        assert!(
+            matches!(
+                &inner.transcript[0],
+                EntryDto::ToolCall { status: ToolStatusDto::Running, .. }
+            ),
+            "第 1 条应仍运行（rev 语义关最后一条）"
+        );
+        assert!(
+            matches!(
+                &inner.transcript[1],
+                EntryDto::ToolCall { status: ToolStatusDto::Done { .. }, .. }
+            ),
+            "第 2 条（最后一条 running）应已结束"
+        );
+    }
+
+    /// 新链路：折叠按 call_id 精确落 output（乱序 Tool 消息也零错配）。
+    #[test]
+    fn fold_pairs_by_call_id_exact() {
+        let mut inner = test_inner();
+        tool_start_entry(&mut inner, "bash", "{}", Some("tc-a"));
+        tool_start_entry(&mut inner, "bash", "{}", Some("tc-b"));
+        // 乱序回放（b 的结果先到）——身份匹配不受顺序影响。
+        fold_tool_outcomes(
+            &mut inner,
+            &[
+                tool_msg("tc-b", "bash", "output-b"),
+                tool_msg("tc-a", "bash", "output-a"),
+            ],
+        );
+        match (&inner.transcript[0], &inner.transcript[1]) {
+            (
+                EntryDto::ToolCall { detail: da, .. },
+                EntryDto::ToolCall { detail: db, .. },
+            ) => {
+                assert_eq!(da.output.as_deref(), Some("output-a"));
+                assert_eq!(db.output.as_deref(), Some("output-b"));
+            }
+            other => panic!("transcript 形状不符: {other:?}"),
+        }
+    }
+
+    /// 旧链路回退：条目无 call_id（消息有）→ 名字 + FIFO 游标依序配对。
+    #[test]
+    fn fold_falls_back_to_name_fifo_without_entry_call_id() {
+        let mut inner = test_inner();
+        tool_start_entry(&mut inner, "bash", "{}", None);
+        tool_start_entry(&mut inner, "bash", "{}", None);
+        fold_tool_outcomes(
+            &mut inner,
+            &[
+                tool_msg("tc-1", "bash", "first"),
+                tool_msg("tc-2", "bash", "second"),
+            ],
+        );
+        match (&inner.transcript[0], &inner.transcript[1]) {
+            (
+                EntryDto::ToolCall { detail: d1, .. },
+                EntryDto::ToolCall { detail: d2, .. },
+            ) => {
+                assert_eq!(d1.output.as_deref(), Some("first"), "第 1 个结果配第 1 条");
+                assert_eq!(d2.output.as_deref(), Some("second"), "第 2 个结果配第 2 条");
+            }
+            other => panic!("transcript 形状不符: {other:?}"),
+        }
+    }
+
+    /// 回合重放幂等（r.messages 为全量历史每回合重放）：带 call_id 的
+    /// Failed 条目重复折合到自身，不错位到后续同名条目。
+    #[test]
+    fn fold_replay_with_call_id_is_idempotent_across_status() {
+        let mut inner = test_inner();
+        tool_start_entry(&mut inner, "bash", "{}", Some("tc-fail"));
+        tool_start_entry(&mut inner, "bash", "{}", Some("tc-ok"));
+        // 第一回合：tc-fail 失败（折叠置 Failed）。
+        fold_tool_outcomes(
+            &mut inner,
+            &[tool_msg("tc-fail", "bash", "Error: boom"), tool_msg("tc-ok", "bash", "fine")],
+        );
+        // 第二回合重放同一历史：两条各自命中自身（Failed 条目按身份
+        // 重新折合，不消费 tc-ok 的配对）。
+        fold_tool_outcomes(
+            &mut inner,
+            &[tool_msg("tc-fail", "bash", "Error: boom"), tool_msg("tc-ok", "bash", "fine")],
+        );
+        match (&inner.transcript[0], &inner.transcript[1]) {
+            (
+                EntryDto::ToolCall { detail: df, status: sf, .. },
+                EntryDto::ToolCall { detail: d2, status: s2, .. },
+            ) => {
+                assert!(
+                    matches!(sf, ToolStatusDto::Failed { .. }),
+                    "失败态重放后仍为 Failed"
+                );
+                assert!(df.output.as_deref().unwrap().contains("Error: boom"));
+                assert!(
+                    matches!(s2, ToolStatusDto::Done { .. }),
+                    "tc-ok 不被失败重放挤占"
+                );
+                assert_eq!(d2.output.as_deref(), Some("fine"));
+            }
+            other => panic!("transcript 形状不符: {other:?}"),
+        }
+    }
 }

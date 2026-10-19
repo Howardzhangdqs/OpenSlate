@@ -45,6 +45,9 @@ sealed class UiEntry {
         val fullArgs: String = "",
         var output: String? = null,
         var expanded: Boolean = false,
+        /** 工具调用 id（live 事件与 DB 重建条目携带；旧镜像/旧事件为
+         *  null）。详情弹窗凭它懒加载 history 里的全量输出。 */
+        val callId: String? = null,
     ) : UiEntry()
     data class Delegate(val agent: String, var done: Boolean) : UiEntry()
     data class Approval(val toolName: String, val decision: String) : UiEntry()
@@ -991,6 +994,17 @@ object RuntimeBridge {
         }
     }
 
+    /**
+     * 按 call_id 拉取工具调用的完整输出（详情弹窗懒加载）。FFI 侧是
+     * Rust 内存 history 的同步扫描（锁内 clone，无网络/磁盘 IO），挂
+     * IO 线程仅为不阻塞主线程。null = 运行时未就绪 / 无匹配（call_id
+     * 未知、history 被压缩、子代理工具）——调用方回退条目自带的
+     * preview 显示。
+     */
+    suspend fun fetchToolOutput(callId: String): String? = withContext(Dispatchers.IO) {
+        runtimeRef.get()?.toolOutputByCallId(callId)
+    }
+
     // ── MCP 服务名（[mcp.servers] 单键名；校验/改名落盘在 Rust）────
 
     /** 服务名缓存：get / set 成功后刷新；初值 = Rust 缺省（改名前与
@@ -1702,6 +1716,7 @@ object RuntimeBridge {
             "tool_start" -> {
                 val name = obj.optString("name", "tool")
                 val fullArgs = obj.optString("args", "")
+                val callId = obj.optString("call_id").ifBlank { null }
                 mutate {
                     copy(
                         toolCalls = toolCalls + 1,
@@ -1711,21 +1726,31 @@ object RuntimeBridge {
                             argsPreview = fullArgs.take(64),
                             status = "running",
                             fullArgs = fullArgs,
+                            callId = callId,
                         )
                     )
                 }
             }
             "tool_end" -> {
                 val name = obj.optString("name", "tool")
+                val callId = obj.optString("call_id").ifBlank { null }
                 // 优先 Kotlin 侧缓存（host 工具的完整输出）；native 工具在 Rust
                 // 进程内执行，没有 host call，用事件携带的 preview 兜底。
                 val out = takeToolOutput(name)
                     ?: obj.optString("preview", "").ifBlank { null }
                 mutate {
-                    // Rust 保证 tool_end 按工具调用顺序发射：并发多条同名调用时，
-                    // 第 N 个 tool_end 对应该名下第一个仍在 running 的条目。
+                    // 配对：call_id 精确匹配优先（新链路，事件与条目都携带）；
+                    // 任一侧缺失 call_id 时回退既有契约——Rust 保证 tool_end
+                    // 按工具调用顺序发射，并发多条同名调用时第 N 个 tool_end
+                    // 对应该名下第一个仍在 running 的条目（旧事件/旧镜像路径）。
                     // （indexOfLast 会在并发时把输出互相配错。）
-                    val idx = entries.indexOfFirst { it is UiEntry.ToolCall && it.name == name && it.status == "running" }
+                    val idx = (if (callId != null) {
+                        entries.indexOfFirst { it is UiEntry.ToolCall && it.callId == callId }
+                    } else -1).let { exact ->
+                        if (exact >= 0) exact else entries.indexOfFirst {
+                            it is UiEntry.ToolCall && it.name == name && it.status == "running"
+                        }
+                    }
                     if (idx >= 0) {
                         val e = entries[idx] as UiEntry.ToolCall
                         // ask_user 的答案/终态 JSON（提交时由 Kotlin 写入）优先于
@@ -2299,8 +2324,11 @@ object RuntimeBridge {
                         val detail = e.optJSONObject("detail")
                         val name = e.optString("name")
                         val fullArgs = detail?.optString("args") ?: e.optString("args")
-                        if (name == ASK_USER_TOOL && e.has("call_id") && !e.isNull("call_id")) {
-                            askArgsByCallId[e.optString("call_id")] = fullArgs
+                        // call_id（live 事件 / DB 重建条目携带；旧快照无 → null，
+                        // 详情弹窗跳过懒加载维持现状显示）。
+                        val callId = e.optString("call_id").ifBlank { null }
+                        if (name == ASK_USER_TOOL && callId != null) {
+                            askArgsByCallId[callId] = fullArgs
                         }
                         add(
                             UiEntry.ToolCall(
@@ -2313,6 +2341,7 @@ object RuntimeBridge {
                                 } else "done",
                                 fullArgs = fullArgs,
                                 output = detail?.takeIf { it.has("output") && !it.isNull("output") }?.optString("output"),
+                                callId = callId,
                             )
                         )
                     }
@@ -2995,6 +3024,7 @@ object RuntimeBridge {
             is UiEntry.Meta -> o.put("x", e.text)
             is UiEntry.ToolCall -> o.put("n", e.name).put("a", e.argsPreview)
                 .put("s", e.status).put("f", e.fullArgs).put("o", e.output ?: "")
+                .put("c", e.callId ?: "")
             is UiEntry.Delegate -> o.put("n", e.agent).put("d", e.done)
             is UiEntry.Approval -> o.put("n", e.toolName).put("d", e.decision)
             UiEntry.StepBreak -> {}
@@ -3013,6 +3043,7 @@ object RuntimeBridge {
             status = o.optString("s", "done"),
             fullArgs = o.optString("f"),
             output = o.optString("o").ifBlank { null },
+            callId = o.optString("c").ifBlank { null }, // 旧镜像无此键 → null
         )
         "delegate" -> UiEntry.Delegate(o.optString("n"), o.optBoolean("d"))
         "approval" -> UiEntry.Approval(o.optString("n"), o.optString("d"))

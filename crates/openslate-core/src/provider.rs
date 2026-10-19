@@ -75,11 +75,14 @@ pub trait ProgressCallback: Send {
     fn on_usage(&mut self, usage: Usage);
     /// Called after the model response is fully received.
     fn on_request_end(&mut self);
-    /// Called before a tool is executed.
-    fn on_tool_start(&mut self, name: &str, args: &str);
+    /// Called before a tool is executed. `call_id` is the provider-assigned
+    /// tool call id (`ToolCallId`), letting UIs pair start/end events with
+    /// the exact call (and later fetch the full output by it).
+    fn on_tool_start(&mut self, name: &str, args: &str, call_id: &str);
     /// Called after a tool execution completes. `preview` 携带输出前若干
-    /// 字符（供 UI 投影；可能为空串——工具无输出时）。
-    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, preview: &str);
+    /// 字符（供 UI 投影；可能为空串——工具无输出时）。`call_id` 同
+    /// [`ProgressCallback::on_tool_start`]。
+    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, preview: &str, call_id: &str);
 
     /// Called once a step is fully done — after the LLM response AND any tool
     /// calls it requested have executed. Default no-op. Used to emit a per-step

@@ -565,11 +565,11 @@ impl ProgressCallback for SpinnerCallback {
         }
     }
 
-    fn on_tool_start(&mut self, name: &str, args: &str) {
+    fn on_tool_start(&mut self, name: &str, args: &str, _call_id: &str) {
         self.emit_line(&format!("  -> {}({})", name, args));
     }
 
-    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, _preview: &str) {
+    fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, _preview: &str, _call_id: &str) {
         let suffix = if truncated { " ..." } else { "" };
         self.emit_line(&format!("  <- {} [{} bytes]{}", name, bytes, suffix));
     }

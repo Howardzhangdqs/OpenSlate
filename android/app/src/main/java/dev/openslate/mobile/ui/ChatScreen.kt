@@ -812,6 +812,13 @@ private fun ToolChipRow(
 private class ToolOutParts(val exitCode: String?, val stdout: String, val stderr: String)
 
 /**
+ * 取更长的输出（null 视为空）。懒加载全量与条目自带输出（host 缓存 /
+ * 事件 preview / 恢复快照）各有更完整的场景，按长度择优，两边都不丢。
+ */
+private fun longerOf(a: String?, b: String?): String? =
+    if ((a ?: "").length >= (b ?: "").length) a else b
+
+/**
  * 拆解工具输出：`--- stdout ---` / `--- stderr ---` 分段（native bash）；
  * 非格式化输出（如 termux 回传的合并文本）整体按 stdout 处理；
  * exit_code 行（"exit_code: N"）提取为独立字段。
@@ -838,6 +845,13 @@ private fun parseToolOut(raw: String): ToolOutParts {
  * 可滚动），文本经 SelectionContainer 长按选择复制；底部提供整段一键复制。
  * 替代原就地展开视图（maxLines=16 硬限制 + 不可滚动，长输出看不全）。
  * 执行中的工具打开时显示等待文案，完成输出经 ChatScreen 的实时回查刷新。
+ *
+ * 懒加载全量输出：条目携带 callId 且非 running / 非 ask_user 时，经 FFI
+ * 从 Rust 内存 history 拉取 max_output_bytes 上限内的完整版本，与条目
+ * 自带输出（host 工具的 Kotlin 缓存 / 事件 preview / 恢复快照）**取更
+ * 长者**显示——host 缓存可能比 DB 版本更长且未截断，DB 版有 secret 打
+ * 码，两者都安全，丢任何一边都可能缺内容。旧条目无 callId / FFI 未命
+ * 中（history 被压缩、子代理工具）→ 静默回退 preview，维持现状显示。
  */
 @Composable
 private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
@@ -847,8 +861,26 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     val mono = MaterialTheme.typography.bodySmall.copy(
         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
     )
-    val parts = remember(tc.output) { parseToolOut(tc.output.orEmpty()) }
-    var tab by remember(tc.output) { mutableStateOf(0) }
+    // 懒加载资格：有 callId + 已结束 + 非 ask_user（其条目输出即权威脱敏
+    // 终态，绝不懒加载替换）。
+    val lazyEligible = tc.callId != null && tc.status != "running" && tc.name != RuntimeBridge.ASK_USER_TOOL
+    var fullOut by remember { mutableStateOf<String?>(null) }
+    // 载入完成标记：区分「拉取中」（显示进度行）与「未命中返回 null」
+    // （隐进度行，回退 preview）。
+    var fullLoaded by remember { mutableStateOf(!lazyEligible) }
+    LaunchedEffect(tc.callId, tc.status) {
+        if (lazyEligible) {
+            fullOut = RuntimeBridge.fetchToolOutput(tc.callId!!)
+            fullLoaded = true
+        } else {
+            fullOut = null
+            fullLoaded = true
+        }
+    }
+    // 取更长者：懒加载全量与条目自带输出（host 缓存/preview/恢复快照）。
+    val shownOut = longerOf(fullOut, tc.output)
+    val parts = remember(shownOut) { parseToolOut(shownOut.orEmpty()) }
+    var tab by remember(shownOut) { mutableStateOf(0) }
     val running = tc.status == "running"
 
     Dialog(
@@ -910,6 +942,24 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                         .verticalScroll(scroll)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 ) {
+                    // 懒加载进度行（极轻）：FFI 拉取全量输出期间显示，到货即隐。
+                    if (!fullLoaded) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        ) {
+                            CircularProgressIndicator(
+                                strokeWidth = 1.5.dp,
+                                modifier = Modifier.size(13.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "载入完整输出",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline,
+                            )
+                        }
+                    }
                     Text(
                         "命令",
                         style = MaterialTheme.typography.labelSmall,

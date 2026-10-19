@@ -751,6 +751,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_shutdown(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_tool_output_by_call_id(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_constructor_openslateruntime_create(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_eventcallback_on_event(
@@ -834,6 +836,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_tool_output_by_call_id(`ptr`: Long,`callId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_init_callback_vtable_eventcallback(`vtable`: UniffiVTableCallbackInterfaceEventCallback,
     ): Unit
     external fun uniffi_openslate_mobile_fn_func_set_mcp_host_token(`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1036,6 +1040,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_shutdown() and 0xFFFF) != 11461) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_tool_output_by_call_id() and 0xFFFF) != 46733) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_constructor_openslateruntime_create() and 0xFFFF) != 3802) {
@@ -1662,6 +1669,13 @@ public interface OpenSlateRuntimeInterface {
      */
     fun `shutdown`()
     
+    /**
+     * 按 call_id 拉取工具调用的完整输出（内存 history 直读；UI 详情
+     * 弹窗懒加载用）。无匹配（未知 id / history 已被压缩 / 子代理工具）
+     * 返回 null，调用方回退 preview。
+     */
+    fun `toolOutputByCallId`(`callId`: kotlin.String): kotlin.String?
+    
     companion object
 }
 
@@ -2250,6 +2264,25 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 }
     }
     
+    
+
+    
+    /**
+     * 按 call_id 拉取工具调用的完整输出（内存 history 直读；UI 详情
+     * 弹窗懒加载用）。无匹配（未知 id / history 已被压缩 / 子代理工具）
+     * 返回 null，调用方回退 preview。
+     */override fun `toolOutputByCallId`(`callId`: kotlin.String): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_tool_output_by_call_id(
+        it,
+        
+        FfiConverterString.lower(`callId`),_status)
+}
+    }
+    )
+    }
     
 
     

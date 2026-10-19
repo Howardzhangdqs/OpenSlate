@@ -2004,7 +2004,7 @@ fn tool_outcome_from_message(msg: &Message) -> ToolEntryStatus {
 /// live-measured `elapsed_ms` survives a success refine.
 ///
 /// Matching: by `tool_call_id` where an entry carries one (live
-/// entries never do — core's `on_tool_start` passes no id), else by
+/// entries never do — `TuiEvent::ToolStart` carries no id), else by
 /// tool name with a FIFO cursor per name: the Nth result of a name
 /// pairs with the Nth entry of that name, because root-level tool
 /// calls START (`ToolStart` events → entries) and COMPLETE (Tool

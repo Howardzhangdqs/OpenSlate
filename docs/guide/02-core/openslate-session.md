@@ -74,9 +74,9 @@ pub struct CoreInner {
 | `delegate_target(args)`（:277） | 从 call_agent 参数取子 agent id（agent_id/agent/child 三键尝试，失败回退 "call_agent"） |
 | `tool_failure_summary(content)`（:290） | 5 个行首失败标记锚定：`Error:` / `approval denied tool` / `child agent call denied` / `[tool call cancelled` / `[error]`；首行 ≤60 字符摘要 |
 | `flush_stream(inner)`（:321） | 冲刷 answer/reasoning 缓冲为条目（reasoning 先于 answer；空白丢弃）+ 冲 pending_step_meta |
-| `tool_start_entry(inner, name, args)`（:344） | call_agent 走 `Delegate{agent, done:false}` + 深度/计数增；其余 push `ToolCall{status: Running, detail.args=capped}` + tool_timers 计时 |
-| `tool_end_entry(inner, name, bytes, truncated)`（:372） | 最后一条同名 Running → Done{elapsed}；call_agent 额外 FIFO 完成最老未完成 Delegate |
-| `fold_tool_outcomes(inner, messages)`（:409） | 回合 Tool 消息折叠：live 条目无 call_id → **名字 + FIFO 游标**配对；成功精化保住 live elapsed；失败标记翻转 Failed；输出全文留存 8KB；孤儿结果 debug 日志丢弃 |
+| `tool_start_entry(inner, name, args, call_id)`（:344） | call_agent 走 `Delegate{agent, done:false}` + 深度/计数增；其余 push `ToolCall{call_id, status: Running, detail.args=capped}` + tool_timers 计时 |
+| `tool_end_entry(inner, name, bytes, truncated, call_id)`（:372） | 配对**call_id 精确匹配优先**（身份匹配，不受状态限制），任一侧缺失 → 最后一条同名 Running（历史行为）；call_agent 额外 FIFO 完成最老未完成 Delegate |
+| `fold_tool_outcomes(inner, messages)`（:409） | 回合 Tool 消息折叠：`msg.tool_call_id == entry.call_id` **身份匹配优先**（回合全量历史重放幂等，Failed 条目折合自身不错位），任一侧缺失 → **名字 + FIFO**配对（游标 = 扫描起点，TUI 同款语义；旧「过滤后 nth(count)」双重计数会丢同名第 2+ 个结果，已随本轮修正）；成功精化保住 live elapsed；失败标记翻转 Failed；输出全文留存 8KB；孤儿结果 debug 日志丢弃 |
 | `approval_summary(req)`（:470） | 转接 protocol 的 From |
 
 ## 2. engine.rs
@@ -84,7 +84,7 @@ pub struct CoreInner {
 ### SessionProgressBridge（:44，impl ProgressCallback）
 
 - 全部回调持 core 锁「**先改镜像、再广播**」→ 同一连接上事件序 == 转写追加序。
-- 事件映射：`on_request_start` 冲掉上一请求挂起 usage 行 + RequestStart；`on_delta`/`on_reasoning` 进 stream 缓冲 + 广播；`on_usage` 挂起 `pending_step_meta`（Meta 行落在本步工具行之下，fix-19 hold）；`on_tool_start/end` → `tool_start_entry`/`tool_end_entry` + 广播（preview 空串转 None）；`on_step_end` 冲流 + 连续边界折叠为一个 StepBreak。
+- 事件映射：`on_request_start` 冲掉上一请求挂起 usage 行 + RequestStart；`on_delta`/`on_reasoning` 进 stream 缓冲 + 广播；`on_usage` 挂起 `pending_step_meta`（Meta 行落在本步工具行之下，fix-19 hold）；`on_tool_start/end` → `tool_start_entry`/`tool_end_entry` + 广播（preview 空串转 None；**call_id 透传**：条目落 id + `ServerMsg::ToolStart/ToolEnd.call_id` 携带，客户端按其精确配对与懒加载全量输出，空串转 None）；`on_step_end` 冲流 + 连续边界折叠为一个 StepBreak。
 - `usage_meta_line`（:149）：`↑in ↓out [⎓cached]`（TUI 的 ttft/速率装饰是客户端渲染层，不进协议数据）。
 
 ### spawn_engine_turn（:169）与 engine_turn（:185）

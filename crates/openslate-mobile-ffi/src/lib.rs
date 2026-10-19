@@ -335,6 +335,14 @@ impl OpenSlateRuntime {
         self.inner.current_run_id()
     }
 
+    /// 按 call_id 拉取工具调用的完整输出（内存 history 直读；UI 详情
+    /// 弹窗懒加载用）。无匹配（未知 id / history 已被压缩 / 子代理工具）
+    /// 返回 null，调用方回退 preview。
+    pub fn tool_output_by_call_id(&self, call_id: String) -> Option<String> {
+        openslate_mobile::alog!("ffi: tool_output_by_call_id(call_id={call_id})");
+        self.inner.tool_output_by_call_id(call_id)
+    }
+
     /// 切换到指定历史会话（成功后回推新 snapshot 事件）。
     pub fn open_session(&self, run_id: String) -> Result<(), MobileError> {
         openslate_mobile::alog!("ffi: open_session {run_id}");

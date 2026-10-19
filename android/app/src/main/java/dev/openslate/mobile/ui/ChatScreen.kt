@@ -82,6 +82,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -89,7 +90,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -260,10 +263,86 @@ fun ChatScreen(
             ?: d
     }
 
-    LaunchedEffect(state.entries.size, showThinking) {
+    // ── 智能贴底跟随 ────────────────────────────────────────────────────
+    // 「跟随」是用户意图闩（followBottom），几何「贴底」（listAtBottom）只
+    // 是闩的合上条件。不把几何直接当跟随开关：流式输出会让末条目在一帧内
+    // 长出几十 dp，瞬时几何立刻翻成「不在底」，直接驱动会跟丢；闩 + 明确
+    // 的合上/断开事件才稳定。
+    //
+    // - 合上：滚动完全停稳（fling 结束，isScrollInProgress 门控）且几何贴底。
+    // - 断开：手指拖动列表（DragInteraction.Start）。程序滚动（贴底跟随、
+    //   聚焦轻推、pill 跳转）不经过 interactionSource，绝不误断。
+    // - 跟随：闩合上时，条目追加（size）/ 末条目内容增长（lastEntrySig：
+    //   流式 delta 与工具输出回填都并入同一条目、size 不变）/ 思考中伪条
+    //   目（showThinking）任一变化 → scrollToItem 即时贴底（不用
+    //   animateScrollToItem：高频重入会动画打架）。闩断开时完全静默。
+    //
+    // 问卷/设置等 NavHost 往返：ChatScreen 离开组合再回来，listState
+    // （rememberLazyListState 内部 saveable）、followBottom、
+    // revealedSessionId 原样恢复；重跑的跟随 effect 被闩拦住（不在底 →
+    // 静默），会话揭示 effect 被 revealedSessionId 拦住（同会话不重揭示）
+    // → 打开问卷时的阅读位置原样保留。
+    var followBottom by rememberSaveable { mutableStateOf(false) }
+
+    // 几何贴底判定：末条目可见、且其底缘距视口底 ≤ 余量。完全贴底时该距
+    // 离恰为 LazyColumn 的底部 contentPadding（84dp，悬浮输入条的让位空
+    // 间），余量取 96dp = 84dp 基准 + 12dp 手感容差；调整 contentPadding
+    // 时同步核对本值。「末条目就是最后一条」是硬条件——它整条在视口下方
+    // 时（用户在读更早内容）即便可见区贴近视口底也不是贴底。首帧 / 恢复
+    // 初期 layout 未就绪 → 一律视为不在底（保守，恢复路径绝不误滚）。
+    val atBottomSlackPx = with(LocalDensity.current) { AT_BOTTOM_SLACK_DP.dp.toPx() }.roundToInt()
+    val listAtBottom by remember(atBottomSlackPx) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf false
+            if (last.index != info.totalItemsCount - 1) return@derivedStateOf false
+            info.viewportEndOffset - (last.offset + last.size) <= atBottomSlackPx
+        }
+    }
+
+    // 末条目内容签名：条目追加看 size，同条目内的流式增长看它。
+    val lastEntrySig = remember(state.entries) { entrySig(state.entries.lastOrNull()) }
+
+    // 会话揭示（旧「加载/切换即滚底」语义的守卫版）：首次拿到会话内容（启
+    // 动 snapshot）与切换会话（openSession / new_session 的新 snapshot，
+    // session_id 必变）→ 落到最新末条并合上闩。rememberSaveable 记住已揭
+    // 示的 session_id：NavHost 往返（session_id 不变）不重跑，返回不滚底。
+    var revealedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(state.sessionId) {
+        val id = state.sessionId
+        if (id.isEmpty() || id == revealedSessionId) return@LaunchedEffect
+        revealedSessionId = id
+        followBottom = true
         val target = renderItems.lastIndex + if (showThinking) 1 else 0
-        if (target >= 0) {
-            listState.animateScrollToItem(target)
+        if (target >= 0) listState.scrollToItem(target)
+    }
+
+    // 空转写（新会话 / session_reset）视为贴底：无内容可读，后续首条内容
+    // 直接跟随（快照尚未换新 session_id 的路径也能恢复跟随语义）。
+    LaunchedEffect(state.entries.isEmpty()) {
+        if (state.entries.isEmpty()) followBottom = true
+    }
+
+    // 内容跟随触发器：仅闩合上时滚。末条目 scrollToItem 受 max scroll 钳
+    // 制——条目再高也稳稳落在「底」，长消息流式增长时始终露出最新内容。
+    LaunchedEffect(state.entries.size, lastEntrySig, showThinking) {
+        if (!followBottom) return@LaunchedEffect
+        val target = renderItems.lastIndex + if (showThinking) 1 else 0
+        if (target >= 0) listState.scrollToItem(target)
+    }
+
+    // 闩的合上：滚动停稳且几何贴底。isScrollInProgress 门控挡住拖动/fling
+    // 途经贴底区的瞬时满足——轻拂到底、聚焦轻推、跳转落底等「停稳后在底」
+    // 才恢复跟随。
+    LaunchedEffect(Unit) {
+        snapshotFlow { !listState.isScrollInProgress && listAtBottom }
+            .collect { settledAtBottom -> if (settledAtBottom) followBottom = true }
+    }
+
+    // 闩的断开：手指拖动 = 用户接管视口（上翻阅读），期间到停稳前绝不自动滚。
+    LaunchedEffect(Unit) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) followBottom = false
         }
     }
 
@@ -280,8 +359,8 @@ fun ChatScreen(
 
     // 面板展开时：手指拖动聊天列表 → 收起面板（collapseComposer 统一路径）。
     // 监听 LazyListState.interactionSource 的 DragInteraction.Start——只有
-    // 真实手指拖动才产生；聚焦轻推与新消息贴底的 animateScrollToItem 是
-    // 程序滚动、不经过 interactionSource，不会误收刚展开的面板。
+    // 真实手指拖动才产生；聚焦轻推与贴底跟随的 scrollToItem 是程序滚动、
+    // 不经过 interactionSource，不会误收刚展开的面板。
     LaunchedEffect(composerFocused) {
         if (!composerFocused) return@LaunchedEffect
         listState.interactionSource.interactions.collect { interaction ->
@@ -589,12 +668,34 @@ fun ChatScreen(
     }
 }
 
+/** 贴底判定余量（dp）：完全贴底时末条目底缘距视口底 = 底部 contentPadding（84dp），另加 12dp 手感容差。 */
+private const val AT_BOTTOM_SLACK_DP = 96
+
 /** 渲染投影：相邻的连续工具调用聚合为一组（中间夹的 Meta/StepBreak 一并吸收），其余条目单行。 */
 private sealed class RenderItem {
     data class Single(val entry: UiEntry, val index: Int) : RenderItem()
 
     /** parts 保序混装工具调用与夹缝中的 Meta/StepBreak；tools 是其中的 ToolCall 子集。 */
     data class ToolGroup(val parts: List<UiEntry>, val startIdx: Int) : RenderItem()
+}
+
+/**
+ * 末条目内容签名（类型 + 长度/终态）：智能贴底跟随的「同条目增长」触发源。
+ * 流式 delta / reasoning 与工具输出回填都并入最后一条条目自身（entries.size
+ * 不变），签名随之逐次变化，跟随触发器才「看得见」这些增长。
+ */
+private fun entrySig(e: UiEntry?): String = when (e) {
+    null -> ""
+    is UiEntry.User -> "u:${e.text.length}"
+    is UiEntry.Assistant -> "a:${e.text.length}"
+    is UiEntry.Reasoning -> "r:${e.text.length}"
+    is UiEntry.Meta -> "m:${e.text.length}"
+    // status/output 是 var，但 bridge 侧每次回填都以 copy 换新实例/新列表，
+    // 这里的读取随重组刷新。
+    is UiEntry.ToolCall -> "t:${e.status}:${e.output?.length ?: -1}"
+    is UiEntry.Delegate -> "d:${e.done}"
+    is UiEntry.Approval -> "p"
+    UiEntry.StepBreak -> "b"
 }
 
 private fun groupEntries(entries: List<UiEntry>): List<RenderItem> {

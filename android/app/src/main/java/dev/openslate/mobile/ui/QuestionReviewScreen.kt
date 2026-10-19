@@ -72,7 +72,7 @@ import kotlinx.coroutines.launch
  *
  * 只读语义：答案按提交时的状态展示（跳过/未答保持对应提示），底部无
  * 提交/跳过类动作——只有向导式「上一题/下一题」导航（复用 [AskPrimaryButton]
- * 几何）+ 末题/单题位出「已提交的答案 · 只读」状态条（成功绿，明示不可作答）。
+ * 几何）+ 末题/单题位出「关闭问卷」按钮（成功绿 + Check，保留已提交语义、点击关闭）。
  * 投影被清（session_reset）时页内自动 pop；退出经 DisposableEffect 清态，
  * 不留陈旧投影。
  */
@@ -228,7 +228,7 @@ internal fun QuestionReviewScreen(onBack: () -> Unit) {
                     )
                     Spacer(Modifier.height(4.dp))
                     // 只读页脚：向导式导航（与待答页主操作行同几何，无提交/
-                    // 跳过语义）；末题/单题位出只读状态条替代「提交」位。
+                    // 跳过语义）；末题/单题位出「关闭问卷」按钮替代「提交」位。
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -253,8 +253,22 @@ internal fun QuestionReviewScreen(onBack: () -> Unit) {
                             )
                         }
                         if (n == 1 || cur == n - 1) {
-                            ReadOnlyAnsweredStrip(
+                            // 末题/单题位出「关闭问卷」（成功绿保留已提交语义，
+                            // Check 前导图标；点击与返回键同路 pop 回聊天流）。
+                            AskPrimaryButton(
+                                text = "关闭问卷",
+                                tint = successGreen(),
+                                enabled = true,
+                                onClick = onBack,
                                 modifier = if (n > 1) Modifier.weight(2f) else Modifier.fillMaxWidth(),
+                                leading = {
+                                    Icon(
+                                        Icons.Filled.Check,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
+                                        tint = successGreen(),
+                                    )
+                                },
                             )
                         } else {
                             AskPrimaryButton(
@@ -279,33 +293,3 @@ internal fun QuestionReviewScreen(onBack: () -> Unit) {
     }
 }
 
-/**
- * 只读状态条（占待答页「提交」位）：AskPrimaryButton 同几何（min 48dp、
- * 10dp 圆角、labelLarge），成功绿 12% 底 + Check 图标——沿用「已回答」的
- * 语义色，明示整卷已提交、当前为只读回看；不可点击、无任何动作语义。
- */
-@Composable
-private fun ReadOnlyAnsweredStrip(modifier: Modifier = Modifier) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center,
-        modifier = modifier
-            .heightIn(min = 48.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .background(successGreen().copy(alpha = 0.12f))
-            .padding(horizontal = 12.dp, vertical = 12.dp),
-    ) {
-        Icon(
-            Icons.Filled.Check,
-            contentDescription = null,
-            modifier = Modifier.size(16.dp),
-            tint = successGreen(),
-        )
-        Spacer(Modifier.width(6.dp))
-        Text(
-            "已提交的答案 · 只读",
-            style = MaterialTheme.typography.labelLarge,
-            color = successGreen(),
-        )
-    }
-}

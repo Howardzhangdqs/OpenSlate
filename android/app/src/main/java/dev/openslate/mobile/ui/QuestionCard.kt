@@ -534,7 +534,10 @@ internal fun SegmentBar(
     tall: Boolean = false,
 ) {
     Row(
-        modifier = modifier.fillMaxWidth().heightIn(min = 44.dp),
+        // 固定 44dp 触摸高（曾用 heightIn(min=44dp)：在有界高度约束下（全屏
+        // Column）segment 的 fillMaxHeight() 会把 Row 撑满整屏、挤没题区与
+        // 页脚；无界约束（内联 LazyColumn item）下两者等价，固定值两处安全。
+        modifier = modifier.fillMaxWidth().height(44.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         for (i in 0 until count) {
@@ -724,7 +727,9 @@ internal fun AskQuestionPager(
                     onBodyOverflow(page, max > 0)
                 }
         }
-        Box(Modifier.fillMaxWidth()) {
+        // fillMaxHeight：Pager 默认把小于视口的页在交叉轴居中放置；钉满视口
+        // 高让内容锚定顶部（全屏页内容短时不悬在屏中央），内联页高≈内容高无感。
+        Box(Modifier.fillMaxWidth().fillMaxHeight()) {
             // 每页 = 页级题头（chip + 题干）+ 题型控件，作为整体横向滚动
             // （10dp 间距沿用原卡片级 QuestionHeader↔题区间距）。外层 Column
             // 只做视口滚动；内层 Column 是自然高上报节点（在 scroll 内、不

@@ -58,6 +58,14 @@ const KEEP_BYTES: usize = 24 * 1024;
 pub const BASH_TOOL: &str = "bash";
 pub const TERMUX_BASH_TOOL: &str = "termux_bash";
 
+/// termux HostTool 壳的 host call 等待上限：远超 router 默认 120s——命令
+/// 停滞（Termux 未启动/被冻结）期间 Kotlin 侧进入「等待 Termux 连接」
+/// 模式（stall 面板引导用户恢复、豁免 TermuxExec 90s 计时、连接后原 id
+/// 重发续跑），要给用户从容恢复的时间余量；仍设上限防永久挂死（turn
+/// 取消 / runtime 关停另有 fail_all 兜底）。配套：TermuxExec 的硬上限
+/// （Kotlin 侧）略低于此值，超时错误文本由 Kotlin 路径先给出。
+const TERMUX_HOST_CALL_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// 本工具历史上用过的所有名字（切换时统一清理）。pub：runtime 的
 /// reload 让位判定按它界定「bash 工具域」——MCP 新名册里的名字落在
 /// 此域内才允许让 host bash 工具让位，其余撞名仍是真冲突（回滚）。
@@ -230,7 +238,7 @@ pub fn register_bash_tools(
                     "additionalProperties": false
                 }),
                 router,
-            )));
+            ).with_timeout(TERMUX_HOST_CALL_TIMEOUT)));
         }
     }
 }

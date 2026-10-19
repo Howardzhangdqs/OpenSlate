@@ -80,7 +80,9 @@ ChatScreen Composer
 | 层 | 上限 | 行为 |
 |----|------|------|
 | Rust `HOST_CALL_TIMEOUT`（hostcall.rs） | **120s** | 超时移除 pending，工具报错（回合可继续，不是 runtime 失败） |
-| Kotlin Termux 结果（TermuxExec RESULT_TIMEOUT_MS） | **90s** | deferred 超时 → resolveHostCall(false, "timeout…") |
+| Rust termux HostTool（exec.rs `TERMUX_HOST_CALL_TIMEOUT`） | **900s** | bash/termux_bash/termux.run 的 HostTool 壳专用（`call_with_id` 覆盖，照 ask_user 先例）：停滞期间 Kotlin 侧进入等待连接模式（见 §3.1.1），给用户从容恢复 Termux 的余量，仍防永久挂死 |
+| Kotlin Termux 结果（TermuxExec RESULT_TIMEOUT_MS） | **90s** | deferred 超时 → resolveHostCall(false, "timeout…")；「等待连接」模式豁免（见 §3.1.1） |
+| Kotlin Termux 硬上限（TermuxExec HARD_WAIT_TIMEOUT_MS） | **880s** | 等待连接模式的全局兜底（略低于 Rust 900s，超时定性由 Kotlin 先给出） |
 | `shutdown()` | — | `fail_all("runtime shutting down")`：全部在途立刻失败 + 审批全拒 |
 
 重复/迟到应答：`resolve` 对不在途的 id 返回 false（超时已清/已答/关停），幂等安全。同回合同名工具多次调用的输出经 Kotlin `pendingToolOutputs`（工具名 → deque）按序配对。
@@ -125,6 +127,70 @@ edit_file）对模型是 opt-in（root.md 不含即不可见）。
 工具管理页/状态页把它分组为 MCP（`termux` 组）；PTC namespace 上 MCP
 接管后从顶层工具变为 `tools.termux.bash` 组（server_alias = 前缀
 termux），HostTool 兜底形态保持顶层。
+
+### 3.1.1 termux 停滞面板 → 等待连接 → 重发续跑（HostTool 兜底路径）
+
+Termux 未启动/被冻结/停止态时，RUN_COMMAND 的结果 PendingIntent 永不
+回传——命令「停滞」。原实现是单向横幅提示（按钮只 `startActivity`，90s
+后命令超时报错）；现为**活的连接面板 + 等待连接后续跑**，对 Agent 完全
+透明（无论初始已连接还是后来才连上，结果都经同一链路回填）：
+
+```text
+命令停滞检测（RuntimeBridge.armTermuxStallWatchdog，首发与重发共用）
+  runInTermux 派发后 0.5s（TERMUX_STALL_WATCHDOG_MS）仍 isPending
+  → termuxStalledCalls += id；TermuxExec.setWaitingConnection(id, true)
+      （豁免 TermuxExec 90s 计时——awaitResult 切换到 1s 轮询等待，
+        不判死、不回错误；豁免解除后重起完整 90s 窗口）
+  → UiState.termuxStallSince 置最早时刻 → 聊天页点亮连接面板
+
+连接面板（ChatScreen.TermuxStallBanner + ui/TermuxStallTracker.kt）
+  stall 激活期间聊天页周期重探（2.5s；tracker CAS 单飞防抖）+ ON_RESUME
+  立即重探（gateRefresh 同款门控；tracker 与面板可见性解耦——Ready
+  收起面板后重探继续到 stall 清零，重发后再 stall 能被重新捕获）
+  → 探测阶梯复用 detectTermuxStatus（MCP host 探活 → 安装/权限 →
+    echo ok 通道往返），状态-动作矩阵：
+      Checking      → spinner「正在探测 Termux…」
+      NotInstalled  → 「去安装」（F-Droid 详情页 intent）
+      NoPermission  → 「去授权」（本应用系统权限页 intent）
+      ChannelDown   → 「打开 Termux」（McpHostManager.startTermuxApp；
+                      副文案带 TermuxDiagnostics.describe 摘要）
+      Ready         → 面板收起（可见条件含 tracker !is Ready）
+
+连接事件 → 重发续跑（TermuxStallTracker → RuntimeBridge.onTermuxConnectionRestored）
+  仅「非 Ready → Ready」跳变触发一次，且需自上次 Ready 后观察到过
+  通道中断（sawDownSinceReady）：
+    未见中断（慢命令误报停滞）→ 只解除等待豁免、恢复正常计时，不重发
+      （防命令重复执行；面板照常在 Ready 时收起）
+    见过中断（Termux 真死过）→ 宽限 2s（TERMUX_RESEND_GRACE_MS：停止态
+      期间排队的原始命令可能正在补跑，先等结果落地）→ 对 stalled 集合里
+      仍 isPending 的 id 用**原 id** TermuxExec.resend：
+        复用 pending 表既有 deferred（不新建 pending 项），重发即消费
+        本次连接事件（id 清出 stalled 集合；每 id 每次连接事件至多一次）
+        request code 按派发序号分段（0x1000_0000/段），避免与
+        FLAG_ONE_SHOT 旧 PendingIntent 记录错绑
+      → 解除等待豁免（恢复正常 90s 计时）+ 重武装看门狗
+        （再 stall → 回到等待模式，等下一次连接事件——天然兜底
+          「进程起了又死」的 Ready 误判）
+
+结果回填（零新增链路）
+  Termux RunCommandService → TermuxResultReceiver → TermuxExec.complete(id)
+  → 原 deferred → runInTermux 挂起点唤醒 → recordToolOutput +
+    resolveHostCall(id, ok, payload) → Rust oneshot → 工具结果带上
+    下一请求，模型无感继续
+  → finally：id 出 stalled 集合；集合空 → termuxStallSince=null → 面板收起
+```
+
+边界与现状：
+
+- **MCP 路径不在此链路**：host 在线时 bash 走 MCP over HTTP，host 死亡
+  = ExecutionError 直回模型（回合可继续），无停滞面板/重发——运行期
+  host 死亡不做工具热切换（见 §3.1），修复入口 = 设置页「重载 MCP」/
+  健康态门控自动 reloadMcpServers。停滞面板只覆盖 HostTool 兜底路径
+  （host 缺席时的 RUN_COMMAND 桥接）。
+- 跨进程重启的停滞挂起**不持久化**（二期限定）：App 进程被杀则等待中的
+  命令随 deferred 消失，重启后无续跑。
+- turn 取消 / runtime 关停照旧：`TermuxExec.cancelAll`（等待模式一并
+  清理）+ Rust `fail_all`。
 
 ### 3.2 ask_user（Agent 向用户提问，UI 全链路）
 

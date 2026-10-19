@@ -429,11 +429,18 @@ object RuntimeBridge {
     private val pendingToolOutputs =
         java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<String>>()
 
-    /** 0.5s 仍无应答的 termux host call id 集合（并发调用共用；空 = 熄灭横幅）。
+    /** 0.5s 仍无应答的 termux host call id 集合（并发调用共用；空 = 熄灭面板）。
      *  点亮/熄灭与状态更新都经 termuxStallMutex 串行，避免竞态下横幅残留。 */
     private val termuxStalledCalls: MutableSet<Long> =
         java.util.concurrent.ConcurrentHashMap.newKeySet()
     private val termuxStallMutex = Mutex()
+
+    /** stall 看门狗阈值：命令发出多久仍无应答判定停滞（进入等待连接模式）。 */
+    private const val TERMUX_STALL_WATCHDOG_MS = 500L
+
+    /** 连接事件确认 Ready 后、重发前的宽限：停止态期间排队的原始命令可能
+     *  正在补跑，先等结果落地再只重发仍无应答的（防命令重复执行）。 */
+    private const val TERMUX_RESEND_GRACE_MS = 2_000L
 
     /** reloadMcpServers 串行化：设置页保存、诊断自愈、工具页刷新等多个
      *  调用点可能并发触发热重载；Rust 侧 reload（让位→swap→重算）非
@@ -2316,22 +2323,8 @@ object RuntimeBridge {
             return
         }
         scope.launch(Dispatchers.IO) {
-            // stall 看门狗：命令发出 0.5s 仍无应答（Termux 未启动/被冻结时
-            // 结果 PendingIntent 永不回传）→ 记入 stall 集合并点亮"Termux
-            // 未响应"横幅，用户可直接拉起 Termux 而不是干等 90s 超时。
-            val watchdog = launch {
-                delay(500)
-                termuxStallMutex.withLock {
-                    // 锁内双检 isPending：结果可能在 delay 期间已到达。
-                    if (TermuxExec.isPending(id)) {
-                        termuxStalledCalls.add(id)
-                        mutate {
-                            val now = System.currentTimeMillis()
-                            copy(termuxStallSince = termuxStallSince?.coerceAtMost(now) ?: now)
-                        }
-                    }
-                }
-            }
+            // stall 看门狗（首发与重发共用，见 armTermuxStallWatchdog）。
+            val watchdog = armTermuxStallWatchdog(id)
             try {
                 val (output, error) = TermuxExec.run(ctx, id, command)
                 if (output != null) {
@@ -2347,13 +2340,91 @@ object RuntimeBridge {
             } finally {
                 watchdog.cancel()
                 // 结果到达/取消/异常都退出 stall；仅当没有其他并发 termux
-                // 调用仍处 stall 时才熄灭横幅（不能被先完成的那次误清）。
+                // 调用仍处 stall 时才熄灭面板（不能被先完成的那次误清）。
                 termuxStallMutex.withLock {
-                    if (termuxStalledCalls.remove(id) && termuxStalledCalls.isEmpty()) {
+                    termuxStalledCalls.remove(id)
+                    if (termuxStalledCalls.isEmpty()) {
                         mutate { copy(termuxStallSince = null) }
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * termux stall 看门狗：命令发出 [TERMUX_STALL_WATCHDOG_MS] 仍无应答
+     * （Termux 未启动/被冻结时结果 PendingIntent 永不回传）→ 记入 stall
+     * 集合、标记「等待 Termux 连接」模式（豁免 TermuxExec 90s 计时，等
+     * 连接后续跑）并点亮连接面板（termuxStallSince）。首发与重发共用：
+     * 重发后命令再 stall（Ready 误判，进程起了又死）→ 回到等待模式，
+     * 等待下一次连接事件。
+     */
+    private fun armTermuxStallWatchdog(id: Long): Job = scope.launch {
+        delay(TERMUX_STALL_WATCHDOG_MS)
+        termuxStallMutex.withLock {
+            // 锁内双检 isPending：结果可能在 delay 期间已到达。
+            if (TermuxExec.isPending(id)) {
+                termuxStalledCalls.add(id)
+                TermuxExec.setWaitingConnection(id, true)
+                mutate {
+                    val now = System.currentTimeMillis()
+                    // coerceAtMost：并发多次 stall 保持最早时刻（已等待
+                    // 秒数从首条停滞起算）。
+                    copy(termuxStallSince = termuxStallSince?.coerceAtMost(now) ?: now)
+                }
+            }
+        }
+    }
+
+    /**
+     * Termux 连接恢复入口（TermuxStallTracker 探测确认 Ready 时回调；
+     * 停滞面板的周期重探 / ON_RESUME 重探驱动）。结果回传走既有
+     * `complete(id)` → 本类 runInTermux 挂起点 → `resolveHostCall` 链路，
+     * 零新增回填路径。
+     *
+     * @param resend true = 探测阶梯观察到过通道中断（Termux 真死过）→
+     *   宽限 [TERMUX_RESEND_GRACE_MS] 后对 stalled 集合里**仍无应答**的
+     *   id 用原 id 重发 RUN_COMMAND 续跑（每 id 每次连接事件至多一次）；
+     *   false = 未见中断（慢命令误报）→ 仅解除等待豁免、恢复正常计时，
+     *   不重发（防命令重复执行）。
+     */
+    internal fun onTermuxConnectionRestored(resend: Boolean) {
+        val ctx = appContext ?: return
+        scope.launch(Dispatchers.IO) {
+            if (!resend) {
+                termuxStallMutex.withLock {
+                    termuxStalledCalls.forEach { TermuxExec.setWaitingConnection(it, false) }
+                    // 无重发即无重发看门狗：不会再 stall 重亮，顺手熄灭
+                    // stallSince（面板条件失效 + 聊天页周期重探停摆；各 id
+                    // 完成时 finally 幂等收尾）。
+                    if (termuxStalledCalls.isNotEmpty()) {
+                        mutate { copy(termuxStallSince = null) }
+                    }
+                }
+                return@launch
+            }
+            // 宽限：用户打开 Termux 的瞬间，停止态期间排队的原始命令可能
+            // 正在补跑——先等结果落地，只重发仍无应答的（防重复执行）。
+            delay(TERMUX_RESEND_GRACE_MS)
+            val resended = mutableListOf<Long>()
+            termuxStallMutex.withLock {
+                for (id in termuxStalledCalls.toList()) {
+                    // isPending 双检：结果可能已在宽限期内到达。
+                    if (TermuxExec.isPending(id) && TermuxExec.resend(ctx, id)) {
+                        // 解除等待豁免：awaitResult 重起完整 90s 窗口。
+                        TermuxExec.setWaitingConnection(id, false)
+                        resended += id
+                    }
+                }
+                // 重发即消费本次连接事件：清出等待集合（防同事件重复重发，
+                // 再 stall 由重发的看门狗重新标记）；集合清空时熄灭面板。
+                termuxStalledCalls.removeAll(resended.toSet())
+                if (termuxStalledCalls.isEmpty()) {
+                    mutate { copy(termuxStallSince = null) }
+                }
+            }
+            // 重发后重武装看门狗（锁外启动，launch 不持锁等待）。
+            resended.forEach { armTermuxStallWatchdog(it) }
         }
     }
 

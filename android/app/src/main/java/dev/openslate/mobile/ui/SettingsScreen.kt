@@ -1866,20 +1866,9 @@ internal fun CompactButton(
     }
 }
 
-/** 状态行：成功 → 实心对勾圆（绿）；未就绪 → 实心红叉圆（error 色）。 */
-@Composable
-private fun McpStatusLine(ok: Boolean, text: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(
-            imageVector = if (ok) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
-            contentDescription = if (ok) "已就绪" else "未就绪",
-            tint = if (ok) successGreen()
-            else MaterialTheme.colorScheme.error,
-            modifier = Modifier.height(14.dp).width(14.dp),
-        )
-        Text("  $text", style = MaterialTheme.typography.labelMedium)
-    }
-}
+/** 状态行（McpStatusLine）已提炼为共享组件 ui/StatusChecklist.kt
+ *  （StatusChecklist + StatusCheckRow + statusCheckOf）：本页五灯与聊天页
+ *  Termux 停滞连接面板共用同一套行视觉（绿勾/红叉/spinner/空点）。 */
 
 /**
  * bash 工具执行后端（独立运行模式，多选）。
@@ -2831,11 +2820,39 @@ private fun McpSection() {
             }
         }
         // 检测中也显示（expanded 即渲染）：区块内每个灯按 checked 命中
-        // 才出现——检测完一项显示一项，未完成的项不占位。
+        // 才出现——检测完一项显示一项，未完成的项不占位（StatusChecklist
+        // 空清单不组合，语义一致）。前三灯（Termux/权限/通道）一组，后
+        // 两灯（host 安装/运行）一组——通道指引块夹在两组之间，与提炼前
+        // 的渲染顺序逐项一致（视觉零变化的重构验收点）。
         if (expanded) {
-            if ("termuxInstalled" in status.checked) McpStatusLine(status.termuxInstalled, "Termux 已安装")
-            if ("termuxPerm" in status.checked) McpStatusLine(status.termuxPerm, "RUN_COMMAND 权限")
-            if ("termuxAllowed" in status.checked) McpStatusLine(status.termuxAllowed, "RUN_COMMAND 通道")
+            StatusChecklist(
+                buildList {
+                    if ("termuxInstalled" in status.checked) {
+                        add(
+                            StatusCheckRow(
+                                statusCheckOf(status.termuxInstalled),
+                                "Termux 已安装",
+                            ),
+                        )
+                    }
+                    if ("termuxPerm" in status.checked) {
+                        add(
+                            StatusCheckRow(
+                                statusCheckOf(status.termuxPerm),
+                                "RUN_COMMAND 权限",
+                            ),
+                        )
+                    }
+                    if ("termuxAllowed" in status.checked) {
+                        add(
+                            StatusCheckRow(
+                                statusCheckOf(status.termuxAllowed),
+                                "RUN_COMMAND 通道",
+                            ),
+                        )
+                    }
+                },
+            )
             status.channel?.let {
                 Text(
                     TermuxDiagnostics.describe(it),
@@ -2930,8 +2947,28 @@ private fun McpSection() {
                     }
                 })
             }
-            if ("hostInstalled" in status.checked) McpStatusLine(status.hostInstalled, "MCP 服务已安装")
-            if ("hostAlive" in status.checked) McpStatusLine(status.hostAlive, "服务运行中")
+            // 后两灯：行级 guard 在 buildList 内（与提炼前逐行 if 一致；
+            // 空清单不组合 = 无一命中时整块消失，同原行为）。
+            StatusChecklist(
+                buildList {
+                    if ("hostInstalled" in status.checked) {
+                        add(
+                            StatusCheckRow(
+                                statusCheckOf(status.hostInstalled),
+                                "MCP 服务已安装",
+                            ),
+                        )
+                    }
+                    if ("hostAlive" in status.checked) {
+                        add(
+                            StatusCheckRow(
+                                statusCheckOf(status.hostAlive),
+                                "服务运行中",
+                            ),
+                        )
+                    }
+                },
+            )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             // 前置三绿（Termux/权限/放行）就绪才出现 —— 那时恰好只剩

@@ -191,6 +191,11 @@ pub struct HostTool {
     description: String,
     schema: Value,
     router: Arc<HostCallRouter>,
+    /// host call 等待上限覆盖（None = router 默认 [`HostCallRouter::call`]）。
+    /// termux 系壳需要远超默认 120s 的余量：命令停滞期间宿主进入「等待
+    /// Termux 连接」模式（面板引导用户恢复、连接后原 id 重发续跑），见
+    /// exec.rs 的 `TERMUX_HOST_CALL_TIMEOUT` 与 ask_user 的先例。
+    timeout: Option<Duration>,
 }
 
 impl HostTool {
@@ -205,7 +210,15 @@ impl HostTool {
             description: description.into(),
             schema,
             router,
+            timeout: None,
         }
+    }
+
+    /// 覆盖 host call 等待上限（builder 风格；语义同 ask_user 对
+    /// [`HostCallRouter::call_with_id`] 的自定义超时用法）。
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -225,8 +238,16 @@ impl Tool for HostTool {
 
     async fn execute(&self, args: &Value) -> Result<ToolOutput, ToolError> {
         let started = std::time::Instant::now();
+        // 自定义超时走 call_with_id（照 ask_user 用法）；默认路径不变。
+        let result = match self.timeout {
+            Some(timeout) => {
+                let id = self.router.allocate_id();
+                self.router.call_with_id(id, &self.name, args, timeout).await
+            }
+            None => self.router.call(&self.name, args).await,
+        };
         let duration_ms = started.elapsed().as_millis() as u64;
-        match self.router.call(&self.name, args).await {
+        match result {
             Ok(value) => {
                 let content = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
                 Ok(ToolOutput {

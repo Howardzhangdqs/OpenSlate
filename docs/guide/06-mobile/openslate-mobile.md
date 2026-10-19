@@ -28,10 +28,10 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/runtime.rs` | 1514 | `MobileRuntime`、`RuntimeOptions` | FFI 边界的组合根；create/send/shutdown/会话管理/registry 查询全部入口 |
 | `src/bootstrap.rs` | 396 | `MobilePaths` | 宿主注入的 4 个路径；首启目录脚手架 + 默认配置；DB 路径归位 |
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
-| `src/hostcall.rs` | 310 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`fail_all` 对 ask_user 豁免（持久化恢复） |
+| `src/hostcall.rs` | 447 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`call_with_id`（自定义超时，ask_user 先例）；`HostTool::with_timeout`（超时覆盖 builder——termux 壳用，见 exec.rs）；`fail_all` 对 ask_user 豁免（持久化恢复） |
 | `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`AskUserExemptApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、Manual 审批豁免（见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
 | `src/secrets.rs` | — | `PersistentSecretVault`、`env_source`、`mask_with_known_values` | ask_user secret 子系统：会话内存 + store v4 `credentials` 持久镜像两级凭据库、env 注入源、file 写入（0600）、脱敏值源（见 [04-tools/ask-user.md §8](../04-tools/ask-user.md)） |
-| `src/exec.rs` | 857 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1） |
+| `src/exec.rs` | 940 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1）；termux HostTool 壳专用超时 `TERMUX_HOST_CALL_TIMEOUT` = **900s**（停滞期间 Kotlin 侧等待连接 + 重发续跑，见 android-app.md / call-chains.md §3.1.1；配套 Kotlin `HARD_WAIT_TIMEOUT_MS` = 880s） |
 | `src/provider.rs` | 88 | `mobile_provider_factory`、`MobileSecrets` | provider 工厂：内存 key 注入 + env 兜底 |
 | `src/registry.rs` | 541 | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |

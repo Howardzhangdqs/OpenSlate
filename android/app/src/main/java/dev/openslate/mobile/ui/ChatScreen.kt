@@ -1,6 +1,9 @@
 package dev.openslate.mobile.ui
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
@@ -183,11 +186,27 @@ fun ChatScreen(
     // 成本低，故不设轮询定时器；面板聚焦时另有 refresh（ComposerFocusPanel）。
     // ChatScreen 无 config_changed / MCP reload 回调处理点，按约定不新增链路。
     LaunchedEffect(Unit) { ComposerMcpStatusTracker.refresh(context) }
+    // Termux stall 激活期间周期重探连接（约 2.5s；tracker CAS 单飞防抖，
+    // 在途探测的 refresh 为无操作）——stall 解除（termuxStallSince 变
+    // null）即停。重探与面板可见性解耦：Ready 收起面板后重探仍继续到
+    // stall 清零，重发后再 stall 能被下一轮探测重新捕获。
+    LaunchedEffect(state.termuxStallSince) {
+        if (state.termuxStallSince == null) return@LaunchedEffect
+        while (true) {
+            TermuxStallTracker.refresh(context)
+            delay(2_500)
+        }
+    }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 ComposerMcpStatusTracker.refresh(context)
+                // stall 在途时回前台立即重探：用户从 Termux 切回的最快
+                // 路径确认恢复并续跑（gateRefresh 同款 ON_RESUME 门控）。
+                if (RuntimeBridge.state.value.termuxStallSince != null) {
+                    TermuxStallTracker.refresh(context)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -440,7 +459,7 @@ fun ChatScreen(
                     }
                 }
             }
-            // 底部悬浮组：termux stall 提示卡（出现时从输入区上方展开）+ 输入区。
+            // 底部悬浮组：termux 停滞连接面板（stall 时从输入区上方展开）+ 输入区。
             // SharedTransitionLayout：输入框常驻状态行 ↔ 聚焦面板卡片之间的
             // sharedBounds 位移动画容器（key composer.model / composer.effort，
             // 见 Composer 状态行与 ModelPickerRow/EffortPickerRow 的锚点）。
@@ -478,9 +497,15 @@ fun ChatScreen(
                             }
                         },
                     )
+                    // Termux 停滞连接面板：stall 激活期间实时显示连接阶梯；
+                    // 探测确认 Ready 时收起（连接事件已交 RuntimeBridge 续跑，
+                    // 结果经既有链路回填，全部命令完成后 termuxStallSince 清零）。
+                    val termuxStall by TermuxStallTracker.state.collectAsState()
                     TermuxStallBanner(
-                        visible = state.running && state.termuxStallSince != null,
+                        visible = state.running && state.termuxStallSince != null &&
+                            termuxStall.status !is TermuxStatus.Ready,
                         stallSince = state.termuxStallSince,
+                        status = termuxStall.status,
                         glass = glass,
                         rootCoords = { rootCoords },
                     )
@@ -1757,15 +1782,21 @@ private fun ApprovalBanner(
 }
 
 /**
- * Termux stall 提示卡：termux 命令发出 0.5s 仍无应答时悬浮在输入区上方
- * （与输入胶囊同语言：磨砂玻璃面板 + 细边框 + 轻阴影）。「打开 Termux」
- * 直接拉起 Termux 前台完成初始化；命令仍在等结果，横幅不消失——结果
- * 到达（termuxStallSince 变 null）时经 AnimatedVisibility 自动收起。
+ * Termux 停滞连接面板：termux 命令发出 0.5s 仍无应答时悬浮在输入区上方
+ * （与输入胶囊同语言：磨砂玻璃面板 + 细边框 + 轻阴影）。**检查清单面板**
+ * （与设置页 MCP 控制区同一套视觉，复用 StatusChecklist）：按探测阶梯
+ * （TermuxStallTracker → detectTermuxStatus：MCP host 探活 → 安装/权限
+ * → echo ok 通道往返）映射为四行检查记录（已安装/权限/已运行/通道应答），
+ * 完成项绿色对勾、卡点 spinner + 对应操作按钮；stall 激活期间聊天页
+ * 周期重探 + ON_RESUME 重探，连接恢复（Ready）经 RuntimeBridge 原 id
+ * 重发续跑、结果回填后（termuxStallSince 变 null）经 AnimatedVisibility
+ * 自动收起（收起动画期间可见全绿清单 + 收尾语）。
  */
 @Composable
 private fun TermuxStallBanner(
     visible: Boolean,
     stallSince: Long?,
+    status: TermuxStatus,
     glass: Glass,
     rootCoords: () -> LayoutCoordinates?,
 ) {
@@ -1775,7 +1806,7 @@ private fun TermuxStallBanner(
         exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
     ) {
         val context = LocalContext.current
-        // 点击后的轻量反馈：按钮文字切换 + 禁用重复点击。横幅本身保持可见。
+        // 「打开 Termux」点击后的轻量反馈：按钮文字切换 + 禁用重复点击。
         var pulled by remember { mutableStateOf(false) }
         // 已等待秒数（每秒跳一次；stallSince 换新则重算）。
         var waitedSec by remember(stallSince) { mutableStateOf(0) }
@@ -1786,6 +1817,126 @@ private fun TermuxStallBanner(
                     ((System.currentTimeMillis() - stallSince) / 1000).toInt().coerceAtLeast(0)
                 delay(1_000)
             }
+        }
+        // 检查记录行集合：探测阶梯 → 四行状态映射（阶梯短路的语义 = 前置
+        // 项通过才轮到当前卡点；未轮到的行保持 Pending 不抢注意力）。
+        val rows = buildList {
+            add(
+                StatusCheckRow(
+                    state = when (status) {
+                        is TermuxStatus.Checking -> StatusCheckState.InProgress
+                        is TermuxStatus.NotInstalled -> StatusCheckState.Failed
+                        else -> StatusCheckState.Done
+                    },
+                    title = "Termux 已安装",
+                    summary = if (status is TermuxStatus.NotInstalled) {
+                        "bash 依赖 Termux 执行命令；安装后打开一次再回到本页"
+                    } else {
+                        null
+                    },
+                    actionLabel = if (status is TermuxStatus.NotInstalled) "去安装" else null,
+                    onAction = if (status is TermuxStatus.NotInstalled) {
+                        {
+                            // Termux 不在 Play 上架：开 F-Droid 详情页（浏览器
+                            // 兜底；无浏览器静默失败不崩溃）。
+                            runCatching {
+                                context.startActivity(
+                                    Intent(
+                                        Intent.ACTION_VIEW,
+                                        Uri.parse("https://f-droid.org/en/packages/com.termux/"),
+                                    ),
+                                )
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                StatusCheckRow(
+                    state = when (status) {
+                        is TermuxStatus.Checking, is TermuxStatus.NotInstalled -> StatusCheckState.Pending
+                        is TermuxStatus.NoPermission -> StatusCheckState.Failed
+                        else -> StatusCheckState.Done
+                    },
+                    title = "RUN_COMMAND 权限",
+                    summary = if (status is TermuxStatus.NoPermission) {
+                        "系统设置 → 应用 → OpenSlate → 权限，或经 Shizuku 一键授予"
+                    } else {
+                        null
+                    },
+                    actionLabel = if (status is TermuxStatus.NoPermission) "去授权" else null,
+                    onAction = if (status is TermuxStatus.NoPermission) {
+                        {
+                            // 优先系统权限弹窗（Activity 上下文可达，与设置页
+                            // McpSection 同款）；非 Activity 上下文兜底直达本
+                            // 应用详情页。
+                            val activity = context as? android.app.Activity
+                            if (activity != null) {
+                                activity.requestPermissions(
+                                    arrayOf(
+                                        dev.openslate.mobile.bridge.TermuxExec.RUN_COMMAND_PERMISSION,
+                                    ),
+                                    1002,
+                                )
+                            } else {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.parse("package:${context.packageName}"),
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                StatusCheckRow(
+                    state = when (status) {
+                        is TermuxStatus.Checking, is TermuxStatus.NotInstalled,
+                        is TermuxStatus.NoPermission,
+                        -> StatusCheckState.Pending
+                        is TermuxStatus.ChannelDown -> StatusCheckState.InProgress
+                        is TermuxStatus.Ready -> StatusCheckState.Done
+                    },
+                    title = "Termux 已运行",
+                    summary = if (status is TermuxStatus.ChannelDown) {
+                        "${status.summary}；打开后回到本页即自动继续"
+                    } else {
+                        null
+                    },
+                    actionLabel = if (status is TermuxStatus.ChannelDown) {
+                        if (pulled) "已拉起，等待应答…" else "打开 Termux"
+                    } else {
+                        null
+                    },
+                    onAction = if (status is TermuxStatus.ChannelDown) {
+                        {
+                            if (McpHostManager.startTermuxApp(context.applicationContext)) {
+                                pulled = true
+                            }
+                        }
+                    } else {
+                        null
+                    },
+                ),
+            )
+            add(
+                StatusCheckRow(
+                    state = when (status) {
+                        is TermuxStatus.Ready -> StatusCheckState.Done
+                        is TermuxStatus.ChannelDown -> StatusCheckState.InProgress
+                        else -> StatusCheckState.Pending
+                    },
+                    title = "命令通道应答",
+                ),
+            )
         }
         Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
             GlassPanel(
@@ -1805,6 +1956,7 @@ private fun TermuxStallBanner(
                         .fillMaxWidth()
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                 ) {
+                    // 标题行：面板身份 + 已等待计数（阶梯无关的不变量）。
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             Icons.Outlined.Terminal,
@@ -1813,10 +1965,7 @@ private fun TermuxStallBanner(
                             tint = MaterialTheme.colorScheme.tertiary,
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text(
-                            "Termux 未响应",
-                            style = MaterialTheme.typography.titleSmall,
-                        )
+                        Text("Termux 连接", style = MaterialTheme.typography.titleSmall)
                         Spacer(Modifier.width(8.dp))
                         Text(
                             "已等待 ${waitedSec}s",
@@ -1824,23 +1973,17 @@ private fun TermuxStallBanner(
                             color = MaterialTheme.colorScheme.outline,
                         )
                     }
-                    Text(
-                        "命令已发出一段时间仍无应答，Termux 可能未启动或被系统冻结。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                    Row(Modifier.padding(top = 8.dp)) {
-                        SoftButton(
-                            onClick = {
-                                if (McpHostManager.startTermuxApp(context.applicationContext)) {
-                                    pulled = true
-                                }
-                            },
-                            enabled = !pulled,
-                        ) {
-                            Text(if (pulled) "已拉起，等待应答…" else "打开 Termux")
-                        }
+                    // 检查记录主体：四行阶梯映射（见上方 rows 构建）。
+                    StatusChecklist(rows = rows, modifier = Modifier.padding(top = 8.dp))
+                    if (status is TermuxStatus.Ready) {
+                        // 全绿收尾语（收起动画期间可见；连接事件已触发原 id
+                        // 重发，命令结果经既有链路回填）。
+                        Text(
+                            "已连接，命令继续执行，结果将自动回填…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
                     }
                 }
             }

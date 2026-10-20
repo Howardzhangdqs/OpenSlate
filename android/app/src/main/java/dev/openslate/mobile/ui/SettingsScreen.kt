@@ -149,16 +149,14 @@ fun SettingsScreen(
     var modelsProvider by remember { mutableStateOf<ProviderUi?>(null) }
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
     // 工具域二级 Tab 选中态。「命令行」Tab 已删（bash 后端选择并入
-    // 「内置工具」）：rememberSaveable 的恢复值绕过 initializer，存量
-    // 进程重建后可能带回旧四 Tab 索引，读取统一经旧→新映射折算——
-    // 0(MCP)→0、1(命令行)/2(工具管理)→1、3(内置工具)→2；新写入恒
-    // 0..2 直通。首次点击后落盘值即归位，映射仅兜历史恢复值不越界。
-    var toolTabRaw by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
-    val toolTab = when (toolTabRaw) {
-        3 -> 2
-        2, 1 -> 1
-        else -> 0
-    }
+    // 「内置工具」），值域 0..2。saveable 显式换新 key（toolTabV2）：
+    // 旧 key 的存量值是四 Tab 时代索引，语义已变且与新写入无法区分——
+    // 曾用读侧映射折算（旧 3→2、旧 1/2→1），但它会连新点击一起劫持
+    // （点「内置工具」写 2 被折回 1，Tab 永远点不亮，真机实测 bug）；
+    // 换 key 一次性丢弃旧值，落点重置 MCP（0），无映射表。
+    var toolTab by androidx.compose.runtime.saveable.rememberSaveable(
+        key = "toolTabV2",
+    ) { mutableStateOf(0) }
     var modelTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
 
     // API key 存在性批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，
@@ -234,7 +232,7 @@ fun SettingsScreen(
                     )) {
                         androidx.compose.material3.Tab(
                             selected = toolTab == idx,
-                            onClick = { toolTabRaw = idx },
+                            onClick = { toolTab = idx },
                             text = { Text(label) },
                         )
                     }

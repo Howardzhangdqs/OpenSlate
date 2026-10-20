@@ -67,13 +67,18 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /** 工具分组固定展示顺序（类别按名前缀推导）。 */
-private val TOOL_GROUP_ORDER = listOf("主机", "命令行", "MCP 工具", "内置")
+private val TOOL_GROUP_ORDER = listOf("主机", "MCP 工具", "内置")
 
-/** 工具归类：`mobile.*` → 主机；`bash`/`termux_bash` → 命令行；
+/** 工具归类：`mobile.*` → 主机；`bash` → 内置（native toybox sh，注册名
+ *  不经任何模板展开，非 MCP 域）；`termux_bash` → MCP 工具（HostTool
+ *  兜底形态经 builtin 小模板注册，`mcpServerSlugOf` 对它与 host 内置名
+ *  （`termux_read_file` 等）走同一 builtin 退化分支——名侧无法区分归属
+ *  （RuntimeBridge 注释原文），展示归组随同类落「MCP 工具」组聚合卡）；
  *  MCP（模板正则命中，旧 `__` 启发式兜底）→ MCP 工具；其余 → 内置。 */
 private fun toolGroupLabel(name: String): String = when {
     name.startsWith("mobile.") -> "主机"
-    name == "bash" || name == "termux_bash" -> "命令行"
+    name == "bash" -> "内置"
+    name == "termux_bash" -> "MCP 工具"
     // MCP 判定与卡片聚合同源（mcpServerSlugOf，模板正则提取）：三占位
     // 符模型的注册名不必含 `__`（如 `{prefix}.{server}.{tool}` 展开成
     // `termux.memory.create_entities`），contains("__") 旧启发式仅兜底。
@@ -139,9 +144,12 @@ private fun termuxUnavailableHint(status: TermuxStatus): String? = when (status)
  * - MCP 工具组按所属 server（slug）聚合为卡片：卡片总开关 = 批量可见性
  *   （单次全量覆写 FFI），展开后逐工具复用 ToolRow；显示名经 prefs 的
  *   server 清单反查，server 已删（工具仍在注册表）回退 slug +「（未配置）」；
- * - Termux 依赖工具（termux_bash / 单后端 bash）：进页与 ON_RESUME 时
- *   检测 Termux 可用性（后端含 termux 才检测），异常时名字旁警示图标
- *   + 展开详情提示，用户打开 Termux 返回后自动重检。
+ *   host 内置前缀组（builtin 小模板退化 slug、反查 miss 的裸名工具组）
+ *   例外：头名「Termux 服务内置」、不标未配置——工具属于聚合 host 本身；
+ * - Termux 依赖工具（termux_bash 并入 MCP 工具组随卡聚合 / 单后端 bash
+ *   在「内置」组）：进页与 ON_RESUME 时检测 Termux 可用性（后端含
+ *   termux 才检测），异常时名字旁警示图标 + 展开详情提示，用户打开
+ *   Termux 返回后自动重检。
  */
 @Composable
 fun ToolManagementSection() {
@@ -381,11 +389,24 @@ fun ToolManagementSection() {
                         }
                         for ((slug, groupTools) in bySlug) {
                             val names = mcpServerNames
+                            // host 内置前缀组（builtin 小模板退化 slug：组内
+                            // 全部为裸名工具、且反查不到用户 server）：这些
+                            // 工具属于聚合 host 本身（bash/read_file/…），
+                            // 不是「被删的 server 还留着的工具」——头名给
+                            // 「Termux 服务内置」，不再标「（未配置）」。反查
+                            // 命中（默认安装流 server 名恰为前缀键名）时不动
+                            // ——既有归卡现状保持；用户配置 server 的回退
+                            // 逻辑原样。
+                            val builtinGroup = names != null && slug !in names &&
+                                groupTools.all { !it.name.contains("__") }
                             McpToolGroupCard(
                                 slug = slug,
-                                displayName = names?.get(slug) ?: slug,
-                                // 反查表未就绪时不标「未配置」（防加载间隙闪标注）。
-                                configured = names != null && slug in names,
+                                displayName = if (builtinGroup) "Termux 服务内置" else {
+                                    names?.get(slug) ?: slug
+                                },
+                                // 反查表未就绪时不标「未配置」（防加载间隙闪标注）；
+                                // host 内置组同理不标（见上）。
+                                configured = names != null && (builtinGroup || slug in names),
                                 tools = groupTools,
                                 expanded = slug in expandedGroups,
                                 onToggleExpand = {
@@ -920,9 +941,9 @@ private fun McpToolGroupCard(
                             tool = t,
                             visible = isVisible(t.name),
                             expanded = t.name in expandedTools,
-                            // MCP 工具名不依赖 Termux（dependsOnTermux 仅
-                            // bash/termux_bash 为真，此 lambda 对组内恒返
-                            // 回 null）；仍走同一表达式以防规则将来变化。
+                            // termux_bash 并入本组后组内也有 Termux 依赖工具：
+                            // dependsOnTermux 对它为真（termux 后端启用时）→
+                            // 状态异常照常警示；其余 MCP 工具名恒返 null 不警示。
                             termuxStatus = termuxStatusFor(t.name),
                             onToggleExpand = { onToggleToolExpand(t.name) },
                             onVisibleChange = { onToolVisibleChange(t.name, it) },

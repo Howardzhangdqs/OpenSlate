@@ -111,6 +111,10 @@ fun StatusChecklist(
                 } else {
                     LocalContentColor.current
                 }
+                // 文本块 weight(1f)：非 weighted 子元素（图标/按钮）先测量，
+                // 文本在剩余宽度内换行——否则长摘要（多行 softWrap）会把行内
+                // 宽度吃满，尾随 SoftButton 被挤到 0 宽（0 宽下其 Text 逐字符
+                // 竖排换行，形成一根隐形的超高柱：按钮消失 + 行高暴涨双 bug）。
                 if (row.summary == null) {
                     // 两空格前缀与 McpStatusLine 逐字一致（图标与文字的间距
                     // 在源实现里就是字符串前导空格，保持像素级一致）。
@@ -118,9 +122,10 @@ fun StatusChecklist(
                         "  ${row.title}",
                         style = MaterialTheme.typography.labelMedium,
                         color = titleColor,
+                        modifier = Modifier.weight(1f),
                     )
                 } else {
-                    Column {
+                    Column(Modifier.weight(1f)) {
                         Text(
                             "  ${row.title}",
                             style = MaterialTheme.typography.labelMedium,

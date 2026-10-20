@@ -37,6 +37,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -76,6 +77,11 @@ import dev.openslate.mobile.bridge.RuntimeBridge
  *   整体在 imePadding 之上，键盘弹起时列底随 IME 上移——面板在 composer
  *   上方向上生长，composer 相对键盘的位置不变，不存在被顶飞的可能，
  *   也不与 IME 动画争抢布局（同一布局子树一起移动）。
+ * - 首行 Termux 状态区可点击：在面板内展开/收起 MCP 五灯子面板
+ *   （McpLightsTracker → probeMcpLights 探测 + 共享映射 mcpLightRow
+ *   渲染，与设置页 MCP 区同一口径：五项独立判定成败、失败时机与
+ *   「打开 Termux」时机同源；展开瞬间 refresh，ON_RESUME 且展开时
+ *   再检）。右缘 MCP / tools 计数保留原状、不参与点击。
  * - 未聚焦时 AnimatedVisibility 不参与组合，高度/间距零变化（硬性要求）。
  *
  * 生命周期：
@@ -167,24 +173,56 @@ internal fun ComposerFocusPanel(
                     // ── 首行：Termux 连接状态（排首位）+ 右缘 MCP 连接数 ──
                     // MCP 数 = 正常连接着的下游 server 数（host 活着才有值；
                     // 死亡/未知显示 —）。工具计数已删（卡片精简）。
+                    // 左侧状态区按钮化：点击在面板内展开/收起 Termux 阶梯
+                    // 子面板（下方 AnimatedVisibility）；状态色文案保留，
+                    // 尾缘箭头随展开态 180° 旋转（ModelPickerRow 同语言）。
+                    var termuxExpanded by remember { mutableStateOf(false) }
+                    val termuxArrowAngle by animateFloatAsState(
+                        targetValue = if (termuxExpanded) 180f else 0f,
+                        label = "composerTermuxArrow",
+                    )
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Icon(
-                            Icons.Outlined.Terminal,
-                            contentDescription = null,
-                            modifier = Modifier.size(13.dp),
-                            tint = termuxColor,
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            // 探测细节（耗时/HTTP 码）只入快照供诊断，不进
-                            // 常驻 UI——运行状态文案保持干净。
-                            termuxText,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = termuxColor,
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                // 竖向加垫出触达高度（≈28dp）；不加水平内边
+                                // 距，Terminal 图标与下方行保持同一左缘网格。
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { termuxExpanded = !termuxExpanded }
+                                .padding(vertical = 6.dp),
+                        ) {
+                            Icon(
+                                Icons.Outlined.Terminal,
+                                contentDescription = null,
+                                modifier = Modifier.size(13.dp),
+                                tint = termuxColor,
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                // 探测细节（耗时/HTTP 码）只入快照供诊断，不进
+                                // 常驻 UI——运行状态文案保持干净。
+                                termuxText,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = termuxColor,
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                Icons.Filled.KeyboardArrowDown,
+                                contentDescription = if (termuxExpanded) {
+                                    "收起 Termux 连接详情"
+                                } else {
+                                    "展开 Termux 连接详情"
+                                },
+                                tint = MaterialTheme.colorScheme.outline,
+                                // 同 ModelPickerRow：绘制相位读取，避免逐帧重组。
+                                modifier = Modifier
+                                    .size(14.dp)
+                                    .graphicsLayer { rotationZ = termuxArrowAngle },
+                            )
+                        }
                         Spacer(Modifier.weight(1f))
                         // MCP 官方品牌 logo（非 Material 图标）：用户指定的
                         // 「一律 Material 图标」规范例外，仅此一处；资源为
@@ -227,6 +265,51 @@ internal fun ComposerFocusPanel(
                             "tools ${live.agentTools ?: "—"}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    // ── MCP 五灯子面板：首行状态区点击展开/收起 ──
+                    // 折叠语言对齐 ToolNameTemplateSection（expandVertically +
+                    // 200ms 淡入淡出）。数据 = McpLightsTracker（与设置页 MCP
+                    // 区同一探测管线 probeMcpLights、同一五灯映射 mcpLightRow
+                    // ——五项独立判定成败）；展开瞬间 refresh 一次，从 Termux
+                    // 切回（ON_RESUME）时若面板展开再 refresh——手动打开
+                    // Termux 唤醒后返回即见重检结果，无需收起重开。不再触发
+                    // TermuxStallTracker（onTermuxConnectionRestored 回归停滞
+                    // 面板专属语义）。五行全显（checked→终态、当前步骤→进行
+                    // 中、其余→待检测），高度有界，小屏与 IME 共存无需滚动。
+                    val lights by McpLightsTracker.state.collectAsState()
+                    val mcpActions = remember(context) { standardMcpLightActions(context) }
+                    LaunchedEffect(termuxExpanded) {
+                        if (termuxExpanded) McpLightsTracker.refresh(context)
+                    }
+                    @Suppress("DEPRECATION") // 非 deprecated 替代在 lifecycle-runtime-compose（非本项目依赖），与设置页 McpSection 同款用法
+                    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+                        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && termuxExpanded) {
+                                McpLightsTracker.refresh(context)
+                            }
+                        }
+                        lifecycleOwner.lifecycle.addObserver(obs)
+                        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+                    }
+                    AnimatedVisibility(
+                        visible = termuxExpanded,
+                        enter = expandVertically() + fadeIn(tween(200)),
+                        exit = shrinkVertically() + fadeOut(tween(200)),
+                    ) {
+                        StatusChecklist(
+                            buildList {
+                                for (key in MCP_LIGHT_KEYS) {
+                                    mcpLightRow(
+                                        key = key,
+                                        result = lights ?: McpLightsResult(),
+                                        displayDetails = true,
+                                        actions = mcpActions,
+                                    )?.let { add(it) }
+                                }
+                            },
+                            modifier = Modifier.padding(top = 6.dp),
                         )
                     }
                     // 次行：已连接 server 名单（精简保留；未连接/为空不占位）。

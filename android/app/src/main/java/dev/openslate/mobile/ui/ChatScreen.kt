@@ -1,9 +1,6 @@
 package dev.openslate.mobile.ui
 
-import android.content.Intent
-import android.net.Uri
 import android.os.Build
-import android.provider.Settings
 import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
@@ -149,7 +146,6 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import dev.openslate.mobile.R
-import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.PendingQuestionUi
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
@@ -1968,7 +1964,8 @@ private fun ApprovalBanner(
 /**
  * Termux 停滞连接面板：termux 命令发出 0.5s 仍无应答时悬浮在输入区上方
  * （与输入胶囊同语言：磨砂玻璃面板 + 细边框 + 轻阴影）。**检查清单面板**
- * （与设置页 MCP 控制区同一套视觉，复用 StatusChecklist）：按探测阶梯
+ * （与设置页 MCP 控制区同一套视觉，经共享组件 TermuxStatusChecklist
+ * 渲染，与 composer 聚焦面板的 Termux 子面板同源）：按探测阶梯
  * （TermuxStallTracker → detectTermuxStatus：MCP host 探活 → 安装/权限
  * → echo ok 通道往返）映射为四行检查记录（已安装/权限/已运行/通道应答），
  * 完成项绿色对勾、卡点 spinner + 对应操作按钮；stall 激活期间聊天页
@@ -1989,9 +1986,6 @@ private fun TermuxStallBanner(
         enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
         exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
     ) {
-        val context = LocalContext.current
-        // 「打开 Termux」点击后的轻量反馈：按钮文字切换 + 禁用重复点击。
-        var pulled by remember { mutableStateOf(false) }
         // 已等待秒数（每秒跳一次；stallSince 换新则重算）。
         var waitedSec by remember(stallSince) { mutableStateOf(0) }
         LaunchedEffect(stallSince) {
@@ -2001,126 +1995,6 @@ private fun TermuxStallBanner(
                     ((System.currentTimeMillis() - stallSince) / 1000).toInt().coerceAtLeast(0)
                 delay(1_000)
             }
-        }
-        // 检查记录行集合：探测阶梯 → 四行状态映射（阶梯短路的语义 = 前置
-        // 项通过才轮到当前卡点；未轮到的行保持 Pending 不抢注意力）。
-        val rows = buildList {
-            add(
-                StatusCheckRow(
-                    state = when (status) {
-                        is TermuxStatus.Checking -> StatusCheckState.InProgress
-                        is TermuxStatus.NotInstalled -> StatusCheckState.Failed
-                        else -> StatusCheckState.Done
-                    },
-                    title = "Termux 已安装",
-                    summary = if (status is TermuxStatus.NotInstalled) {
-                        "bash 依赖 Termux 执行命令；安装后打开一次再回到本页"
-                    } else {
-                        null
-                    },
-                    actionLabel = if (status is TermuxStatus.NotInstalled) "去安装" else null,
-                    onAction = if (status is TermuxStatus.NotInstalled) {
-                        {
-                            // Termux 不在 Play 上架：开 F-Droid 详情页（浏览器
-                            // 兜底；无浏览器静默失败不崩溃）。
-                            runCatching {
-                                context.startActivity(
-                                    Intent(
-                                        Intent.ACTION_VIEW,
-                                        Uri.parse("https://f-droid.org/en/packages/com.termux/"),
-                                    ),
-                                )
-                            }
-                        }
-                    } else {
-                        null
-                    },
-                ),
-            )
-            add(
-                StatusCheckRow(
-                    state = when (status) {
-                        is TermuxStatus.Checking, is TermuxStatus.NotInstalled -> StatusCheckState.Pending
-                        is TermuxStatus.NoPermission -> StatusCheckState.Failed
-                        else -> StatusCheckState.Done
-                    },
-                    title = "RUN_COMMAND 权限",
-                    summary = if (status is TermuxStatus.NoPermission) {
-                        "系统设置 → 应用 → OpenSlate → 权限，或经 Shizuku 一键授予"
-                    } else {
-                        null
-                    },
-                    actionLabel = if (status is TermuxStatus.NoPermission) "去授权" else null,
-                    onAction = if (status is TermuxStatus.NoPermission) {
-                        {
-                            // 优先系统权限弹窗（Activity 上下文可达，与设置页
-                            // McpSection 同款）；非 Activity 上下文兜底直达本
-                            // 应用详情页。
-                            val activity = context as? android.app.Activity
-                            if (activity != null) {
-                                activity.requestPermissions(
-                                    arrayOf(
-                                        dev.openslate.mobile.bridge.TermuxExec.RUN_COMMAND_PERMISSION,
-                                    ),
-                                    1002,
-                                )
-                            } else {
-                                runCatching {
-                                    context.startActivity(
-                                        Intent(
-                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                            Uri.parse("package:${context.packageName}"),
-                                        ),
-                                    )
-                                }
-                            }
-                        }
-                    } else {
-                        null
-                    },
-                ),
-            )
-            add(
-                StatusCheckRow(
-                    state = when (status) {
-                        is TermuxStatus.Checking, is TermuxStatus.NotInstalled,
-                        is TermuxStatus.NoPermission,
-                        -> StatusCheckState.Pending
-                        is TermuxStatus.ChannelDown -> StatusCheckState.InProgress
-                        is TermuxStatus.Ready -> StatusCheckState.Done
-                    },
-                    title = "Termux 已运行",
-                    summary = if (status is TermuxStatus.ChannelDown) {
-                        "${status.summary}；打开后回到本页即自动继续"
-                    } else {
-                        null
-                    },
-                    actionLabel = if (status is TermuxStatus.ChannelDown) {
-                        if (pulled) "已拉起，等待应答…" else "打开 Termux"
-                    } else {
-                        null
-                    },
-                    onAction = if (status is TermuxStatus.ChannelDown) {
-                        {
-                            if (McpHostManager.startTermuxApp(context.applicationContext)) {
-                                pulled = true
-                            }
-                        }
-                    } else {
-                        null
-                    },
-                ),
-            )
-            add(
-                StatusCheckRow(
-                    state = when (status) {
-                        is TermuxStatus.Ready -> StatusCheckState.Done
-                        is TermuxStatus.ChannelDown -> StatusCheckState.InProgress
-                        else -> StatusCheckState.Pending
-                    },
-                    title = "命令通道应答",
-                ),
-            )
         }
         Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
             GlassPanel(
@@ -2157,8 +2031,9 @@ private fun TermuxStallBanner(
                             color = MaterialTheme.colorScheme.outline,
                         )
                     }
-                    // 检查记录主体：四行阶梯映射（见上方 rows 构建）。
-                    StatusChecklist(rows = rows, modifier = Modifier.padding(top = 8.dp))
+                    // 检查记录主体：四行阶梯映射（共享组件，与 composer
+                    // 聚焦面板的 Termux 子面板同源同款）。
+                    TermuxStatusChecklist(status = status, modifier = Modifier.padding(top = 8.dp))
                     if (status is TermuxStatus.Ready) {
                         // 全绿收尾语（收起动画期间可见；连接事件已触发原 id
                         // 重发，命令结果经既有链路回填）。

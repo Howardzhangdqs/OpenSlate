@@ -143,10 +143,15 @@ Termux 未启动/被冻结/停止态时，RUN_COMMAND 的结果 PendingIntent �
         不判死、不回错误；豁免解除后重起完整 90s 窗口）
   → UiState.termuxStallSince 置最早时刻 → 聊天页点亮连接面板
 
-连接面板（ChatScreen.TermuxStallBanner + ui/TermuxStallTracker.kt）
+连接面板（ChatScreen.TermuxStallBanner + ui/TermuxStallTracker.kt；清单渲染 =
+  共享组件 TermuxStatusChecklist（ui/TermuxChecklist.kt，stall 面板专属）
+  ——composer 聚焦面板的五灯子面板走另一口径 ui/McpLights.kt：与设置页
+  MCP 区同一探测管线 probeMcpLights/同一映射 mcpLightRow，五项独立判定）
   stall 激活期间聊天页周期重探（2.5s；tracker CAS 单飞防抖）+ ON_RESUME
   立即重探（gateRefresh 同款门控；tracker 与面板可见性解耦——Ready
-  收起面板后重探继续到 stall 清零，重发后再 stall 能被重新捕获）
+  收起面板后重探继续到 stall 清零，重发后再 stall 能被重新捕获）；composer
+  聚焦面板五灯子面板独立探测（McpLightsTracker：展开时 + ON_RESUME 展开态
+  refresh，autoRestartHost=true 顺手拉起 host，不经本 tracker）
   → 探测阶梯复用 detectTermuxStatus（MCP host 探活 → 安装/权限 →
     echo ok 通道往返），状态-动作矩阵：
       Checking      → spinner「正在探测 Termux…」

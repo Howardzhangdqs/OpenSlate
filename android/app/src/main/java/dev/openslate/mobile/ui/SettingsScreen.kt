@@ -94,7 +94,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.async
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -2162,11 +2161,22 @@ private data class McpStatus(
     val checked: Set<String> = emptySet(),
 )
 
-/** 五个状态灯的 key（渐进渲染的判定 + 摘要行进度统计共用；整轮结束时
- *  短路路径未检测的项也一次性补齐，保证五灯语义完整）。 */
-private val MCP_LIGHT_KEYS = listOf(
-    "termuxInstalled", "termuxPerm", "termuxAllowed", "hostInstalled", "hostAlive",
+/** McpStatus → 五灯探测结果（共享映射 mcpLightRow 的入参形态；五灯
+ *  key/字段一一对应，缺失的 restartedHost 以 false 兜底——渐进渲染中
+ *  hostAlive 失败摘要只存在于子面板语境，设置页不消费该分支）。 */
+private fun McpStatus.toLights(): McpLightsResult = McpLightsResult(
+    installed = termuxInstalled,
+    perm = termuxPerm,
+    allowed = termuxAllowed,
+    channel = channel,
+    hostInstalled = hostInstalled,
+    hostAlive = hostAlive,
+    checked = checked,
 )
+
+// 五个状态灯的 key（MCP_LIGHT_KEYS）与检测序：权威定义在 ui/McpLights.kt
+// （probeMcpLights 五灯探测管线，设置页与 composer 聚焦面板子面板共用
+// 一份口径；同包直接可见，无需 import）。
 
 /**
  * MCP 状态的进程级快照：全量重检完成后写入，进页/切回先用快照渲染
@@ -2385,144 +2395,94 @@ private fun McpSection() {
             val t0 = System.currentTimeMillis()
             log("── 状态检查开始 ──")
             step("检查 Termux / 权限")
-            val s = McpStatus(probing = false,
-                termuxInstalled = dev.openslate.mobile.bridge.TermuxExec.isTermuxInstalled(context),
-                termuxPerm = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context),
-                termuxAllowed = false, hostInstalled = false, hostAlive = false)
-            log("Termux 已安装：${s.termuxInstalled}；RUN_COMMAND 权限：${s.termuxPerm}")
-            ensureActive() // 被更新的触发取消 → 立即退出，不写状态
-            // 渐进提交：每步完成即写回，检测完一项显示一项（灯区块只
-            // 渲染已完成的项），不再等整轮结束才统一落地。probing 保持
-            // true 到整轮结束——期间摘要行显示进度而非结论。
-            status = s.copy(probing = true, checked = setOf("termuxInstalled", "termuxPerm"))
-            var full = s
-            var alive = false
+            // 探测序提炼到共享管线 probeMcpLights（ui/McpLights.kt，与
+            // composer 聚焦面板子面板共用一份口径）；本函数保留页面编排：
+            // 渐进 status 写回 + 步骤指示、步骤 2.5/5（依赖 servers 清单）、
+            // 快照落地与收尾自愈。
+            status = McpStatus(probing = true)
             var missing = emptySet<String>()
             var tools: Map<String, Int>? = null
-            if (s.termuxInstalled && s.termuxPerm) {
-                kotlinx.coroutines.coroutineScope {
-                    // 端口探活走独立 HTTP 通道，先并行发出（不占 Termux 通道）。
-                    val aliveD = async { McpHostManager.hostAliveDetail(context) }
-
-                    // ── 步骤 1：RUN_COMMAND 通道（echo ok 往返 + 精确诊断）──
-                    // 独立成步：卡在这即通道问题（Termux 冷启动 / 被冻结解冻 / 放行未开）。
-                    step("检测 RUN_COMMAND 通道（echo ok）")
-                    val watcher = launch {
-                        kotlinx.coroutines.delay(5000)
-                        log("仍在等待 RUN_COMMAND 应答…（Termux 冷启动或被系统冻结后首次命令较慢；" +
-                            "常开 Termux 通知常驻 + Wakelock 并对其关闭电池优化可避免）")
+            val lights = probeMcpLights(
+                context,
+                autoRestartHost = !busy,
+                log = { log(it) },
+                onStage = { st ->
+                    // 渐进提交：每步完成即写回，检测完一项显示一项（灯区块
+                    // 只渲染已完成的项），不再等整轮结束才统一落地。probing
+                    // 保持 true 到整轮结束——期间摘要行显示进度而非结论。
+                    // 步骤指示由本阶段结论推导（与提炼前各 step() 调用点一
+                    // 一对应）：阶段收尾即预告下一步。
+                    when {
+                        st.checked == setOf("termuxInstalled", "termuxPerm") ->
+                            if (st.installed && st.perm) step("检测 RUN_COMMAND 通道（echo ok）")
+                            else step("探活服务端口")
+                        "termuxAllowed" in st.checked && "hostInstalled" !in st.checked && st.allowed ->
+                            step("检查 host 安装")
+                        "hostInstalled" in st.checked && "hostAlive" !in st.checked ->
+                            step("探活服务端口")
+                        "hostAlive" in st.checked && st.allowed && st.hostInstalled &&
+                            !st.hostAlive && !busy ->
+                            step("自动拉起 MCP 服务")
                     }
-                    val chan = TermuxDiagnostics.ensureTermuxUp(context, log = { log(it) }, onStall = {
-                        // 0.5s 无应答：不等整轮，先亮「打开 Termux」指引（复用
-                        // NoResponse 渲染路径）。这是早写的显示态，refresh 协程
-                        // 内部流程不受影响（allowed 来自返回值 chan）；整轮结束
-                        // 后 2207 行处用真实结论覆盖（重试通过则变绿）。
-                        log("RUN_COMMAND 已 ${TermuxDiagnostics.PROBE_STALL_HINT_MS}ms 无应答——先显示「打开 Termux」指引，检测仍在后台继续…")
-                        status = status.copy(
-                            channel = TermuxDiagnostics.ChannelResult.NoResponse(
-                                stopped = TermuxDiagnostics.isTermuxStopped(context), ms = 0,
-                            ),
-                            termuxAllowed = false,
-                            checked = status.checked + "termuxAllowed",
-                        )
-                    })
-                    watcher.cancel()
-                    log("RUN_COMMAND 通道最终结果：${TermuxDiagnostics.describe(chan)}")
-                    val allowed = chan is TermuxDiagnostics.ChannelResult.Ok
-                    // 前台拉起可能让部分 ROM（MIUI 等）补全 RUN_COMMAND 授权：复查一次。
-                    val permNow = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context)
-                    if (!s.termuxPerm && permNow) {
-                        log("Termux 启动后权限检查结果已更新：未授予 → 已授予")
-                    }
-                    ensureActive() // 取消轮不写中间态
-                    status = status.copy(termuxPerm = permNow, termuxAllowed = allowed, channel = chan,
-                        checked = status.checked + "termuxAllowed")
-
-                    // ── 步骤 2：host 安装（通道已热，秒回）──
-                    val inst = if (allowed) {
-                        step("检查 host 安装")
-                        McpHostManager.isHostInstalled(context)
-                    } else false
-                    log("host 已安装：$inst")
-                    ensureActive() // 取消轮不写中间态
-                    status = status.copy(hostInstalled = inst, checked = status.checked + "hostInstalled")
-
-                    // ── 步骤 2.5：server 启动命令探测（通道放行才有意义）──
-                    // 首 token 在 Termux 缺失（如未装 npx）的 server 必然无法
-                    // 启动，行内直接警示 + 安装指引；通道未放行不探测（五灯
-                    // 状态已引导修通道，不叠加命令级警示），探测失败返回空集
-                    // 不误报。切分逻辑与 manifestToml 一致（首 token = 可执行名）。
-                    if (allowed && servers.isNotEmpty()) {
-                        step("探测 server 命令可用性")
-                        val firstTokens = servers.map { it.command.trim().split(Regex("\\s+")).first() }
-                        missing = McpHostManager.probeCommandAvailable(context, firstTokens)
-                        if (missing.isNotEmpty()) {
-                            log("Termux 缺少命令：${missing.joinToString("、")}（对应服务器无法启动，见行内提示）")
-                        }
-                        ensureActive() // 取消轮不写中间态
-                        status = status.copy(missingCommands = missing)
-                    }
-
-                    // ── 步骤 3：端口探活（并行已发出，此时收结果）──
-                    step("探活服务端口")
-                    val (a, adetail) = aliveD.await()
-                    alive = a
-                    log("探活 ${McpHostManager.HOST_URL}：${if (a) "应答正常（$adetail）" else "无应答（$adetail）"}")
-                    ensureActive() // 取消轮不写中间态
-                    status = status.copy(hostAlive = alive, checked = status.checked + "hostAlive")
-
-                    // ── 步骤 4：host 已装但未运行 → 自动拉起（无需点重装）──
-                    if (allowed && inst && !alive && !busy) {
-                        step("自动拉起 MCP 服务")
-                        log("服务未运行，自动拉起（停止旧进程 → nohup 后台启动）…")
-                        runCatching { McpHostManager.restartHost(context) { log(it) } }
-                            .onSuccess {
-                                val (a2, d2) = McpHostManager.hostAliveDetail(context)
-                                alive = a2
-                                ensureActive() // 取消轮不写中间态
-                                status = status.copy(hostAlive = alive)
-                                log(
-                                    if (a2) "服务已自动恢复（$d2），无需重装"
-                                    else "自动拉起后仍未应答（$d2）——可点「自动化操作（重新安装）」修复",
-                                )
-                            }
-                            .onFailure {
-                                log("自动拉起失败：${it.message?.take(160)}——可点「自动化操作（重新安装）」修复")
-                            }
-                    }
-                    // ── 步骤 5：工具可见性。状态行的判定源 = 注册表计数
-                    // （agent 真实可见，比 host 侧探针更诚实）；host 侧 HTTP
-                    // 探针（hostToolsByPrefix）降级为深度诊断——区分「server
-                    // 没起来」vs「host 有但未注册」，只在手动全量时跑一次。
-                    if (alive) {
-                        step("获取 host 工具列表")
-                        val reg = RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES)
-                        tools = reg
-                        ensureActive() // 取消轮不写中间态
-                        status = status.copy(hostTools = reg)
-                        log("注册表工具：" + (reg?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
-                            ?: "runtime 未就绪（状态未知）"))
-                        val hostSide = McpHostManager.hostToolsByPrefix(context)
-                        log("host 侧探针：" + (hostSide?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
-                            ?: "获取失败"))
-                    }
-                    full = s.copy(
-                        termuxAllowed = allowed, channel = chan, hostInstalled = inst,
-                        termuxPerm = permNow, missingCommands = missing, hostTools = tools,
+                    status = status.copy(
+                        termuxInstalled = st.installed,
+                        termuxPerm = st.perm,
+                        termuxAllowed = st.allowed,
+                        channel = st.channel,
+                        hostInstalled = st.hostInstalled,
+                        hostAlive = st.hostAlive,
+                        checked = st.checked,
                     )
+                },
+            )
+            ensureActive() // 取消轮不继续：不覆盖更新一轮已写的新状态/快照
+            // ── 步骤 2.5：server 启动命令探测（通道放行才有意义；依赖
+            // servers 清单，留在设置页）── 首 token 在 Termux 缺失（如未装
+            // npx）的 server 必然无法启动，行内直接警示 + 安装指引；通道
+            // 未放行不探测（五灯状态已引导修通道，不叠加命令级警示），探
+            // 测失败返回空集不误报。切分逻辑与 manifestToml 一致（首
+            // token = 可执行名）。
+            if (lights.allowed && servers.isNotEmpty()) {
+                step("探测 server 命令可用性")
+                val firstTokens = servers.map { it.command.trim().split(Regex("\\s+")).first() }
+                missing = McpHostManager.probeCommandAvailable(context, firstTokens)
+                if (missing.isNotEmpty()) {
+                    log("Termux 缺少命令：${missing.joinToString("、")}（对应服务器无法启动，见行内提示）")
                 }
-            } else {
-                step("探活服务端口")
-                val (a, adetail) = McpHostManager.hostAliveDetail(context)
-                alive = a
-                log("探活 ${McpHostManager.HOST_URL}：${if (a) "应答正常（$adetail）" else "无应答（$adetail）"}")
                 ensureActive() // 取消轮不写中间态
-                status = status.copy(hostAlive = alive, checked = status.checked + "hostAlive")
+                status = status.copy(missingCommands = missing)
+            }
+            // ── 步骤 5：工具可见性。状态行的判定源 = 注册表计数（agent
+            // 真实可见，比 host 侧探针更诚实）；host 侧 HTTP 探针
+            // （hostToolsByPrefix）降级为深度诊断——区分「server 没起来」
+            // vs「host 有但未注册」，只在手动全量时跑一次。
+            if (lights.hostAlive) {
+                step("获取 host 工具列表")
+                val reg = RuntimeBridge.mcpRegistryToolsByPrefix(MCP_SERVER_NAMES)
+                tools = reg
+                ensureActive() // 取消轮不写中间态
+                status = status.copy(hostTools = reg)
+                log("注册表工具：" + (reg?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
+                    ?: "runtime 未就绪（状态未知）"))
+                val hostSide = McpHostManager.hostToolsByPrefix(context)
+                log("host 侧探针：" + (hostSide?.entries?.joinToString("、") { "${it.key}(${it.value}个)" }?.ifEmpty { "无" }
+                    ?: "获取失败"))
             }
             ensureActive() // 取消轮不落地：不覆盖更新一轮已写的新状态/快照
             // 五灯 key 一次性补齐：短路路径某些检测没跑，最终落地补全五灯
-            // 语义（与改造前的最终态一致）。
-            val final = full.copy(hostAlive = alive, checked = MCP_LIGHT_KEYS.toSet())
+            // 语义（与提炼前的最终态一致）。
+            val final = McpStatus(
+                probing = false,
+                termuxInstalled = lights.installed,
+                termuxPerm = lights.perm,
+                termuxAllowed = lights.allowed,
+                channel = lights.channel,
+                hostInstalled = lights.hostInstalled,
+                hostAlive = lights.hostAlive,
+                missingCommands = missing,
+                hostTools = tools,
+                checked = MCP_LIGHT_KEYS.toSet(),
+            )
             status = final
             McpStatusCache.update(final)
             step(null)
@@ -2825,31 +2785,16 @@ private fun McpSection() {
         // 两灯（host 安装/运行）一组——通道指引块夹在两组之间，与提炼前
         // 的渲染顺序逐项一致（视觉零变化的重构验收点）。
         if (expanded) {
+            // 前三灯：行构造走共享映射 mcpLightRow（ui/McpLights.kt，与
+            // composer 聚焦面板子面板同一语义源）；displayDetails=false
+            // 只出状态化标题——通道细节由下方指引块自管，避免重复。
             StatusChecklist(
                 buildList {
-                    if ("termuxInstalled" in status.checked) {
-                        add(
-                            StatusCheckRow(
-                                statusCheckOf(status.termuxInstalled),
-                                "Termux 已安装",
-                            ),
-                        )
-                    }
-                    if ("termuxPerm" in status.checked) {
-                        add(
-                            StatusCheckRow(
-                                statusCheckOf(status.termuxPerm),
-                                "RUN_COMMAND 权限",
-                            ),
-                        )
-                    }
-                    if ("termuxAllowed" in status.checked) {
-                        add(
-                            StatusCheckRow(
-                                statusCheckOf(status.termuxAllowed),
-                                "RUN_COMMAND 通道",
-                            ),
-                        )
+                    for (key in listOf("termuxInstalled", "termuxPerm", "termuxAllowed")) {
+                        if (key in status.checked) {
+                            mcpLightRow(key, status.toLights(), displayDetails = false)
+                                ?.let { add(it) }
+                        }
                     }
                 },
             )
@@ -2947,25 +2892,16 @@ private fun McpSection() {
                     }
                 })
             }
-            // 后两灯：行级 guard 在 buildList 内（与提炼前逐行 if 一致；
-            // 空清单不组合 = 无一命中时整块消失，同原行为）。
+            // 后两灯：同一共享映射（行级 guard 保留——checked 命中才渲染，
+            // 避免权限检测完成前的瞬间闪现；空清单不组合 = 无一命中时整块
+            // 消失，同原行为）。
             StatusChecklist(
                 buildList {
-                    if ("hostInstalled" in status.checked) {
-                        add(
-                            StatusCheckRow(
-                                statusCheckOf(status.hostInstalled),
-                                "MCP 服务已安装",
-                            ),
-                        )
-                    }
-                    if ("hostAlive" in status.checked) {
-                        add(
-                            StatusCheckRow(
-                                statusCheckOf(status.hostAlive),
-                                "服务运行中",
-                            ),
-                        )
+                    for (key in listOf("hostInstalled", "hostAlive")) {
+                        if (key in status.checked) {
+                            mcpLightRow(key, status.toLights(), displayDetails = false)
+                                ?.let { add(it) }
+                        }
                     }
                 },
             )

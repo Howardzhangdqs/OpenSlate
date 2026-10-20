@@ -63,8 +63,11 @@ RUSTFLAGS="-C linker=rust-lld" cargo build --release \
 
 ```bash
 # 构建（gradle，900s 超时；失败即中止，绝不装旧 APK）
-scripts/build-apk.sh                # 只构建
+scripts/build-apk.sh                # 只构建（debug 包）
+scripts/build-apk.sh --release      # release 包（交给用户真机测试一律用这个——
+                                    #   debug 包 debuggable 未优化、真机卡顿）
 scripts/build-apk.sh --install      # 构建 + adb install -r
+scripts/build-apk.sh --release --install   # release 构建 + 安装
 scripts/build-apk.sh --install --launch   # 再 force-stop + 冷启 + 清 logcat
 
 # 或手动

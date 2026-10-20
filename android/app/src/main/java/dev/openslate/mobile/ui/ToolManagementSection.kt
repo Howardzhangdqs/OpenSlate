@@ -90,24 +90,22 @@ private fun toolGroupLabel(name: String): String = when {
 /** Termux 状态阶梯（[TermuxStatus] / [detectTermuxStatus]）已上提至
  *  ComposerMcpStatus.kt（internal，本包直引），此处不再持有私有副本。 */
 
-/** 后端 CSV 是否启用了 termux（解析同 ExecBackendSection：逗号分隔 + trim）。 */
+/** 后端 CSV 是否启用了 termux（逗号分隔 + trim）。并行契约下 termux
+ *  恒在后端集合中（桥层归一化收口），此判定实际恒真，保留作防御——
+ *  异常空集时不误触发检测/警示。 */
 private fun termuxBackendEnabled(backendsCsv: String?): Boolean =
     backendsCsv?.split(',')?.map { it.trim() }?.contains("termux") == true
 
 /**
- * 工具是否依赖 Termux（命名规则来自 Rust 侧注册：单选后端 → 工具名
- * `bash`；双选 → `bash`=native + `termux_bash`）。`termux_bash` 必走
- * Termux；`bash` 仅在 termux 后端单独启用（无 native 兜底）时才走
- * Termux——双后端时 bash 是系统 shell，不依赖 Termux。
+ * 工具是否依赖 Termux（命名规则来自 Rust 侧注册：native bash 开关 ON →
+ * `bash`=native 进程内 + `termux_bash`；OFF → 仅 `termux_bash`，`bash`
+ * 不注册）。`termux_bash` 必走 Termux（MCP 在线接管、离线 RUN_COMMAND
+ * 兜底）；`bash` 恒为 native 进程内 shell、不依赖 Termux——警示判定
+ * 仅剩 termux_bash。
  */
 private fun dependsOnTermux(name: String, backendsCsv: String?): Boolean {
     if (!termuxBackendEnabled(backendsCsv)) return false
-    if (name == "termux_bash") return true
-    if (name == "bash") {
-        val backends = backendsCsv?.split(',')?.map { it.trim() }.orEmpty()
-        return "native" !in backends
-    }
-    return false
+    return name == "termux_bash"
 }
 
 /** 不可用提示文案；Ready/检测中返回 null → 不警示。警示只在「host
@@ -118,7 +116,7 @@ private fun termuxUnavailableHint(status: TermuxStatus): String? = when (status)
     TermuxStatus.NotInstalled ->
         "Termux 未安装：该工具需要 Termux 环境，暂无法使用。"
     TermuxStatus.NoPermission ->
-        "RUN_COMMAND 权限未授予：该工具暂无法使用。可在「bash 工具执行后端」中申请权限，" +
+        "RUN_COMMAND 权限未授予：该工具暂无法使用。可在系统设置中为本应用授权，" +
             "或在设置页启动 MCP 服务后经 MCP 路径执行。"
     is TermuxStatus.ChannelDown ->
         // stopped（未启动过/被强停）用「未启动」比「未就绪」更准确，也不带 describe 摘要。
@@ -146,9 +144,9 @@ private fun termuxUnavailableHint(status: TermuxStatus): String? = when (status)
  *   server 清单反查，server 已删（工具仍在注册表）回退 slug +「（未配置）」；
  *   host 内置前缀组（builtin 小模板退化 slug、反查 miss 的裸名工具组）
  *   例外：头名「Termux 服务内置」、不标未配置——工具属于聚合 host 本身；
- * - Termux 依赖工具（termux_bash 并入 MCP 工具组随卡聚合 / 单后端 bash
- *   在「内置」组）：进页与 ON_RESUME 时检测 Termux 可用性（后端含
- *   termux 才检测），异常时名字旁警示图标 + 展开详情提示，用户打开
+ * - Termux 依赖工具（termux_bash 并入 MCP 工具组随卡聚合）：进页与
+ *   ON_RESUME 时检测 Termux 可用性（后端含 termux 才检测——并行契约
+ *   下恒真），异常时名字旁警示图标 + 展开详情提示，用户打开
  *   Termux 返回后自动重检。
  */
 @Composable

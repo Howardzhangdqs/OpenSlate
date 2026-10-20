@@ -43,5 +43,5 @@
 
 - 时序敏感的等待一律带超时（总表见 [errors-and-logging.md](errors-and-logging.md) §4）。
 - debug 专属能力（`DebugReceiver` 广播注入）放 `android/app/src/debug/` 源集，release 不得携带。
-- 桌面 builtin fs/shell 工具在 mobile 默认关闭（`[builtin_tools] enabled = false`）；shell 能力经 `exec.rs` 的 bash 后端多选（native / termux）注入。
+- 桌面 builtin fs/shell 工具在 mobile 默认关闭（`[builtin_tools] enabled = false`）；shell 能力经 `exec.rs` 的 bash 后端注入（2026-10 起**名字与后端一一绑定**：native ⇒ `bash`、termux ⇒ `termux_bash`；UI 为「启用 native bash」单开关，termux 恒在）。
 - 本机网络适配（aliyun 镜像、`openslate-responder`、askama/rquickjs-sys/genai patch）**勿"修复"**，背景见 [../07-build-dev/troubleshooting.md](../07-build-dev/troubleshooting.md)。

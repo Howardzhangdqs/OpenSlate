@@ -1,14 +1,17 @@
 //! 手机端 shell 执行层（独立运行模式）。
 //!
-//! bash 工具按设置多选动态注册（`register_bash_tools`，切换即热生效）：
+//! bash 工具按设置多选动态注册（`register_bash_tools`，切换即热生效），
+//! 注册名与后端一一绑定：native ⇒ `bash`，termux ⇒ `termux_bash`：
 //!
-//! - 只选 native：`bash` = 进程内 Android 系统 sh（toybox）
-//! - 只选 termux：`bash` = Termux RUN_COMMAND（宿主执行）
-//! - 两个都选：`bash` = native，`termux_bash` = termux
+//! - 选 native：`bash` = 进程内 Android 系统 sh（toybox）
+//! - 选 termux：`termux_bash` = Termux RUN_COMMAND（宿主执行兜底）
 //!
-//! 命名固定（`bash` / `termux_bash`，见 bootstrap 默认 root.md 白名单），
-//! 变化的是注册与否：未选中的名字直接从注册表注销，模型不可见；运行
-//! 中途切换时旧名字调用会得到 NotFound，模型可自纠。
+//! 即 {native,termux} → bash+termux_bash；{termux} → 仅 termux_bash；
+//! {native} → 仅 bash；{} → 空。不存在 `bash` = termux 的形态（native
+//! 不选则 `bash` 不注册，名字不给别的后端顶替）。命名固定（`bash` /
+//! `termux_bash`，见 bootstrap 默认 root.md 白名单），变化的是注册与否：
+//! 未选中的名字直接从注册表注销，模型不可见；运行中途切换时旧名字调用
+//! 会得到 NotFound，模型可自纠。
 //!
 //! ## env 注入（ask_user secret 子系统）
 //!
@@ -214,32 +217,25 @@ pub fn register_bash_tools(
             env,
         )));
     }
-    if sel.termux {
-        // 两个都选时 native 独占 `bash`，termux 用 `termux_bash`；
-        // 只选 termux 时由它顶替 `bash`。
-        let name = if sel.native {
-            TERMUX_BASH_TOOL
-        } else {
-            BASH_TOOL
-        };
-        if !owned(name) {
-            registry.register_boxed(Box::new(HostTool::new(
-                name,
-                "Run a shell command inside the local Termux environment (Android) and return its \
-                 combined stdout/stderr. The Termux bootstrap (full coreutils, apt, python, ...) is \
-                 available; network access from Termux may be restricted by the device network. \
-                 Avoid interactive commands. Output beyond ~8KB is truncated.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": { "type": "string", "description": "shell command to execute" }
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false
-                }),
-                router,
-            ).with_timeout(TERMUX_HOST_CALL_TIMEOUT)));
-        }
+    if sel.termux && !owned(TERMUX_BASH_TOOL) {
+        // 注册名与后端一一绑定：termux 恒用 `termux_bash`（与 native
+        // 开关无关；native 不选时 `bash` 不注册，不由 termux 顶替）。
+        registry.register_boxed(Box::new(HostTool::new(
+            TERMUX_BASH_TOOL,
+            "Run a shell command inside the local Termux environment (Android) and return its \
+             combined stdout/stderr. The Termux bootstrap (full coreutils, apt, python, ...) is \
+             available; network access from Termux may be restricted by the device network. \
+             Avoid interactive commands. Output beyond ~8KB is truncated.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "shell command to execute" }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+            router,
+        ).with_timeout(TERMUX_HOST_CALL_TIMEOUT)));
     }
 }
 
@@ -600,7 +596,8 @@ mod tests {
         );
         assert!(reg.contains("bash") && reg.contains("termux_bash"));
 
-        // 切到仅 termux：bash 由 termux 顶替（host 工具壳），旧 shell.run 清掉。
+        // 切到仅 termux：termux_bash 在场（host 工具壳），`bash` 不注册
+        // （名字与后端一一绑定，不由 termux 顶替），旧 shell.run 清掉。
         register_bash_tools(
             &reg,
             ExecSelection {
@@ -613,14 +610,19 @@ mod tests {
             &[],
         );
         let names = reg.tool_names();
-        assert!(names.contains(&"bash".to_owned()), "{names:?}");
-        assert!(!names.contains(&"termux_bash".to_owned()), "{names:?}");
+        assert!(!names.contains(&"bash".to_owned()), "{names:?}");
+        assert!(names.contains(&"termux_bash".to_owned()), "{names:?}");
         assert!(!names.contains(&"shell.run".to_owned()), "{names:?}");
-        // bash 现在是 host 工具壳：调用会发 host call 信封（这里仅验证非
-        // NotFound——真正的往返在 runtime_flow 集成测试覆盖）。
+        // termux_bash 现在是 host 工具壳：调用会发 host call 信封（这里仅
+        // 验证非 NotFound——真正的往返在 runtime_flow 集成测试覆盖）；
+        // bash 已注销：调用得到 NotFound。
         let _ = reg
+            .execute("termux_bash", &serde_json::json!({"command": "x"}))
+            .await;
+        let gone = reg
             .execute("bash", &serde_json::json!({"command": "x"}))
             .await;
+        assert!(gone.is_err(), "bash 不注册 → NotFound: {gone:?}");
     }
 
     #[tokio::test]

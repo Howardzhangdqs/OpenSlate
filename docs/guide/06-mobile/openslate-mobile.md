@@ -217,16 +217,15 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 - `fail_all(reason)`：关停兜底，drain 全部 pending 立刻失败（引擎解栈）；**ask_user 豁免**（放回待答，问卷留给持久化恢复——若 fail 会把错误结果并入历史、行被迫关卷，迟到答案无处补全）。
 - `HostTool`（hostcall.rs:139-196）：由宿主执行的 `Tool` 壳——name/description/schema 进注册表，execute 转发 router；Err 也返回 `Ok(ToolOutput{status: Error})`（工具失败，不炸回合）。
 
-## 7. `exec.rs` 详解（bash 后端多选 × MCP 接管）
+## 7. `exec.rs` 详解（bash 后端注册 × MCP 接管）
 
-**host 侧命名矩阵**（固定、变化的是注册与否；未选中的名字直接从注册表注销，模型不可见；运行中途切换时旧名字调用得到 NotFound，模型可自纠）：
+**命名矩阵**（2026-10 语义改版：名字与后端**一一绑定**——native ⇒ `bash`、termux ⇒ `termux_bash`，不存在「termux 顶替 bash」形态；固定的是名字，变化的是注册与否；未选中的名字直接从注册表注销，模型不可见；运行中途切换时旧名字调用得到 NotFound，模型可自纠。UI 侧（设置页单开关）恒写含 termux 形态，{native}/{}/全不选只可能来自旧存量——Kotlin 桥层 normalizeExecBackends 归一化后不再出现）：
 
-| 多选 | `bash` | `termux_bash` |
+| 后端集合 | `bash` | `termux_bash` |
 |------|--------|---------------|
-| 仅 native | native shell | 不注册 |
-| 仅 termux | termux（HostTool 壳顶替） | 不注册 |
-| 双选 | native | termux（HostTool 壳） |
-| 全不选 | 不注册 | 不注册（bash 能力整体下线，`normalized()` 恒等、**不自动回退**） |
+| {native,termux}（默认/UI ON） | native shell | termux（HostTool 壳兜底） |
+| {termux}（UI OFF） | 不注册 | termux（HostTool 壳兜底） |
+| {native} / {}（旧存量/异常） | native shell / 不注册 | 不注册（`normalized()` 恒等、**不自动回退**） |
 
 - 常量（exec.rs）：`DEFAULT_TIMEOUT_MS = 30_000`、`MAX_TIMEOUT_MS = 120_000`（调用方可指定，超出 clamp）、`MAX_OUTPUT_BYTES = 64KiB`（超限截断保头尾）、`KEEP_BYTES = 24KiB`；`BASH_TOOL="bash"`、`TERMUX_BASH_TOOL="termux_bash"`；`ALL_BASH_NAMES`（pub）还含历史名 `"shell.run"` / `"termux.run"`（切换时统一清理；reload 的让位判定按它界定「bash 工具域」）。
 - `ExecSelection`（位标志 struct）+ `parse_csv`（未知值忽略，全未知 = 空）+ `ExecSelectionCell`（`Arc<AtomicU8>` 存 bits，FFI `set_exec_backends` 热更新）。
@@ -269,7 +268,7 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 
 - 集成测试 `crates/openslate-mobile/tests/runtime_flow.rs`（desktop 可跑，无 Android 依赖）：`mobile_runtime_closed_loop_streaming`（scripted provider 流式回包闭环）、`mobile_runtime_host_call_roundtrip`（信封往返 + resolve）、`mobile_runtime_hello_version_check`（版本不匹配报错）、`mobile_runtime_shutdown_rejects_send`、`mobile_runtime_tool_visibility_roundtrip`。harness：`ScriptedProvider`（脚本化 `ModelStreamEvent` 流）+ `Collector`（事件采集 + `wait_for_count` 按类型计数等待）。
 - 单元测试在各模块 `#[cfg(test)] mod tests`：runtime 生命周期 / 安全守卫（触达私有状态；DB 校验经独立 scratch 连接）、hostcall 四条路径（roundtrip/error/timeout/fail_all）、exec（注册矩阵 / 热切换 / native 执行 / 截断 / 脱敏 / MCP 接管判定与让位）、bootstrap（幂等 / realign 四场景）、provider（set/get 往返）。
-- 降级阶梯（runtime tests，手写 std::net MCP HTTP 挡板同 app wiring 集成测试模式）：`set_exec_backends` 热切换不误杀 MCP bash 工具、HostTool 在场 reload 升级接管（不撞名回滚）、reload 全败兜底在场、reload 真冲突回滚装回让位工具、termux-only 命名矩阵（默认 / 自定义 builtin 模板，证明不硬编码）、builtin 模板 setter（校验 + 落盘 + 空串删键）。
+- 降级阶梯（runtime tests，手写 std::net MCP HTTP 挡板同 app wiring 集成测试模式）：`set_exec_backends` 热切换不误杀 MCP bash 工具、HostTool 在场 reload 升级接管（不撞名回滚）、reload 全败兜底在场、reload 真冲突回滚装回让位工具、termux-only 命名矩阵（仅 termux_bash 在场、`bash` 不注册；默认 / 自定义 builtin 模板，证明不硬编码）、builtin 模板 setter（校验 + 落盘 + 空串删键）。
 - 跑法：`cargo test -p openslate-mobile`。
 
 ## 11. 接手检查清单

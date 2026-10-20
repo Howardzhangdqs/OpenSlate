@@ -146,8 +146,8 @@ impl MobileRuntime {
         openslate_mcp_builtin::set_shell_env_source(Some(env_source.clone()));
 
         // host/本地工具集：mobile.ping（演示）+ ask_user（Agent 向用户
-        // 提问）+ bash 工具（按设置多选动态注册：单选 → bash；双选 →
-        // bash=native + termux_bash）+ 注入项。
+        // 提问）+ bash 工具（按设置多选动态注册：native ⇒ `bash`；
+        // termux ⇒ `termux_bash`，名字与后端一一绑定）+ 注入项。
         let exec_selection = ExecSelectionCell::new(ExecSelection::default());
         let mut extra_tools = opts.extra_tools;
         extra_tools.push(Box::new(AskUserTool::new(ask_ctx.clone())));
@@ -161,8 +161,9 @@ impl MobileRuntime {
             }),
             host_router.clone(),
         )));
-        // bash 工具不进 extra_tools（命名随设置变化）：先注册默认
-        // native-only，装配完成后由 set_exec_backends 按偏好重注册。
+        // bash 工具不进 extra_tools（注册名随设置变化）：装配期按默认
+        // 多选（空 = 暂不注册）注册，宿主随后由 set_exec_backends 按持
+        // 久化偏好热注册。
 
         let secrets = Arc::new(MobileSecrets::default());
         let factory = opts
@@ -333,8 +334,9 @@ impl MobileRuntime {
     }
 
     /// 设置 bash 工具后端多选（逗号分隔："native"、"termux"、
-    /// "native,termux"；热生效，无需重启）。命名规则：
-    /// 单选 → `bash`；双选 → `bash`=native + `termux_bash`=termux。
+    /// "native,termux"；热生效，无需重启）。命名规则（名字与后端一一
+    /// 绑定）：native ⇒ `bash`（不选则 `bash` 不注册）；termux ⇒
+    /// `termux_bash`。
     ///
     /// 选择点 3：热切换前重算 MCP 接管（统一谓词 [`crate::exec::
     /// mcp_owned_bash_names`]）——MCP 已接管的名字不清理、不顶替，修掉
@@ -547,10 +549,11 @@ impl MobileRuntime {
 
         // 6) swap 成功后重算 host bash 注册（同一统一谓词）：MCP 接管名
         //    保持让位；MCP 缺席（host 掉线 / 清单无 bash）时 HostTool
-        //    兜底回装——bash 能力在 reload 前后始终有人在场，不因重载
-        //    出现空窗。运行期 host 死亡不做热切换（工具列表已进上下文，
-        //    McpTool 失败语义由调用方感知），接管/兜底的交接只在 reload
-        //    边界发生。
+        //    兜底回装——已启用后端的 bash 能力在 reload 前后始终有人
+        //    在场，不因重载出现空窗（未启用的后端不回装：native 关了
+        //    `bash` 消失是预期，不算空窗）。运行期 host 死亡不做热切换
+        //    （工具列表已进上下文，McpTool 失败语义由调用方感知），
+        //    接管/兜底的交接只在 reload 边界发生。
         crate::exec::register_bash_tools(
             &self.registry,
             self.exec_selection.get(),
@@ -2356,7 +2359,7 @@ mod tests {
     #[test]
     fn reload_mcp_takes_over_from_host_tool_without_rollback() {
         let (paths, _dir) = temp_paths();
-        // 起始无 MCP：HostTool 兜底占位 termux_bash（双选命名）。
+        // 起始无 MCP：HostTool 兜底占位 termux_bash（termux 固定名）。
         let (collector, _rx) = Collector::new();
         let runtime =
             MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
@@ -2390,7 +2393,10 @@ mod tests {
         let runtime =
             MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
         runtime.set_exec_backends("termux");
-        assert!(runtime.registry.contains("bash"), "HostTool 兜底（顶替名）");
+        assert!(
+            runtime.registry.contains("termux_bash"),
+            "HostTool 兜底（termux 固定名）"
+        );
 
         // 死端口：bind 取端口后立刻 drop，连接必然被拒。
         let dead_url = {
@@ -2408,7 +2414,7 @@ mod tests {
         assert!(!env["failed"].as_array().unwrap().is_empty(), "{env}");
         // 兜底仍在场（重算后 HostTool 回装/保持）。
         assert!(
-            runtime.registry.contains("bash"),
+            runtime.registry.contains("termux_bash"),
             "全败后 HostTool 兜底仍在"
         );
         runtime.shutdown();
@@ -2425,13 +2431,13 @@ mod tests {
         runtime.set_exec_backends("termux");
         let host_tool = runtime
             .registry
-            .get("bash")
-            .expect("HostTool 兜底（顶替名）");
+            .get("termux_bash")
+            .expect("HostTool 兜底（termux 固定名）");
         let ping_before = runtime.registry.get("mobile.ping").expect("extra ping");
 
-        // 模板 `{tool}`：裸名原样注册 → bash（让位）+ mobile.ping（与
-        // extra_tools 演示工具真冲突 → 回滚）。
-        let url = spawn_mock_mcp_host(&["bash", "mobile.ping"]);
+        // 模板 `{tool}`：裸名原样注册 → termux_bash（让位）+ mobile.ping
+        // （与 extra_tools 演示工具真冲突 → 回滚）。
+        let url = spawn_mock_mcp_host(&["termux_bash", "mobile.ping"]);
         append_mcp_config(&paths, &url, Some("{tool}"));
         let env = envelope(&runtime.reload_mcp());
         assert!(!env["ok"].as_bool().unwrap(), "应因真冲突失败: {env}");
@@ -2440,13 +2446,16 @@ mod tests {
             "错误文案: {env}"
         );
 
-        // （host_tool 变量保用于断言兜底语义：装回的 bash 必须仍是
+        // （host_tool 变量保用于断言兜底语义：装回的 termux_bash 必须仍是
         // HostTool 而非 mock 工具，见下方 description 断言。）
         let _ = host_tool;
         // 回滚后：让位的 HostTool 装回（SharedTool 包同一 Arc，外层 Arc
         // 必然新——以描述语义判定是 HostTool 而非 mock），ping 未被顶替，
         // MCP 名册仍为空。
-        let restored = runtime.registry.get("bash").expect("回滚后兜底装回");
+        let restored = runtime
+            .registry
+            .get("termux_bash")
+            .expect("回滚后兜底装回");
         assert!(
             restored.description().contains("Termux environment"),
             "装回的应是 HostTool 兜底: {}",
@@ -2458,9 +2467,11 @@ mod tests {
         runtime.shutdown();
     }
 
-    /// termux-only 命名矩阵：仅选 termux 后端 + MCP 提供裸 bash →
-    /// HostTool 顶替 `bash`，MCP 注册名 = builtin 模板展开（默认
-    /// termux_bash；自定义 `{prefix}.bash` → termux.bash，证明不硬编码）。
+    /// termux-only 命名矩阵：仅选 termux 后端 → HostTool 固定注册
+    /// `termux_bash`（`bash` 不注册——名字与后端一一绑定，native 未选
+    /// 不由 termux 顶替）；MCP 注册名 = builtin 模板展开（默认
+    /// termux_bash；自定义 `{prefix}.{tool}` → termux.bash，证明不硬
+    /// 编码）。
     #[test]
     fn termux_only_naming_matrix_follows_builtin_template() {
         // (a) 默认模板。
@@ -2472,7 +2483,7 @@ mod tests {
         let runtime = MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
         runtime.set_exec_backends("termux");
         let names = runtime.registry.tool_names();
-        assert!(names.contains(&"bash".to_owned()), "{names:?}");
+        assert!(!names.contains(&"bash".to_owned()), "native 未选不注册: {names:?}");
         assert!(names.contains(&"termux_bash".to_owned()), "{names:?}");
         runtime.shutdown();
 
@@ -2487,14 +2498,14 @@ mod tests {
         let runtime = MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
         runtime.set_exec_backends("termux");
         let names = runtime.registry.tool_names();
-        assert!(names.contains(&"bash".to_owned()), "{names:?}");
+        assert!(!names.contains(&"bash".to_owned()), "native 未选不注册: {names:?}");
         assert!(
             names.contains(&"termux.bash".to_owned()),
             "MCP 注册名 = 模板展开: {names:?}"
         );
         assert!(
-            !names.contains(&"termux_bash".to_owned()),
-            "不得硬编码 termux_bash: {names:?}"
+            names.contains(&"termux_bash".to_owned()),
+            "HostTool 固定名不受模板影响: {names:?}"
         );
         runtime.shutdown();
     }

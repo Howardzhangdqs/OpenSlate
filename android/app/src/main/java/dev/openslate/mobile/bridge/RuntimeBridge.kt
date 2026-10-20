@@ -692,25 +692,51 @@ object RuntimeBridge {
         return SecretStore.save(ctx, provider, value)
     }
 
-    // ── bash 工具执行后端（native shell.run / termux）──────────────
+    // ── bash 工具执行后端（native 开关 + termux 恒在）──────────────
 
     private const val PREF_EXEC_BACKEND = "exec_backend"
 
-    /** 当前 bash 后端多选（CSV："native" / "termux" / "native,termux"）。 */
-    fun execBackends(): String =
-        appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
-            ?.getString(PREF_EXEC_BACKEND, "native") ?: "native"
+    /** 首装默认（无存值时）：native 开 + termux 恒在。 */
+    private const val DEFAULT_EXEC_BACKENDS = "native,termux"
 
-    /** 切换 bash 后端多选：FFI 热切换 + 本地持久化（重启恢复）。
-     *  命名规则（Rust 侧）：单选 → `bash`；双选 → `bash`=native + `termux_bash`。 */
+    /**
+     * 存量集合归一化（并行契约，Rust 侧同语义）：**termux 恒在**——旧
+     * {native} 补入 termux、空/未知集合归为 {termux}；native 开关状态
+     * 只看结果是否含 "native"。未知 token 丢弃（历史写入只可能产生
+     * native/termux 子集），{} / {native} 单独形态经此一律折到新契约。
+     */
+    private fun normalizeExecBackends(backends: String?): String {
+        val tokens = backends?.split(',')?.map { it.trim() }.orEmpty()
+        val set = linkedSetOf<String>()
+        if ("native" in tokens) set.add("native")
+        set.add("termux")
+        return set.joinToString(",")
+    }
+
+    /** 当前 bash 后端集合（CSV，恒含 "termux"；含 "native" 与否 = 设置页
+     *  「启用 native bash」开关）。无存值（首装）→ 两者齐开。 */
+    fun execBackends(): String {
+        val stored = appContext
+            ?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+            ?.getString(PREF_EXEC_BACKEND, null)
+            ?: return DEFAULT_EXEC_BACKENDS
+        return normalizeExecBackends(stored)
+    }
+
+    /** 写入后端集合：FFI 热切换 + 本地持久化（重启恢复）。写入同样过
+     *  归一化——termux 恒在不变量在桥层收口，UI 侧写法再偏差也不破坏。
+     *  命名规则（Rust 侧）：含 native → `bash` 注册；termux_bash 恒注册。 */
     fun setExecBackendsAndPersist(backends: String) {
-        runtimeRef.get()?.setExecBackends(backends)
+        val normalized = normalizeExecBackends(backends)
+        runtimeRef.get()?.setExecBackends(normalized)
         appContext?.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
-            ?.edit()?.putString(PREF_EXEC_BACKEND, backends)?.apply()
-        Log.i(TAG, "exec backends set to $backends")
+            ?.edit()?.putString(PREF_EXEC_BACKEND, normalized)?.apply()
+        Log.i(TAG, "exec backends set to $normalized")
     }
 
     private fun restoreExecBackend() {
+        // execBackends() 已归一化：旧 {native} / {} / {termux} 存量在恢复
+        // 入口一次折到新契约形态（termux 恒在），分发方式不变。
         val backends = execBackends()
         runtimeRef.get()?.setExecBackends(backends)
         Log.i(TAG, "start: restored exec backends = $backends")
@@ -2444,9 +2470,10 @@ object RuntimeBridge {
     /**
      * host call 处理：mobile.ping 直答；termux 后端工具（HostTool 兜底
      * 壳）经 RUN_COMMAND intent 在 Termux 执行、结果 PendingIntent 回传。
-     * 工具名三种形态：termux.run（历史）/ termux_bash（双选）/ bash
-     * （仅选 termux 时 HostTool 顶替名——MCP 接管后同名工具走 MCP
-     * 路径，不会到这）。mcp.recover_host = MCP host 死亡自愈通道（Rust
+     * 工具名形态：termux.run（历史）/ termux_bash（termux 后端恒注册，
+     * MCP 离线时的 RUN_COMMAND 兜底名）/ bash（旧「仅 termux」形态的
+     * HostTool 顶替名——并行契约下不再产生，防御性保留；MCP 接管后
+     * 同名工具走 MCP 路径，不会到这）。mcp.recover_host = MCP host 死亡自愈通道（Rust
      * 装饰器发起）。其余显式 unsupported。
      */
     private fun handleHostCall(obj: JSONObject) {

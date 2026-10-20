@@ -393,9 +393,9 @@ fun SettingsScreen(
                     }
                     2 -> {
                         // ── 工具域（二级 Tab 在上方吸顶）：MCP / 工具管理 / 内置工具 ──
-                        // 原「命令行」Tab 已删：ExecBackendSection（bash 后端
-                        // 多选）迁入「内置工具」Tab 置顶——先定哪些内置 bash
-                        // 工具存在（注册层），再看内置工具行为设置。
+                        // 原「命令行」Tab 已删：ExecBackendSection（native bash
+                        // 开关；termux 恒在）迁入「内置工具」Tab 置顶——先定
+                        // 哪些内置 bash 工具存在（注册层），再看内置工具行为设置。
                         when (toolTab) {
                             0 -> {
                                 McpSection()
@@ -1810,41 +1810,6 @@ private fun Toggle(label: String, value: Boolean, onToggle: () -> Unit) {
     }
 }
 
-/** 方形复选框行（多选场景；Checkbox 圆形默认改为方角以区分单选语义）。
- *  subtitle 非空时在标题下加灰色小字说明行（labelSmall + outline，与
- *  区块内其他说明小字同款）。 */
-@Composable
-private fun CheckboxRow(
-    label: String,
-    checked: Boolean,
-    onChange: (Boolean) -> Unit,
-    subtitle: String? = null,
-) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clickable { onChange(!checked) },
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        androidx.compose.material3.Checkbox(
-            checked = checked,
-            onCheckedChange = onChange,
-        )
-        if (subtitle == null) {
-            Text(label, style = MaterialTheme.typography.bodyMedium)
-        } else {
-            Column(Modifier.weight(1f)) {
-                Text(label, style = MaterialTheme.typography.bodyMedium)
-                Text(
-                    subtitle,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-        }
-    }
-}
-
 /** 跳到本 App 的系统应用详情页（手动授予权限的兜底入口）。 */
 private fun openOwnAppSettings(context: android.content.Context) {
     context.startActivity(
@@ -1884,20 +1849,21 @@ internal fun CompactButton(
  *  Termux 停滞连接面板共用同一套行视觉（绿勾/红叉/spinner/空点）。 */
 
 /**
- * bash 工具执行后端（独立运行模式，多选）。
+ * 是否启用 native bash（Toybox）——单开关。
  *
- * 归属：设置页工具域「内置工具」Tab 置顶（原独立「命令行」Tab 已删）；
- * 后端多选决定 bash / termux_bash 的注册（见工具管理 Tab 的分组）。
+ * 并行契约（Rust 侧同语义，已冻结）：termux 后端**恒在**后端集合中
+ * （termux_bash 经 MCP 服务提供、离线 RUN_COMMAND 兜底，始终注册），
+ * 本开关只控制 App 进程内 native bash 的有无：
+ * - ON → backends = {native, termux}（bash + termux_bash 都注册）；
+ * - OFF → backends = {termux}（仅 termux_bash；`bash` 工具不再注册，
+ *   工具管理页随之消失——预期行为）。
  *
- * - native：进程内 Android 系统 sh（toybox），零依赖零授权。
- * - termux：Termux RUN_COMMAND，完整 Linux 环境。
- *
- * 命名（Rust 侧注册）：单选 → 工具名 `bash`；双选 → `bash`（native）+
- * `termux_bash`（termux）。
+ * 归属：设置页工具域「内置工具」Tab 置顶（原独立「命令行」Tab 已删）。
+ * 读写都经 RuntimeBridge 归一化（termux 恒在不变量在桥层收口），开关
+ * 状态只看集合是否含 native。
  */
 @Composable
 private fun ExecBackendSection() {
-    val context = androidx.compose.ui.platform.LocalContext.current
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     // prefs 读取预取到 IO 线程（组合期同步读盘会卡帧）；null = 加载中。
     var backends by remember { mutableStateOf<String?>(null) }
@@ -1906,152 +1872,42 @@ private fun ExecBackendSection() {
             RuntimeBridge.execBackends()
         }
     }
-    fun isEnabled(name: String) =
-        backends?.split(',')?.map { it.trim() }?.contains(name) == true
-    /** 允许全不选（bash 功能整体下线）；空集持久化为空串。 */
-    fun setEnabled(name: String, on: Boolean) {
-        val set = linkedSetOf<String>()
-        if (isEnabled("native") || name == "native" && on) set.add("native")
-        if (isEnabled("termux") || name == "termux" && on) set.add("termux")
-        if (name == "native" && !on) set.remove("native")
-        if (name == "termux" && !on) set.remove("termux")
-        val csv = set.joinToString(",")
-        // 写操作（FFI 热切换 + prefs 落盘）包 IO 协程；完成后回主线程更新 UI。
-        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            RuntimeBridge.setExecBackendsAndPersist(csv)
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) { backends = csv }
-        }
-    }
-    val noneSelected = !isEnabled("native") && !isEnabled("termux")
-    var hasPerm by remember {
-        mutableStateOf(dev.openslate.mobile.bridge.TermuxExec.hasPermission(context))
-    }
-    var grantMsg by remember { mutableStateOf<String?>(null) }
-    var granting by remember { mutableStateOf(false) }
+    val nativeEnabled = backends
+        ?.split(',')?.map { it.trim() }?.contains("native") == true
 
-    // 从系统设置授予/撤销权限后返回时自动刷新状态。
-    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
-    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
-        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                hasPerm = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(obs)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
-    }
-
-    Section(title = "bash 工具执行后端（可多选）") {
+    Section(title = "启用 native bash（Toybox）") {
         if (backends == null) {
-            // 预取进行中：占位一行，避免加载间隙闪"未选择任何后端"红色告警。
+            // 预取进行中：占位一行，避免加载间隙开关闪现默认态。
             Text("加载中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
         } else {
-            CheckboxRow(
-                label = "Native",
-                subtitle = "Android 自带系统 shell（toybox 子集，零依赖零授权）",
-                checked = isEnabled("native"),
-                onChange = { setEnabled("native", it) },
-            )
-            CheckboxRow(
-                label = "Termux",
-                subtitle = "Termux 完整 Linux 环境（apt/python/…）",
-                checked = isEnabled("termux"),
-                onChange = { setEnabled("termux", it) },
-            )
-            when {
-                noneSelected -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Outlined.Warning,
-                        contentDescription = "警告",
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.height(14.dp).width(14.dp),
-                    )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("启用 native bash", style = MaterialTheme.typography.bodyMedium)
                     Text(
-                        "  未选择任何后端：模型将没有 bash 工具，无法执行任何命令。",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                isEnabled("native") && isEnabled("termux") -> Text(
-                    "已多选：native 工具名为 bash，Termux 工具名为 termux_bash。" +
-                        "MCP 服务在线时 Termux 命令经 MCP 执行（host 内置 bash），未在线走 RUN_COMMAND 兜底。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-                isEnabled("termux") -> Text(
-                    "仅 termux：工具名为 bash（Termux 后端）。MCP 服务在线时命令走 MCP 路径，" +
-                        "未在线时以 RUN_COMMAND Intent 兜底（完整环境需在 ~/.termux/termux.properties " +
-                        "设置 allow-external-apps=true）。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-                else -> Text(
-                    "仅 native：工具名为 bash，零依赖、零授权，无需 Termux（MCP 服务不影响该路径）。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-
-            if (isEnabled("termux")) {
-                val installed = dev.openslate.mobile.bridge.TermuxExec.isTermuxInstalled(context)
-                Text(
-                    if (installed) "Termux：已安装" else "Termux：未安装（请先安装 Termux）",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-                Text(
-                    if (hasPerm) "RUN_COMMAND 权限：已授予" else "RUN_COMMAND 权限：未授予",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-                // 部分 ROM（MIUI/HyperOS 等）在 Termux 从未启动时无法完成
-                // 授予：提示先打开一次 Termux（PackageManager 查询轻量，同步调用）。
-                if (!hasPerm && installed &&
-                    dev.openslate.mobile.bridge.TermuxDiagnostics.isTermuxStopped(context)
-                ) {
-                    Text(
-                        "Termux 尚未启动过（或被强制停止）。部分系统此状态下无法授予该权限：" +
-                            "先打开一次 Termux，返回后再点「申请权限」；或直接用 Shizuku 一键授权。",
+                        "App 进程内的 Android 系统 sh。关闭后 bash 工具不再注册。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline,
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (!hasPerm) {
-                        CompactButton(text = "申请权限", onClick = {
-                            val activity = context as? android.app.Activity
-                            if (activity != null) {
-                                activity.requestPermissions(
-                                    arrayOf(dev.openslate.mobile.bridge.TermuxExec.RUN_COMMAND_PERMISSION),
-                                    1002,
-                                )
-                            } else {
-                                openOwnAppSettings(context)
-                            }
-                        })
-                        CompactButton(text = "打开应用设置", onClick = { openOwnAppSettings(context) })
-                        CompactButton(text = "申请 Shizuku 授权", onClick = {
-                            dev.openslate.mobile.bridge.ShizukuGrant.requestShizukuPermission()
-                        })
-                        CompactButton(text = "Shizuku 一键授权", enabled = !granting, onClick = {
-                            granting = true
-                            grantMsg = null
-                            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                                val err = dev.openslate.mobile.bridge.ShizukuGrant
-                                    .grantTermuxPermission(context)
-                                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                    granting = false
-                                    hasPerm = dev.openslate.mobile.bridge.TermuxExec.hasPermission(context)
-                                    grantMsg = err ?: "授权成功"
-                                }
-                            }
-                        })
-                    }
-                }
-                grantMsg?.let {
-                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
-                }
+                androidx.compose.material3.Switch(
+                    checked = nativeEnabled,
+                    onCheckedChange = { on ->
+                        // 并行契约写法：termux 恒在——ON = {native,termux}、
+                        // OFF = {termux}；{} / {native} 单独形态不再写出。
+                        val next = if (on) "native,termux" else "termux"
+                        backends = next // 乐观更新（Switch 行现成范式）
+                        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                            RuntimeBridge.setExecBackendsAndPersist(next)
+                        }
+                    },
+                )
             }
+            Text(
+                "Termux 的 bash（termux_bash）经 MCP 服务提供，离线时自动走 RUN_COMMAND 兜底，" +
+                    "始终可用、无需在此开关。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
         }
     }
 }

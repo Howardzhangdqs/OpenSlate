@@ -44,7 +44,7 @@ JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**�
 | `send(msg: String)` | 119-127 | ClientMsg JSON；非阻塞（内部 spawn） |
 | `setApiKey(provider, value)` | 130-132 | 内存注入，不落盘 |
 | `setHttpProxy(url)` | 136-146 | 设/清（空串清除）进程级 `OPENSLATE_HTTP_PROXY` env；受限网络下宿主可经 adb reverse 共享电脑代理；**约定由宿主主线程在回合间调用** |
-| `setExecBackends(backends)` | 151-153 | CSV："native" / "termux" / "native,termux"；热生效 |
+| `setExecBackends(backends)` | 151-153 | CSV："native,termux" / "termux"（UI 单开关恒写含 termux 形态；名字与后端一一绑定：native⇒bash、termux⇒termux_bash）；热生效 |
 | `listTools(): String` | 159-162 | 工具清单 JSON 数组（name/description/input_schema，按 name 排序） |
 | `getAgentToolVisibility(): String` | 166-169 | `{"tools":[…],"hidden_tools":[…]}` |
 | `setAgentToolVisibility(tools, hiddenTools): String` | 175-180 | 全量覆写 + 热生效；返回 ok 信封 |

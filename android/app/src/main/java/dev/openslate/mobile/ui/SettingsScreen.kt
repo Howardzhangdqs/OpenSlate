@@ -148,7 +148,17 @@ fun SettingsScreen(
     /** Provider 的模型管理弹窗（null = 关闭）。 */
     var modelsProvider by remember { mutableStateOf<ProviderUi?>(null) }
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
-    var toolTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+    // 工具域二级 Tab 选中态。「命令行」Tab 已删（bash 后端选择并入
+    // 「内置工具」）：rememberSaveable 的恢复值绕过 initializer，存量
+    // 进程重建后可能带回旧四 Tab 索引，读取统一经旧→新映射折算——
+    // 0(MCP)→0、1(命令行)/2(工具管理)→1、3(内置工具)→2；新写入恒
+    // 0..2 直通。首次点击后落盘值即归位，映射仅兜历史恢复值不越界。
+    var toolTabRaw by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+    val toolTab = when (toolTabRaw) {
+        3 -> 2
+        2, 1 -> 1
+        else -> 0
+    }
     var modelTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
 
     // API key 存在性批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，
@@ -213,17 +223,18 @@ fun SettingsScreen(
             }
 
             // ── 工具域二级 Tab：吸顶固定（在滚动容器外），紧贴主 Tab ──
+            // 原「命令行」Tab 已删，bash 后端选择（ExecBackendSection）并入
+            // 「内置工具」Tab。
             if (tab == 2) {
                 androidx.compose.material3.TabRow(selectedTabIndex = toolTab) {
                     for ((label, idx) in listOf(
                         "MCP" to 0,
-                        "命令行" to 1,
-                        "工具管理" to 2,
-                        "内置工具" to 3,
+                        "工具管理" to 1,
+                        "内置工具" to 2,
                     )) {
                         androidx.compose.material3.Tab(
                             selected = toolTab == idx,
-                            onClick = { toolTab = idx },
+                            onClick = { toolTabRaw = idx },
                             text = { Text(label) },
                         )
                     }
@@ -383,15 +394,20 @@ fun SettingsScreen(
                         }
                     }
                     2 -> {
-                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 命令行 / 工具管理 / 内置工具 ──
+                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 工具管理 / 内置工具 ──
+                        // 原「命令行」Tab 已删：ExecBackendSection（bash 后端
+                        // 多选）迁入「内置工具」Tab 置顶——先定哪些内置 bash
+                        // 工具存在（注册层），再看内置工具行为设置。
                         when (toolTab) {
                             0 -> {
                                 McpSection()
                                 LogSection()
                             }
-                            1 -> ExecBackendSection()
-                            2 -> ToolManagementSection()
-                            else -> BuiltinToolBehaviorSection()
+                            1 -> ToolManagementSection()
+                            else -> {
+                                ExecBackendSection()
+                                BuiltinToolBehaviorSection()
+                            }
                         }
                     }
                 }
@@ -1871,6 +1887,9 @@ internal fun CompactButton(
 
 /**
  * bash 工具执行后端（独立运行模式，多选）。
+ *
+ * 归属：设置页工具域「内置工具」Tab 置顶（原独立「命令行」Tab 已删）；
+ * 后端多选决定 bash / termux_bash 的注册（见工具管理 Tab 的分组）。
  *
  * - native：进程内 Android 系统 sh（toybox），零依赖零授权。
  * - termux：Termux RUN_COMMAND，完整 Linux 环境。

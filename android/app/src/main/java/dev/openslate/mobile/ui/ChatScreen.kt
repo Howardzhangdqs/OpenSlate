@@ -39,6 +39,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -1052,6 +1053,68 @@ internal fun clampTextForRender(text: String, ref: String? = null): RenderClamp 
     return RenderClamp(text.substring(0, headEnd) + "\n" + text.substring(tailStart), note)
 }
 
+/** 分块渲染行数上限：每块 ≤100 行。 */
+private const val CHUNK_MAX_LINES = 100
+
+/** 分块渲染单行折段阈值：>2000 字符的行按 ~2000 字符折段为伪行。 */
+private const val CHUNK_FOLD_LINE = 2000
+
+/** 分块渲染每块字符上限（含换行计，~4KB）——单块 Compose Text 布局成本封顶。 */
+private const val CHUNK_MAX_CHARS = 4096
+
+/** 病态兜底阈值：任一分块 >16K 字符 = 两级分块失效（理论上恒不触发，
+ *  防御分块参数未来回归），该输出整段回退 clampTextForRender 钳制渲染。 */
+private const val PATHOLOGICAL_CHUNK_CHARS = 16 * 1024
+
+/**
+ * 大文本 → 渲染块序列：按行分块（每块 ≤[CHUNK_MAX_LINES] 行），单行
+ * >[CHUNK_FOLD_LINE] 字符再按 ~2000 字符折段为伪行块；同时受
+ * [CHUNK_MAX_CHARS]（~4KB）总量约束（行均长时先行触顶封块），保证每块
+ * 渲染 Text ≤~4KB。带稳定 key（"c{i}"）供 LazyColumn item(key=) 防重组
+ * 错位。空文本不出块。折段切点做 UTF-16 代理对保护（同
+ * [clampTextForRender] 先例）。**只影响显示**：伪行折段引入的换行不属于
+ * 原文，字符统计与复制一律用未分块原串。
+ */
+internal fun chunkTextForLazyRender(text: String): List<Pair<String, String>> {
+    if (text.isEmpty()) return emptyList()
+    val chunks = ArrayList<Pair<String, String>>()
+    val lines = ArrayList<String>() // 当前块累积的行/伪行
+    var chars = 0                   // 当前块字符数（含行间换行）
+    fun flush() {
+        if (lines.isNotEmpty()) {
+            chunks += "c${chunks.size}" to lines.joinToString("\n")
+            lines.clear()
+            chars = 0
+        }
+    }
+    for (line in text.split('\n')) {
+        var off = 0
+        while (true) {
+            // 折段：>2000 字符的行切为 ~2000 字符伪行；切点劈开代理对时回退 1。
+            val end: Int
+            if (line.length - off > CHUNK_FOLD_LINE) {
+                var cut = off + CHUNK_FOLD_LINE
+                if (Character.isHighSurrogate(line[cut - 1])) cut--
+                end = cut
+            } else {
+                end = line.length
+            }
+            val piece = line.substring(off, end)
+            off = end
+            // 总量约束：放入本行会超 ~4KB 且块非空 → 先封块（伪行 ≤2000，
+            // 封块后必放得下，无死循环）。
+            if (lines.isNotEmpty() && chars + piece.length + 1 > CHUNK_MAX_CHARS) flush()
+            if (lines.isNotEmpty()) chars++ // 行间换行计入
+            lines.add(piece)
+            chars += piece.length
+            if (lines.size >= CHUNK_MAX_LINES) flush()
+            if (off >= line.length) break
+        }
+    }
+    flush()
+    return chunks
+}
+
 /** 输出文本里 `[STORED OUTPUT ref="out-N" …]` 标记的 ref 提取（core 落盘预览）。 */
 private val STORED_REF_MARKER = Regex("""\[STORED OUTPUT ref="([^"]+)"""")
 
@@ -1309,17 +1372,18 @@ private fun parseToolOut(raw: String): ToolOutParts {
  * 码，两者都安全，丢任何一边都可能缺内容。旧条目无 callId / FFI 未命
  * 中（history 被压缩、子代理工具）→ 静默回退 preview，维持现状显示。
  *
- * 渲染钳制（真机卡死修复）：落盘全文经 expand_stored_output 回填后可达
- * 512 KiB，单个 Compose Text 布局几十万字符直接冻结 UI——超 32K 字符的
- * 分段经 [clampTextForRender] 只渲染头 24K + 尾 8K + 省略说明行（回答
- * 「完整输出存在哪」：files/outputs/ 落盘 + output_query 按 ref 分段查看
- * + 复制完整输出按钮）。钳制只影响显示：字符统计与底部「复制完整输出」
- * （未钳制全文，输出非空才出现）均用原串。
+ * 渲染钳制（真机卡死修复史）：b17bf68 曾以「头 24K + 尾 8K」钳制止住单个
+ * Text 布局 512 KiB 全文导致的 UI 冻结，代价是中段不可见；现升级为**分块
+ * 虚拟滚动**（方案 A：全文载入 + LazyColumn 分块，内存 2MiB 峰值可接受）——
+ * 当前分段全文经 [chunkTextForLazyRender] 两级分块（≤100 行/块 + 单行
+ * >2000 字符折段 + ~4KB/块封顶）逐块渲染，中段完整可滚；钳制降级为病态
+ * 兜底（任一块 >16K 字符才整段回退 [clampTextForRender]，理论上恒不触发）。
+ * 分块只影响显示：字符统计与底部「复制完整输出」（未分块全文，输出非空才
+ * 出现）均用原串。
  */
 @Composable
 private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     val clipboard = LocalClipboardManager.current
-    val scroll = rememberScrollState()
     // 系统等宽（不用 MonoFont 子集）：工具输出是任意内容，子集字形覆盖不全。
     val mono = MaterialTheme.typography.bodySmall.copy(
         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
@@ -1363,6 +1427,45 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
             fullCopied = false
         }
     }
+    // 当前分段全文（未分块原串，remember 键控防重组重算）：分块渲染的输入；
+    // null = 无输出（占位「（无输出）」）。
+    val rawText = when {
+        running -> null
+        parts.stderr.isNotEmpty() && tab == 1 -> parts.stderr.ifBlank { "（空）" }
+        parts.stdout.isNotBlank() -> parts.stdout
+        else -> null
+    }
+    // 输出分块（分块虚拟滚动的渲染层，纯函数 remember 缓存）：当前分段全文
+    // 两级分块（≤100 行/块 + 单行 >2000 字符折段 + ~4KB/块），每块一个
+    // LazyColumn item——中段完整可滚（替代旧头尾钳制），内存 2MiB 峰值可
+    // 接受（方案 A）。
+    val chunks = remember(rawText) {
+        if (rawText == null) emptyList() else chunkTextForLazyRender(rawText)
+    }
+    // 病态兜底判断：任一块 >16K 字符 = 两级分块失效（理论上恒不触发，防御
+    // 分块参数回归）→ 整段回退 b17bf68 的 clampTextForRender 钳制渲染。
+    val pathological = remember(chunks) {
+        chunks.any { it.second.length > PATHOLOGICAL_CHUNK_CHARS }
+    }
+    val clamp = remember(rawText, storedRef) {
+        if (pathological && rawText != null) clampTextForRender(rawText, storedRef) else null
+    }
+    // 存储位置说明行（常驻，输出块最上方）：输出为落盘全文（含 [STORED
+    // OUTPUT] 标记，或懒加载全量长于条目自带输出）时说明完整输出的存放
+    // 位置与查询途径——中段经分块已完整可看，不再有「已显示头尾」措辞。
+    val storedNote = remember(shownOut, fullOut, tc.output, storedRef) {
+        val out = shownOut.orEmpty()
+        val full = fullOut // 局部捕获：fullOut 是委托属性，lambda 内不可 smart cast
+        val stored = STORED_REF_MARKER.containsMatchIn(out) ||
+            (full != null && full.length > (tc.output ?: "").length)
+        if (stored) {
+            "完整输出（${out.length / 1024} KB）已压缩存储在 App 私有目录 files/outputs/，" +
+                "可让模型用 output_query${if (storedRef != null) "（ref=$storedRef）" else ""}分段查看，" +
+                "或点下方「复制完整输出」"
+        } else {
+            null
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1376,7 +1479,9 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                 .fillMaxHeight(0.9f),
         ) {
             Column {
-                // 头部：工具名 + exit code 徽标 + 关闭。
+                // 头部：工具名 + exit code 徽标 + 关闭。固定在 LazyColumn 之外
+                // （不作为首个 item——取舍：标题/关闭钮是弹窗 chrome，恒可见
+                // 恒可达优于随内容滚动，且免一个 item 的重组）。
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
@@ -1416,164 +1521,205 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                     thickness = 0.5.dp,
                     color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                 )
-                // 内容区：命令 + 输出，整体可滚动、可选择。
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .verticalScroll(scroll)
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                ) {
-                    // 懒加载进度行（极轻）：FFI 拉取全量输出期间显示，到货即隐。
-                    if (!fullLoaded) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(bottom = 8.dp),
-                        ) {
-                            CircularProgressIndicator(
-                                strokeWidth = 1.5.dp,
-                                modifier = Modifier.size(13.dp),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "载入完整输出",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.outline,
-                            )
-                        }
-                    }
-                    if (bashCmd == null) {
-                        // 非 bash 类 / 解析失败：维持原「命令」区原始 JSON 展示。
-                        Text(
-                            "命令",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                        SelectionContainer {
-                            Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
-                        }
-                    } else {
-                        // bash 类：顶部具体命令（去 JSON wrapper，系统等宽、可
-                        // 多行），前缀与工具条同语言——termux_bash 挂品牌 logo
-                        // （固定配色不走 tint）、bash 挂 `$` 提示符（文本语义，
-                        // 非图标）。不设「命令」标签：前缀标记本身即语义。
-                        Row(verticalAlignment = Alignment.Top) {
-                            if (tc.name == TERMUX_BASH_TOOL) {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_termux),
-                                    contentDescription = null,
-                                    modifier = Modifier
-                                        .padding(top = 2.dp)
-                                        .size(13.dp),
-                                    tint = Color.Unspecified,
-                                )
-                                Spacer(Modifier.width(6.dp))
-                            }
-                            SelectionContainer {
-                                Text(
-                                    if (tc.name == NATIVE_BASH_TOOL) {
-                                        "\$ " + bashCmd.first
-                                    } else {
-                                        bashCmd.first
-                                    },
-                                    style = mono,
-                                )
-                            }
-                        }
-                        // 调用参数区：command 外其余参数（如 timeout_ms）pretty
-                        // JSON；无其余参数整区省略（命令已全量显示，信息不丢）。
-                        if (bashCmd.second.isNotBlank()) {
-                            Spacer(Modifier.height(12.dp))
-                            Text(
-                                "调用参数",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                            SelectionContainer {
-                                Text(bashCmd.second, style = mono)
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    // 输出区头：标签 + stdout/stderr 切换 + 字符数提示。
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            if (running) "输出（执行中…）" else "输出",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                        Spacer(Modifier.width(12.dp))
-                        if (parts.stderr.isNotEmpty()) {
-                            listOf("stdout" to 0, "stderr" to 1).forEach { (label, idx) ->
-                                val selected = tab == idx
-                                val labelColor = if (selected) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.outline
+                // 内容区：单个 LazyColumn 分块虚拟滚动（方案 A：全文载入 +
+                // 分块渲染，内存 2MiB 峰值可接受）。原 Column(verticalScroll)
+                // 已移除——进度行/命令块/参数块/输出头/说明行/输出分块全部
+                // 成为 item，消除同向嵌套滚动；1000 item 量级默认配置无压力，
+                // 不加 animateItemPlacement 之类的额外机制。
+                // SelectionContainer 包整个 LazyColumn：输出分块共享同一
+                // selection registrar → 跨 item 选择；命令/参数区各自的内层
+                // SelectionContainer 就近优先接管（维持原独立选择语义），外层
+                // 实际只覆盖输出块。取舍：lazy item 滚出视口被析构时其选中态
+                // 随之失效（拖选同时深滚会断选），展示场景可接受。
+                SelectionContainer {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                    ) {
+                        // 懒加载进度行（极轻）：FFI 拉取全量输出期间显示，到货即隐。
+                        if (!fullLoaded) {
+                            item(key = "loading") {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(bottom = 8.dp),
+                                ) {
+                                    CircularProgressIndicator(
+                                        strokeWidth = 1.5.dp,
+                                        modifier = Modifier.size(13.dp),
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        "载入完整输出",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.outline,
+                                    )
                                 }
-                                Text(
-                                    label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = labelColor,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(50))
-                                        .background(
-                                            if (selected) {
-                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
-                                            } else {
-                                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                                            },
-                                        )
-                                        .border(0.5.dp, labelColor.copy(alpha = 0.4f), RoundedCornerShape(50))
-                                        .clickable { tab = idx }
-                                        .padding(horizontal = 10.dp, vertical = 3.dp),
-                                )
-                                Spacer(Modifier.width(6.dp))
                             }
                         }
-                        Spacer(Modifier.weight(1f))
-                        if (!running) {
-                            val shownLen = if (tab == 1) parts.stderr.length else parts.stdout.length
-                            Text(
-                                "$shownLen 字符",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.outline,
-                            )
+                        // 命令区：整块一个 item（体量小，无分块必要）。
+                        item(key = "cmd") {
+                            Column {
+                                if (bashCmd == null) {
+                                    // 非 bash 类 / 解析失败：维持原「命令」区原始 JSON 展示。
+                                    Text(
+                                        "命令",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    SelectionContainer {
+                                        Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
+                                    }
+                                } else {
+                                    // bash 类：顶部具体命令（去 JSON wrapper，系统等宽、可
+                                    // 多行），前缀与工具条同语言——termux_bash 挂品牌 logo
+                                    // （固定配色不走 tint）、bash 挂 `$` 提示符（文本语义，
+                                    // 非图标组件）。不设「命令」标签：前缀标记本身即语义。
+                                    Row(verticalAlignment = Alignment.Top) {
+                                        if (tc.name == TERMUX_BASH_TOOL) {
+                                            Icon(
+                                                painter = painterResource(R.drawable.ic_termux),
+                                                contentDescription = null,
+                                                modifier = Modifier
+                                                    .padding(top = 2.dp)
+                                                    .size(13.dp),
+                                                tint = Color.Unspecified,
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                        }
+                                        SelectionContainer {
+                                            Text(
+                                                if (tc.name == NATIVE_BASH_TOOL) {
+                                                    "\$ " + bashCmd.first
+                                                } else {
+                                                    bashCmd.first
+                                                },
+                                                style = mono,
+                                            )
+                                        }
+                                    }
+                                    // 调用参数区：command 外其余参数（如 timeout_ms）pretty
+                                    // JSON；无其余参数整区省略（命令已全量显示，信息不丢）。
+                                    if (bashCmd.second.isNotBlank()) {
+                                        Spacer(Modifier.height(12.dp))
+                                        Text(
+                                            "调用参数",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                        SelectionContainer {
+                                            Text(bashCmd.second, style = mono)
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(12.dp))
+                            }
                         }
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    if (running) {
-                        Text(
-                            "执行中，完成后自动显示…",
-                            style = mono,
-                            color = MaterialTheme.colorScheme.outline,
-                        )
-                    } else {
-                        // 渲染钳制（真机卡死修复）：当前分段超长（>32K 字符）时只
-                        // 渲染头 24K + 尾 8K + 说明行——单个 Compose Text 布局几十万
-                        // 字符即冻结 UI。钳制只影响显示：上方字符统计与底部复制
-                        // 仍用未钳制原串。
-                        val rawText = when {
-                            parts.stderr.isNotEmpty() && tab == 1 -> parts.stderr.ifBlank { "（空）" }
-                            parts.stdout.isNotBlank() -> parts.stdout
-                            else -> null
+                        // 输出区头：标签 + stdout/stderr 切换 + 字符数提示（统计用
+                        // 未分块原串——分块只是渲染层）。
+                        item(key = "outhead") {
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        if (running) "输出（执行中…）" else "输出",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                    if (parts.stderr.isNotEmpty()) {
+                                        listOf("stdout" to 0, "stderr" to 1).forEach { (label, idx) ->
+                                            val selected = tab == idx
+                                            val labelColor = if (selected) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.outline
+                                            }
+                                            Text(
+                                                label,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = labelColor,
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(50))
+                                                    .background(
+                                                        if (selected) {
+                                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)
+                                                        } else {
+                                                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                                                        },
+                                                    )
+                                                    .border(0.5.dp, labelColor.copy(alpha = 0.4f), RoundedCornerShape(50))
+                                                    .clickable { tab = idx }
+                                                    .padding(horizontal = 10.dp, vertical = 3.dp),
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                        }
+                                    }
+                                    Spacer(Modifier.weight(1f))
+                                    if (!running) {
+                                        val shownLen = if (tab == 1) parts.stderr.length else parts.stdout.length
+                                        Text(
+                                            "$shownLen 字符",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.outline,
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.height(4.dp))
+                            }
                         }
-                        val clamp = remember(rawText, storedRef) {
-                            rawText?.let { clampTextForRender(it, storedRef) }
-                        }
-                        // 省略说明行（系统等宽、tertiary、居左）：超限才出现，
-                        // 置于内容上方（与输出头字符数统计同属元信息层）。
-                        clamp?.omissionNote?.let { note ->
-                            Text(
-                                note,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontFamily = FontFamily.Monospace,
-                                ),
-                                color = MaterialTheme.colorScheme.tertiary,
-                                modifier = Modifier.padding(bottom = 6.dp),
-                            )
-                        }
-                        SelectionContainer {
-                            Text(clamp?.display ?: "（无输出）", style = mono)
+                        if (running) {
+                            item(key = "running") {
+                                Text(
+                                    "执行中，完成后自动显示…",
+                                    style = mono,
+                                    color = MaterialTheme.colorScheme.outline,
+                                )
+                            }
+                        } else {
+                            // 存储位置说明行（常驻，输出块最上方）：落盘全文场景
+                            // 说明完整输出的存放位置与查询途径——中段经分块已
+                            // 完整可看，不再有「已显示头尾」措辞。
+                            if (storedNote != null) {
+                                item(key = "storenote") {
+                                    Text(
+                                        storedNote,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontFamily = FontFamily.Monospace,
+                                        ),
+                                        color = MaterialTheme.colorScheme.tertiary,
+                                        modifier = Modifier.padding(bottom = 6.dp),
+                                    )
+                                }
+                            }
+                            if (clamp != null) {
+                                // 病态兜底（理论上恒不触发，见 pathological 注释）：
+                                // 整段回退 b17bf68 的头尾钳制渲染 + 省略说明行。
+                                clamp.omissionNote?.let { note ->
+                                    item(key = "clampnote") {
+                                        Text(
+                                            note,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontFamily = FontFamily.Monospace,
+                                            ),
+                                            color = MaterialTheme.colorScheme.tertiary,
+                                            modifier = Modifier.padding(bottom = 6.dp),
+                                        )
+                                    }
+                                }
+                                item(key = "clampbody") {
+                                    Text(clamp.display, style = mono)
+                                }
+                            } else if (chunks.isEmpty()) {
+                                item(key = "noout") {
+                                    Text("（无输出）", style = mono)
+                                }
+                            } else {
+                                // 输出分块：每块一个 Text item（稳定 key "c{i}" 防重组
+                                // 错位），样式与旧输出体同款（系统等宽、softWrap
+                                // 保持默认开）；虚拟滚动只组合视口内分块。
+                                itemsIndexed(chunks, key = { _, c -> c.first }) { _, c ->
+                                    Text(c.second, style = mono)
+                                }
+                            }
                         }
                     }
                 }
@@ -1581,8 +1727,12 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                     thickness = 0.5.dp,
                     color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                 )
-                // 底部动作行：整段一键复制（配合长按手动选择）。四枚按钮（命令/
-                // stdout/stderr/完整输出）在 360dp 屏放不下时横滑——同
+                // 底部动作行：整段一键复制（配合长按手动选择）。取舍：保留在
+                // LazyColumn 之外的原位（常驻 footer）而非末 item / footer 叠加
+                // ——实现最简单（零遮挡/背景处理），复制按钮恒可达（长输出不必
+                // 滚到底），说明行文案「点下方『复制完整输出』」也因此恒成立；
+                // 仅横向滚动，与 LazyColumn 不同向、无嵌套滚动问题。四枚按钮
+                // （命令/stdout/stderr/完整输出）在 360dp 屏放不下时横滑——同
                 // SettingsScreen 色板行的横滑先例，放得下时无感知。
                 Row(
                     modifier = Modifier

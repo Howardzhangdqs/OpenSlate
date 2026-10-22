@@ -25,6 +25,7 @@
 | 17 | Kotlin 主线程 ANR，栈在 FFI 调用里 | 在主线程调了阻塞型 FFI 方法（`listProviderModels` / `registryUpdateSource` / `registrySearch` / `lookupModelMeta`） | 包进 `Dispatchers.IO`（FFI doc 注释已标明哪些方法必须 IO 线程） |
 | 18 | logcat 看不到 Rust 日志 | tag 过滤错 / 进程未起 | Rust tag 是 `OpenSlateRust`（不是 crate 名）；`adb logcat -s OpenSlateRust`；确认 AgentService 前台服务在跑 |
 | 19 | 历史会话页大量 run 显示 running | 上次进程被杀没走 onDestroy，run 停在 running | 下次启动 `assemble_state` 的 `mark_running_runs_interrupted` 会统一清扫为 interrupted——正常现象，无需手工修库 |
+| 20 | 磁盘爆满（常在并行 `cargo test` 期间触发）/ `target/debug` 巨大 | 静态链接测试二进制 × 全量 DWARF（单个体积 ~75% 是调试段，410MB+）× **cargo 不做旧产物 GC**（源码一变新 hash 落盘、旧二进制永存；du 还会因 cargo 硬链接重复计数虚高，以 `df -h` 为准）；爆满刻是并行 rustc 临时文件的瞬时峰值 | 已预防：根 `Cargo.toml [profile.dev]` 调 `debug = "line-tables-only"` + `incremental = false`。应急清理（保 48h 内热缓存）：`find target/debug/deps -type f -mtime +2 -delete && rm -rf target/debug/incremental`；要干净基线直接 `cargo clean`（只清 host `target/`，不碰 `target-android/`，代价是下次全量重编） |
 
 ## 测试设备
 

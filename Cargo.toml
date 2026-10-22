@@ -136,6 +136,18 @@ rquickjs-sys = { path = "vendor/rquickjs-sys" }
 #   chat usage 不分模态，天然 None。
 genai = { path = "vendor/genai" }
 
+# dev/test 构建体积控制（2026-10 实证 target/debug 曾累积 142G）：
+# - 静态链接的测试二进制单个体积 ~75% 是 DWARF 调试段（全量 debug=2）；
+#   line-tables-only 保留断点/行号回溯，砍掉变量级调试信息（单二进制
+#   410MB → ~100MB 量级）。
+# - cargo 不做旧产物 GC：每次源码变更产出新 hash 文件，旧测试二进制
+#   永久累积；incremental 缓存同理持续膨胀且多轮全量测试吃不到增量
+#   红利，故关闭。
+# 应急清理见 docs/guide/07-build-dev/troubleshooting.md #20。
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
 opt-level = "z"
 lto = true

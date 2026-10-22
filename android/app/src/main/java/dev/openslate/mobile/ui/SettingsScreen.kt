@@ -216,9 +216,11 @@ fun SettingsScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            // ── Tab 栏：每个域独立负责一类设置 ──────────────────
+            // ── Tab 栏：每个域独立负责一类设置。「智能体」尾插（索引 3）：
+            // 既有索引 0/1/2 语义不动——深链硬编码（主 tab=2 工具、
+            // settings?toolTab=3 二级 tab）与存量 saveable 不受影响。──
             androidx.compose.material3.TabRow(selectedTabIndex = tab) {
-                val tabs = listOf("外观" to 0, "模型" to 1, "工具" to 2)
+                val tabs = listOf("通用" to 0, "模型" to 1, "工具" to 2, "智能体" to 3)
                 for ((label, idx) in tabs) {
                     androidx.compose.material3.Tab(
                         selected = tab == idx,
@@ -281,8 +283,17 @@ fun SettingsScreen(
             ) {
                 when (tab) {
                     0 -> {
-                        // ── 外观域：主题模式（持久化 + 全局生效）──────
-                        Section(title = "主题") {
+                        // ── 通用域：外观（主题模式 + 主题色归组一节）──────
+                        // 原平级「主题」「主题色」两节收进一个 Section：Section
+                        // 组件无嵌套层级视觉（标题同为 titleMedium），嵌套会
+                        // 双标题打架——改为节内行内标签（titleSmall）+
+                        // HorizontalDivider 分隔两个小组，原两行组件不动。
+                        Section(
+                            title = "外观",
+                            subtitle = "应用的深浅色模式与主题色。",
+                        ) {
+                            // ── 主题模式（持久化 + 全局生效）──
+                            Text("主题", style = MaterialTheme.typography.titleSmall)
                             Text(
                                 "选择应用的深浅色配色：跟随系统或固定浅色/深色。" +
                                     "即时生效，重启后保持。",
@@ -301,9 +312,9 @@ fun SettingsScreen(
                                     onThemeModeChange(modes.first { it.first == label }.second)
                                 },
                             )
-                        }
-                        // ── 外观域：主题色（强调色圆形选择器，即时生效 + 落盘）──
-                        Section(title = "主题色") {
+                            HorizontalDivider()
+                            // ── 主题色（强调色圆形选择器，即时生效 + 落盘）──
+                            Text("主题色", style = MaterialTheme.typography.titleSmall)
                             Text(
                                 "点选应用的强调色，即时生效并保存。",
                                 style = MaterialTheme.typography.bodySmall,
@@ -448,6 +459,10 @@ fun SettingsScreen(
                                 ImageProcessingSection(snackbarHostState)
                             }
                         }
+                    }
+                    3 -> {
+                        // ── 智能体域（尾插）：角色定位（system prompt 源）编辑 ──
+                        AgentPersonaSection(snackbarHostState)
                     }
                 }
             }
@@ -2247,6 +2262,113 @@ private fun ImageProcessingSliderRow(
             subtitle,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.outline,
+        )
+    }
+}
+
+/**
+ * 智能体域：agent 角色定位（每回合 system prompt 的源文本）编辑。
+ *
+ * - 读 = 进入 tab 时 [RuntimeBridge.getAgentPersona] 预填：get 是同步无
+ *   副作用 FFI，在本分区组合进入时的 [LaunchedEffect] 里调一次（切走
+ *   析构、回来重读），不随每帧重组反复调；null 态占位防首帧闪空框。
+ * - 写 = 显式「保存」（dirty 才可用）→ [RuntimeBridge.setAgentPersona]
+ *   （suspend，内部已切 IO）：成功以返回的规范化正文回填输入框（空输入
+ *   保存 = 管线恢复默认提示语，如实展示）+ snackbar；失败 snackbar
+ *   「保存失败」，输入保持不动（错误细节桥层已 log）。
+ * - 「恢复默认」次按钮：确认后走同一保存链路存空串（管线空→默认），
+ *   同样以返回的默认正文回填。
+ */
+@Composable
+private fun AgentPersonaSection(snackbar: SnackbarHostState) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    // 编辑文本；null = 预填中。
+    var text by remember { mutableStateOf<String?>(null) }
+    // 最近一次保存/回读的生效正文：dirty = 编辑文本与之不等；保存成功
+    // 后用返回的规范化文本同步二者（回填 + dirty 归零）。
+    var saved by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        val cur = RuntimeBridge.getAgentPersona()
+        text = cur
+        saved = cur
+    }
+    var saving by remember { mutableStateOf(false) }
+    var confirmReset by remember { mutableStateOf(false) }
+
+    // 保存链路（「保存」与「恢复默认」共用；恢复默认 = 存空串，管线
+    // 空→默认）。scope 在主线程，setAgentPersona 内部切 IO，返回后回
+    // 主线程更新状态；snackbar 挂起至消失，saving 先复位不卡按钮态。
+    fun persist(body: String) {
+        if (saving) return
+        saving = true
+        scope.launch {
+            val effective = RuntimeBridge.setAgentPersona(body)
+            if (effective != null) {
+                text = effective
+                saved = effective
+            }
+            saving = false
+            snackbar.showSnackbar(if (effective != null) "已保存，下一回合生效" else "保存失败")
+        }
+    }
+
+    Section(
+        title = "角色定位",
+        subtitle = "定义 agent 的身份、性格与用途——作为系统提示发送给模型，下一回合起生效",
+    ) {
+        val cur = text
+        if (cur == null) {
+            Text(
+                "加载中…",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        } else {
+            // 输入框视觉语言与设置页既有表单一致（Provider 编辑表单 /
+            // 工具名模板的 OutlinedTextField + label）。
+            OutlinedTextField(
+                value = cur,
+                onValueChange = { text = it },
+                label = { Text("系统提示词") },
+                minLines = 6,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "清空后保存 = 恢复默认提示语。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            // 动作行：次按钮居左、主按钮居右（Provider 编辑表单同节奏）。
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SoftButton(enabled = !saving, onClick = { confirmReset = true }) {
+                    Text("恢复默认")
+                }
+                Spacer(Modifier.weight(1f))
+                SoftButton(
+                    enabled = !saving && text != saved,
+                    onClick = { persist(cur) },
+                ) { Text(if (saving) "保存中…" else "保存") }
+            }
+        }
+    }
+
+    if (confirmReset) {
+        AlertDialog(
+            onDismissRequest = { confirmReset = false },
+            title = { Text("恢复默认角色定位") },
+            text = { Text("当前内容将被覆盖为默认提示语。") },
+            confirmButton = {
+                SoftButton(onClick = {
+                    confirmReset = false
+                    persist("")
+                }) { Text("恢复默认") }
+            },
+            dismissButton = {
+                SoftButton(onClick = { confirmReset = false }) { Text("取消") }
+            },
         )
     }
 }

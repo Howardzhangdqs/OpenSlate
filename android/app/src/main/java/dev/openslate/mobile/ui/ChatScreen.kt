@@ -1117,6 +1117,8 @@ internal fun chunkTextForLazyRender(text: String): List<Pair<String, String>> {
 
 /** 输出文本里 `[STORED OUTPUT ref="out-N" …]` 标记的 ref 提取（core 落盘预览）。 */
 private val STORED_REF_MARKER = Regex("""\[STORED OUTPUT ref="([^"]+)"""")
+/** 预览标记里的 size=N（原文总字节）——判断展示是否完整，小输出免打扰。 */
+private val STORED_SIZE_MARKER = Regex("""\[STORED OUTPUT [^\]]*?size=(\d+)""")
 
 /**
  * 落盘输出引用解析（渲染钳制说明行用）：输出文本里的 `[STORED OUTPUT
@@ -1450,20 +1452,28 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     val clamp = remember(rawText, storedRef) {
         if (pathological && rawText != null) clampTextForRender(rawText, storedRef) else null
     }
-    // 存储位置说明行（常驻，输出块最上方）：输出为落盘全文（含 [STORED
-    // OUTPUT] 标记，或懒加载全量长于条目自带输出）时说明完整输出的存放
-    // 位置与查询途径——中段经分块已完整可看，不再有「已显示头尾」措辞。
+    // 存储位置说明行（输出块最上方）：输出为落盘全文（含 [STORED
+    // OUTPUT] 标记，或懒加载全量长于条目自带输出）**且展示不完整**
+    // （传输层头尾截断：可见长度 < 标记里的原文 size）时才提示存储位置
+    // 与查询途径——小输出全文都在眼前，说明行纯属噪音，不出。
     val storedNote = remember(shownOut, fullOut, tc.output, storedRef) {
         val out = shownOut.orEmpty()
         val full = fullOut // 局部捕获：fullOut 是委托属性，lambda 内不可 smart cast
         val stored = STORED_REF_MARKER.containsMatchIn(out) ||
             (full != null && full.length > (tc.output ?: "").length)
-        if (stored) {
-            "完整输出（${out.length / 1024} KB）已压缩存储在 App 私有目录 files/outputs/，" +
-                "可让模型用 output_query${if (storedRef != null) "（ref=$storedRef）" else ""}分段查看，" +
-                "或点下方「复制完整输出」"
-        } else {
+        if (!stored) {
             null
+        } else {
+            // out 含标记行（~80 字符）+ 内容；全文可见时 out.length 恒大于
+            // 原文 size。解析失败（异常形态）保守回退：显示。
+            val origSize = STORED_SIZE_MARKER.find(out)?.groupValues?.get(1)?.toIntOrNull()
+            if (origSize != null && out.length >= origSize) {
+                null
+            } else {
+                "完整输出（${out.length / 1024} KB）已压缩存储在 App 私有目录 files/outputs/，" +
+                    "可让模型用 output_query${if (storedRef != null) "（ref=$storedRef）" else ""}分段查看，" +
+                    "或点下方「复制完整输出」"
+            }
         }
     }
 

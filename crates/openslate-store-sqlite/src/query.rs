@@ -114,10 +114,10 @@ pub struct TranscriptEntryRecord {
     pub created_at: i64,
 }
 
-/// A tool output record (v6; v7 加 `ref`). 元数据行——压缩字节在
-/// `files/outputs/{sha256}.zst`（content-addressed，跨 run 共享）；
-/// `orig_bytes` / `line_count` 是**压缩前**的原文计量（详情弹窗全文
-/// 闭环按 `orig_bytes` 校验解压完整性）。
+/// A tool output record (v6; v7 加 `ref`；v8 加 `frame_index`). 元数据行
+/// ——压缩字节在 `files/outputs/{sha256}.zst`（content-addressed，跨 run
+/// 共享）；`orig_bytes` / `line_count` 是**压缩前**的原文计量（详情弹窗
+/// 全文闭环按 `orig_bytes` 校验解压完整性）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutputRecord {
     /// `out-<uuid simple>`（行 id，行级唯一；与 ref 载体不同）。
@@ -133,6 +133,9 @@ pub struct ToolOutputRecord {
     pub orig_bytes: i64,
     /// 原文行数（`str::lines()` 语义）。
     pub line_count: i64,
+    /// 行级帧索引 BLOB（v8；空 = legacy 单帧 zstd 文件。布局见
+    /// `schema.rs::DDL_TOOL_OUTPUTS` kdoc，编解码在 openslate-mobile）。
+    pub frame_index: Vec<u8>,
     pub created_at: i64,
 }
 
@@ -345,6 +348,7 @@ type ToolOutputRow = (
     String, // tool_name
     i64,    // orig_bytes
     i64,    // line_count
+    Vec<u8>, // frame_index
     i64,    // created_at
 );
 
@@ -453,7 +457,8 @@ fn row_to_tool_output(row: ToolOutputRow) -> ToolOutputRecord {
         tool_name: row.4,
         orig_bytes: row.5,
         line_count: row.6,
-        created_at: row.7,
+        frame_index: row.7,
+        created_at: row.8,
     }
 }
 
@@ -973,7 +978,7 @@ impl SqliteStore {
         Self::validate_tool_output_ref(ref_id)?;
         let pool = self.pool();
         let row: Option<ToolOutputRow> = query_as(
-            "SELECT id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at \
+            "SELECT id, run_id, ref, sha256, tool_name, orig_bytes, line_count, frame_index, created_at \
              FROM tool_outputs \
              WHERE run_id = ? AND ref = ?",
         )
@@ -1000,7 +1005,7 @@ impl SqliteStore {
         }
         let pool = self.pool();
         let row: Option<ToolOutputRow> = query_as(
-            "SELECT id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at \
+            "SELECT id, run_id, ref, sha256, tool_name, orig_bytes, line_count, frame_index, created_at \
              FROM tool_outputs \
              WHERE run_id = ? AND sha256 = ?",
         )
@@ -1059,6 +1064,36 @@ impl SqliteStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StoreError::QueryError(format!(
                 "read tool output file for sha256 '{sha256}' failed: {e}"
+            ))),
+        }
+    }
+
+    /// 长输出压缩文件的**路径**（`files/outputs/{sha256}.zst`）。
+    ///
+    /// v8 seekable 分块层的随机读入口：调用方（mobile `output_range`）
+    /// 需要 `File` 句柄做文件级 seek 解压，不能走整篇读内存的
+    /// [`Self::read_tool_output_bytes`]。`sha256` 校验同上（全 64 hex）；
+    /// 文件缺失返回 `Ok(None)`；内存库无 files_dir → `Ok(None)`。
+    pub async fn tool_output_file_path(
+        &self,
+        sha256: &str,
+    ) -> Result<Option<std::path::PathBuf>, StoreError> {
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StoreError::QueryError(format!(
+                "invalid tool output sha256 (expected 64 hex chars): '{sha256}'"
+            )));
+        }
+        let Some(path) = self
+            .files_dir()
+            .map(|d| d.join("outputs").join(format!("{sha256}.zst")))
+        else {
+            return Ok(None);
+        };
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(Some(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::QueryError(format!(
+                "stat tool output file for sha256 '{sha256}' failed: {e}"
             ))),
         }
     }
@@ -2060,11 +2095,37 @@ mod tests {
 
         let sha: String = "ab".repeat(32);
         let data = zst("long output body");
+        let frame_index: Vec<u8> = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let effective = store
-            .insert_tool_output("out-1", "run-1", "out-1", &sha, "bash", 16, 1, &data, 2000)
+            .insert_tool_output(
+                "out-1",
+                "run-1",
+                "out-1",
+                &sha,
+                "bash",
+                16,
+                1,
+                &frame_index,
+                &data,
+                2000,
+            )
             .await
             .expect("insert");
         assert_eq!(effective, "out-1", "新行返回传入的 ref");
+
+        // frame_index 随行往返（find_tool_output / find_tool_output_by_sha）
+        let rec = store
+            .find_tool_output("run-1", "out-1")
+            .await
+            .expect("find")
+            .expect("row");
+        assert_eq!(rec.frame_index, frame_index, "frame_index 经 ref 查询往返");
+        let rec = store
+            .find_tool_output_by_sha("run-1", &sha)
+            .await
+            .expect("find by sha")
+            .expect("row");
+        assert_eq!(rec.frame_index, frame_index, "frame_index 经 sha 查询往返");
 
         let bytes = store
             .read_tool_output_bytes(&sha)
@@ -2072,6 +2133,14 @@ mod tests {
             .expect("read")
             .expect("file exists");
         assert_eq!(bytes, data, "压缩字节零损往返");
+
+        // 文件路径 API：存在 → Some；删除后 → None
+        let p = store
+            .tool_output_file_path(&sha)
+            .await
+            .expect("path")
+            .expect("exists");
+        assert!(p.ends_with(format!("{sha}.zst")), "got: {}", p.display());
 
         // 文件缺失（行在、文件被手动清）→ Ok(None)
         std::fs::remove_file(
@@ -2090,9 +2159,19 @@ mod tests {
                 .is_none(),
             "文件缺失返回 None（调用方回落）"
         );
+        assert!(
+            store
+                .tool_output_file_path(&sha)
+                .await
+                .expect("path")
+                .is_none(),
+            "路径 API 同语义：缺失返回 None"
+        );
 
         // 非法 sha 形状 → Err（防路径拼接）
         assert!(store.read_tool_output_bytes("../etc/passwd").await.is_err());
         assert!(store.read_tool_output_bytes("ab").await.is_err());
+        assert!(store.tool_output_file_path("../etc/passwd").await.is_err());
+        assert!(store.tool_output_file_path("ab").await.is_err());
     }
 }

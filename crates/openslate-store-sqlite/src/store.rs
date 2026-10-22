@@ -194,6 +194,7 @@ impl SqliteStore {
                 4 => schema::migrate_v4_to_v5(&mut tx).await?,
                 5 => schema::migrate_v5_to_v6(&mut tx).await?,
                 6 => schema::migrate_v6_to_v7(&mut tx).await?,
+                7 => schema::migrate_v7_to_v8(&mut tx).await?,
                 v => {
                     return Err(StoreError::MigrationError(format!(
                         "未知的 schema 版本步进起点: v{v}"
@@ -1274,10 +1275,10 @@ mod tests {
         store.run_migrations().await.expect("idempotent rerun");
     }
 
-    /// v5 → v6 → v7 步进：建 `tool_outputs` 表 + 索引；步进重跑幂等
+    /// v5 → v6 → v7 → v8 步进：建 `tool_outputs` 表 + 索引；步进重跑幂等
     ///（把 user_version 手工拨回 5 模拟「步进事务提交前崩溃重放」）。
     #[tokio::test]
-    async fn test_v5_db_migrates_to_v7_and_step_rerun_idempotent() {
+    async fn test_v5_db_migrates_to_v8_and_step_rerun_idempotent() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("v5_to_v6.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
@@ -1298,9 +1299,9 @@ mod tests {
         }
 
         let store = SqliteStore::new(path_str).await.expect("reopen");
-        store.run_migrations().await.expect("v5 → v7 (rerun steps)");
+        store.run_migrations().await.expect("v5 → v8 (rerun steps)");
 
-        assert_eq!(store.user_version().await.expect("version"), 7);
+        assert_eq!(store.user_version().await.expect("version"), 8);
 
         // 表就位且数据完好
         let tables: Vec<String> = query_scalar(
@@ -1343,11 +1344,11 @@ mod tests {
         store.run_migrations().await.expect("idempotent rerun");
     }
 
-    /// v6 → v7 步进（破坏性，开发期拍板）：`tool_outputs` 整表重建为带
-    /// `ref` 列形态——存量行随 DROP 消失（缓存可弃，降级路径兜底），新
-    /// 列无缺省值、唯一索引就位；步进重跑幂等。
+    /// v6 → v8 连续步进（破坏性，开发期拍板）：`tool_outputs` 整表重建为
+    /// 最终形态（v7 加 `ref` 列、v8 加 `frame_index` 列）——存量行随
+    /// DROP 消失（缓存可弃，降级路径兜底），步进重跑幂等。
     #[tokio::test]
-    async fn test_v6_db_migrates_to_v7_rebuilds_tool_outputs() {
+    async fn test_v6_db_migrates_to_v8_rebuilds_tool_outputs() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("v6_to_v7.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
@@ -1391,9 +1392,9 @@ mod tests {
         }
 
         let store = SqliteStore::new(path_str).await.expect("reopen");
-        store.run_migrations().await.expect("v6 → v7");
+        store.run_migrations().await.expect("v6 → v8");
 
-        assert_eq!(store.user_version().await.expect("version"), 7);
+        assert_eq!(store.user_version().await.expect("version"), 8);
 
         // 存量行已随 DROP 消失（破坏性拍板，不回填）
         let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
@@ -1430,6 +1431,96 @@ mod tests {
         assert!(dup.is_err(), "idx_tool_outputs_run_ref 应拒绝同 run 同 ref");
 
         // 幂等重跑（表已空，重放 DROP/CREATE 空转）
+        store.run_migrations().await.expect("idempotent rerun");
+    }
+
+    /// v7 → v8 步进（破坏性，开发期拍板）：`tool_outputs` 重建为带
+    /// `frame_index BLOB NOT NULL DEFAULT x''` 列形态——v7 存量行随 DROP
+    /// 消失（单帧 zstd 无帧索引可回填）；裸 INSERT 可省略 frame_index
+    /// （落缺省空 BLOB = legacy 单帧文件）；步进重跑幂等。
+    #[tokio::test]
+    async fn test_v7_db_migrates_to_v8_adds_frame_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("v7_to_v8.sqlite");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        {
+            let store = SqliteStore::new(path_str).await.expect("store");
+            store.run_migrations().await.expect("migrate to latest first");
+            store
+                .insert_run("v7-run", None, "root", "completed", "{}", 1000)
+                .await
+                .expect("seed run");
+            // 手工造真 v7 形态表（无 frame_index 列）+ 塞一行，拨回版本 7
+            query("DROP TABLE tool_outputs")
+                .execute(store.pool())
+                .await
+                .expect("drop v8 shape");
+            query(
+                "CREATE TABLE tool_outputs (\
+                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, ref TEXT NOT NULL, \
+                    sha256 TEXT NOT NULL, tool_name TEXT NOT NULL, \
+                    orig_bytes INTEGER NOT NULL, line_count INTEGER NOT NULL, \
+                    created_at INTEGER NOT NULL, \
+                    UNIQUE(run_id, sha256), FOREIGN KEY(run_id) REFERENCES runs(id)\
+                 )",
+            )
+            .execute(store.pool())
+            .await
+            .expect("create v7 shape");
+            query(
+                "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+                 VALUES ('to-1', 'v7-run', 'out-1', 'aa', 'bash', 1, 1, 1)",
+            )
+            .execute(store.pool())
+            .await
+            .expect("seed v7 row");
+            query("PRAGMA user_version = 7")
+                .execute(store.pool())
+                .await
+                .expect("stamp v7");
+        }
+
+        let store = SqliteStore::new(path_str).await.expect("reopen");
+        store.run_migrations().await.expect("v7 → v8");
+
+        assert_eq!(store.user_version().await.expect("version"), 8);
+
+        // 存量行已随 DROP 消失（破坏性拍板，无帧索引可回填）
+        let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0, "v7 存量行随重建丢弃（缓存可弃）");
+
+        // run 本体不受影响
+        let run = store.get_run("v7-run").await.expect("get").expect("kept");
+        assert_eq!(run.status, "completed");
+
+        // frame_index 列就位：裸 INSERT 省略该列 → 缺省空 BLOB（legacy 判定）
+        query(
+            "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('to-2', 'v7-run', 'out-1', 'bb', 'bash', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("bare insert without frame_index");
+        let fi: Option<Vec<u8>> =
+            query_scalar("SELECT frame_index FROM tool_outputs WHERE id = 'to-2'")
+                .fetch_one(store.pool())
+                .await
+                .expect("frame_index");
+        assert_eq!(fi.as_deref(), Some(&[][..]), "缺省空 BLOB");
+        // BLOB NOT NULL：显式 NULL 被拒
+        let null_fi = query(
+            "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, frame_index, created_at) \
+             VALUES ('to-3', 'v7-run', 'out-2', 'cc', 'bash', 1, 1, NULL, 1)",
+        )
+        .execute(store.pool())
+        .await;
+        assert!(null_fi.is_err(), "frame_index NOT NULL：NULL 必须被拒");
+
+        // 幂等重跑
         store.run_migrations().await.expect("idempotent rerun");
     }
 

@@ -3,7 +3,8 @@
 //! 全部 12 张表：`runs`、`execution_nodes`、`steps`、`messages`、
 //! `prompt_snapshots`、`audit_log`、`trace_events`、`pending_questions`
 //! （v3）、`credentials`（v4）、`attachments`（v5）、`transcript_entries`
-//! （v5）、`tool_outputs`（v6；v7 加 `ref` 列 + 唯一索引）。
+//! （v5）、`tool_outputs`（v6；v7 加 `ref` 列 + 唯一索引；v8 加
+//! `frame_index` BLOB 列）。
 //!
 //! 迁移机制（见 [`crate::store::SqliteStore::run_migrations`]）：
 //! - 以 `PRAGMA user_version` 记录当前 schema 版本，目标版本为
@@ -52,13 +53,18 @@ use sqlx::{query, query_scalar, SqliteConnection};
 ///   整表重建，存量行随 DROP 消失——长输出缓存本就可弃，旧消息里的
 ///   16hex 标记查无行即走既有降级路径（弹窗回落预览原文 / output_query
 ///   报未知 ref），孤儿文件由启动 GC 清扫；不做回填兼容迁移。
-pub const SCHEMA_VERSION: i64 = 7;
+/// - `8`：`tool_outputs` 重建为带 `frame_index BLOB NOT NULL DEFAULT x''`
+///   列的形态（seekable 分块压缩层）：行级帧索引 BLOB，布局见
+///   [`DDL_TOOL_OUTPUTS`] 的 kdoc。**破坏性**（开发期拍板 2026-10-22）：
+///   照 v7 先例 DROP 整表重建——v7 存量行是普通单帧 zstd 文件（无帧
+///   索引可回填），随 DROP 消失后由写入路径按 seekable 格式重落盘。
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// 基线建表 DDL（v0 → v1 执行；全新库直接建成最终形态）。
 ///
 /// 顺序有意义：被外键引用的表必须先建。v5 的 `attachments` /
 /// `transcript_entries` 与 v6 的 `tool_outputs` 只引用 `runs`，追加在
-/// 基线集合尾部；全新库随后仍会逐版本步进到 v7（步进 DDL 全部
+/// 基线集合尾部；全新库随后仍会逐版本步进到 v8（步进 DDL 全部
 /// `IF NOT EXISTS`，幂等）。
 pub fn ddl_statements() -> Vec<&'static str> {
     vec![
@@ -305,7 +311,8 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
 );
 "#;
 
-/// 工具长输出落盘引用行（v6；长输出落盘 + output_query 设计 C1）。
+/// 工具长输出落盘引用行（v6；长输出落盘 + output_query 设计 C1；v7 加
+/// `ref`；v8 加 `frame_index`）。
 ///
 /// 生命周期与布局对齐 `attachments` 的 content-addressed 模式，但有两点
 /// 刻意差异：**无 bind/引用计数**（行随工具执行直接带 run_id，不存在
@@ -322,7 +329,23 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
 ///   的**会话内唯一**短 id（`out-N`，由宿主 storer 按 run 内自增序号
 ///   分配）。`idx_tool_outputs_run_ref` 唯一索引兜底 run 内唯一性；查询
 ///   侧 `find_tool_output` 按 `(run_id, ref)` 精确匹配——**严格会话
-///   隔离**，一个 run 的 ref 不能被其他 run 解析。
+///   隔离**，一个 run 的 ref 不能被其他 run 解析；
+/// - `frame_index`（v8）：seekable 分块压缩的**行级帧索引** BLOB（空
+///   BLOB = 行指向普通单帧 zstd 文件，读取端按 legacy 整篇解压）。
+///   store 不解析内容，仅持久化透传；**布局（全小端）**：
+///
+///   ```text
+///   offset  size  字段
+///   0       1     版本号（当前 = 1）
+///   1       4     条目数 N（u32 LE）
+///   5       12×N  N 个条目，每条：
+///                 u32 LE 首行号（1-based；该帧首字节所在行）
+///                 u64 LE 帧起始「解压后」字节偏移
+///   ```
+///
+///   不变量：条目 0 恒为 `(1, 0)`；首行号非降、偏移严格递增；末条偏移
+///   `< orig_bytes`（空内容例外：N = 0）。编码/解码在 openslate-mobile
+///   的 `output_storer` / `output_range` 模块。
 const DDL_TOOL_OUTPUTS: &str = r#"
 CREATE TABLE IF NOT EXISTS tool_outputs (
     id TEXT PRIMARY KEY,
@@ -332,6 +355,7 @@ CREATE TABLE IF NOT EXISTS tool_outputs (
     tool_name TEXT NOT NULL,
     orig_bytes INTEGER NOT NULL,
     line_count INTEGER NOT NULL,
+    frame_index BLOB NOT NULL DEFAULT x'',
     created_at INTEGER NOT NULL,
     UNIQUE(run_id, sha256),
     FOREIGN KEY(run_id) REFERENCES runs(id)
@@ -712,6 +736,44 @@ pub(crate) async fn migrate_v5_to_v6(conn: &mut SqliteConnection) -> Result<(), 
 /// 幂等：DROP/CREATE/INDEX 全部 `IF [NOT] EXISTS`，全新库（基线已是
 /// 最终形态）重放为空转。
 pub(crate) async fn migrate_v6_to_v7(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
+
+    query("DROP TABLE IF EXISTS tool_outputs")
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(DDL_TOOL_OUTPUTS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_TOOL_OUTPUTS_SHA256)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_TOOL_OUTPUTS_RUN_REF)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    Ok(())
+}
+
+/// v7 → v8：`tool_outputs` **破坏性重建**为带 `frame_index` BLOB 列的
+/// 形态（seekable 分块压缩层；开发期拍板 2026-10-22：允许破坏性更新，
+/// 存量迁移代码能免则免）。
+///
+/// 1. `DROP TABLE IF EXISTS tool_outputs`——无表 FK 引用它，重建无级联
+///    风险（v6→v7 同款形态）；存量行随 DROP 消失——v7 行指向普通单帧
+///    zstd 文件，无帧索引可回填（回填 = 整篇重压缩，开发期不值当），
+///    消失后走既有降级路径（旧 ref 查无行 → 弹窗回落预览 / output_query
+///    报未知 ref；孤儿文件由启动 GC `gc_orphan_output_files` 清扫）；
+/// 2. 以最终 DDL 重建（`frame_index BLOB NOT NULL DEFAULT x''`——裸
+///    INSERT 可省略该列，读取端把空 BLOB 判为 legacy 单帧文件；写入路径
+///    [`crate::write::SqliteStore::insert_tool_output`] 恒显式给值）；
+/// 3. 建全部索引（sha256 寻址 + run/ref 唯一）。
+///
+/// 幂等：DROP/CREATE/INDEX 全部 `IF [NOT] EXISTS`，全新库（基线已是
+/// 最终形态）重放为空转。
+pub(crate) async fn migrate_v7_to_v8(conn: &mut SqliteConnection) -> Result<(), StoreError> {
     let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
 
     query("DROP TABLE IF EXISTS tool_outputs")

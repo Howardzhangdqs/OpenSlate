@@ -723,7 +723,12 @@ impl SqliteStore {
     ///   自增序号分配；查询侧收 `out-` + 1..16 位数字形态，不做旧
     ///   16hex 兼容）；
     /// - `data_zst`：**调用方传入的已压缩字节**（sha256 是原文的 sha，
-    ///   store 信任不复算、不感知压缩参数）；
+    ///     store 信任不复算、不感知压缩参数；v8 起调用方应传 seekable
+    ///   分块格式，`frame_index` 与之配套——空 `frame_index` = legacy
+    ///   单帧文件，读取端按整篇解压兜底）；
+    /// - `frame_index`（v8）：行级帧索引 BLOB（布局见 `schema.rs`
+    ///   `DDL_TOOL_OUTPUTS` kdoc；store 不解析，透传入库。同 sha ⇒ 同
+    ///   内容 ⇒ 同索引，幂等冲突分支无需刷新）；
     /// - 同 run 同 sha 幂等：`ON CONFLICT(run_id, sha256) DO UPDATE` 仅
     ///   刷新 `created_at`（同 sha ⇒ 同内容，其余计量字段必然一致），
     ///   并**返回既有行的 ref**（`RETURNING`）——调用方拿真实 ref 构造
@@ -743,6 +748,7 @@ impl SqliteStore {
         tool_name: &str,
         orig_bytes: i64,
         line_count: i64,
+        frame_index: &[u8],
         data_zst: &[u8],
         created_at: i64,
     ) -> Result<String, StoreError> {
@@ -758,8 +764,8 @@ impl SqliteStore {
         // ref 命中（防御）→ DO NOTHING，RETURNING 空 → 报错。
         let effective_ref: Option<String> = query_scalar(
             "INSERT INTO tool_outputs \
-             (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, frame_index, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(run_id, sha256) DO UPDATE SET created_at = excluded.created_at \
              ON CONFLICT(run_id, ref) DO NOTHING \
              RETURNING ref",
@@ -771,6 +777,7 @@ impl SqliteStore {
         .bind(tool_name)
         .bind(orig_bytes)
         .bind(line_count)
+        .bind(frame_index)
         .bind(created_at)
         .fetch_optional(self.pool())
         .await
@@ -2151,18 +2158,27 @@ mod tests {
             .expect("run");
 
         let sha = sha64('a');
+        let frame_index: &[u8] = &[1, 2, 3, 4, 5];
         let first = store
-            .insert_tool_output("out-1", "run-1", "out-1", &sha, "bash", 100, 5, &[1, 2, 3], 2000)
+            .insert_tool_output("out-1", "run-1", "out-1", &sha, "bash", 100, 5, frame_index, &[9, 9], 2000)
             .await
             .expect("first insert");
         assert_eq!(first, "out-1", "新行返回调用方传入的 ref");
         // 同 run 同 sha：幂等——不报错、不新增行、仅刷新 created_at，
         // 且返回既有行的 ref（调用方拿真实 ref 构造回执）。
         let second = store
-            .insert_tool_output("out-2", "run-1", "out-2", &sha, "bash", 100, 5, &[1, 2, 3], 3000)
+            .insert_tool_output("out-2", "run-1", "out-2", &sha, "bash", 100, 5, &[7, 7], &[9, 9], 3000)
             .await
             .expect("upsert insert");
         assert_eq!(second, "out-1", "sha 命中 → 既有行的 ref 胜出");
+
+        // frame_index 首写持久化（幂等分支不覆盖：首写的帧索引保留）
+        let stored: Vec<u8> =
+            query_scalar::<_, Vec<u8>>("SELECT frame_index FROM tool_outputs WHERE run_id = 'run-1'")
+                .fetch_one(store.pool())
+                .await
+                .expect("frame_index");
+        assert_eq!(stored, frame_index, "frame_index 列持久化往返");
 
         let (count, created_at): (i64, i64) =
             sqlx::query_as::<_, (i64, i64)>("SELECT COUNT(*), MAX(created_at) FROM tool_outputs")
@@ -2186,11 +2202,11 @@ mod tests {
             .expect("run");
 
         store
-            .insert_tool_output("out-1", "run-1", "out-1", &sha64('a'), "bash", 10, 1, &[1], 1000)
+            .insert_tool_output("out-1", "run-1", "out-1", &sha64('a'), "bash", 10, 1, &[], &[1], 1000)
             .await
             .expect("first");
         let err = store
-            .insert_tool_output("out-2", "run-1", "out-1", &sha64('b'), "bash", 10, 1, &[2], 2000)
+            .insert_tool_output("out-2", "run-1", "out-1", &sha64('b'), "bash", 10, 1, &[], &[2], 2000)
             .await
             .expect_err("ref 撞不同 sha 必须报错");
         assert!(
@@ -2222,12 +2238,12 @@ mod tests {
 
         let sha = sha64('b');
         store
-            .insert_tool_output("out-a", "run-a", "out-1", &sha, "bash", 10, 2, &[9, 9], 1500)
+            .insert_tool_output("out-a", "run-a", "out-1", &sha, "bash", 10, 2, &[9, 9], &[0; 4], 1500)
             .await
             .expect("run a output");
         // ref 序号按 run 独立：run-b 的第一条也从 out-1 起
         store
-            .insert_tool_output("out-b", "run-b", "out-1", &sha, "bash", 10, 2, &[9, 9], 2500)
+            .insert_tool_output("out-b", "run-b", "out-1", &sha, "bash", 10, 2, &[9, 9], &[0; 4], 2500)
             .await
             .expect("run b output");
 
@@ -2261,11 +2277,11 @@ mod tests {
 
         let sha = sha64('c');
         store
-            .insert_tool_output("out-a", "run-a", "out-1", &sha, "bash", 16, 1, &[7; 8], 1500)
+            .insert_tool_output("out-a", "run-a", "out-1", &sha, "bash", 16, 1, &[], &[7; 8], 1500)
             .await
             .expect("out a");
         store
-            .insert_tool_output("out-b", "run-b", "out-1", &sha, "bash", 16, 1, &[7; 8], 2500)
+            .insert_tool_output("out-b", "run-b", "out-1", &sha, "bash", 16, 1, &[], &[7; 8], 2500)
             .await
             .expect("out b");
         let file = store
@@ -2318,6 +2334,7 @@ mod tests {
                 "bash",
                 4,
                 1,
+                &[],
                 &[1, 2, 3, 4],
                 2000,
             )
@@ -2346,7 +2363,7 @@ mod tests {
             .await
             .expect("run");
         let err = store
-            .insert_tool_output("out-x", "run-1", "out-1", &sha64('f'), "bash", 1, 1, &[1], 1)
+            .insert_tool_output("out-x", "run-1", "out-1", &sha64('f'), "bash", 1, 1, &[], &[1], 1)
             .await
             .expect_err("内存库必须明确拒绝");
         assert!(

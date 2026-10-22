@@ -554,6 +554,7 @@ async fn turn_error_restores_pending_input_and_surfaces_error() {
     // The server's failure lands as TurnDone(Err) through the link.
     link.emit(ServerMsg::TurnError {
         message: "boom".into(),
+        kind: None,
     });
     app.drain_engine_events().await;
     assert!(!app.is_running());
@@ -1230,6 +1231,7 @@ async fn turn_done_err_keeps_committed_live_entries() {
     // The server's failure lands through the link.
     link.emit(ServerMsg::TurnError {
         message: "boom".into(),
+        kind: None,
     });
     app.drain_engine_events().await;
     assert!(!app.is_running());

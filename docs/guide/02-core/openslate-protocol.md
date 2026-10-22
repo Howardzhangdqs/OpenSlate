@@ -86,7 +86,7 @@ pub struct AttachmentDto {
 | `ApprovalRequested` | `id: u64`, `summary: ApprovalSummaryDto` | v3：summary 携带 `server?`（MCP 作用域）/`trigger?`（"manual"/"auto_risk"）/`note?`（AI 审查理由，manual 触发无）；UI 的 (c)/(d) MCP 级选项据 server 显示 |
 | `ApprovalResolved` | `id`, `choice: String` | 首答后广播，所有客户端清横幅。choice 值域 = approve/deny/approve_all + v3 新增连字符拼写 "always-tool"/"session-mcp"/"always-mcp"（由 session 层 `choice_str` 产生） |
 | `TurnOk` | `summary: Box<TurnSummaryDto>` | 回合终态 |
-| `TurnError` | `message` | |
+| `TurnError` | `message`, `kind?: TurnErrorKind` | 回合终态失败。`kind` 机器可读分类（`network`/`rate_limit`/`auth`/`model`/`other`，snake_case wire 形态；引擎的回合级断连重试按 `network` 识别可重试失败；Kotlin 侧暂不消费，serde 忽略未知字段）；`serde(default)` + None 跳键：旧 payload 双向容忍 |
 | `ConfigChanged` | `config: Box<ConfigViewDto>` | 配置 CRUD 成功后广播新视图 |
 | `ModelChanged` | `alias` | |
 | `RunTitle` | `run_id: String`, `title` | 异步 LLM 标题替换占位；历史列表按 run_id 原位更新 |

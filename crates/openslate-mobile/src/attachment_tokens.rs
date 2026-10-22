@@ -305,6 +305,7 @@ mod tests {
         });
         bf.on_event(&ServerMsg::TurnError {
             message: "tool failed".into(),
+            kind: None,
         });
         assert_eq!(bf.drain_completed(), vec![("att-1".to_string(), 321)]);
     }

@@ -819,6 +819,27 @@ pub enum NoticeLevel {
     Error,
 }
 
+/// 回合失败的机器可读分类（[`ServerMsg::TurnError`] 的 `kind` 字段）。
+/// session 引擎按它判定「回合级断连自动重试」（仅 `network`，预算 1 次
+/// + 会话级 10s 冷却窗）；客户端可按类别差异化展示（Kotlin 侧暂不
+/// 消费，serde 忽略未知字段）。snake_case 变体名即 wire 形态
+/// （`"network"` / `"rate_limit"` / `"auth"` / `"model"` / `"other"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnErrorKind {
+    /// 网络中断 / 连接失败（reqwest decode 错、`ConnectionError`、
+    /// 内层为连接错误的 `RetryExhausted`）。唯一可自动重试的类别。
+    Network,
+    /// 限流（429 / rate limit）。
+    RateLimit,
+    /// 认证 / 授权失败（401/403、key 无效）。
+    Auth,
+    /// 模型侧失败（响应畸形、模型不存在、空响应）。
+    Model,
+    /// 其余（超时、运行时限制、存储等）。
+    Other,
+}
+
 // ---------------------------------------------------------------------------
 // server 自描述文件（auto-attach-1：`<config 目录>/server.json`）
 // ---------------------------------------------------------------------------
@@ -1049,6 +1070,10 @@ pub enum ServerMsg {
     },
     TurnError {
         message: String,
+        /// 机器可读错误分类（[`TurnErrorKind`]）；`serde(default)` +
+        /// None 跳键：旧端 payload 双向容忍（未分类 = 无键）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<TurnErrorKind>,
     },
     /// 配置 CRUD 成功后广播新视图（`Box` 同上，仅压尺寸）。
     ConfigChanged {

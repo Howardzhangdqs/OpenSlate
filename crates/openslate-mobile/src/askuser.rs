@@ -1520,6 +1520,7 @@ async fn resume_turn(
             crate::alog!("ask_user resume turn error: {e}");
             state.sink.broadcast(ServerMsg::TurnError {
                 message: e.to_string(),
+                kind: None,
             });
         }
     }

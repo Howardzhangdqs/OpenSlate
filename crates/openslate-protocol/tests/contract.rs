@@ -856,8 +856,46 @@ fn server_turn_events() {
     assert_wire_server(
         ServerMsg::TurnError {
             message: "provider 失败".into(),
+            kind: None,
         },
         r#"{"type":"turn_error","message":"provider 失败"}"#,
+    );
+    // kind 字段（回合级断连重试）：snake_case wire 形态；旧 payload 无
+    // kind 键反序列化为 None（上方样例即覆盖）。
+    assert_wire_server(
+        ServerMsg::TurnError {
+            message: "provider error: connection error: connection reset".into(),
+            kind: Some(TurnErrorKind::Network),
+        },
+        r#"{"type":"turn_error","message":"provider error: connection error: connection reset","kind":"network"}"#,
+    );
+    assert_wire_server(
+        ServerMsg::TurnError {
+            message: "rate limit exceeded".into(),
+            kind: Some(TurnErrorKind::RateLimit),
+        },
+        r#"{"type":"turn_error","message":"rate limit exceeded","kind":"rate_limit"}"#,
+    );
+    assert_wire_server(
+        ServerMsg::TurnError {
+            message: "authentication error: bad key".into(),
+            kind: Some(TurnErrorKind::Auth),
+        },
+        r#"{"type":"turn_error","message":"authentication error: bad key","kind":"auth"}"#,
+    );
+    assert_wire_server(
+        ServerMsg::TurnError {
+            message: "malformed response".into(),
+            kind: Some(TurnErrorKind::Model),
+        },
+        r#"{"type":"turn_error","message":"malformed response","kind":"model"}"#,
+    );
+    assert_wire_server(
+        ServerMsg::TurnError {
+            message: "max steps exceeded: 100".into(),
+            kind: Some(TurnErrorKind::Other),
+        },
+        r#"{"type":"turn_error","message":"max steps exceeded: 100","kind":"other"}"#,
     );
 }
 

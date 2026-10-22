@@ -250,6 +250,7 @@ async fn engine_turn(
             crate::session_event!("turn error: {e}");
             state.sink.broadcast(ServerMsg::TurnError {
                 message: e.to_string(),
+                kind: None,
             });
         }
     }

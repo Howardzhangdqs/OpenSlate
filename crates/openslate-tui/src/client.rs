@@ -99,7 +99,7 @@ pub fn to_tui(msg: ServerMsg) -> Vec<TuiEvent> {
         ServerMsg::TurnOk { summary } => {
             return vec![TuiEvent::TurnDone(Ok(TurnSummary::from(*summary)))];
         }
-        ServerMsg::TurnError { message } => return vec![TuiEvent::TurnDone(Err(message))],
+        ServerMsg::TurnError { message, .. } => return vec![TuiEvent::TurnDone(Err(message))],
         ServerMsg::ConfigChanged { config } => TuiEvent::ConfigChanged(config),
         ServerMsg::ModelChanged { alias } => TuiEvent::ModelChanged(alias),
         // run 标题属历史列表投影（mobile / REST 消费）；TUI 无历史列
@@ -758,6 +758,7 @@ mod tests {
     fn turn_error_maps_to_turn_done_err() {
         let events = to_tui(ServerMsg::TurnError {
             message: "boom".into(),
+            kind: None,
         });
         assert_eq!(events, vec![TuiEvent::TurnDone(Err("boom".into()))]);
     }

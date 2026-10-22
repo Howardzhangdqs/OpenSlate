@@ -495,6 +495,7 @@ async fn handle_submit(
         drop(inner);
         state.sink.broadcast(ServerMsg::TurnError {
             message: "manager unavailable".into(),
+            kind: None,
         });
         return;
     };

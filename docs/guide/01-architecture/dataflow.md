@@ -58,7 +58,7 @@ RunManager::execute_with_run_id → AgentRunner::run_root → runtime::execute_r
   │    ├─ ApprovalManager.check（每个调用都过，无绕过路径；server
   │    │    作用域经 mcp::server_slug_of 反解注入）
   │    │    待批（Manual 等级直问 / Auto 等级启发式风险 ≥Medium）→
-  │    │    回调链：mobile = AskUserExemptApproval(AiReviewApproval(
+  │    │    回调链：mobile = SideEffectFreeApproval(AiReviewApproval(
   │    │    SessionApprovalBridge))，AI 审查环节见 §4.1
   │    │    决策审计 → tracing target=openslate_approval
   │    ├─ call_agent → AgentRunner 递归（CallerFrame 压栈；
@@ -137,7 +137,7 @@ resume 路径: list_messages_by_run 按 seq 读回 → 解码为 core::Message
 
 ### 4.1 审批链时序（AI 审查 + SessionApprovalBridge）
 
-**mobile 审批回调链（外→内）**：`AskUserExemptApproval(AiReviewApproval(SessionApprovalBridge))`（mobile runtime.rs 装配；ask_user 豁免保持最外层）。`AiReviewApproval::decide()`（mobile approval_review.rs）按序：
+**mobile 审批回调链（外→内）**：`SideEffectFreeApproval(AiReviewApproval(SessionApprovalBridge))`（mobile runtime.rs 装配；无副作用工具 ask_user / output_query 豁免保持最外层）。`AiReviewApproval::decide()`（mobile approval_review.rs）按序：
 
 1. **Manual 直通**（P0-2）：`trigger == Manual` 的请求直接进内层 bridge 弹人，**绝不进 AI 审查**（否则「全部手动」被审查器过滤，违背语义）；
 2. **会话作用域快路径**（P0-3）：`bridge.session_allows(req)` 命中（`allowed_tools ∪ allowed_servers`，见下）→ Approved——(a)/(c) 批准过的后续调用不再付一次 LLM 审查费；

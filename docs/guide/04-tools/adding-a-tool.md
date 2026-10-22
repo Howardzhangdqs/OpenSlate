@@ -151,3 +151,46 @@ if cfg.enabled && cfg.net {
 - [ ] 开关矩阵测试 + 沙箱反例测试；
 - [ ] `mcp-builtin.md` 清单表更新；
 - [ ] 高危工具挂进审批默认门（如需）。
+
+## 8. 特例：mobile 侧内置工具（不经 mcp-builtin）——以 `output_query` 为例
+
+宿主直连 `Tool`（`extra_tools` 注入，`AskUserTool` / `HostTool` 同款形态）与 §1-§5 的
+mcp-builtin 路线是两条不同的注册通路：没有 `[builtin_tools]` 开关、没有 server 概念、
+审批按 mobile 装配链（`SideEffectFreeApproval` / AI 审查）走。现有三个先例：
+`ask_user`（askuser.rs）、`mobile.ping`（hostcall.rs）、`output_query`（output_query.rs，
+查落盘输出，2026-10 C4）。以 `output_query` 为参照的改动点：
+
+- **本体**：`crates/openslate-mobile/src/` 新模块实现 `Tool`（name/description/
+  parameters_schema/execute）；`lib.rs` 模块表注册。
+- **注册**：`runtime.rs::create_with` 的 `extra_tools.push(...)`（AskUserTool 旁）；需要
+  store / AppState 等装配后才存在的句柄就走 `SharedStore`（OnceLock 后注）/
+  `Arc<OnceLock<Weak<AppState>>>`（`state_handle()` 交出、装配尾段 set）接缝——装配前
+  调用返回明确错误文案，不是 panic。
+- **白名单**：mobile 的 root.md 默认是**显式工具白名单**（tools 为空 = 暴露全部，mobile
+  语义不可接受）——新工具要进 `bootstrap.rs` 的 `DEFAULT_ROOT_AGENT_MD`，并把旧默认全文
+  追加进 `LEGACY_ROOT_AGENT_MDS`（存量未定制 root.md 自动迁移）。**已定制 root.md 的用户
+  需手动加一行 `- your_tool`；不在白名单 ≠ 报错，只是模型看不到**。
+- **审批**：无副作用工具加入 `askuser.rs` 的 `APPROVAL_EXEMPT_TOOLS` /
+  `SideEffectFreeApproval`（免审，Manual 模式同样豁免）；有副作用的让它走默认链
+  （Auto 缺省 → 启发式 → AI 审查）。
+
+### 8.1 `output_query` 速查（参数 / 行为 / 联动）
+
+参数（flat，`additionalProperties:false`，required `ref`+`op`）：
+
+| 参数 | 类型 | 语义 |
+|------|------|------|
+| `ref` | string | 落盘输出引用 `out-` + 16 hex，取自上一条工具结果里的 `[STORED OUTPUT ref="out-…" …]` 标记 |
+| `op` | enum | `head`（前 N 行）/ `tail`（末 N 行）/ `lines`（行区间，1-based 闭区间）/ `grep`（带行号正则）/ `wc`（行/字节计数） |
+| `n` | int | head/tail 行数（默认 50，上限 2000） |
+| `start` / `end` | int | lines 区间（1-based，inclusive） |
+| `pattern` | string | grep 的 Rust regex（逐行匹配） |
+| `ignore_case` | bool | grep 大小写不敏感（默认 false） |
+
+行为要点：行 1-based、只按 `\n` 切分（行内 `\r` 保留——CRLF 文件 grep 输出行尾带 `\r`）；
+tail 末行无换行也算一行；grep 恒带行号 + 尾注 `showing M of T matches`；wc 返回
+`lines: N, bytes: M`（无末行换行加 note）；**累计输出封顶 = `[limits].max_output_bytes`
+生效值**（超限字符边界截断 + `[output_query: result truncated at N bytes …]` 尾注）；
+数据链带 `len == orig_bytes` 完整性校验（防损坏静默错读）。预览标记联动与全链路见
+[06-mobile/call-chains.md §3.4](../06-mobile/call-chains.md)（一图流）与
+[06-mobile/openslate-mobile.md §15](../06-mobile/openslate-mobile.md)（注册与接线）。

@@ -12,7 +12,7 @@
   回答。与审批系统（高风险操作的风险门，无自由答案负载）**保持分离**——
   提问走 host call，审批走 `SessionApprovalBridge`。
 - **不做二次审批**：默认策略（AutoExcept shell/run_code）自然放行；Manual
-  全审模式下经 `AskUserExemptApproval` 装饰器豁免（装饰 mobile 装配的
+  全审模式下经 `SideEffectFreeApproval`（原 `AskUserExemptApproval`）装饰器豁免（装饰 mobile 装配的
   `manager.approval` callback 槽，core 审批逻辑不动）。
 - PTC 可见性：默认 **Both**（沙箱内 run_code 亦可调用；bridge 路径无
   tool_call 声明 → 不持久化，仅内存通路）。

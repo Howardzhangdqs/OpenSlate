@@ -21,7 +21,7 @@ Kotlin (UniFFI callback)◄──EventSink(单队列+泵线程)──┐
 MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ──► LLM
 ```
 
-## 2. 模块一览（12 个模块 + lib.rs）
+## 2. 模块一览（17 个模块 + lib.rs）
 
 | 模块 | 行数 | 关键导出 | 职责 |
 |------|------|---------|------|
@@ -30,7 +30,7 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
 | `src/hostcall.rs` | 447 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`call_with_id`（自定义超时，ask_user 先例）；`HostTool::with_timeout`（超时覆盖 builder——termux 壳用，见 exec.rs）；`fail_all` 对 ask_user 豁免（持久化恢复） |
 | `src/mcp_recovery.rs` | — | `RecoveringMcpTool`、`RecoveryCtx`、`MCP_RECOVER_HOST_TOOL`、`is_mcp_connection_failure` | MCP host 死亡自愈：外部 MCP 工具的恢复装饰器（连接失败签名 → 单飞恢复 host call `mcp.recover_host` → 注册表同名重发一次）；`RecoveryCtx` = 单飞闩 + 完成代数 + 冷却窗口（10s）+ 注册表弱引用；重试预算 = 1（task-local 重入标记）；包装点两处（create_with 装配期 `wrap_mcp_tools` / reload_mcp scratch 迁移期），见 call-chains.md §3.1.2 |
-| `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`AskUserExemptApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、Manual 审批豁免（见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
+| `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`SideEffectFreeApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、无副作用工具免审装饰器（原 `AskUserExemptApproval`，C4 起覆盖 ask_user + output_query，见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
 | `src/approval_review.rs` | 502 | `AiReviewApproval`、`DEFAULT_REVIEW_TIMEOUT` | 审批 AI 审查装饰器（mobile-only，tool-approval）：AutoRisk 请求先付一次小额 LLM 审查——safe 静默放行 / risky 弹人（note 带审查理由）/ 失败超时 fail-safe 弹人；verdict 缓存（(tool, args hash)→结论，容量 128）；审查模型 = `[capabilities].review` 未绑定继承会话模型；P0 红线全落实（见 [call-chains.md](call-chains.md) §3.3 与 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1） |
 | `src/secrets.rs` | — | `PersistentSecretVault`、`env_source`、`mask_with_known_values` | ask_user secret 子系统：会话内存 + store v4 `credentials` 持久镜像两级凭据库、env 注入源、file 写入（0600）、脱敏值源（见 [04-tools/ask-user.md §8](../04-tools/ask-user.md)） |
 | `src/exec.rs` | 940 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1）；termux HostTool 壳专用超时 `TERMUX_HOST_CALL_TIMEOUT` = **900s**（停滞期间 Kotlin 侧等待连接 + 重发续跑，见 android-app.md / call-chains.md §3.1.1；配套 Kotlin `HARD_WAIT_TIMEOUT_MS` = 880s） |
@@ -39,6 +39,7 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/transcripts.rs` | ~640 | `SyncState`（`persist_range`/`flush_now`/`invalidate`）、`sync_loop`、`rebuild_transcript`、`heal_truncated_tail`、`DANGLING_TAIL_META`/`INCOMPLETE_TURN_META`/`HEAL_META` | transcript 持久化（存储 v5 §4 + 历史转写丢失修复 C1/C3）：SyncState 收口的增量同步 + 三个高危时刻的强制冲刷 + 两级重建（entries 优先 / 消息投影回退 / 截断自愈）+ 存储健康横幅（见 §13）；sync_loop 兼附件 tokens 回填消费点（见 §12.5） |
 | `src/attachment_tokens.rs` | ~330 | `AttachmentTokenBackfill`、`overlay_tokens_from_messages` | 附件 image tokens **响应侧回填**（协议 v5）：EventSink tap 闩首次调用值 → sync_loop 落 transcript → 重开经 messages.meta_json 重放（见 §12.5） |
 | `src/output_storer.rs` | ~200 | `MobileOutputStorer` | 长输出落盘 storer（长输出落盘 + output_query C3）：实现 core `ToolOutputStorer` 接缝——超限工具输出 sha256 寻址 → zstd-3 压缩 → store v6 `tool_outputs` 行 + `files/outputs/{sha}.zst`；任何失败返回 `None`（core 回落旧截断路径，绝不失败回合）。store 经 `SharedStore`（OnceLock 后注，AttachmentDataProxy 同款接缝）在 assemble_state 后由 create_with 注入；进程级单槽 `set_tool_output_storer` 随进程生灭（shutdown 无需清理）；装配启动序列挂 `gc_orphan_output_files`（失败仅告警） |
+| `src/output_query.rs` | ~1100 | `OutputQueryTool`、`OUTPUT_QUERY_TOOL` | output_query 内置工具（长输出落盘 + output_query C4）：模型按 `[STORED OUTPUT ref=…]` 标记取回落盘全文的 head/tail/lines/grep/wc 五算子查询；64KB 块式行迭代核心（改造自 uutils/coreutils head，MIT 署名）一份共用；累计封顶 = `max_output_bytes` 生效值；免审批（见 §15） |
 | `src/registry.rs` | 541+ | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新）；`supports_video`（models.dev modalities 直读——Submit 门控的 video 维） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
 
@@ -76,7 +77,7 @@ pub fn set_mcp_host_token(token: &str) {
 3. `MobilePaths::realign_database_path()`（best-effort，失败仅告警，见 §4.3）；
 4. `EventSink::new(callback)`（泵线程已启动）；
 5. `HostCallRouter::new(sink, timeout)`；**`PersistentSecretVault` + `AskUserContext::new(router, vault)`**（工具先于 AppState 构造）+ **env 注入源注册**（`env_source(vault)` → mcp-builtin `set_shell_env_source` 进程级注册 + native bash 经 `register_bash_tools` 传入）；
-6. 组装工具集：`opts.extra_tools` + 追加 `HostTool("mobile.ping")`（schema 为空 object，`additionalProperties:false`）；**bash 工具不进 extra_tools**（命名随设置变化），装配完成后由 `register_bash_tools` 按当前多选注册；
+6. 组装工具集：`opts.extra_tools` + 追加 `HostTool("mobile.ping")`（schema 为空 object，`additionalProperties:false`）+ **`OutputQueryTool`**（长输出落盘 C4；复用下述 `output_store_handle` 的 `SharedStore` 接缝，AppState 弱引用经共享 OnceLock 在第 10 步后注）；**bash 工具不进 extra_tools**（命名随设置变化），装配完成后由 `register_bash_tools` 按当前多选注册；
 7. `MobileSecrets` + `mobile_provider_factory`（或注入 factory）；
 8. `RegistryStore::new(&paths.config_dir)`；
 9. 构建 tokio runtime：**multi_thread、worker_threads=2、线程名 `openslate-mobile`**（runtime.rs:133-138）；
@@ -138,7 +139,7 @@ server `build_state` 的 mobile 变体（origin / 显式路径 / 注入 factory�
   1. `apply_approval(&mut manager, &config, true, false)` 装上 legacy 语义基线（wiring 通用链）；
   2. 建桥 `SessionApprovalBridge::new(sink)` → **初始规则 = `rules_from_config(&config)` + mobile 专属 opt-in**：`config.approval.is_none()`（`[approval]` 段缺省）时 `default_level = Auto`（设计 v3 用户拍板：自动判断 = 启发式预过滤 + AI 审查；显式配置（legacy 或新键）按映射保持原行为）→ `bridge.set_rules(initial_rules)`；
   3. `ApprovalManager::with_rules(approval_bridge.rules_handle())` **挂桥的共享 cell**（P0-5：`apply_approval` 的重建形状必须被此步覆盖——游离副本会让 always_*/set_approval_config 热更永远到不了引擎且无编译错误；防回归单测 `approval_rules_cell_shared_between_bridge_and_engine` 钉死桥/引擎/manager 三方同一 cell）；
-  4. callback 链 = `AskUserExemptApproval(AiReviewApproval(bridge))`——ask_user 豁免最外层；`AiReviewApproval::new(bridge, sink, provider_factory, registry, Handle::current()).with_timeout(review_timeout)`，SessionCore 构造完后 `review_approval.wire(&core)` 后注（core 字段 `Mutex<Option<Arc<SessionCore>>>` 防循环依赖，AskUserContext.wire 同款先例）；
+  4. callback 链 = `SideEffectFreeApproval(AiReviewApproval(bridge))`——无副作用工具（ask_user / output_query）豁免最外层；`AiReviewApproval::new(bridge, sink, provider_factory, registry, Handle::current()).with_timeout(review_timeout)`，SessionCore 构造完后 `review_approval.wire(&core)` 后注（core 字段 `Mutex<Option<Arc<SessionCore>>>` 防循环依赖，AskUserContext.wire 同款先例）；
 - 初始会话模型：`[capabilities] main` 代号优先（不可解析时回退 root agent 别名）（runtime.rs:790-798）；session_label 默认 `"OpenSlate Mobile"`；
 - **启动清扫**（runtime.rs:806-839，必须在恢复最近 run 之前）：
   - `mark_running_runs_interrupted(now_ms)`：上次进程被杀留下的 running run 统一标 interrupted（get_last_resumable_run 只排除 failed，interrupted 仍可续聊，先清扫不影响重启续聊）；
@@ -374,3 +375,68 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 `attachments.rs` 单测：嗅探表（含 heic 拒绝）/ 归一化（缩放重编码 + PNG passthrough 逐字节）/ 门控矩阵（混发、50 张、25MB、20MB、开关两态、caps 三态）/ sha256 去重 / ingest 往返（真实文件库：PNG passthrough、MP4 passthrough、declared 说谎按嗅探、未知格式与超限拒绝）/ 回填封顶（超限跳过、缺行不失败）。
 `runtime.rs` 集成（CapturingProvider 捕获 GenerateRequest）：import→submit e2e（data 装载字节一致 + bind + 持久化引用 + transcript 行带引用）；门控 notice 矩阵（纯文本模型拒图且引擎零调用 / 混发 / 实验关 / 空文本 / 未知 id；多模态+开关开 mp4 放行）；重启 resume 回填（第二轮请求仍带图）；启动 GC（8 天前暂存清、新暂存留）；transcript 往返（entries 行重建 + 旧 run 投影回退不回归 + !same_run 重开轮换 session_id）。
 历史转写丢失修复（C1/C2/C3）：`transcripts.rs` walk 单测（call_id 配对 / 名字兜底 / 错位与数量不齐 bail / 装饰跳过 / 无缺尾 no-op + 三条 Meta 文案 pin）；`runtime.rs` 集成——悬挂 pop 回写（第一次 open 删行 + 投影重建 + 恰一条 DANGLING Meta；第二次 open 无 pop 无新增 Meta、messages 尾行已删）、截断自愈幂等（messages=5/entries=2 → 2 前缀 + HEAL Meta + 投影尾 3，再 open 一致）、中断回合冲刷（tool 执行后模型流错误 → NewSession → DB 含 as-is ToolCall + INCOMPLETE_TURN_META，重开转写完整）、NewSession 二次 busy 守卫（冲刷钩子注入 submit → 拒绝、转写未清、session_id 未轮换）、shutdown 中冲刷（挂死工具回合中关停 → entries 含 User + as-is ToolCall + INCOMPLETE Meta）；store `delete_messages_from_seq` / `delete_transcript_entries_for_run` 边界（空集/越界/计数/幂等/不误伤他 run）与 `insert_transcript_entry` OR IGNORE 语义（重复 seq 静默让位首写行）。
+
+## 15. output_query 工具（长输出落盘 + output_query C4；模块 `output_query.rs`）
+
+模型侧的长输出取回通道：工具结果超 `[limits].output_store_threshold` 落盘后，对话内只剩
+`[STORED OUTPUT ref="out-…" …]` 头尾预览（core `build_preview`，冻结格式），模型经本工具按
+`ref` 查询全文切片。全链路一图流见 [call-chains.md §3.4](call-chains.md)。
+
+### 15.1 注册与接线
+
+- **注册**（runtime.rs `create_with`）：`extra_tools.push(OutputQueryTool::new(output_store_handle.clone()))`
+  ——在 `AskUserTool` / `mobile.ping` 旁；PTC namespace 默认 `None`（`run_code` 沙箱内经
+  `tools.output_query` 平名可用，不需专门处理）。
+- **store 接缝**：复用 `output_storer.rs` 的 `SharedStore`（`Arc<OnceLock<Arc<SqliteStore>>>`，
+  AttachmentDataProxy 同款后注）——与 storer **同一注入点**（`assemble_state` 后
+  `output_store_handle.set(...)`），同一句柄两用。
+- **AppState 接线**：工具本体随即 move 进 registry，接线经共享
+  `Arc<OnceLock<Weak<AppState>>>`（`state_handle()` 交出）在 `create_with` 尾段
+  `set(Arc::downgrade(&state))`（`AskUserContext.wire` 同款防环先例）。用途两个：
+  ① `find_tool_output` 的 `prefer_run`（当前 run 优先）；② 累计输出封顶 =
+  `RuntimeLimits::from_config(&config).max_output_bytes` 生效值（0 = 不限）。未接线 /
+  AppState 已释放（shutdown 后）→ prefer_run=None + 缺省 64KiB。
+- **装配前调用**（注入窗口，正常流程不可达——注入先于首个回合）：返回明确错误文案
+  `output_query is not available: the output store is not wired yet …`（status=Error，
+  不是 Err/panic）。
+- **审批**：无副作用纯读（本会话已脱敏落盘的数据）——`SideEffectFreeApproval`（askuser.rs，
+  原 `AskUserExemptApproval` 泛化）免审；否则 Auto 缺省下启发式 Medium 会为每次查询付一次
+  AI 审查调用。
+
+### 15.2 行为语义
+
+- **数据链**：`ref` 校验（`out-` + 16 hex，去掉前缀）→ `find_tool_output(ref16, 当前 run 优先)`
+  → 无行返回 Error 文案（含期望格式 + 从 `[STORED OUTPUT` 标记取 ref 的提示）→
+  `read_tool_output_bytes(sha64)` → zstd 解压（纯内存，≤1MiB 量级，对齐 storer 的不
+  spawn_blocking 约定）→ **`len == orig_bytes` 完整性校验**（不等报错——防半写文件/内容
+  错位被静默错读）→ 按 op 切片。参数校验错误（op 与字段不匹配 / start>end / n 越界 /
+  非法 regex 编译错误原文回显）一律普通文本 status=Error 回喂自纠。
+- **五算子**（flat schema，`additionalProperties:false`，required `ref`+`op`）：
+  - `head` / `tail`：前/末 N 行（`n` 默认 50、上限 2000；tail 末行无换行也算一行，n ≥ 总行数返回全文）；
+  - `lines`：`start..=end` 闭区间（1-based，start ≥ 1 且 ≤ end）；
+  - `grep`：逐行 Rust regex（`ignore_case` 经 `RegexBuilder::case_insensitive`），恒带行号
+    （`{line_no}:{line}`），全量收集后封顶，尾注 `showing M of T matches`（M = 实际保留行数，
+    封顶时 M < T 即截断提示；单行超 cap 的命中计数但不展示）；
+  - `wc`：`lines: N, bytes: M`（+ `note: no trailing newline`，仅非空且末字节非 `\n` 时）。
+- **行迭代核心一份共用**（`LineScanner`，改造自 uutils/coreutils `head` take.rs，MIT 署名
+  保留在源码常量区）：head/tail/lines 走同一条「跳过 + 拷贝」通路（tail = 跳过
+  `total_line_count - n` 行，跳过量来自落盘行的 `line_count`——与已过完整性校验的原文同源）；
+  grep/wc 逐块扫描。边界：恒定 64KB 读块复用不膨胀（超长单行只膨胀行缓冲）、读侧 EINTR
+  重试、行跨块拼接、末行无换行亦算一行。行切分**只按 `\n`**：行内 `\r` 保留（CRLF 文件
+  grep 输出行尾带 `\r`，工具 description 已注明；与 `str::lines()` 会剥 `\r\n` 之 `\r`
+  不同——行**计数**两种约定恒等）。设计稿曾把 tail 记为
+  `copy_all_but_n_lines(total-n)`，方向反了（该函数是 `head -n -K` 语义，会返回 head），
+  已按「跳过 + 拷贝」正确实现，`copy_all_but_n_*` 两个无算子对应的函数未引入。
+- **累计输出封顶** = `max_output_bytes` 生效值：超限 UTF-8 字符边界截断 + 尾注
+  `[output_query: result truncated at {cap} bytes — narrow start/end, reduce n, or use grep]`。
+- **root.md 白名单**：bootstrap 默认白名单已加 `output_query`；旧默认全文进
+  `LEGACY_ROOT_AGENT_MDS` 自动迁移（未定制存量设备开箱即得）。**已定制 root.md 的用户需
+  手动加 `- output_query`**——不在白名单 ≠ 报错，只是模型看不到该工具。
+
+### 15.3 测试面
+
+`output_query.rs` 内嵌 15 个用例：五算子矩阵、末行无换行、CRLF 保 `\r`、空输出、1MiB 单行
+（含「命中行超 cap 计数不展示」钉死）、64KB 块边界跨行、多字节封顶劈裂（65536 切点落
+`中` 字节中间 → 65535 边界）、grep ignore_case、参数错误文案矩阵（13 组）、未知 ref、
+orig_bytes 完整性失败、装配前错误、`LineScanner` 单元直测（空内容/空行/EOF 后 skip）。
+装配链回归：`tests/runtime_flow.rs` 默认白名单断言含 `output_query`。

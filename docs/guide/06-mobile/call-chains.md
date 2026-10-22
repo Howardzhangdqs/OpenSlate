@@ -517,7 +517,7 @@ session_reset 一并清除（页内 LaunchedEffect 自动 pop）。
 
 Rust 侧规则引擎 / 桥语义见 [../02-core/openslate-session.md](../02-core/openslate-session.md) §3 与
 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1；mobile 装配 =
-`AskUserExemptApproval(AiReviewApproval(SessionApprovalBridge))`（openslate-mobile.md §3.6）。
+`SideEffectFreeApproval(AiReviewApproval(SessionApprovalBridge))`（openslate-mobile.md §3.6）。
 
 ```text
 模型 tool call
@@ -563,6 +563,55 @@ Rust 侧规则引擎 / 桥语义见 [../02-core/openslate-session.md](../02-core
   （always_*）跨会话保留。
 - 多客户端首答赢不变（本链路 mobile 单客户端，MOBILE_CONN_ID=1）。
 - 会话级放行 `run_code` 盖全脚本（一次审批盖整个脚本的既有语义）。
+
+### 3.4 长输出分叉全链路（T1 传输上限 → T2 落盘 → 预览 → output_query / 详情弹窗；C2–C6）
+
+一图流（工具全文从产生到两条取回通道的完整旅程）：
+
+```text
+T1 三腿传输上限（防单条输出打爆回合；C5 抬升）
+  MCP shell/bash    mcp-builtin shell.rs MAX_OUTPUT_BYTES=1MiB（截断保头尾各 256KiB）
+  native bash       mobile exec.rs 同 1MiB/256KiB
+  termux 兜底腿      Kotlin TermuxExec.combined 总 256KiB（头 192KiB + 省略行 + 尾 64KiB；
+                    Binder ~1MB 事务缓冲的安全余量，见 android-app.md TermuxExec）
+        │ ≤1MiB 的全文进入 core 引擎
+        ▼
+mask 全文（mask_tool_output 提前到 fork 之前——落盘的必须是脱敏后文本，
+  vault 凭据绝不落盘；core runtime.rs fork_stored_output 分叉点）
+        ▼
+T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user 豁免）
+  超阈值 && 宿主注册了 storer（mobile = MobileOutputStorer，进程级单槽）
+    → sha256 内容寻址 → zstd-3 → files/outputs/{sha}.zst 先落文件
+    → 再插 tool_outputs 行（schema v6，(run_id, sha) 唯一）
+                                        【写序不变量：先文件后行后 message——
+                                          崩溃窗口内行在则文件必在】
+    → storer 返回 None（任何一步失败）→ core 回落旧 limit 截断路径，回合照常
+        ▼
+对话内替换为冻结格式预览（core output_store.rs build_preview，~2.3KB：
+  [STORED OUTPUT ref="out-{sha256前16hex}" size=N lines=M] 头行
+  + 头 ≤1024B + [... N bytes omitted (M lines) — use output_query to inspect ...]
+  + 尾 ≤1024B；UTF-8 字符边界安全；status=Truncated）
+        │
+        ├─► 模型侧取回：output_query 工具（mobile output_query.rs，C4）
+        │     ref 校验（out-+16hex）→ find_tool_output（当前 run 优先）
+        │     → read_tool_output_bytes → zstd 解压 → len==orig_bytes 完整性校验
+        │     → head/tail/lines/grep/wc 切片（64KB 块式行迭代，行内 \r 保留）
+        │     → 累计封顶 = [limits].max_output_bytes 生效值（超限字符边界截断
+        │       + [output_query: result truncated at N bytes …] 尾注；grep 用
+        │       showing M of T matches）；免审批（SideEffectFreeApproval）
+        │
+        └─► UI 侧取回：详情弹窗 tool_output_by_call_id（见 §6；512KiB 封顶
+            头 448KiB + 省略行 + 尾 64KiB；任何失败回落预览原文）
+```
+
+锚点：core 分叉 `openslate-core/src/runtime.rs`（`fork_stored_output`）；预览/常量
+`openslate-core/src/output_store.rs`（`STORED_OUTPUT_MARKER` / `PREVIEW_EDGE_BYTES` /
+`build_preview`）；mobile 落盘 `openslate-mobile/src/output_storer.rs`（C3）；表结构
+`openslate-store-sqlite/src/schema.rs`（`DDL_TOOL_OUTPUTS`）与查询 `query.rs`
+（`find_tool_output` / `read_tool_output_bytes`）；output_query
+`openslate-mobile/src/output_query.rs`（C4，注册见 openslate-mobile.md §15）；弹窗闭环
+`openslate-mobile/src/runtime.rs`（`tool_output_by_call_id` / `expand_stored_output` /
+`cap_stored_full_text`，C6）。
 
 ## 4. 生命周期
 

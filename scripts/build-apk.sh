@@ -24,6 +24,25 @@ for arg in "$@"; do
 done
 # pipefail：gradle 失败时管道整体非零 → 直接中止，绝不能把旧 APK 装到设备上。
 timeout 900 ./gradlew ":app:assemble$(echo "$VARIANT" | sed 's/^./\U&/')" --console=plain 2>&1 | tr '\r' '\n' | grep -aE "BUILD|FAILURE|e: " || { echo "BUILD FAILED — abort"; exit 1; }
+
+# ── .so 新鲜度守卫 ────────────────────────────────────────────────
+# 本脚本不交叉编译 Rust（前置见 android-build.md [1/3]）。若源码比 jniLibs
+# 里的 .so 新，打包出来的 APK 会「新 Kotlin 绑定 + 旧 .so」符号错配——
+# 真机表现为 UniffiLib <clinit> UnsatisfiedLinkError、runtime 永远「启动中」
+# （2026-10-21 实际踩过）。此处硬失败并给出重建命令，防止旧件上架。
+SO_FILE="$REPO/android/app/src/main/jniLibs/arm64-v8a/libopenslate_mobile.so"
+NEWEST_SRC=$(find "$REPO/crates" "$REPO/vendor/genai/src" "$REPO/Cargo.toml" \
+    \( -name '*.rs' -o -name 'Cargo.toml' \) -newer "$SO_FILE" 2>/dev/null | head -1)
+if [ -n "$NEWEST_SRC" ]; then
+    echo "STALE .so: Rust sources newer than jniLibs artifact (e.g. $NEWEST_SRC)"
+    echo "Rebuild first (see docs/guide/07-build-dev/android-build.md [1/3]):"
+    echo "  NDK=~/android-sdk/ndk/21.4.7075529/toolchains/llvm/prebuilt/linux-x86_64/bin"
+    echo "  CARGO_TARGET_DIR=target-android CC_aarch64_linux_android=\$NDK/aarch64-linux-android26-clang \\"
+    echo "  AR_aarch64_linux_android=\$NDK/llvm-ar CXX_aarch64_linux_android=\$NDK/aarch64-linux-android26-clang++ \\"
+    echo "  cargo build --target aarch64-linux-android --profile mobile -p openslate-mobile-ffi --config ~/.cargo-android/config.toml"
+    echo "  cp target-android/aarch64-linux-android/mobile/libopenslate_mobile.so android/app/src/main/jniLibs/arm64-v8a/"
+    exit 1
+fi
 APK="$REPO/android/app/build/outputs/apk/$VARIANT/app-$VARIANT.apk"
 [ -f "$APK" ] || { echo "APK missing"; exit 1; }
 ls -la "$APK"

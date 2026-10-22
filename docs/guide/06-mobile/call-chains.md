@@ -40,6 +40,10 @@ ChatScreen Composer
 - **终态**：重试仍失败 → `turn_error`（`kind:"network"`，message 尾缀「（已自动重试 1 次）」）。非 Network（rate_limit/auth/model/other）、审批拒绝、工具失败（不进 Err 路径）一律不重试。
 - Kotlin 侧暂不消费 `kind` 字段（serde 忽略未知字段），重试期间的感知 = Notice toast + 转写 Meta 行 + 转圈不停。
 
+### 回合 panic 防线（session engine.rs / askuser.rs）
+
+回合体（含重试循环、迟到答案续跑变体）整体包 `catch_unwind`：provider 侧 panic（工具 panic 已被 runtime 隔离）会被拦截并强制走同一套收尾（running=false / manager 回家），广播 `turn_error(kind:"other")`「内部错误：回合发生 panic（已恢复，可重试）…」——否则 running 永久卡 true，busy 守卫全拒 + AgentService wakelock 永持（§4.2），只有重启 App 可解。
+
 ## 1.1 附件链路（多模态输入，存储 v5 §3/§6；L4）
 
 ```text

@@ -14,6 +14,11 @@
 //!   因「首个 Delta 后不重试」放行的链路）自动重跑整个回合——预算
 //!   每回合 1 次 + 会话级 10s 冷却窗；重试广播 Notice、转写追加 Meta
 //!   标记；用尽后 `TurnError` 携 `kind=network` 与重试次数文案。
+//! - **panic 防线**：回合体整体跑在 `catch_unwind` 内（exp-10）——
+//!   收尾是唯一恢复点，panic 跳过它会让 `running` 永久卡 true
+//!   （busy 守卫全拒 + Kotlin wakelock 永持）。拦截后强制收尾 +
+//!   `TurnError(kind=other)`。依赖 `panic=unwind`（mobile profile
+//!   已保证）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,8 +181,23 @@ fn usage_meta_line(usage: &Usage) -> String {
 /// 而阻塞池线程阻塞正是其设计用途。内层 future 经
 /// `Handle::block_on` 驱动，tokio 定时器/通道/sqlx 均可用。
 ///
-/// 引擎任务自行完成收尾（history 替换 / manager 回传 / 广播
+/// 引擎任务自行完成收尾（运行态复位 / manager 回传 / 广播
 /// turn_ok / turn_error），调用方不再介入。
+///
+/// ## panic 防线（exp-10）
+///
+/// 收尾（[`finalize_turn`]）是 running=false 的**唯一恢复点**：任何
+/// 一次 attempt（含网络重试）中 panic 都会跳过它，`running` 永久卡
+/// true——此后 submit / NewSession / open_session 全被 busy 守卫拒绝、
+/// Kotlin 侧 wakelock（观察 running）永久持有，只有重启 App 可解。
+/// 故回合体（attempt 循环 + 终态构造）整体包进 `catch_unwind`：
+/// panic 被拦截后走**同一套** [`finalize_turn`] 强制收尾，并广播
+/// `TurnError(kind=other)`（panic 不触发网络重试，直接终态）。
+///
+/// manager 以 `&mut` 借用进被保护闭包（`AssertUnwindSafe` 放行）：
+/// panic 展开只作废引用、不销毁值——所有权留在闭包外的本帧，拦截后
+/// 仍能送回 core。注意这依赖 `panic = "unwind"`（workspace 的
+/// `[profile.mobile]` 为 FFI 防线已显式保证）。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_engine_turn(
     state: Arc<AppState>,
@@ -189,10 +209,90 @@ pub fn spawn_engine_turn(
 ) -> tokio::task::JoinHandle<()> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        handle.block_on(engine_turn(
-            state, manager, run_id, provider, history, cancel,
-        ))
+        let mut manager = manager;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(engine_turn(
+                state.clone(),
+                &mut manager,
+                run_id,
+                provider,
+                history,
+                cancel,
+            ))
+        }));
+        let terminal = match caught {
+            Ok(terminal) => terminal,
+            Err(payload) => {
+                let summary = panic_payload_summary(payload.as_ref());
+                tracing::error!("回合 panic 已拦截（{summary}），强制收尾");
+                TurnTerminal::Error {
+                    message: format!("内部错误：回合发生 panic（已恢复，可重试）；{summary}"),
+                    kind: Some(TurnErrorKind::Other),
+                }
+            }
+        };
+        finalize_turn(&state, manager, terminal);
     })
+}
+
+/// 回合终态（收尾时在同一 core 锁内广播）。正常 / 失败 / panic 拦截
+/// 三路共用 [`finalize_turn`]。`pub` 供 mobile `resume_turn`（askuser）
+/// 同构复用。
+pub enum TurnTerminal {
+    /// 成功：history/stats 已由引擎侧折叠完毕，只剩广播。
+    Ok(Box<TurnSummaryDto>),
+    /// 失败（含 panic 拦截）：message 是人读通道；kind 是机器通道
+    /// （`None` = 未分类——resume 路径既有语义）。
+    Error {
+        message: String,
+        kind: Option<TurnErrorKind>,
+    },
+}
+
+/// 回合收尾（正常 / 失败 / panic 拦截三路共用，提取为函数防两份漂移）：
+/// 持 core 锁复位运行态 + manager 回家 + 广播终态。**先复位后广播**——
+/// 客户端收到 TurnOk/TurnError 时 busy 守卫已放行，可立即提交下一
+/// 回合。`pub` 供 mobile `resume_turn` 收尾复用（同款唯一恢复点）。
+pub fn finalize_turn(state: &Arc<AppState>, manager: RunManager, terminal: TurnTerminal) {
+    let mut inner = state.core.lock();
+    inner.running = false;
+    inner.cancel = None;
+    inner.depth_cur = 0;
+    inner.tool_calls_cur = 0;
+    inner.agents_running = 0;
+    // 回合期间 agent_tree 可能被热替换（工具可见性页 set_agent_tool_visibility
+    // 只改 inner.agent_tree，碰不到被 take 走的 manager）——回家的 manager
+    // 采用最新树，下一回合即按新可见性过滤（config 的同款陈旧问题不在
+    // 本路径处理，保持既有语义）。
+    let mut manager = manager;
+    manager.agent_tree = inner.agent_tree.clone();
+    inner.manager = Some(manager);
+    match terminal {
+        TurnTerminal::Ok(summary) => {
+            state.sink.broadcast(ServerMsg::TurnOk { summary });
+        }
+        TurnTerminal::Error { message, kind } => {
+            state.sink.broadcast(ServerMsg::TurnError { message, kind });
+        }
+    }
+}
+
+/// panic 载荷摘要上限（字符；CJK 安全按字符截断）。
+const PANIC_SUMMARY_MAX_CHARS: usize = 200;
+
+/// panic 载荷 → 人读摘要：`&str` / `String` 载荷取原文（按字符截
+/// [`PANIC_SUMMARY_MAX_CHARS`]），其他类型给占位。用于 panic 拦截后的
+/// TurnError message 与 error 日志（panic hook 已先打过 PANIC 栈，这里
+/// 只补「已拦截，强制收尾」语义）。`pub` 供 mobile `resume_turn` 复用。
+pub fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    let raw = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        return "<非文本 panic 载荷>".to_owned();
+    };
+    raw.chars().take(PANIC_SUMMARY_MAX_CHARS).collect()
 }
 
 /// 回合级断连重试预算：每回合至多 1 次自动重跑（后台/网络抖动 →
@@ -269,14 +369,19 @@ fn should_network_retry(
     }
 }
 
+/// 回合体（attempt 循环 + 终态构造）。**不做收尾**——运行态复位 /
+/// manager 回家 / 终态广播统一在 [`finalize_turn`]，由
+/// [`spawn_engine_turn`] 的 catch_unwind 外层在正常与 panic 两条路径
+/// 上各调一次（panic 不触发网络重试：重试循环本身在 catch 保护内，
+/// 展开即直接落到拦截分支的终态）。
 async fn engine_turn(
     state: Arc<AppState>,
-    mut manager: RunManager,
+    manager: &mut RunManager,
     run_id: RunId,
     provider: Box<dyn ModelProvider>,
     history: Vec<Message>,
     cancel: CancellationToken,
-) {
+) -> TurnTerminal {
     let started = std::time::Instant::now();
     let mut bridge = SessionProgressBridge {
         state: state.clone(),
@@ -320,42 +425,35 @@ async fn engine_turn(
         }
     };
 
-    // 回收：无论成败，manager 回家、运行态复位。
-    let mut inner = state.core.lock();
-    inner.running = false;
-    inner.cancel = None;
-    inner.depth_cur = 0;
-    inner.tool_calls_cur = 0;
-    inner.agents_running = 0;
-    // 回合期间 agent_tree 可能被热替换（工具可见性页 set_agent_tool_visibility
-    // 只改 inner.agent_tree，碰不到被 take 走的 manager）——回家的 manager
-    // 采用最新树，下一回合即按新可见性过滤（config 的同款陈旧问题不在
-    // 本路径处理，保持既有语义）。
-    manager.agent_tree = inner.agent_tree.clone();
-    inner.manager = Some(manager);
+    // 终态构造：各自分支短锁折叠产物（history/stats / flush），广播
+    // 交给 finalize_turn（同一收尾时序：先复位后广播）。
     match result {
         Ok(r) => {
-            inner.history = r.messages.clone();
-            flush_stream(&mut inner);
-            fold_tool_outcomes(&mut inner, &r.messages);
-            inner.stats.turns += 1;
-            inner.stats.total_input_tokens += r.total_input_tokens;
-            inner.stats.total_output_tokens += r.total_output_tokens;
-            inner.stats.total_cost_usd += r.total_cost_usd;
-            let dto = TurnSummaryDto::from(r);
+            let dto = {
+                let mut inner = state.core.lock();
+                inner.history = r.messages.clone();
+                flush_stream(&mut inner);
+                fold_tool_outcomes(&mut inner, &r.messages);
+                inner.stats.turns += 1;
+                inner.stats.total_input_tokens += r.total_input_tokens;
+                inner.stats.total_output_tokens += r.total_output_tokens;
+                inner.stats.total_cost_usd += r.total_cost_usd;
+                TurnSummaryDto::from(r)
+            };
             crate::session_event!(
                 "turn ok: {}s · ↑{} ↓{}",
                 started.elapsed().as_secs(),
                 dto.total_input_tokens,
                 dto.total_output_tokens
             );
-            state.sink.broadcast(ServerMsg::TurnOk {
-                summary: Box::new(dto),
-            });
+            TurnTerminal::Ok(Box::new(dto))
         }
         Err(e) => {
             // 失败保留 history 现状（TUI 同款：用户消息留着可重发）。
-            flush_stream(&mut inner);
+            {
+                let mut inner = state.core.lock();
+                flush_stream(&mut inner);
+            }
             let kind = classify_turn_error(&e);
             crate::session_event!("turn error: {e}");
             // 重试用尽的信息并入文案（协议 message 是人读通道，kind 是
@@ -364,10 +462,10 @@ async fn engine_turn(
             if network_retries > 0 {
                 message.push_str(&format!("（已自动重试 {network_retries} 次）"));
             }
-            state.sink.broadcast(ServerMsg::TurnError {
+            TurnTerminal::Error {
                 message,
                 kind: Some(kind),
-            });
+            }
         }
     }
 }
@@ -1176,22 +1274,24 @@ model = "m"
             )
         }
 
-        /// 跑一个回合（engine_turn 直调；脚本注入 provider）。
+        /// 跑一个回合（engine_turn 直调 + 手动收尾，复刻 spawn 闭包的
+        /// 正常路径；panic 防线测试走 spawn_engine_turn 真路径）。
         async fn run_turn(
             scripts: Vec<Script>,
         ) -> (Arc<AppState>, Arc<RecordingSink>, Arc<StdMutex<u32>>) {
             let (provider, calls) = flaky(scripts, None);
-            let (state, sink, manager) = assemble();
+            let (state, sink, mut manager) = assemble();
             let history = state.core.lock().history.clone();
-            engine_turn(
+            let terminal = engine_turn(
                 state.clone(),
-                manager,
+                &mut manager,
                 openslate_core::types::RunId("retry-test-run".into()),
                 provider,
                 history,
                 CancellationToken::new(),
             )
             .await;
+            finalize_turn(&state, manager, terminal);
             (state, sink, calls)
         }
 
@@ -1308,18 +1408,19 @@ model = "m"
             // 会话级冷却：上一刻刚发生过网络重试（时间戳距今 < 10s 窗）
             // → 本次断连不再重试，直接终态（防网络瘫痪时空转）。
             let (provider, calls) = flaky(vec![drop_mid_stream("部分")], None);
-            let (state, sink, manager) = assemble();
+            let (state, sink, mut manager) = assemble();
             state.core.lock().last_network_retry = Some(std::time::Instant::now());
             let history = state.core.lock().history.clone();
-            engine_turn(
+            let terminal = engine_turn(
                 state.clone(),
-                manager,
+                &mut manager,
                 openslate_core::types::RunId("cooldown-run".into()),
                 provider,
                 history,
                 CancellationToken::new(),
             )
             .await;
+            finalize_turn(&state, manager, terminal);
 
             assert_eq!(*calls.lock().unwrap(), 1, "cooldown suppresses the retry");
             let (message, kind) = turn_error(&sink).expect("TurnError terminal");
@@ -1337,17 +1438,18 @@ model = "m"
             // 重试：恰好 1 次调用、无重试 Notice、无 Meta 标记。
             let cancel = CancellationToken::new();
             let (provider, calls) = flaky(vec![drop_mid_stream("部分")], Some(cancel.clone()));
-            let (state, sink, manager) = assemble();
+            let (state, sink, mut manager) = assemble();
             let history = state.core.lock().history.clone();
-            engine_turn(
+            let terminal = engine_turn(
                 state.clone(),
-                manager,
+                &mut manager,
                 openslate_core::types::RunId("cancel-run".into()),
                 provider,
                 history,
                 cancel,
             )
             .await;
+            finalize_turn(&state, manager, terminal);
 
             assert_eq!(*calls.lock().unwrap(), 1, "cancel suppresses the retry");
             assert!(!has_retry_notice(&sink));
@@ -1421,6 +1523,260 @@ model = "m"
             for (err, want) in cases {
                 assert_eq!(classify_turn_error(&err), want, "error: {err}");
             }
+        }
+    }
+
+    // ── panic 防线（catch_unwind 强制收尾，exp-10）───────────────────
+
+    mod panic_guard {
+        use super::*;
+        use crate::approval::SessionApprovalBridge;
+        use crate::state::{ConfigPaths, CoreInner, MsgSink, ProviderFactory, SessionCore};
+        use openslate_core::agent_tree::AgentTree;
+        use openslate_core::config::{parse_openslate_toml, AgentsConfig};
+        use openslate_core::error::ProviderError;
+        use openslate_core::provider::GenerateRequest;
+        use openslate_core::run_manager::RunManager;
+        use openslate_core::skills::SkillsCatalog;
+        use openslate_core::tool::ToolRegistry;
+        use openslate_core::types::{AgentConfig, AgentId, ModelResponse};
+        use openslate_protocol::ClientMsg;
+        use std::sync::Mutex as StdMutex;
+
+        /// 开播即 panic 的 provider：panic 发生在流 future 的 poll 路径
+        /// 上（工具 panic 已被 runtime `execute_tool_safely` 隔离，能
+        /// 到达引擎防线的真实链路就是 provider 侧），经 block_on 栈展开
+        /// 到 spawn 闭包的 catch_unwind。
+        struct PanickingProvider;
+
+        #[async_trait::async_trait]
+        impl ModelProvider for PanickingProvider {
+            async fn generate(
+                &self,
+                _req: GenerateRequest,
+            ) -> Result<ModelResponse, ProviderError> {
+                Err(ProviderError::ServerError(500))
+            }
+
+            async fn generate_stream(
+                &self,
+                _req: GenerateRequest,
+            ) -> tokio::sync::mpsc::Receiver<Result<openslate_core::types::ModelStreamEvent, ProviderError>>
+            {
+                panic!("scripted provider panic");
+            }
+
+            fn provider_name(&self) -> &str {
+                "panic-stub"
+            }
+        }
+
+        /// 记录型 sink：捕获 broadcast 供断言（busy 拒绝走 send_to，若
+        /// 被拒则 broadcasted 里不会出现 SessionReset——正好区分）。
+        #[derive(Default)]
+        struct RecordingSink {
+            broadcasted: StdMutex<Vec<ServerMsg>>,
+        }
+
+        impl MsgSink for RecordingSink {
+            fn broadcast(&self, msg: ServerMsg) {
+                self.broadcasted.lock().unwrap().push(msg);
+            }
+            fn send_to(&self, _conn_id: u64, _msg: ServerMsg) -> bool {
+                true
+            }
+            fn conn_ids(&self) -> Vec<u64> {
+                vec![1]
+            }
+            fn count(&self) -> usize {
+                1
+            }
+            fn close_all(&self) {}
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        fn user_msg(content: &str) -> Message {
+            Message {
+                attachments: None,
+                role: MessageRole::User,
+                content: content.to_owned(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }
+        }
+
+        /// 装配可跑 spawn_engine_turn 的 state + manager（running=true
+        /// 起步，复刻回合进行中被 panic 打断的形态）。
+        fn assemble() -> (Arc<AppState>, Arc<RecordingSink>, RunManager) {
+            let config = parse_openslate_toml(
+                r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#,
+            )
+            .expect("fixture parses");
+            let agents = AgentsConfig {
+                agents: vec![AgentConfig {
+                    hidden_tools: Vec::new(),
+                    id: AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    children: vec![],
+                    tools: vec![],
+                    default_prompt: "root prompt".into(),
+                }],
+            };
+            let agent_tree = AgentTree::from_configs(&agents.agents).expect("tree builds");
+            let manager = RunManager::new(
+                config.clone(),
+                AgentTree::from_configs(&agents.agents).expect("tree builds"),
+                ToolRegistry::new(),
+                SkillsCatalog::default(),
+            );
+            let sink = Arc::new(RecordingSink::default());
+            let factory: ProviderFactory = Arc::new(|_cfg, _alias| {
+                Err(anyhow::anyhow!("panic tests inject the provider directly"))
+            });
+            let inner = CoreInner {
+                session_id: "panic-test-session".into(),
+                session_label: "panic-test".into(),
+                history: vec![user_msg("触发 panic")],
+                transcript: Vec::new(),
+                running: true,
+                compacting: false,
+                depth_cur: 0,
+                agents_running: 0,
+                tool_calls_cur: 0,
+                model_alias: "main".into(),
+                cancel: None,
+                config,
+                agents_cfg: agents,
+                agent_tree,
+                skills: Vec::new(),
+                store: None,
+                session_run: None,
+                manager: None,
+                engine_task: None,
+                paths: ConfigPaths {
+                    active: std::path::PathBuf::from("/dev/null"),
+                    global: None,
+                    local: None,
+                },
+                stats: Default::default(),
+                stream: Default::default(),
+                tool_timers: Default::default(),
+                pending_step_meta: None,
+                last_network_retry: None,
+            };
+            let state = Arc::new(AppState {
+                core: Arc::new(SessionCore::new(inner)),
+                sink: sink.clone() as Arc<dyn MsgSink>,
+                approval: Arc::new(SessionApprovalBridge::new(sink.clone() as Arc<dyn MsgSink>)),
+                auth_token: None,
+                provider_factory: factory,
+                origin: "test",
+                _mcp: Default::default(),
+            });
+            (state, sink, manager)
+        }
+
+        /// 跑一个 panic 回合（经 spawn_engine_turn 生产真路径，含
+        /// catch_unwind 防线）。
+        async fn run_panicking_turn()
+        -> (Arc<AppState>, Arc<RecordingSink>, tokio::task::JoinHandle<()>) {
+            let (state, sink, manager) = assemble();
+            let history = state.core.lock().history.clone();
+            let handle = spawn_engine_turn(
+                state.clone(),
+                manager,
+                openslate_core::types::RunId("panic-run".into()),
+                Box::new(PanickingProvider),
+                history,
+                tokio_util::sync::CancellationToken::new(),
+            );
+            (state, sink, handle)
+        }
+
+        fn turn_error(sink: &RecordingSink) -> Option<(String, Option<TurnErrorKind>)> {
+            sink.broadcasted.lock().unwrap().iter().find_map(|m| {
+                if let ServerMsg::TurnError { message, kind } = m {
+                    Some((message.clone(), *kind))
+                } else {
+                    None
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn panic_is_contained_and_finalized() {
+            // 回合中 provider panic → catch_unwind 拦截：spawn 闭包不上
+            // 抛（JoinHandle ok）、TurnError(kind=other, message 含
+            // panic 字样)、running=false / cancel=None / manager 回家。
+            let (state, sink, handle) = run_panicking_turn().await;
+            handle
+                .await
+                .expect("panic must be contained by the guard, not propagate");
+
+            let (message, kind) = turn_error(&sink).expect("TurnError after contained panic");
+            assert_eq!(kind, Some(TurnErrorKind::Other));
+            assert!(message.contains("panic"), "message: {message}");
+            assert!(message.contains("已恢复"), "message: {message}");
+
+            let inner = state.core.lock();
+            assert!(!inner.running, "running must be reset (the very bug)");
+            assert!(inner.cancel.is_none(), "cancel must be cleared");
+            assert!(inner.manager.is_some(), "manager must be back home");
+            assert!(!inner.busy(), "busy guard must be released");
+        }
+
+        #[tokio::test]
+        async fn new_session_succeeds_after_panic() {
+            // 回归断言（本漏洞）：panic 前若收尾被跳过，running 卡 true
+            // → NewSession 被 busy 守卫拒绝。防线生效后必须能立即新建。
+            let (state, sink, handle) = run_panicking_turn().await;
+            handle.await.expect("panic contained");
+
+            crate::session::dispatch(&state, 1, ClientMsg::NewSession).await;
+            let broadcasted = sink.broadcasted.lock().unwrap().clone();
+            assert!(
+                broadcasted
+                    .iter()
+                    .any(|m| matches!(m, ServerMsg::SessionReset)),
+                "NewSession must succeed after a contained panic, got: {:?}",
+                broadcasted
+                    .iter()
+                    .map(|m| match m {
+                        ServerMsg::SessionReset => "session_reset".to_owned(),
+                        ServerMsg::TurnError { .. } => "turn_error".to_owned(),
+                        ServerMsg::Notice { .. } => "notice".to_owned(),
+                        _ => "other".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn panic_payload_summary_formats_and_truncates() {
+            let s = panic_payload_summary(&"boom".to_owned());
+            assert_eq!(s, "boom");
+            assert_eq!(panic_payload_summary(&String::from("炸了")), "炸了");
+            // 按字符截 200（CJK 安全），不按字节。
+            let long = String::from("啪").repeat(500);
+            assert_eq!(
+                panic_payload_summary(&long).chars().count(),
+                PANIC_SUMMARY_MAX_CHARS
+            );
+            // 非文本载荷 → 占位。
+            assert!(panic_payload_summary(&42u8).contains("panic"));
         }
     }
 }

@@ -37,11 +37,13 @@ handle_submit（session.rs:165）逐步：
      存 inner.cancel；history clone 一份交给引擎
   ▼
 spawn_engine_turn（engine.rs:169）
-  ★ spawn_blocking 专用线程 + Handle::block_on
+  ★ spawn_blocking 专用线程 + Handle::block_on + catch_unwind panic 防线
   原因：审批 decide() 是同步阻塞 trait、会等客户端应答；引擎执行期间
   还有多个同步回调。占 tokio worker 会饿死同 worker 上的转发/写任务
   （实测复现过）。阻塞池线程阻塞正是其设计用途；内层 future 经
-  Handle::block_on 驱动，tokio 定时器/通道/sqlx 均可用。
+  Handle::block_on 驱动，tokio 定时器/通道/sqlx 均可用。回合体整体包
+  catch_unwind——panic 拦截后走同一套收尾 + TurnError(kind=other)，
+  否则 running 永久卡 true（详见 02-core/openslate-session.md engine 章）。
   ▼
 RunManager::execute_with_run_id → AgentRunner::run_root → runtime::execute_run 循环:
   ├─ 组装上下文：system prompt = prompt.rs 解析（profile 体系）
@@ -76,11 +78,12 @@ RunManager::execute_with_run_id → AgentRunner::run_root → runtime::execute_r
      max_child_agent_calls/timeout_ms 纯 LLM 时间预算/max_empty_turns）
      / 取消（CancellationToken 全树共享）
   ▼
-回合收尾 engine_turn（engine.rs:185）持 core 锁:
+回合收尾 finalize_turn（正常/失败/panic 拦截三路共用）持 core 锁:
   inner.running=false、cancel=None、深度/工具计数清零
   manager.agent_tree = inner.agent_tree.clone()   ← 回家的 manager 采用
     最新树（回合期间工具可见性热替换只改 inner.agent_tree）
   inner.manager = Some(manager)                    ← manager 回家
+  （先复位后广播——客户端收到终态时 busy 守卫已放行）
   Ok:  history 替换为 run 结果 messages、flush_stream、
        fold_tool_outcomes（回合 Tool 消息回填 live 条目的输出/失败态，
        名字 + FIFO 游标配对）、stats 累计（turns/tokens/cost）、

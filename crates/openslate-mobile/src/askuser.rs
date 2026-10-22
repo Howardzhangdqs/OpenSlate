@@ -38,9 +38,12 @@ use openslate_core::runtime::MessageSink;
 use openslate_core::tool::Tool;
 use openslate_core::types::{Message, MessageRole, RunId, ToolOutput, ToolOutputStatus};
 use openslate_protocol::{
-    PendingQuestionDto, QuestionReplyAction, QuestionStatus, ServerMsg, TurnSummaryDto,
+    PendingQuestionDto, QuestionReplyAction, QuestionStatus, ServerMsg, TurnErrorKind,
+    TurnSummaryDto,
 };
-use openslate_session::engine::SessionProgressBridge;
+use openslate_session::engine::{
+    finalize_turn, panic_payload_summary, SessionProgressBridge, TurnTerminal,
+};
 use openslate_session::question::QuestionHandler;
 use openslate_session::state::{flush_stream, fold_tool_outcomes, AppState};
 use openslate_store_sqlite::store::SqliteStore;
@@ -1426,7 +1429,10 @@ impl QuestionHandler for MobileQuestionHandler {
 
 /// 起「从迟到 tool result 续跑」的回合任务（engine.rs `spawn_engine_turn`
 /// 的同构变体：跑在 spawn_blocking 专用线程，进度回调走
-/// SessionProgressBridge，收尾自回收）。
+/// SessionProgressBridge，收尾自回收）。**同款 panic 防线**（exp-10）：
+/// 回合体包 catch_unwind，panic 拦截后走 engine 的 [`finalize_turn`]
+/// 强制收尾 + `TurnError(kind=other)`——续跑路径同样不能让 running
+/// 卡 true（engine.rs spawn_engine_turn 文档详述动机）。
 #[allow(clippy::too_many_arguments)]
 fn spawn_resume_turn(
     state: Arc<AppState>,
@@ -1440,34 +1446,53 @@ fn spawn_resume_turn(
 ) -> tokio::task::JoinHandle<()> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        handle.block_on(resume_turn(
-            state,
-            manager,
-            run_id,
-            provider,
-            history,
-            tool_call_id,
-            result_content,
-            cancel,
-        ))
+        // manager 以 &mut 借用进被保护闭包：panic 展开只作废引用、
+        // 不销毁值——拦截后仍能送回 core。
+        let mut manager = manager;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(resume_turn(
+                state.clone(),
+                &mut manager,
+                run_id,
+                provider,
+                history,
+                tool_call_id,
+                result_content,
+                cancel,
+            ))
+        }));
+        let terminal = match caught {
+            Ok(terminal) => terminal,
+            Err(payload) => {
+                let summary = panic_payload_summary(payload.as_ref());
+                crate::alog!(
+                    "ask_user resume turn panicked ({summary}); forcing finalization"
+                );
+                TurnTerminal::Error {
+                    message: format!("内部错误：回合发生 panic（已恢复，可重试）；{summary}"),
+                    kind: Some(TurnErrorKind::Other),
+                }
+            }
+        };
+        finalize_turn(&state, manager, terminal);
     })
 }
 
-/// 与 `engine::engine_turn` 同款收尾（manager 回家 / 运行态复位 / 转写
-/// 折叠 / TurnOk|TurnError 广播）；执行体换成
+/// 与 `engine::engine_turn` 同款回合体（终态构造 + 交回
+/// `engine::finalize_turn` 收尾）；执行体换成
 /// `RunManager::resume_from_tool_result`（补全悬挂 tool result 后从该点
 /// 重新进入 agent 循环——与正常工具结果后的继续同一条路径）。
 #[allow(clippy::too_many_arguments)]
 async fn resume_turn(
     state: Arc<AppState>,
-    mut manager: RunManager,
+    manager: &mut RunManager,
     run_id: RunId,
     provider: Box<dyn ModelProvider>,
     history: Vec<Message>,
     tool_call_id: String,
     result_content: String,
     cancel: CancellationToken,
-) {
+) -> TurnTerminal {
     let started = Instant::now();
     let mut bridge = SessionProgressBridge {
         state: state.clone(),
@@ -1484,44 +1509,40 @@ async fn resume_turn(
         )
         .await;
 
-    let mut inner = state.core.lock();
-    inner.running = false;
-    inner.cancel = None;
-    inner.depth_cur = 0;
-    inner.tool_calls_cur = 0;
-    inner.agents_running = 0;
-    manager.agent_tree = inner.agent_tree.clone();
-    inner.manager = Some(manager);
     match result {
         Ok(r) => {
-            inner.history = r.messages.clone();
-            flush_stream(&mut inner);
-            fold_tool_outcomes(&mut inner, &r.messages);
-            inner.stats.turns += 1;
-            inner.stats.total_input_tokens += r.total_input_tokens;
-            inner.stats.total_output_tokens += r.total_output_tokens;
-            inner.stats.total_cost_usd += r.total_cost_usd;
-            let dto = TurnSummaryDto::from(r);
+            let dto = {
+                let mut inner = state.core.lock();
+                inner.history = r.messages.clone();
+                flush_stream(&mut inner);
+                fold_tool_outcomes(&mut inner, &r.messages);
+                inner.stats.turns += 1;
+                inner.stats.total_input_tokens += r.total_input_tokens;
+                inner.stats.total_output_tokens += r.total_output_tokens;
+                inner.stats.total_cost_usd += r.total_cost_usd;
+                TurnSummaryDto::from(r)
+            };
             crate::alog!(
                 "ask_user resume turn ok: {}s · ↑{} ↓{}",
                 started.elapsed().as_secs(),
                 dto.total_input_tokens,
                 dto.total_output_tokens
             );
-            state.sink.broadcast(ServerMsg::TurnOk {
-                summary: Box::new(dto),
-            });
+            TurnTerminal::Ok(Box::new(dto))
         }
         Err(e) => {
             // 失败保留 history 现状（engine_turn 同款）。问卷行已关卷——
             // 若失败源于 AlreadyAnswered（被 superseded 修复抢跑），行本
             // 就该关；其他失败路径行状态由快照自愈收口。
-            flush_stream(&mut inner);
+            {
+                let mut inner = state.core.lock();
+                flush_stream(&mut inner);
+            }
             crate::alog!("ask_user resume turn error: {e}");
-            state.sink.broadcast(ServerMsg::TurnError {
+            TurnTerminal::Error {
                 message: e.to_string(),
                 kind: None,
-            });
+            }
         }
     }
 }

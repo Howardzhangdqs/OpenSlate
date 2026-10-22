@@ -124,6 +124,9 @@ pub struct CoreInner {
     pub store: Option<SqliteStore>,
     pub session_run: Option<SessionRun>,
     pub manager: Option<RunManager>,
+    /// 当前回合任务（submit / resume 各存一次）。JoinHandle 无人消费：
+    /// 闭包体已包 catch_unwind（engine.rs panic 防线），Err(JoinError)
+    /// 路径实际不可达，仅作任务存活引用（drop 不 abort）。
     pub engine_task: Option<tokio::task::JoinHandle<()>>,
     pub paths: ConfigPaths,
     pub stats: SessionStatsDto,

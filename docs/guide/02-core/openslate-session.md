@@ -7,7 +7,7 @@
 | 文件 | 职责 | 核心符号 |
 |------|------|----------|
 | `state.rs`（824 行） | 共享状态 + 事件出口 + 转写镜像 | `SessionCore`/`CoreInner`/`MsgSink`/`AppState`/`ConfigPaths`/`SessionRun`/视图与镜像辅助函数 |
-| `engine.rs`（530 行） | 引擎回合任务 | `SessionProgressBridge`/`spawn_engine_turn`/`engine_turn`/`run_auto_compact`/`generate_title` |
+| `engine.rs`（530 行） | 引擎回合任务 | `SessionProgressBridge`/`spawn_engine_turn`/`engine_turn`/`finalize_turn`+`TurnTerminal`（panic 防线共用收尾）/`run_auto_compact`/`generate_title` |
 | `approval.rs`（436 行） | 会话审批桥（双作用域集合 + rules 共享 cell） | `SessionApprovalBridge`/`session_allows`/`clear_session_scopes`/`rules_handle` |
 | `question.rs` | ask_user 应答接缝 | `QuestionHandler` |
 | `config_ops.rs`（1312 行） | 配置 CRUD 写回链 | `ConfigChange`/`apply_config_change`/`apply_approval_rules`/`apply_set_api_key` |
@@ -92,8 +92,18 @@ pub struct CoreInner {
 
 - **spawn_blocking 专用线程 + `Handle::block_on`**：审批 `decide()` 是同步阻塞 trait、会等客户端应答；引擎执行期间还有多个同步回调。占 tokio worker 会饿死同 worker 上的转发/写任务（**实测复现过**）。阻塞池线程阻塞正是其设计用途；内层 future 经 Handle::block_on 驱动，tokio 定时器/通道/sqlx 均可用。
 - **回合级断连自动重试**（`classify_turn_error` :218 / `should_network_retry` :250）：Err 先经 `classify_turn_error` 分类（优先类型化下钻 `OpenSlateError::Provider(ProviderError)`；唯一字符串兜底 = `RetryExhausted.last`——adapter 层重试耗尽时内层只剩 Display 文本，文案变更会退化 Other，仅影响分类不影响正确性）。**Network 类**（`ConnectionError` / 内层为连接错误的 `RetryExhausted`）且预算未耗尽（每回合 1 次）+ 未取消（`cancel.is_cancelled()` 守卫，取消竞态尊重用户意图）+ 不在会话级冷却窗内（`CoreInner.last_network_retry` 距今 ≥ 10s，防网络瘫痪空转，照 mcp_recovery 冷却先例）→ **整回合重跑**：转写保留部分流出文本 + 追加 Meta「网络中断，已重试本回合」+ 广播 Notice(Info)「网络中断，正在自动重试…」+ 记冷却时间戳，重入 `execute_with_run_id`（Err 路径不动 inner.history，user 消息仍在——重跑即全新生成）；重试期间 running 保持 true（UI 转圈不停），manager 回收/运行态复位只在最终收尾做一次。重试仍失败或不可重试（RateLimit/Auth/Model/Other/取消）→ 终态 TurnError：`kind` 携带分类，重试用尽并入文案「（已自动重试 N 次）」。
-- 收尾（持 core 锁）：`running=false`、`cancel=None`、深度/工具计数清零；**回家的 manager 采用最新 agent_tree**（`manager.agent_tree = inner.agent_tree.clone()`——回合期间工具可见性热替换只改 inner.agent_tree，碰不到被 take 的 manager）；`inner.manager = Some(manager)`。
-- Ok：history 替换为 run 结果、flush、fold_tool_outcomes、stats 累计、广播 TurnOk。Err：flush、**保留 history 现状**（用户消息留着可重发）、广播 TurnError（含 kind / 重试次数文案）。
+- 收尾（`finalize_turn`，持 core 锁，**正常/失败/panic 拦截三路共用**防漂移）：`running=false`、`cancel=None`、深度/工具计数清零；**回家的 manager 采用最新 agent_tree**（`manager.agent_tree = inner.agent_tree.clone()`——回合期间工具可见性热替换只改 inner.agent_tree，碰不到被 take 的 manager）；`inner.manager = Some(manager)`。**先复位后广播**（客户端收到 TurnOk/TurnError 时 busy 守卫已放行）。Ok：history 替换为 run 结果、flush、fold_tool_outcomes、stats 累计（引擎侧短锁折叠后经 `TurnTerminal::Ok` 广播）；Err：flush、**保留 history 现状**（用户消息留着可重发）、`TurnTerminal::Error` 广播（含 kind / 重试次数文案）。
+
+### panic 防线（exp-10：catch_unwind 强制收尾）
+
+收尾是 `running=false` 的**唯一恢复点**——任何一次 attempt（含网络重试）中 panic 都会跳过它，`running` 永久卡 true：submit / NewSession / open_session 全被 busy 守卫拒绝（「回合进行中」）、Kotlin 侧 wakelock（AgentService 观察 running）永久持有，只有重启 App 可解。防线（`spawn_engine_turn`，mobile 的 `resume_turn` 同构复用）：
+
+- 回合体（attempt 循环 + 终态构造，经 `Handle::block_on`）整体包 `std::panic::catch_unwind(AssertUnwindSafe(..))`——`block_on` 同步驱动整个 future，任意 await 点的 panic 都会展开到此处被拦截。工具 panic 到不了这（runtime `execute_tool_safely` 已隔离成错误 ToolOutput），真实逃逸源是 provider 侧。
+- **manager 以 `&mut` 借用进被保护闭包**：panic 展开只作废引用、不销毁值（所有权留在闭包外帧），拦截后仍能经同一套 `finalize_turn` 送回 core。
+- 拦截路径：`tracing::error!`（「回合 panic 已拦截，强制收尾」；panic hook 已先打过 PANIC 栈）+ `finalize_turn` + `TurnError(kind=other)`，message 形如「内部错误：回合发生 panic（已恢复，可重试）；{payload 摘要 ≤200 字}」（`panic_payload_summary`：字符串载荷取原文按字符截断，其他类型占位）。**panic 不触发网络重试**（重试循环在 catch 内，展开即终态）。
+- 依赖 `panic = "unwind"`：workspace `[profile.mobile]` 为 FFI 防线已显式保证；`[profile.release]`（host）是 abort，防线在该 profile 下退化为不拦截（进程直接 abort，无卡死问题）。
+- `engine_task`（CoreInner）只存 JoinHandle 不消费 JoinError：闭包不再 panic 上抛，Err 路径实际不可达。
+- 回归测试：engine.rs `panic_guard`（panic → TurnError(Other) + running=false + manager 回家；panic 后 NewSession 成功）。
 
 ### run_auto_compact（:377）
 

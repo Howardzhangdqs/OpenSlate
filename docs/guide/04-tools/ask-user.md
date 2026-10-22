@@ -99,7 +99,8 @@ id 的 resolve 是无害 no-op（`HostCallRouter::resolve` 返回 false）。
    + 行重开 pending 可重试）→ `spawn_resume_turn`：
    `RunManager::resume_from_tool_result` 以**与即时路径同一
    `format_question_result` 输出**补全原 tool result 并从该点续跑
-   （`engine::engine_turn` 同款收尾：manager 回家 / 转写折叠 / TurnOk）。
+   （`engine::engine_turn` 同款收尾：经 `engine::finalize_turn` manager
+   回家 / 转写折叠 / TurnOk；同款 catch_unwind panic 防线）。
 
 **迟到等价不变量**（设计 §3 工程要点 7）：答案无论即时返回还是迟到补全，
 消息历史与工具结果完全一致——迟到的时间信息只进 UI 转写，不进模型上下文。

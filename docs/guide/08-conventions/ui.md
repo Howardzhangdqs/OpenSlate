@@ -38,3 +38,23 @@ Text(if (selected) "$option ✓" else option)
 1. 任何状态/能力/方向/操作的可视化标记 → `androidx.compose.material.icons`（extended 包已全量引入，无需加依赖）。
 2. 评审时全局搜可疑 Unicode（✓ ✗ ● ▲ ▶ ◀ ★ 等）出现在 `Text(...)` 字面量里的情况。
 3. 装饰性图标记得 `contentDescription = null`（无障碍语义留给文本）。
+
+## 5. 等宽字体约定（MonoFont vs 系统 Monospace）
+
+权威定义见 `android/app/src/main/java/dev/openslate/mobile/ui/Fonts.kt` 的 KDoc：
+
+- **`MonoFont`**（内嵌 JetBrains Mono 子集，latin/数字/常用符号；缺失字形自动回退系统字体）：
+  **仅用于标识类短文本**——工具名、模型名 / registry 键、命令 / 路径 / 配置片段、
+  条目内的参数摘要预览（单行截断）等。
+- **系统 `FontFamily.Monospace`**：任意长度的内容体——Markdown 代码块、工具输出、
+  日志体、审批卡的完整参数 JSON、弹窗里的 fullArgs 原文等需全字形覆盖的场景，
+  **不得改用 MonoFont 子集**。
+
+### 现有基线（新 UI 对齐它们）
+
+| 基线 | 位置 |
+|------|------|
+| 工具条目（ToolChipRow）的工具名 / argsPreview / bash 命令预览，详情弹窗头部工具名，审批转写行内嵌工具名，审批卡工具名 | `ui/ChatScreen.kt`（均 MonoFont） |
+| 审批卡参数预览、弹窗「调用参数」与 fullArgs 原文、输出体 | `ui/ChatScreen.kt`（系统 Monospace） |
+| 模型 id / registry 键 / 工具命名模板 | `ui/SettingsScreen.kt`、`ui/ToolManagementSection.kt` |
+

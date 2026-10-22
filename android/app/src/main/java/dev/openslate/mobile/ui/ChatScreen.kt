@@ -1025,10 +1025,11 @@ private fun ToolGroupCard(parts: List<UiEntry>, onOpenTool: (UiEntry.ToolCall) -
 
 /**
  * 单个工具条目：状态图标 + 名称 + 参数摘要，点击弹出详情弹窗（完整命令 + 输出）。
- * bash 类工具（termux_bash / bash）的摘要槽改显实际命令（解析 fullArgs 的
- * command 字段）：MonoFont 等宽单行截断 + 前缀区分执行环境（termux_bash 挂
- * Termux 品牌 logo、bash 挂 `$` 提示符——命令文本语义，非图标）；解析失败
- * 回退原 argsPreview。其他工具完全保持现状。
+ * 工具名与参数摘要均 MonoFont 等宽（标识类短文本约定；中文等缺失字形
+ * 自动回退系统字体）。bash 类工具（termux_bash / bash）的摘要槽改显实际
+ * 命令（解析 fullArgs 的 command 字段）：等宽单行截断 + 前缀区分执行环境
+ * （termux_bash 挂 Termux 品牌 logo、bash 挂 `$` 提示符——命令文本语义，
+ * 非图标）；解析失败回退原 argsPreview。
  */
 @Composable
 private fun ToolChipRow(
@@ -1092,7 +1093,7 @@ private fun ToolChipRow(
         Spacer(Modifier.widthIn(min = 6.dp))
         Text(
             tc.name,
-            style = MaterialTheme.typography.labelMedium,
+            style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFont),
             color = statusTint,
         )
         Spacer(Modifier.widthIn(min = 6.dp))
@@ -1122,7 +1123,7 @@ private fun ToolChipRow(
         } else {
             Text(
                 tc.argsPreview,
-                style = MaterialTheme.typography.labelSmall,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFont),
                 color = MaterialTheme.colorScheme.outline,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
@@ -1236,7 +1237,7 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                 ) {
                     Text(
                         tc.name,
-                        style = MaterialTheme.typography.titleSmall,
+                        style = MaterialTheme.typography.titleSmall.copy(fontFamily = MonoFont),
                         modifier = Modifier.weight(1f),
                     )
                     if (parts.exitCode != null) {

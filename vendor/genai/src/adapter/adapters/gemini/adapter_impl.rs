@@ -559,6 +559,7 @@ impl GeminiAdapter {
 			completion_tokens_details,
 
 			total_tokens,
+			image_input_tokens: None, // VENDOR PATCH #3 (OpenSlate): non-openai adapter
 		}
 	}
 

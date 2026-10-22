@@ -229,12 +229,23 @@ impl OpenAIAdapter {
 			return Usage::default();
 		}
 
+		// VENDOR PATCH #3 (OpenSlate): lift `prompt_tokens_details.image_tokens`
+		// to the top-level normalized counter. Read from the raw Value (works
+		// for every OpenAI-compatible gateway, incl. streaming), positive-only.
+		let image_input_tokens = usage_value
+			.get("prompt_tokens_details")
+			.and_then(|d| d.get("image_tokens"))
+			.and_then(|v| v.as_i64())
+			.filter(|v| *v > 0)
+			.map(|v| v as u64);
+
 		// NOTE: here we make sure we do not fail since we do not want to break a response because usage parsing fail
 		let usage = serde_json::from_value(usage_value).map_err(|err| {
 			error!("Fail to deserialize usage. Cause: {err}");
 			err
 		});
 		let mut usage: Usage = usage.unwrap_or_default();
+		usage.image_input_tokens = image_input_tokens;
 		// Will set details to None if no values
 		usage.compact_details();
 
@@ -292,6 +303,7 @@ impl OpenAIAdapter {
 								ContentPart::Binary(binary) => {
 									let is_audio = binary.is_audio();
 									let is_image = binary.is_image();
+									let is_video = binary.is_video();
 
 									// let Binary {
 									// 	content_type, source, ..
@@ -322,6 +334,14 @@ impl OpenAIAdapter {
 									} else if is_image {
 										let image_url = binary.into_url();
 										values.push(json!({"type": "image_url", "image_url": {"url": image_url}}));
+									} else if is_video {
+										// OpenSlate patch（对齐上游 genai 0.7.0 语义；与 anthropic
+										// ReasoningContent 补丁同体例，见根 Cargo.toml [patch] 登记）：
+										// 视频 Binary 走 video_url 块。`into_url()` 对 Base64 source
+										// 产 `data:{mime};base64,…`。不构造 detail 字段（智谱无此
+										// 参数）。ZAI 等委托本 adapter 的变体自动获得。
+										let url = binary.into_url();
+										values.push(json!({"type": "video_url", "video_url": {"url": url}}));
 									} else if matches!(&binary.source, BinarySource::Url(_)) {
 										// TODO: Need to return error
 										warn!("OpenAI doesn't support file from URL, need to handle it gracefully");
@@ -574,6 +594,56 @@ mod tests {
 		assert!(usage.total_tokens.is_none());
 	}
 
+	// VENDOR PATCH #3 (OpenSlate): `prompt_tokens_details.image_tokens` lifted
+	// to the normalized `Usage::image_input_tokens` (present / absent / 0 /
+	// malformed matrix).
+	#[test]
+	fn test_image_input_tokens_lifted_from_prompt_tokens_details() {
+		let usage = OpenAIAdapter::into_usage(
+			AdapterKind::OpenAI,
+			json!({
+				"prompt_tokens": 1200,
+				"completion_tokens": 30,
+				"total_tokens": 1230,
+				"prompt_tokens_details": { "cached_tokens": 64, "image_tokens": 728 }
+			}),
+		);
+		assert_eq!(usage.image_input_tokens, Some(728));
+		assert_eq!(usage.prompt_tokens, Some(1200));
+		assert_eq!(
+			usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
+			Some(64)
+		);
+
+		// Absent details object -> None.
+		let usage = OpenAIAdapter::into_usage(
+			AdapterKind::OpenAI,
+			json!({ "prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105 }),
+		);
+		assert_eq!(usage.image_input_tokens, None);
+
+		// Details without image_tokens (e.g. Zhipu chat usage) -> None.
+		let usage = OpenAIAdapter::into_usage(
+			AdapterKind::OpenAI,
+			json!({ "prompt_tokens": 100, "prompt_tokens_details": { "cached_tokens": 10 } }),
+		);
+		assert_eq!(usage.image_input_tokens, None);
+
+		// 0 treated as not-reported (zero_as_none semantics).
+		let usage = OpenAIAdapter::into_usage(
+			AdapterKind::OpenAI,
+			json!({ "prompt_tokens_details": { "image_tokens": 0 } }),
+		);
+		assert_eq!(usage.image_input_tokens, None);
+
+		// Malformed (non-numeric) -> None, usage parsing itself unaffected.
+		let usage = OpenAIAdapter::into_usage(
+			AdapterKind::OpenAI,
+			json!({ "prompt_tokens_details": { "image_tokens": "728" } }),
+		);
+		assert_eq!(usage.image_input_tokens, None);
+	}
+
 	/// When an assistant message carries reasoning_content, it must appear
 	/// in the serialized JSON so providers that require it (Kimi, DeepSeek)
 	/// don't reject the request.
@@ -617,6 +687,49 @@ mod tests {
 		assert!(
 			assistant_json.get("reasoning_content").is_none(),
 			"reasoning_content should be absent when not set"
+		);
+	}
+
+	// OpenSlate patch test: image and video Binary parts serialize to
+	// image_url / video_url blocks with a `data:` prefixed url (base64 source),
+	// and NO `detail` field (Zhipu GLM has no such parameter).
+	#[test]
+	fn test_binary_image_and_video_serialize_to_url_blocks() {
+		use crate::chat::Binary;
+
+		let user_msg = ChatMessage::user(MessageContent::from_parts(vec![
+			ContentPart::Text("describe these".to_string()),
+			ContentPart::Binary(Binary::from_base64("image/png", "aW1n", None)),
+			ContentPart::Binary(Binary::from_base64("video/mp4", "dmlk", Some("clip.mp4".to_string()))),
+		]));
+
+		let chat_req = ChatRequest::new(vec![user_msg]);
+		let parts = OpenAIAdapter::into_openai_request_parts(&test_model(), chat_req).expect("should serialize");
+
+		let user_json = &parts.messages[0];
+		assert_eq!(user_json["role"], "user");
+		let content = user_json["content"].as_array().expect("content should be a parts array");
+		assert_eq!(content.len(), 3, "text + image + video parts");
+
+		// Text part first.
+		assert_eq!(content[0], json!({"type": "text", "text": "describe these"}));
+
+		// Image part: image_url block, data: prefixed url, no `detail` field.
+		assert_eq!(
+			content[1],
+			json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1n"}}),
+			"image binary must serialize as image_url with data: prefixed base64 url"
+		);
+		assert!(
+			content[1].get("image_url").unwrap().get("detail").is_none(),
+			"no detail field (Zhipu GLM has no such parameter)"
+		);
+
+		// Video part (OpenSlate patch, upstream 0.7.0 semantics): video_url block.
+		assert_eq!(
+			content[2],
+			json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,dmlk"}}),
+			"video binary must serialize as video_url with data: prefixed base64 url"
 		);
 	}
 }

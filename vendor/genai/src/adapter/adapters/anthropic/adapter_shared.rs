@@ -107,6 +107,7 @@ impl AnthropicAdapter {
 			}),
 
 			total_tokens: Some(total_tokens),
+			image_input_tokens: None, // VENDOR PATCH #3 (OpenSlate): non-openai adapter
 		}
 	}
 

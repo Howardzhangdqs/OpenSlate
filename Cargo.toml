@@ -122,8 +122,18 @@ askama_parser = { git = "https://github.com/askama-rs/askama.git", tag = "v0.16.
 # 硬失败）；vendor 副本补充了该绑定（照抄 gnu 版，quickjs 为纯 C ABI，
 # 二进制布局一致）。上游合入后可移除。
 rquickjs-sys = { path = "vendor/rquickjs-sys" }
-# genai 0.6.5 vendor：anthropic adapter 原本丢弃历史 ReasoningContent——
-# patch 为回传 thinking block（多轮 extended-thinking 语义）。
+# genai 0.6.5 vendor，本地补丁三条（升级 0.7 前先 rebase 这里）：
+# ① anthropic adapter 原本丢弃历史 ReasoningContent——patch 为回传
+#   thinking block（多轮 extended-thinking 语义）。
+# ② openai adapter_shared User Binary 分支补 video_url 块（照抄上游
+#   0.7.0 语义；不构造 detail 字段——智谱无此参数），配合 chat/binary.rs
+#   的 Binary::is_video()。ZAI 等委托 openai adapter 的变体自动获得。
+# ③ usage 解析补 image_input_tokens（OpenAI 系 chat
+#   `usage.prompt_tokens_details.image_tokens` / Responses API
+#   `input_tokens_details.image_tokens` → 顶层归一化计数；chat/usage.rs
+#   Usage 字段 + openai adapter_shared into_usage + openai_resp
+#   resp_usage.rs 两路径抬升）。供 mobile 响应侧附件 token 回填；智谱
+#   chat usage 不分模态，天然 None。
 genai = { path = "vendor/genai" }
 
 [profile.release]

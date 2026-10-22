@@ -25,6 +25,14 @@ pub struct Usage {
 	/// Total tokens as reported by the API, or computed as prompt + completion
 	/// (including cache read/creation tokens when applicable).
 	pub total_tokens: Option<i32>,
+	/// VENDOR PATCH #3 (OpenSlate): image input tokens reported inside the
+	/// OpenAI-compatible `usage.prompt_tokens_details.image_tokens`
+	/// (Responses API: `input_tokens_details.image_tokens`), lifted to a
+	/// top-level counter by the openai/openai_resp adapters. `None` when the
+	/// provider does not report a per-modality input breakdown (e.g. Zhipu
+	/// chat usage has no such field). Non-openai adapters leave it `None`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub image_input_tokens: Option<u64>,
 }
 
 impl Usage {

@@ -49,7 +49,10 @@ panic = "unwind"
 |-------|------|---------|
 | askama 系列（GitHub 同版本 git 源） | cargo 拉取长期 TLS 失败（大陆网络） | 网络恢复后 |
 | `vendor/rquickjs-sys`（path） | 上游缺 aarch64-linux-android 绑定，硬失败 | 上游合入后 |
-| `vendor/genai`（path，0.6.5 patched） | anthropic adapter 回传 thinking block 等本地改动 | 视上游发布 |
+| `vendor/genai`（path，0.6.5 patched，两条本地补丁） | ① anthropic adapter 回传 thinking block（多轮 extended-thinking）；② openai adapter User Binary 分支补 `video_url` 块 + `Binary::is_video()`（照抄上游 0.7.0 语义，智谱多模态） | 视上游发布（升级 0.7 前先 rebase 两条补丁） |
+
+vendored genai 补丁明细（补丁点均搜 `OpenSlate patch`）见
+`03-models/model-genai.md` §8；其测试在 `vendor/genai` 目录内独立跑（见 §2）。
 
 详见 [troubleshooting.md](troubleshooting.md)。
 

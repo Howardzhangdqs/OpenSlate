@@ -95,6 +95,13 @@ impl Binary {
 		self.content_type.trim().to_ascii_lowercase().starts_with("audio/")
 	}
 
+	// OpenSlate patch (aligned with upstream genai 0.7.0): video predicate
+	// needed by the OpenAI adapter video_url branch (see adapter_shared.rs).
+	/// Returns true if this binary is a video (content_type starts with "video/").
+	pub fn is_video(&self) -> bool {
+		self.content_type.trim().to_ascii_lowercase().starts_with("video/")
+	}
+
 	/// Returns true if this binary is a PDF (content_type equals "application/pdf").
 	pub fn is_pdf(&self) -> bool {
 		self.content_type.trim().eq_ignore_ascii_case("application/pdf")

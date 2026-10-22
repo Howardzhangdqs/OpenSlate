@@ -44,8 +44,8 @@ You are a helpful AI assistant.
 /// termux.run；v3 = output_query 加入前的多选命名版）。已装机设备的
 /// root.md 与之一致时视为未定制，自动迁移到当前默认（bash / termux_bash
 /// / output_query）；用户改过则保持不动——**不在白名单 ≠ 报错**，只是
-/// 模型看不到该工具（存量已定制 root.md 的用户需手动加
-/// `- output_query`）。
+/// 模型看不到该工具；启动迁移对外科式补齐（见
+/// [`ensure_builtin_tool_whitelisted`]）兜底——app 私有目录无编辑器可达。
 const LEGACY_ROOT_AGENT_MDS: &[&str] = &[
     // v3：多选命名版（output_query 加入前）。
     r#"---
@@ -136,6 +136,16 @@ impl MobilePaths {
                 fs::write(&root_md, DEFAULT_ROOT_AGENT_MD)
                     .with_context(|| format!("迁移默认 agent 失败：{}", root_md.display()))?;
                 tracing::info!("mobile bootstrap: migrated legacy root agent (bash/termux_bash)");
+            } else if let Some(patched) = ensure_builtin_tool_whitelisted(&current) {
+                // 定制过的 root.md：app 私有目录无编辑器可达（release 不可
+                // run-as、设置页无该文件编辑入口），用户没有手动加白名单
+                // 的途径——启动时外科式补齐必备内置工具（只在 tools: 列表
+                // 尾部追加缺失项，其余内容逐字不动）。
+                fs::write(&root_md, &patched)
+                    .with_context(|| format!("补齐内置工具白名单失败：{}", root_md.display()))?;
+                tracing::info!(
+                    "mobile bootstrap: appended missing builtin tools to customized root agent"
+                );
             }
         }
 
@@ -290,9 +300,85 @@ path = "{db}"
     )
 }
 
+/// 必须出现在 root.md 工具白名单里的内置工具（模型可见性的唯一闸门）。
+/// app 私有目录无编辑器可达（release 不可 run-as、设置页无该文件编辑
+/// 入口），定制过 root.md 的用户没有手动补的途径——启动时外科式补齐。
+/// 若用户刻意删掉某项，下次启动会再次补上：单用户语义下可接受（有意
+/// 关闭请用工具自身的配置开关而非白名单剔除）。
+const REQUIRED_BUILTIN_TOOLS: &[&str] = &["output_query"];
+
+/// 定制 root.md 的白名单外科式补齐：`tools:` 块存在、且存在至少一条
+/// 缩进列表项时，把 [`REQUIRED_BUILTIN_TOOLS`] 中缺失的项追加到列表
+/// 尾部（缩进对齐既有项）；其余内容逐字不动。无可补 / 形态不认识
+/// （如内联 `tools: [a, b]`、空列表、无 tools 块）→ None（不动文件，
+/// 宁可不修不可修错）。
+fn ensure_builtin_tool_whitelisted(root_md: &str) -> Option<String> {
+    let missing: Vec<&str> = REQUIRED_BUILTIN_TOOLS
+        .iter()
+        .copied()
+        // 任意位置出现「- 工具名」即视为已在白名单（含 prose 提及的保守
+        // 误判：宁可不补，不动定制文件）。
+        .filter(|t| !root_md.contains(&format!("- {t}")))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = root_md.lines().collect();
+    let tools_idx = lines.iter().position(|l| l.trim_end() == "tools:")?;
+    // tools: 之后连续的缩进列表项（"- xxx" 形态）的最后一条与缩进宽度。
+    let mut last_item: Option<usize> = None;
+    let mut indent = "    ";
+    for (i, l) in lines.iter().enumerate().skip(tools_idx + 1) {
+        let t = l.trim_start();
+        if t.starts_with("- ") {
+            last_item = Some(i);
+            indent = &l[..l.len() - t.len()];
+        } else if !t.is_empty() {
+            break;
+        }
+    }
+    let insert_at = last_item? + 1;
+    let mut patched: Vec<String> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if i == insert_at {
+            for tool in &missing {
+                patched.push(format!("{indent}- {tool}"));
+            }
+        }
+        patched.push((*l).to_owned());
+    }
+    let mut out = patched.join("\n");
+    out.push('\n');
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_tool_surgery_appends_to_customized_whitelist() {
+        // 定制过的 root.md（含非默认工具项）：外科式追加，其余逐字不动。
+        let customized = "---\nid: root\nname: OpenSlate\nmodel: main\ntools:\n    - mobile.ping\n    - bash\n    - termux_bash\n    - termux_read_file\n---\n你好。\n";
+        let patched = ensure_builtin_tool_whitelisted(customized)
+            .expect("应补齐 output_query");
+        assert!(patched.contains("- termux_read_file\n    - output_query\n"));
+        // 头部与正文原样保留。
+        assert!(patched.starts_with("---\nid: root\n"));
+        assert!(patched.ends_with("你好。\n"));
+    }
+
+    #[test]
+    fn builtin_tool_surgery_idempotent_and_bail_forms() {
+        // 已包含 → None（幂等）。
+        let has = "tools:\n    - bash\n    - output_query\n";
+        assert!(ensure_builtin_tool_whitelisted(has).is_none());
+        // 内联列表形态 / 无 tools 块 → None（宁可不修）。
+        assert!(ensure_builtin_tool_whitelisted("tools: [bash]\n").is_none());
+        assert!(ensure_builtin_tool_whitelisted("id: root\n").is_none());
+        // 空 tools 块（无列表项可锚定）→ None。
+        assert!(ensure_builtin_tool_whitelisted("tools:\n---\n").is_none());
+    }
 
     #[test]
     fn ensure_layout_is_idempotent_and_writes_defaults() {

@@ -429,9 +429,11 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
   已按「跳过 + 拷贝」正确实现，`copy_all_but_n_*` 两个无算子对应的函数未引入。
 - **累计输出封顶** = `max_output_bytes` 生效值：超限 UTF-8 字符边界截断 + 尾注
   `[output_query: result truncated at {cap} bytes — narrow start/end, reduce n, or use grep]`。
-- **root.md 白名单**：bootstrap 默认白名单已加 `output_query`；旧默认全文进
-  `LEGACY_ROOT_AGENT_MDS` 自动迁移（未定制存量设备开箱即得）。**已定制 root.md 的用户需
-  手动加 `- output_query`**——不在白名单 ≠ 报错，只是模型看不到该工具。
+- **root.md 白名单**：bootstrap 默认白名单已加 `output_query`；未定制存量经
+  `LEGACY_ROOT_AGENT_MDS` 自动迁移；**定制过的 root.md 由启动时的外科式补齐兜底**
+  （`ensure_builtin_tool_whitelisted`：`REQUIRED_BUILTIN_TOOLS` 缺失项追加到 tools:
+  列表尾，其余逐字不动——app 私有目录无编辑器可达，用户没有手动途径）。
+  不在白名单 ≠ 报错，只是模型看不到该工具。
 
 ### 15.3 测试面
 

@@ -168,8 +168,9 @@ mcp-builtin 路线是两条不同的注册通路：没有 `[builtin_tools]` 开�
   调用返回明确错误文案，不是 panic。
 - **白名单**：mobile 的 root.md 默认是**显式工具白名单**（tools 为空 = 暴露全部，mobile
   语义不可接受）——新工具要进 `bootstrap.rs` 的 `DEFAULT_ROOT_AGENT_MD`，并把旧默认全文
-  追加进 `LEGACY_ROOT_AGENT_MDS`（存量未定制 root.md 自动迁移）。**已定制 root.md 的用户
-  需手动加一行 `- your_tool`；不在白名单 ≠ 报错，只是模型看不到**。
+  追加进 `LEGACY_ROOT_AGENT_MDS`（存量未定制 root.md 自动迁移），**同时加入
+  `REQUIRED_BUILTIN_TOOLS`**（定制过的 root.md 启动时外科式补齐——app 私有目录无编辑器
+  可达，用户没有手动途径）。不在白名单 ≠ 报错，只是模型看不到**。
 - **审批**：无副作用工具加入 `askuser.rs` 的 `APPROVAL_EXEMPT_TOOLS` /
   `SideEffectFreeApproval`（免审，Manual 模式同样豁免）；有副作用的让它走默认链
   （Auto 缺省 → 启发式 → AI 审查）。

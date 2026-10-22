@@ -6,7 +6,7 @@
 //! 生命周期 API。
 
 use openslate_core::error::StoreError;
-use sqlx::query;
+use sqlx::{query, query_scalar};
 
 use crate::store::SqliteStore;
 
@@ -719,10 +719,17 @@ impl SqliteStore {
     /// 写入一条工具长输出：压缩字节先落 `files/outputs/{sha256}.zst`
     /// （不存在才写），再插 `tool_outputs` 行。
     ///
+    /// - `ref_id`：**会话内唯一**短 id（`out-N`，调用方 storer 按 run 内
+    ///   自增序号分配；查询侧收 `out-` + 1..16 hex 形态）；
     /// - `data_zst`：**调用方传入的已压缩字节**（sha256 是原文的 sha，
     ///   store 信任不复算、不感知压缩参数）；
     /// - 同 run 同 sha 幂等：`ON CONFLICT(run_id, sha256) DO UPDATE` 仅
-    ///   刷新 `created_at`（同 sha ⇒ 同内容，其余计量字段必然一致）；
+    ///   刷新 `created_at`（同 sha ⇒ 同内容，其余计量字段必然一致），
+    ///   并**返回既有行的 ref**（`RETURNING`）——调用方拿真实 ref 构造
+    ///   落盘回执，序号竞态窗口内也不会出现「回执 ref 与行不符」；
+    /// - 同 run 同 ref 撞不同 sha：理论不可达（序号分配在 storer 的串行
+    ///   路径上），防御处理——`ON CONFLICT(run_id, ref) DO NOTHING` +
+    ///   `RETURNING` 空 → 报错（不覆盖既有行，调用方回落旧截断路径）；
     /// - 内存库（无 files_dir）明确报错（fail fast，对齐
     ///   [`Self::insert_attachment`]——测试库不应静默丢全文）。
     #[allow(clippy::too_many_arguments)]
@@ -730,13 +737,14 @@ impl SqliteStore {
         &self,
         id: &str,
         run_id: &str,
+        ref_id: &str,
         sha256: &str,
         tool_name: &str,
         orig_bytes: i64,
         line_count: i64,
         data_zst: &[u8],
         created_at: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<String, StoreError> {
         let outputs_dir = self.files_dir().map(|d| d.join("outputs")).ok_or_else(|| {
             StoreError::WriteError(
                 "tool output writes require a file-backed store; in-memory store has no files_dir"
@@ -745,23 +753,33 @@ impl SqliteStore {
         })?;
         Self::write_tool_output_file(&outputs_dir, sha256, data_zst)?;
 
-        query(
+        // 双冲突子句：sha 命中 → 幂等刷新 created_at 并回既有行的 ref；
+        // ref 命中（防御）→ DO NOTHING，RETURNING 空 → 报错。
+        let effective_ref: Option<String> = query_scalar(
             "INSERT INTO tool_outputs \
-             (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(run_id, sha256) DO UPDATE SET created_at = excluded.created_at",
+             (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(run_id, sha256) DO UPDATE SET created_at = excluded.created_at \
+             ON CONFLICT(run_id, ref) DO NOTHING \
+             RETURNING ref",
         )
         .bind(id)
         .bind(run_id)
+        .bind(ref_id)
         .bind(sha256)
         .bind(tool_name)
         .bind(orig_bytes)
         .bind(line_count)
         .bind(created_at)
-        .execute(self.pool())
+        .fetch_optional(self.pool())
         .await
         .map_err(werr)?;
-        Ok(())
+        effective_ref.ok_or_else(|| {
+            StoreError::WriteError(format!(
+                "tool output ref '{ref_id}' already exists in run '{run_id}' with a different \
+                 sha256 (ref allocation raced); no row was overwritten"
+            ))
+        })
     }
 
     // ── 转写条目（v5；entry_json 透传，store 不解析）──────────────────
@@ -1551,8 +1569,8 @@ mod tests {
         .expect("victim transcript entry");
         // v6 子表同上（tool_outputs 行级塞数据）
         sqlx::query(
-            "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
-             VALUES ('victim-to', 'victim', 'sha-v-out', 'bash', 100, 5, 1500)",
+            "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('victim-to', 'victim', 'out-1', 'sha-v-out', 'bash', 100, 5, 1500)",
         )
         .execute(store.pool())
         .await
@@ -2132,15 +2150,18 @@ mod tests {
             .expect("run");
 
         let sha = sha64('a');
-        store
-            .insert_tool_output("out-1", "run-1", &sha, "bash", 100, 5, &[1, 2, 3], 2000)
+        let first = store
+            .insert_tool_output("out-1", "run-1", "out-1", &sha, "bash", 100, 5, &[1, 2, 3], 2000)
             .await
             .expect("first insert");
-        // 同 run 同 sha：幂等——不报错、不新增行、仅刷新 created_at。
-        store
-            .insert_tool_output("out-2", "run-1", &sha, "bash", 100, 5, &[1, 2, 3], 3000)
+        assert_eq!(first, "out-1", "新行返回调用方传入的 ref");
+        // 同 run 同 sha：幂等——不报错、不新增行、仅刷新 created_at，
+        // 且返回既有行的 ref（调用方拿真实 ref 构造回执）。
+        let second = store
+            .insert_tool_output("out-2", "run-1", "out-2", &sha, "bash", 100, 5, &[1, 2, 3], 3000)
             .await
             .expect("upsert insert");
+        assert_eq!(second, "out-1", "sha 命中 → 既有行的 ref 胜出");
 
         let (count, created_at): (i64, i64) =
             sqlx::query_as::<_, (i64, i64)>("SELECT COUNT(*), MAX(created_at) FROM tool_outputs")
@@ -2149,6 +2170,40 @@ mod tests {
                 .expect("count");
         assert_eq!(count, 1, "同 run 同 sha 不新增行");
         assert_eq!(created_at, 3000, "created_at 被刷新为最新值");
+    }
+
+    /// 同 run 同 ref 撞不同 sha（防御路径）：DO NOTHING + 报错，既有行
+    /// 不被覆盖。序号分配在 storer 串行路径上，正常不可达——本测试钉死
+    /// 「真撞上也不静默损坏」。
+    #[tokio::test]
+    async fn test_tool_output_ref_conflict_errors_without_overwrite() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-1", None, "root", "running", "{}", 1000)
+            .await
+            .expect("run");
+
+        store
+            .insert_tool_output("out-1", "run-1", "out-1", &sha64('a'), "bash", 10, 1, &[1], 1000)
+            .await
+            .expect("first");
+        let err = store
+            .insert_tool_output("out-2", "run-1", "out-1", &sha64('b'), "bash", 10, 1, &[2], 2000)
+            .await
+            .expect_err("ref 撞不同 sha 必须报错");
+        assert!(
+            err.to_string().contains("ref 'out-1' already exists"),
+            "got: {err}"
+        );
+
+        // 既有行原样保留
+        let (sha,): (String,) =
+            sqlx::query_as::<_, (String,)>("SELECT sha256 FROM tool_outputs WHERE run_id = 'run-1'")
+                .fetch_one(store.pool())
+                .await
+                .expect("row");
+        assert_eq!(sha, sha64('a'), "既有行未被覆盖");
     }
 
     #[tokio::test]
@@ -2166,11 +2221,12 @@ mod tests {
 
         let sha = sha64('b');
         store
-            .insert_tool_output("out-a", "run-a", &sha, "bash", 10, 2, &[9, 9], 1500)
+            .insert_tool_output("out-a", "run-a", "out-1", &sha, "bash", 10, 2, &[9, 9], 1500)
             .await
             .expect("run a output");
+        // ref 序号按 run 独立：run-b 的第一条也从 out-1 起
         store
-            .insert_tool_output("out-b", "run-b", &sha, "bash", 10, 2, &[9, 9], 2500)
+            .insert_tool_output("out-b", "run-b", "out-1", &sha, "bash", 10, 2, &[9, 9], 2500)
             .await
             .expect("run b output");
 
@@ -2204,11 +2260,11 @@ mod tests {
 
         let sha = sha64('c');
         store
-            .insert_tool_output("out-a", "run-a", &sha, "bash", 16, 1, &[7; 8], 1500)
+            .insert_tool_output("out-a", "run-a", "out-1", &sha, "bash", 16, 1, &[7; 8], 1500)
             .await
             .expect("out a");
         store
-            .insert_tool_output("out-b", "run-b", &sha, "bash", 16, 1, &[7; 8], 2500)
+            .insert_tool_output("out-b", "run-b", "out-1", &sha, "bash", 16, 1, &[7; 8], 2500)
             .await
             .expect("out b");
         let file = store
@@ -2256,6 +2312,7 @@ mod tests {
             .insert_tool_output(
                 "out-keep",
                 "run-1",
+                "out-1",
                 &sha_referenced,
                 "bash",
                 4,
@@ -2288,7 +2345,7 @@ mod tests {
             .await
             .expect("run");
         let err = store
-            .insert_tool_output("out-x", "run-1", &sha64('f'), "bash", 1, 1, &[1], 1)
+            .insert_tool_output("out-x", "run-1", "out-1", &sha64('f'), "bash", 1, 1, &[1], 1)
             .await
             .expect_err("内存库必须明确拒绝");
         assert!(

@@ -28,7 +28,9 @@ use async_trait::async_trait;
 /// 落盘回执（core 用于构造预览）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOutput {
-    /// 全文引用 id（`output_query` 按 id 取回；由存储层生成，全局唯一）。
+    /// 全文引用（`output_query` 按 ref 取回；**由宿主存储层分配的
+    /// 会话内唯一短 id**（如 `out-3`）——core 不感知格式与唯一性来源，
+    /// 只透传进预览标记）。
     pub ref_id: String,
     /// 原文字节数（预览头行的 `size=` 与省略量诚实值计算都用它）。
     pub orig_bytes: usize,

@@ -2,7 +2,7 @@
 
 > SQLite 持久化 crate（`crates/openslate-store-sqlite/src/`，6 个模块）：schema（DDL + 版本化迁移）、store（连接管理）、write（全部写操作）、query（只读查询 + 记录类型）、recorder（逐消息持久化适配器）、codec（v5 压缩列编解码）。sqlx 0.9（sqlite-bundled），**不用宏**——动态 SQL 走 `AssertSqlSafe`。依赖 core（错误类型 + MessageSink + Message/MessageMeta）+ zstd 0.13。
 >
-> **当前 schema 版本：v6**（v5 多模态改造 + v6 长输出落盘 `tool_outputs` 表）。
+> **当前 schema 版本：v7**（v5 多模态改造 + v6 长输出落盘 `tool_outputs` 表 + v7 `ref` 列/会话隔离）。
 
 ## 1. schema.rs —— DDL + 版本化迁移（640 行）
 
@@ -10,7 +10,7 @@
 
 ```rust
 // :44
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 ```
 
 - **v1 基线**：7 张表 + 索引（等价旧无版本机制的最终形态；基线 DDL 已含 CHECK 约束、不含 `runs.cwd`）。
@@ -24,6 +24,7 @@ pub const SCHEMA_VERSION: i64 = 6;
   4. 非唯一索引 `idx_messages_run_seq` **删除不重建**（`idx_messages_run_seq_uq` 最左前缀 `(run_id, seq)` 完全覆盖其查询计划）。
 - **v4→v5 是破坏性迁移**（用户拍板 2026-10-21：软件未发布开发期）：不复制旧数据——`DROP TABLE messages` 后直接以最终 DDL 重建，旧行历史丢弃；存量脏数据（v2 时代重复 seq）一并消失，新表 `UNIQUE(run_id, seq)` 必然可建。`runs` / `credentials` / `pending_questions` 原样保留（API key、会话列表不丢）。无 FK 引用 messages，重建无级联风险，无需临时表 + RENAME。
 - **v6**（长输出落盘 + output_query 设计 C1）：新表 `tool_outputs`（+ `idx_tool_outputs_sha256` 索引）。超限工具输出全文的 content-addressed 落盘（压缩字节在 `files/outputs/{sha256}.zst`，DB 存引用行 + 计量字段）。纯新增、无数据搬移（v6 前的超限输出已被截断丢弃，无从恢复）。
+- **v7**（会话内短 ref + 严格会话隔离，用户拍板 2026-10-22）：`tool_outputs` **破坏性重建**为带 `ref` 列的最终形态——ref 是**会话内唯一**短 id（`out-N`，宿主 storer 按 run 内自增序号分配）+ `UNIQUE INDEX idx_tool_outputs_run_ref(run_id, ref)`。**破坏性**（开发期拍板 2026-10-22，用户本地数据可弃）：DROP 整表重建、存量行丢弃、不做回填兼容——长输出缓存可弃，旧消息里的 16hex 标记查无行即走既有降级路径（弹窗回落预览原文 / output_query 报未知 ref），孤儿文件由启动 GC 清扫。
 
 ### 12 张表
 
@@ -40,7 +41,7 @@ pub const SCHEMA_VERSION: i64 = 6;
 | `credentials` | v4（:240） | name TEXT PK（凭据键：env 变量名或 `file:<path>`）/ **kind CHECK IN ('env','file')** / target / value（**明文**——加密边界与威胁模型见 DDL 注释：app 私有 sqlite + Android 沙箱，防意外泄漏不防 root/备份提取；升级路径 Android Keystore via FFI）/ created_at / updated_at（upsert 刷新，created 首写固定）。**无 FK**。读写方法刻意分层：`list_credentials()`/`CredentialRecord` **无明文**（管理面），`get_credential_value()`/`load_credentials_with_values()` 明文仅 vault 消费 |
 | `attachments` | v5（:263） | id TEXT PK（`att-<uuid>`）/ **run_id?**（NULL = 已导入未绑定，composer 暂存；Submit 时 `bind_attachments` 批量绑定。SQLite FK 对 NULL 父值放行）/ sha256 NOT NULL / mime NOT NULL（归一化后，白名单见 `mime_extension`）/ filename? / size_bytes NOT NULL（归一化后字节数）/ created_at / **UNIQUE(run_id, sha256)**（run 内去重；跨 run 复用靠相同 sha256 指向同一文件）/ FK(run_id)→runs。**字节不进 DB**——content-addressed 落 `files/{sha256}.{ext}`，见 §3 |
 | `transcript_entries` | v5（:284） | id TEXT PK / run_id NOT NULL FK→runs / seq（mobile 层收口 helper 分配，run 内唯一）/ **entry_json TEXT NOT NULL**（`EntryDto` serde JSON **透传**，store 不解析；不压缩——单条几百字节负收益）/ created_at。与 `steps` 的语义边界：steps 是执行步骤，Approval/Delegate/StepBreak/Meta 不是；行级写入天然增量，回合中途崩溃不丢整回合 UI 条目 |
-| `tool_outputs` | v6（DDL_TOOL_OUTPUTS） | id TEXT PK（`out-<uuid simple>`）/ run_id NOT NULL FK→runs / sha256 NOT NULL（全 64 hex；`ref_id = "out-" + sha256[..16]`）/ tool_name / **orig_bytes**（压缩前原文字节数）/ **line_count**（原文行数）/ created_at / **UNIQUE(run_id, sha256)**。生命周期对齐 attachments 的 content-addressed 模式但**无 bind/引用计数**：行按 run 独立、文件按 sha 跨 run 共享于 `files/outputs/{sha256}.zst`（调用方传入已压缩字节） |
+| `tool_outputs` | v6（v7 加 ref 列重建，DDL_TOOL_OUTPUTS） | id TEXT PK（`out-<uuid simple>`）/ run_id NOT NULL FK→runs / **ref TEXT NOT NULL（v7——会话内唯一短 id `out-N`，宿主 storer 按 run 自增序号分配）** / sha256 NOT NULL（全 64 hex）/ tool_name / **orig_bytes**（压缩前原文字节数）/ **line_count**（原文行数）/ created_at / **UNIQUE(run_id, sha256)** + **UNIQUE INDEX (run_id, ref)**。生命周期对齐 attachments 的 content-addressed 模式但**无 bind/引用计数**：行按 run 独立、文件按 sha 跨 run 共享于 `files/outputs/{sha256}.zst`（调用方传入已压缩字节） |
 
 建表顺序有意义：被外键引用的表先建（`ddl_statements()` :51 返回序即此序；v5 两张新表只引用 runs，追加在尾部）。
 
@@ -51,6 +52,7 @@ pub const SCHEMA_VERSION: i64 = 6;
 - v3：`idx_pending_questions_status`。
 - **v5 新增**：`idx_attachments_sha256`（delete_run / 启动 GC 的行级 `SELECT 1 WHERE sha256=?` 走此索引）、`idx_transcript_run_seq`（**UNIQUE**）。
 - **v6 新增**：`idx_tool_outputs_sha256`（delete_run / 启动 GC 的行级引用判定走此索引）。
+- **v7 新增**：`idx_tool_outputs_run_ref`（**UNIQUE**，`(run_id, ref)`——`find_tool_output` 精确匹配走此索引；run 内唯一性兜底，分配器在 mobile storer 的串行路径上）。
 - **v5 删除**：`idx_messages_run_seq`（非唯一）——随 `DROP TABLE messages` 消亡且不重建，uq 最左前缀完全覆盖。
 
 ### 迁移机制（`SqliteStore::run_migrations` 驱动）
@@ -58,10 +60,10 @@ pub const SCHEMA_VERSION: i64 = 6;
 - `PRAGMA user_version` 记录当前版本；目标 = `SCHEMA_VERSION`。
 - **每版本步进独立事务**：`user_version` 与 DDL 同事务提交——崩溃后重跑不会出现半迁移。
 - v0 兼容：DDL 全部 `IF NOT EXISTS`；`ALTER TABLE` 前先经 `pragma_table_info` 列存在检查（`column_exists` :426）。
-- 步进函数：`migrate_v0_to_v1`（:444）/ `migrate_v1_to_v2`（:468）/ `migrate_v2_to_v3`（:518）/ `migrate_v3_to_v4`（:534）/ **`migrate_v4_to_v5`（:558，单事务内 7 步：DROP messages → 最终 DDL 重建 → 建 uq + execution_node_id 两索引 → runs 两列 ALTER（column_exists 守卫）→ attachments/transcript_entries 建表建索引 → user_version=5 由驱动器写入）** / `migrate_v5_to_v6`（tool_outputs 建表建索引，纯新增幂等）。v4→v5 步进事务提交后驱动器做一次 `wal_checkpoint(TRUNCATE)` 回收 WAL（best-effort，失败仅告警）——迁移 O(1) DDL 无数据复制，无耗时风险。
-- 全新库路径：基线 `DDL_MESSAGES` 直接是 v5 最终形态，逐版本步进幂等收敛到 v6。
+- 步进函数：`migrate_v0_to_v1`（:444）/ `migrate_v1_to_v2`（:468）/ `migrate_v2_to_v3`（:518）/ `migrate_v3_to_v4`（:534）/ **`migrate_v4_to_v5`（:558，单事务内 7 步：DROP messages → 最终 DDL 重建 → 建 uq + execution_node_id 两索引 → runs 两列 ALTER（column_exists 守卫）→ attachments/transcript_entries 建表建索引 → user_version=5 由驱动器写入）** / `migrate_v5_to_v6`（tool_outputs 建表建索引，纯新增幂等）/ **`migrate_v6_to_v7`（破坏性：DROP tool_outputs → 最终 DDL 重建（含 ref 列）→ 建 sha256 + run_ref 两索引；存量行丢弃不回填，幂等——全新库重放为空转）**。v4→v5 步进事务提交后驱动器做一次 `wal_checkpoint(TRUNCATE)` 回收 WAL（best-effort，失败仅告警）——迁移 O(1) DDL 无数据复制，无耗时风险。
+- 全新库路径：基线 `DDL_MESSAGES` 直接是 v5 最终形态、`DDL_TOOL_OUTPUTS` 直接是 v7 最终形态，逐版本步进幂等收敛到 v7。
 - 高版本库报 `MigrationError`（"请先升级程序"）。
-- 测试常量：`TABLE_NAMES`（12 表）/ `INDEX_NAMES`（11 索引）+ CHECK 约束防漂移测试。
+- 测试常量：`TABLE_NAMES`（12 表）/ `INDEX_NAMES`（12 索引）+ CHECK 约束防漂移测试。
 - **回滚策略：无**（与既有 4 个版本一致）。
 
 **新表/新列变更流程**：新 `SCHEMA_VERSION` 步进 + 独立事务函数（`migrate_vN_to_vN+1`）+ 同步 `TABLE_NAMES`/`INDEX_NAMES` + 索引计数测试。
@@ -134,12 +136,12 @@ v5 转写 API：
 | `delete_messages_from_seq(run_id, from_seq) -> u64` | 新增（write.rs） | 删该 run `seq >= from_seq` 的尾部消息行（**悬挂尾巴 pop 回写，C2**：open_session / 重启恢复 pop 悬挂 assistant 后同步删行）；返回删除行数 |
 | `delete_transcript_entries_for_run(run_id) -> u64` | 新增（write.rs） | 删该 run 全部转写条目行（**悬挂 pop 重建清场，C2**）：全删 + 调用方失效 SyncState 游标 → sync_loop 从 0 全量重写（幂等） |
 
-v6 长输出 API（压缩字节 content-addressed 落 `files/outputs/`，DB 存引用）：
+v6/v7 长输出 API（压缩字节 content-addressed 落 `files/outputs/`，DB 存引用 + ref）：
 
 | 函数 | 语义 |
 |------|------|
 | `write_tool_output_file(outputs_dir, sha256, data_zst)`（私有） | 幂等写 `files/outputs/{sha256}.zst`（存在即跳过，跨 run 共享） |
-| `insert_tool_output(id, run_id, sha256, tool_name, orig_bytes, line_count, data_zst: &[u8], created_at)` | 先落文件再插行；`data_zst` 是**调用方已压缩字节**（sha 为原文 sha，store 信任不复算）；同 run 同 sha 幂等（`ON CONFLICT DO UPDATE SET created_at`）；内存库明确报错 fail fast |
+| `insert_tool_output(id, run_id, ref_id, sha256, tool_name, orig_bytes, line_count, data_zst: &[u8], created_at) -> String` | 先落文件再插行；`data_zst` 是**调用方已压缩字节**（sha 为原文 sha，store 信任不复算）；同 run 同 sha 幂等（`ON CONFLICT(run_id, sha256) DO UPDATE SET created_at`）并**返回既有行的 ref**（`RETURNING`，调用方拿真实 ref 构造回执）；同 run 同 ref 撞不同 sha 防御性报错（DO NOTHING 不覆盖）；内存库明确报错 fail fast |
 
 ask_user 问卷持久化（v3）：`insert_pending_question`（:738）/ `transition_pending_question(request_id, from, to) -> bool`（:766，**原子状态迁移，幂等首答者赢**）。
 
@@ -147,7 +149,7 @@ ask_user 持久凭据（v4）：`upsert_credential`（:790，name 主键 upsert�
 
 ## 5. query.rs —— 只读查询 + 记录类型（1678 行）
 
-记录类型（serde derive）：`RunRecord`（:18，含 title?/cost_usd + **v5 input_tokens/output_tokens**）/ `ExecutionNodeRecord` / `StepRecord` / **`MessageRecord`（:74——`content_json` 是 `content_zst` 解压后的 JSON 文本（解压在 store 侧完成交付），新增 `meta_json: Option<String>` 旁路列）** / `PromptSnapshotRecord` / `AuditLogRecord` / `TraceEventRecord` / `PendingQuestionRecord`（v3）/ `CredentialRecord`（v4，无明文）/ **`AttachmentRecord`（:92，v5——引用形状，wire/DB 同构）** / **`TranscriptEntryRecord`（:109，v5——entry_json 透传）** / **`ToolOutputRecord`（v6——id/run_id/sha256(64hex)/tool_name/orig_bytes/line_count/created_at，orig_bytes·line_count 为压缩前原文计量）**。
+记录类型（serde derive）：`RunRecord`（:18，含 title?/cost_usd + **v5 input_tokens/output_tokens**）/ `ExecutionNodeRecord` / `StepRecord` / **`MessageRecord`（:74——`content_json` 是 `content_zst` 解压后的 JSON 文本（解压在 store 侧完成交付），新增 `meta_json: Option<String>` 旁路列）** / `PromptSnapshotRecord` / `AuditLogRecord` / `TraceEventRecord` / `PendingQuestionRecord`（v3）/ `CredentialRecord`（v4，无明文）/ **`AttachmentRecord`（:92，v5——引用形状，wire/DB 同构）** / **`TranscriptEntryRecord`（:109，v5——entry_json 透传）** / **`ToolOutputRecord`（v6/v7——id/run_id/ref_id（会话内短 id）/sha256(64hex)/tool_name/orig_bytes/line_count/created_at，orig_bytes·line_count 为压缩前原文计量）**。
 
 查询 API：
 
@@ -165,7 +167,9 @@ ask_user 持久凭据（v4）：`upsert_credential`（:790，name 主键 upsert�
 | **`get_attachment(id)`** | :840（v5） | 单条附件元数据 |
 | **`list_run_attachments(run_id)`** | :857（v5） | run 的附件清单（created_at, id 稳定序） |
 | **`list_transcript_entries(run_id)`** | :878（v5） | run 的转写条目按 seq 升序；**空结果 = v5 前的 run 或无条目——调用方回退 message 投影（设计 §4 两级策略）** |
-| **`find_tool_output(ref16, prefer_run?)`** | v6 | 按 `ref_id` 短引用（16 hex，格式非法 Err）前缀反查 `tool_outputs` 行；命中多行时 `ORDER BY (run_id = ?) DESC, created_at DESC LIMIT 1`（当前 run 优先）；未命中 None（调用方回落消息 content 原文） |
+| **`find_tool_output(run_id, ref_id)`** | v7 | **严格会话隔离**：`(run_id, ref)` 精确匹配（`WHERE run_id = ? AND ref = ?`）——一个 run 的 ref 不能被其他 run 解析，跨 run 同 ref（各自 `out-1`）互不可见，**无「当前 run 优先 / 任意 run 回落」路径**；ref 形状 = `out-` + 1..16 hex（格式非法 Err）；未命中 None（调用方回落消息 content 原文或报未知 ref） |
+| **`find_tool_output_by_sha(run_id, sha256)`** | v7 | storer 幂等路径：同 run 同 sha 命中 → 带回该行真实 ref（同内容同 ref，序号不跳号）；sha 必须 64 hex |
+| **`max_tool_output_ref_num(run_id) -> i64`** | v7 | 该 run 现有 ref 序号最大值（无可解析行 → 0）；storer 分配下一个 ref 用 max+1（写入路径串行，撞号由唯一索引兜底） |
 | **`read_tool_output_bytes(sha256)`** | v6 | 读 `files/outputs/{sha256}.zst` **压缩字节**（解压与 orig_bytes 校验归调用方）；sha 必须全 64 hex（防路径拼接）；文件缺失 Ok(None)；内存库 Ok(None) |
 
 问卷/凭据查询：`list_pending_questions()` / `get_pending_question(request_id)` / `list_credentials()` / `get_credential_value(name)` / `load_credentials_with_values()`（明文仅 vault 消费）。

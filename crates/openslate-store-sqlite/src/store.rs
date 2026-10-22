@@ -193,6 +193,7 @@ impl SqliteStore {
                 3 => schema::migrate_v3_to_v4(&mut tx).await?,
                 4 => schema::migrate_v4_to_v5(&mut tx).await?,
                 5 => schema::migrate_v5_to_v6(&mut tx).await?,
+                6 => schema::migrate_v6_to_v7(&mut tx).await?,
                 v => {
                     return Err(StoreError::MigrationError(format!(
                         "未知的 schema 版本步进起点: v{v}"
@@ -1273,19 +1274,19 @@ mod tests {
         store.run_migrations().await.expect("idempotent rerun");
     }
 
-    /// v5 → v6 步进：建 `tool_outputs` 表 + sha256 索引；步进重跑幂等
+    /// v5 → v6 → v7 步进：建 `tool_outputs` 表 + 索引；步进重跑幂等
     ///（把 user_version 手工拨回 5 模拟「步进事务提交前崩溃重放」）。
     #[tokio::test]
-    async fn test_v5_db_migrates_to_v6_and_step_rerun_idempotent() {
+    async fn test_v5_db_migrates_to_v7_and_step_rerun_idempotent() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("v5_to_v6.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
 
         {
             let store = SqliteStore::new(path_str).await.expect("store");
-            store.run_migrations().await.expect("migrate to v6 first");
+            store.run_migrations().await.expect("migrate to latest first");
             // 塞一行 v5 时代数据 + 拨回版本 5，模拟 v5 存量库（步进 DDL
-            // 全 IF NOT EXISTS，v6 已建的表/索引就是重放结果）
+            // 全 IF NOT EXISTS，已建的表/索引就是重放结果）
             store
                 .insert_run("v5-run", None, "root", "completed", "{}", 1000)
                 .await
@@ -1297,9 +1298,9 @@ mod tests {
         }
 
         let store = SqliteStore::new(path_str).await.expect("reopen");
-        store.run_migrations().await.expect("v5 → v6 (rerun step)");
+        store.run_migrations().await.expect("v5 → v7 (rerun steps)");
 
-        assert_eq!(store.user_version().await.expect("version"), 6);
+        assert_eq!(store.user_version().await.expect("version"), 7);
 
         // 表就位且数据完好
         let tables: Vec<String> = query_scalar(
@@ -1319,22 +1320,116 @@ mod tests {
 
         // 索引就位 + 新表可写（行级；文件写走 insert_tool_output 属
         // write.rs 测试范围）
-        let idx: Option<String> = query_scalar(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tool_outputs_sha256'",
-        )
-        .fetch_optional(store.pool())
-        .await
-        .expect("idx check");
-        assert!(idx.is_some(), "idx_tool_outputs_sha256 应存在");
+        for idx_name in ["idx_tool_outputs_sha256", "idx_tool_outputs_run_ref"] {
+            let idx: Option<String> = query_scalar(
+                sqlx::AssertSqlSafe(format!(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name='{idx_name}'"
+                )),
+            )
+            .fetch_optional(store.pool())
+            .await
+            .expect("idx check");
+            assert!(idx.is_some(), "{idx_name} 应存在");
+        }
         query(
-            "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
-             VALUES ('to-1', 'v5-run', 'abc', 'bash', 1, 1, 1)",
+            "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('to-1', 'v5-run', 'out-1', 'abc', 'bash', 1, 1, 1)",
         )
         .execute(store.pool())
         .await
         .expect("insert on migrated db");
 
         // 幂等重跑
+        store.run_migrations().await.expect("idempotent rerun");
+    }
+
+    /// v6 → v7 步进（破坏性，开发期拍板）：`tool_outputs` 整表重建为带
+    /// `ref` 列形态——存量行随 DROP 消失（缓存可弃，降级路径兜底），新
+    /// 列无缺省值、唯一索引就位；步进重跑幂等。
+    #[tokio::test]
+    async fn test_v6_db_migrates_to_v7_rebuilds_tool_outputs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("v6_to_v7.sqlite");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        {
+            let store = SqliteStore::new(path_str).await.expect("store");
+            store.run_migrations().await.expect("migrate to v6");
+            store
+                .insert_run("v6-run", None, "root", "completed", "{}", 1000)
+                .await
+                .expect("seed run");
+            // 手工造真 v6 形态表（无 ref 列）+ 塞两行，拨回版本 6
+            query("DROP TABLE tool_outputs")
+                .execute(store.pool())
+                .await
+                .expect("drop v7 shape");
+            query(
+                "CREATE TABLE tool_outputs (\
+                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL, sha256 TEXT NOT NULL, \
+                    tool_name TEXT NOT NULL, orig_bytes INTEGER NOT NULL, \
+                    line_count INTEGER NOT NULL, created_at INTEGER NOT NULL, \
+                    UNIQUE(run_id, sha256), FOREIGN KEY(run_id) REFERENCES runs(id)\
+                 )",
+            )
+            .execute(store.pool())
+            .await
+            .expect("create v6 shape");
+            for (id, sha) in [("to-1", "aa"), ("to-2", "bb")] {
+                query(AssertSqlSafe(format!(
+                    "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
+                     VALUES ('{id}', 'v6-run', '{sha}', 'bash', 1, 1, 1)"
+                )))
+                .execute(store.pool())
+                .await
+                .expect("seed v6 row");
+            }
+            query("PRAGMA user_version = 6")
+                .execute(store.pool())
+                .await
+                .expect("stamp v6");
+        }
+
+        let store = SqliteStore::new(path_str).await.expect("reopen");
+        store.run_migrations().await.expect("v6 → v7");
+
+        assert_eq!(store.user_version().await.expect("version"), 7);
+
+        // 存量行已随 DROP 消失（破坏性拍板，不回填）
+        let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0, "v6 存量行随重建丢弃（缓存可弃）");
+
+        // run 本体不受影响；ref 列无缺省值（漏给直接被拒）
+        let run = store.get_run("v6-run").await.expect("get").expect("kept");
+        assert_eq!(run.status, "completed");
+        let no_ref = query(
+            "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('to-x', 'v6-run', 'cc', 'bash', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await;
+        assert!(no_ref.is_err(), "ref NOT NULL 无缺省：漏给必须被拒");
+
+        // 唯一索引生效：同 run 同 ref 拒绝
+        query(
+            "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('to-3', 'v6-run', 'out-1', 'cc', 'bash', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("first ref row");
+        let dup = query(
+            "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('to-4', 'v6-run', 'out-1', 'dd', 'bash', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await;
+        assert!(dup.is_err(), "idx_tool_outputs_run_ref 应拒绝同 run 同 ref");
+
+        // 幂等重跑（表已空，重放 DROP/CREATE 空转）
         store.run_migrations().await.expect("idempotent rerun");
     }
 

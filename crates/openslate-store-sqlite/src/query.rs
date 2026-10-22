@@ -114,16 +114,19 @@ pub struct TranscriptEntryRecord {
     pub created_at: i64,
 }
 
-/// A tool output record (v6). 元数据行——压缩字节在
+/// A tool output record (v6; v7 加 `ref`). 元数据行——压缩字节在
 /// `files/outputs/{sha256}.zst`（content-addressed，跨 run 共享）；
 /// `orig_bytes` / `line_count` 是**压缩前**的原文计量（详情弹窗全文
 /// 闭环按 `orig_bytes` 校验解压完整性）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutputRecord {
-    /// `out-<uuid simple>`。
+    /// `out-<uuid simple>`（行 id，行级唯一；与 ref 载体不同）。
     pub id: String,
     pub run_id: String,
-    /// 全 64 hex；`ref_id = "out-" + sha256[..16]`。
+    /// 会话内唯一短 id（`out-N`；消息 content 里 `[STORED OUTPUT
+    /// ref="out-…"` 标记携带，由 storer 按 run 内自增序号分配）。
+    pub ref_id: String,
+    /// 全 64 hex（文件名与内容寻址键）。
     pub sha256: String,
     pub tool_name: String,
     /// 原文字节数（压缩前）。
@@ -337,6 +340,7 @@ type TranscriptEntryRow = (
 type ToolOutputRow = (
     String, // id
     String, // run_id
+    String, // ref
     String, // sha256
     String, // tool_name
     i64,    // orig_bytes
@@ -444,11 +448,12 @@ fn row_to_tool_output(row: ToolOutputRow) -> ToolOutputRecord {
     ToolOutputRecord {
         id: row.0,
         run_id: row.1,
-        sha256: row.2,
-        tool_name: row.3,
-        orig_bytes: row.4,
-        line_count: row.5,
-        created_at: row.6,
+        ref_id: row.2,
+        sha256: row.3,
+        tool_name: row.4,
+        orig_bytes: row.5,
+        line_count: row.6,
+        created_at: row.7,
     }
 }
 
@@ -932,42 +937,102 @@ impl SqliteStore {
         Ok(rows.into_iter().map(row_to_transcript_entry).collect())
     }
 
-    // ── 工具长输出（v6）────────────────────────────────────────────
+    // ── 工具长输出（v6 表 / v7 ref 列）──────────────────────────────
 
-    /// 按 `ref_id` 短引用前缀查长输出行（详情弹窗全文闭环 / output_query
+    /// `ref` 形状校验（v7）：`out-` + **1..16 位 hex**（新序号 `out-3`
+    /// 与手工造的长形态都收；格式非法直接报错，bind 传参，值不进 SQL
+    /// 文本）。
+    fn validate_tool_output_ref(ref_id: &str) -> Result<(), StoreError> {
+        match ref_id.strip_prefix("out-") {
+            Some(hex)
+                if !hex.is_empty()
+                    && hex.len() <= 16
+                    && hex.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                Ok(())
+            }
+            _ => Err(StoreError::QueryError(format!(
+                "invalid tool output ref (expected \"out-\" followed by 1-16 hex chars): '{ref_id}'"
+            ))),
+        }
+    }
+
+    /// 按 `(run_id, ref)` 精确查长输出行（详情弹窗全文闭环 / output_query
     /// 的数据源）。
     ///
-    /// - `ref16`：`ref_id` 去掉 `out-` 前缀后的 **16 个 hex 字符**（消息
-    ///   content 里 `[STORED OUTPUT ref="out-…"` 标记携带）；格式非法
-    ///   直接报错（bind 传参，值不进 SQL 文本）；
-    /// - `prefer_run`：命中多行（同 sha 跨 run 各一行）时优先返回该 run
-    ///   的行（当前会话 run），否则按 `created_at DESC` 取最新；
-    /// - 未命中返回 `None`（调用方回落消息 content 原文）。
+    /// **严格会话隔离**（用户拍板 2026-10-22）：必须传 `run_id`，`WHERE
+    /// run_id = ? AND ref = ?` 精确匹配——一个 run 的 ref 不能被其他
+    /// run 解析，跨 run 同 ref（各自 `out-1`）互不可见；无「当前 run
+    /// 优先 / 任意 run 回落」路径。未命中返回 `None`（调用方回落消息
+    /// content 原文或报未知 ref）。
     pub async fn find_tool_output(
         &self,
-        ref16: &str,
-        prefer_run: Option<&str>,
+        run_id: &str,
+        ref_id: &str,
     ) -> Result<Option<ToolOutputRecord>, StoreError> {
-        if ref16.len() != 16 || !ref16.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(StoreError::QueryError(format!(
-                "invalid tool output ref (expected 16 hex chars): '{ref16}'"
-            )));
-        }
+        Self::validate_tool_output_ref(ref_id)?;
         let pool = self.pool();
-        // (run_id = ?) 对 NULL 参数求值为 NULL：prefer_run 缺失时全部行
-        // 同序，退化为纯 created_at DESC。
         let row: Option<ToolOutputRow> = query_as(
-            "SELECT id, run_id, sha256, tool_name, orig_bytes, line_count, created_at \
+            "SELECT id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at \
              FROM tool_outputs \
-             WHERE substr(sha256, 1, 16) = ? \
-             ORDER BY (run_id = ?) DESC, created_at DESC LIMIT 1",
+             WHERE run_id = ? AND ref = ?",
         )
-        .bind(ref16)
-        .bind(prefer_run)
+        .bind(run_id)
+        .bind(ref_id)
         .fetch_optional(pool)
         .await
         .map_err(qerr)?;
         Ok(row.map(row_to_tool_output))
+    }
+
+    /// 按 `(run_id, sha256)` 查长输出行——storer 的幂等路径：同 run 同
+    /// 内容重复落盘时**复用既有行的 ref**（同内容同 ref，序号不因幂等
+    /// 跳号）。sha 必须全 64 hex。
+    pub async fn find_tool_output_by_sha(
+        &self,
+        run_id: &str,
+        sha256: &str,
+    ) -> Result<Option<ToolOutputRecord>, StoreError> {
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StoreError::QueryError(format!(
+                "invalid tool output sha256 (expected 64 hex chars): '{sha256}'"
+            )));
+        }
+        let pool = self.pool();
+        let row: Option<ToolOutputRow> = query_as(
+            "SELECT id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at \
+             FROM tool_outputs \
+             WHERE run_id = ? AND sha256 = ?",
+        )
+        .bind(run_id)
+        .bind(sha256)
+        .fetch_optional(pool)
+        .await
+        .map_err(qerr)?;
+        Ok(row.map(row_to_tool_output))
+    }
+
+    /// 该 run 现有 ref 序号的最大值（`out-N` 的 N；无行 / 无可解析序号
+    /// → 0）。storer 分配下一个 ref 用 `max + 1`。
+    ///
+    /// **并发约定**：store 的 tool_outputs 写入目前都在 mobile storer 的
+    /// 串行路径上（单回合内工具结果顺序落盘），max+1 分配无竞态窗口；
+    /// 真并发撞号由 `idx_tool_outputs_run_ref` 唯一索引兜底（insert 报
+    /// 错 → storer 回落旧截断路径，不产生损坏数据）。
+    pub async fn max_tool_output_ref_num(&self, run_id: &str) -> Result<i64, StoreError> {
+        let pool = self.pool();
+        let refs: Vec<String> = query_scalar("SELECT ref FROM tool_outputs WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_all(pool)
+            .await
+            .map_err(qerr)?;
+        Ok(refs
+            .iter()
+            .filter_map(|r| r.strip_prefix("out-"))
+            .filter(|tail| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
+            .filter_map(|tail| tail.parse::<i64>().ok())
+            .max()
+            .unwrap_or(0))
     }
 
     /// 读长输出压缩字节（`files/outputs/{sha256}.zst`）。
@@ -1784,11 +1849,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 工具长输出（v6）：find 前缀命中 / prefer_run / 校验 / 字节读取
+    // 工具长输出（v6 表 / v7 ref）：find 严格会话隔离 / 按 sha 幂等 /
+    // 序号 max / 校验 / 字节读取
     // -----------------------------------------------------------------------
 
+    /// 严格会话隔离：`(run_id, ref)` 精确匹配，跨 run 互不可见。
     #[tokio::test]
-    async fn test_find_tool_output_prefix_prefer_run_and_miss() {
+    async fn test_find_tool_output_strict_run_scoping() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("to_query.sqlite");
         let store = SqliteStore::new(path.to_str().expect("utf-8"))
@@ -1799,20 +1866,26 @@ mod tests {
             insert_run(&store.pool(), run, None, "root", "completed", "{}", at).await;
         }
 
-        // 同 sha 前缀（a1b2…）跨 run 两行；不同前缀一行
-        let sha_shared: String = "a1b2".to_owned() + &"c".repeat(60);
-        let sha_other: String = "ffff".to_owned() + &"0".repeat(60);
-        for (id, run, sha, at) in [
-            ("out-a", "run-a", sha_shared.as_str(), 1500i64),
-            ("out-b", "run-b", sha_shared.as_str(), 2500),
-            ("out-c", "run-a", sha_other.as_str(), 3500),
+        // 两个 run 各自的 out-1（不同 sha）；run-a 另有 out-2 与一条
+        // 长形态 ref（16 hex）——格式上界一并覆盖。
+        let sha_a: String = "a".repeat(64);
+        let sha_b: String = "b".repeat(64);
+        let sha_d: String = "d".repeat(64);
+        let sha_legacy: String = "a1b2".to_owned() + &"c".repeat(60);
+        let legacy_ref = format!("out-{}", &sha_legacy[..16]);
+        for (id, run, ref_id, sha, at) in [
+            ("out-a", "run-a", "out-1", sha_a.as_str(), 1500i64),
+            ("out-b", "run-b", "out-1", sha_b.as_str(), 2500),
+            ("out-c", "run-a", legacy_ref.as_str(), sha_legacy.as_str(), 3500),
+            ("out-d", "run-a", "out-2", sha_d.as_str(), 4500),
         ] {
             sqlx::query(
-                "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
-                 VALUES (?, ?, ?, 'bash', 10, 2, ?)",
+                "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+                 VALUES (?, ?, ?, ?, 'bash', 10, 2, ?)",
             )
             .bind(id)
             .bind(run)
+            .bind(ref_id)
             .bind(sha)
             .bind(at)
             .execute(store.pool())
@@ -1820,50 +1893,148 @@ mod tests {
             .expect("seed tool output row");
         }
 
-        // 前缀命中前置：非法 ref16（长度不足）直接 Err，不进 SQL
-        let err = store
-            .find_tool_output("a1b2c", None)
-            .await
-            .expect_err("ref16 必须 16 hex");
-        assert!(err.to_string().contains("16 hex"), "got: {err}");
-
+        // run 内精确命中
         let record = store
-            .find_tool_output(&sha_shared[..16], None)
-            .await
-            .expect("find")
-            .expect("hit");
-        assert_eq!(record.sha256, sha_shared);
-        assert_eq!(
-            record.run_id, "run-b",
-            "无 prefer_run → created_at 最新（run-b 的行）"
-        );
-        assert_eq!(record.tool_name, "bash");
-        assert_eq!(record.orig_bytes, 10);
-        assert_eq!(record.line_count, 2);
-
-        // 当前 run 优先：同 sha 两行，prefer run-a 拿 run-a 的行
-        let record = store
-            .find_tool_output(&sha_shared[..16], Some("run-a"))
+            .find_tool_output("run-a", "out-1")
             .await
             .expect("find")
             .expect("hit");
         assert_eq!(record.run_id, "run-a");
-        assert_eq!(record.created_at, 1500);
+        assert_eq!(record.ref_id, "out-1");
+        assert_eq!(record.sha256, sha_a);
+        assert_eq!(record.tool_name, "bash");
+        assert_eq!(record.orig_bytes, 10);
+        assert_eq!(record.line_count, 2);
 
-        // 未知前缀 → None
+        // 同 ref 不同 run → 各自的行（互不可见 ≠ 互相遮挡）
+        let record = store
+            .find_tool_output("run-b", "out-1")
+            .await
+            .expect("find")
+            .expect("hit");
+        assert_eq!(record.run_id, "run-b");
+        assert_eq!(record.sha256, sha_b);
+
+        // 长形态 ref（16 hex 上界）同样精确命中
+        let record = store
+            .find_tool_output("run-a", &legacy_ref)
+            .await
+            .expect("find")
+            .expect("hit");
+        assert_eq!(record.sha256, sha_legacy);
+
+        // **跨会话隔离**：run-a 独有的 ref 在 run-b 不可解析
         assert!(
             store
-                .find_tool_output("0000000000000000", None)
+                .find_tool_output("run-b", "out-2")
+                .await
+                .expect("find")
+                .is_none(),
+            "run-a 的 out-2 在 run-b 不可解析"
+        );
+        assert!(
+            store
+                .find_tool_output("run-b", &legacy_ref)
+                .await
+                .expect("find")
+                .is_none(),
+            "run-a 的 legacy ref 在 run-b 不可解析"
+        );
+        // 双方都没有的 ref → None
+        assert!(
+            store
+                .find_tool_output("run-a", "out-9")
                 .await
                 .expect("find")
                 .is_none()
         );
 
-        // 非法形状 → Err（长度 / 非 hex）
-        assert!(store.find_tool_output("short", None).await.is_err());
+        // 非法形状 → Err（缺前缀 / 空 hex / 超 16 位 / 非 hex）
+        assert!(store.find_tool_output("run-a", "out-").await.is_err());
+        assert!(store.find_tool_output("run-a", "1").await.is_err());
         assert!(
             store
-                .find_tool_output("zzzzzzzzzzzzzzzz", None)
+                .find_tool_output("run-a", &format!("out-{}", "a".repeat(17)))
+                .await
+                .is_err()
+        );
+        assert!(store.find_tool_output("run-a", "out-zzzz").await.is_err());
+    }
+
+    /// 按 sha 幂等查找 + ref 序号 max：storer 的两条支撑查询。
+    #[tokio::test]
+    async fn test_find_by_sha_and_max_ref_num() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("to_sha.sqlite");
+        let store = SqliteStore::new(path.to_str().expect("utf-8"))
+            .await
+            .expect("file store");
+        store.run_migrations().await.expect("migrations");
+        for (run, at) in [("run-a", 1000i64), ("run-b", 2000)] {
+            insert_run(&store.pool(), run, None, "root", "completed", "{}", at).await;
+        }
+
+        assert_eq!(
+            store.max_tool_output_ref_num("run-a").await.expect("max"),
+            0,
+            "无行 → 0（storer 从 out-1 起分配）"
+        );
+
+        let sha_a: String = "c".repeat(64);
+        let sha_b: String = "d".repeat(64);
+        for (id, run, ref_id, sha) in [
+            ("out-a", "run-a", "out-1", sha_a.as_str()),
+            ("out-b", "run-a", "out-7", sha_b.as_str()),
+            ("out-c", "run-b", "out-3", sha_a.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_outputs (id, run_id, ref, sha256, tool_name, orig_bytes, line_count, created_at) \
+                 VALUES (?, ?, ?, ?, 'bash', 10, 2, 1000)",
+            )
+            .bind(id)
+            .bind(run)
+            .bind(ref_id)
+            .bind(sha)
+            .execute(store.pool())
+            .await
+            .expect("seed");
+        }
+
+        // 按 (run, sha) 命中 → 带回该行真实 ref；跨 run 同 sha 各自的行
+        let hit = store
+            .find_tool_output_by_sha("run-a", &sha_a)
+            .await
+            .expect("find")
+            .expect("hit");
+        assert_eq!(hit.ref_id, "out-1");
+        let hit_b = store
+            .find_tool_output_by_sha("run-b", &sha_a)
+            .await
+            .expect("find")
+            .expect("hit");
+        assert_eq!(hit_b.ref_id, "out-3", "run-b 的同 sha 行独立 ref");
+        assert!(
+            store
+                .find_tool_output_by_sha("run-b", &sha_b)
+                .await
+                .expect("find")
+                .is_none(),
+            "run-b 没有 sha_b"
+        );
+
+        // max 序号：run-a = 7（下一个分配 out-8）；run-b = 3；未知 run = 0
+        assert_eq!(store.max_tool_output_ref_num("run-a").await.expect("max"), 7);
+        assert_eq!(store.max_tool_output_ref_num("run-b").await.expect("max"), 3);
+        assert_eq!(
+            store.max_tool_output_ref_num("no-run").await.expect("max"),
+            0
+        );
+
+        // sha 形状校验
+        assert!(store.find_tool_output_by_sha("run-a", "abc").await.is_err());
+        assert!(
+            store
+                .find_tool_output_by_sha("run-a", &"z".repeat(64))
                 .await
                 .is_err()
         );
@@ -1881,10 +2052,11 @@ mod tests {
 
         let sha: String = "ab".repeat(32);
         let data = zst("long output body");
-        store
-            .insert_tool_output("out-1", "run-1", &sha, "bash", 16, 1, &data, 2000)
+        let effective = store
+            .insert_tool_output("out-1", "run-1", "out-1", &sha, "bash", 16, 1, &data, 2000)
             .await
             .expect("insert");
+        assert_eq!(effective, "out-1", "新行返回传入的 ref");
 
         let bytes = store
             .read_tool_output_bytes(&sha)

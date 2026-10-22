@@ -33,7 +33,7 @@ use openslate_session::state::{
 use crate::approval_review::AiReviewApproval;
 use crate::attachment_tokens::AttachmentTokenBackfill;
 use crate::askuser::{
-    AskUserContext, AskUserExemptApproval, AskUserTool, MobileQuestionHandler,
+    AskUserContext, AskUserTool, MobileQuestionHandler, SideEffectFreeApproval,
     startup_question_maintenance,
 };
 use crate::bootstrap::MobilePaths;
@@ -166,7 +166,9 @@ impl MobileRuntime {
 
         // host/本地工具集：mobile.ping（演示）+ ask_user（Agent 向用户
         // 提问）+ bash 工具（按设置多选动态注册：native ⇒ `bash`；
-        // termux ⇒ `termux_bash`，名字与后端一一绑定）+ 注入项。
+        // termux ⇒ `termux_bash`，名字与后端一一绑定）+ 注入项
+        // （+ output_query，见下方 output_store_handle 处——它要复用
+        // 同一 store 接缝句柄）。
         let exec_selection = ExecSelectionCell::new(ExecSelection::default());
         let mut extra_tools = opts.extra_tools;
         extra_tools.push(Box::new(AskUserTool::new(ask_ctx.clone())));
@@ -200,6 +202,14 @@ impl MobileRuntime {
         openslate_core::output_store::set_tool_output_storer(Some(Arc::new(
             crate::output_storer::MobileOutputStorer::new(output_store_handle.clone()),
         )));
+        // output_query（长输出落盘 C4）：查落盘输出全文的内置工具。store
+        // 复用上面的 SharedStore 接缝（同一注入点后注）；AppState 弱引用
+        // 经共享 OnceLock 在 assemble_state 后接线（当前 run 优先 +
+        // [limits].max_output_bytes 生效值）。
+        let output_query_tool =
+            crate::output_query::OutputQueryTool::new(output_store_handle.clone());
+        let output_query_state = output_query_tool.state_handle();
+        extra_tools.push(Box::new(output_query_tool));
         let inner_factory = opts
             .provider_factory
             .unwrap_or_else(|| mobile_provider_factory(secrets.clone()));
@@ -237,6 +247,9 @@ impl MobileRuntime {
         // ask_user 接线：上下文注入 store/配置 + QuestionHandler 装配
         // （dispatch 的 question_reply / cancel 由此进 mobile 实现）。
         ask_ctx.wire(&state);
+        // output_query 接线：AppState 弱引用（当前 run 优先 + 输出封顶
+        // 生效值；AskUserContext.wire 同款装配后注入）。
+        let _ = output_query_state.set(Arc::downgrade(&state));
         state
             .core
             .set_question_handler(Arc::new(MobileQuestionHandler::new(ask_ctx.clone())));
@@ -2149,10 +2162,10 @@ async fn assemble_state(
     }
     approval_bridge.set_rules(initial_rules);
     // AI 审查装饰器（设计 v3，mobile-only）：AutoRisk 请求先过 LLM 审查
-    // （safe 静默放行 / risky 弹人 / 失败 fail-safe 弹人）；ask_user 豁免
-    // 保持最外层。SessionCore 此刻尚不存在（manager 要先进 CoreInner、
-    // 装饰器又要快照 core 的 config/model_alias）——wire 后注，
-    // AskUserContext.wire 同款防环先例。
+    // （safe 静默放行 / risky 弹人 / 失败 fail-safe 弹人）；无副作用工具
+    // （ask_user / output_query）豁免保持最外层。SessionCore 此刻尚不
+    // 存在（manager 要先进 CoreInner、装饰器又要快照 core 的
+    // config/model_alias）——wire 后注，AskUserContext.wire 同款防环先例。
     let sink_dyn: Arc<dyn MsgSink> = sink.clone();
     let review_approval = Arc::new(
         AiReviewApproval::new(
@@ -2165,7 +2178,7 @@ async fn assemble_state(
         .with_timeout(review_timeout),
     );
     manager.approval = ApprovalManager::with_rules(approval_bridge.rules_handle()).with_callback(
-        Arc::new(AskUserExemptApproval::new(review_approval.clone())),
+        Arc::new(SideEffectFreeApproval::new(review_approval.clone())),
     );
 
     // 初始会话模型：capabilities.main（用户在设置页改的主对话模型）

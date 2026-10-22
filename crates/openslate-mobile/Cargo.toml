@@ -37,6 +37,8 @@ sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 # 缩略图出口 base64（attachment_thumbnail_base64 → FFI JSON）。
 base64 = "0.22"
+# output_query 工具的 grep 算子（纯 Rust；lock 内已有 regex→memchr 传递闭包）。
+regex = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 

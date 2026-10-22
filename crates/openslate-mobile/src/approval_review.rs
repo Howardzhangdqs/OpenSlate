@@ -7,9 +7,10 @@
 //! 审批（note 携带审查理由，经 `ApprovalSummaryDto` 下发 UI 显示
 //! 「AI 审查判定高风险：…」）。
 //!
-//! 装配链（外→内）：`AskUserExemptApproval(AiReviewApproval(Session
-//! ApprovalBridge))`——仿 askuser.rs 装饰器先例；ask_user 豁免保持最外
-//! 层，`SessionApprovalBridge` 的 respond 通道不动。
+//! 装配链（外→内）：`SideEffectFreeApproval(AiReviewApproval(Session
+//! ApprovalBridge))`——仿 askuser.rs 装饰器先例；无副作用工具
+//! （ask_user / output_query）豁免保持最外层，`SessionApprovalBridge`
+//! 的 respond 通道不动。
 //!
 //! ## 红线（Oracle 审查 P0 系列）
 //!

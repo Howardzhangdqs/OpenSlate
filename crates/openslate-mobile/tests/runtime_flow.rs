@@ -380,7 +380,7 @@ fn mobile_runtime_tool_visibility_roundtrip() {
         serde_json::from_str(&runtime.get_agent_tool_visibility_json()).unwrap();
     assert_eq!(
         vis["tools"],
-        serde_json::json!(["mobile.ping", "bash", "termux_bash"])
+        serde_json::json!(["mobile.ping", "bash", "termux_bash", "output_query"])
     );
     assert_eq!(vis["hidden_tools"], serde_json::json!([]));
 

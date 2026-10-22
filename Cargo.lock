@@ -2514,6 +2514,7 @@ dependencies = [
  "openslate-protocol",
  "openslate-session",
  "openslate-store-sqlite",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

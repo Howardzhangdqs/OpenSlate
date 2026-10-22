@@ -25,8 +25,30 @@ pub struct MobilePaths {
 }
 
 /// mobile 默认 root agent：显式工具白名单（tools 为空 = 暴露全部注册
-/// 工具，mobile 语义下不可接受——Phase 1 只有 mobile.ping）。
+/// 工具，mobile 语义下不可接受）。`output_query`（长输出落盘 C4）加入
+/// 后，存量未定制 root.md 经 [`LEGACY_ROOT_AGENT_MDS`] 自动迁移。
 const DEFAULT_ROOT_AGENT_MD: &str = r#"---
+id: root
+name: OpenSlate
+model: main
+tools:
+    - mobile.ping
+    - bash
+    - termux_bash
+    - output_query
+---
+You are a helpful AI assistant.
+"#;
+
+/// 旧版默认（历届自动生成的 Phase 1/2 白名单，历史命名 shell.run /
+/// termux.run；v3 = output_query 加入前的多选命名版）。已装机设备的
+/// root.md 与之一致时视为未定制，自动迁移到当前默认（bash / termux_bash
+/// / output_query）；用户改过则保持不动——**不在白名单 ≠ 报错**，只是
+/// 模型看不到该工具（存量已定制 root.md 的用户需手动加
+/// `- output_query`）。
+const LEGACY_ROOT_AGENT_MDS: &[&str] = &[
+    // v3：多选命名版（output_query 加入前）。
+    r#"---
 id: root
 name: OpenSlate
 model: main
@@ -36,12 +58,7 @@ tools:
     - termux_bash
 ---
 You are a helpful AI assistant.
-"#;
-
-/// 旧版默认（历届自动生成的 Phase 1/2 白名单，历史命名 shell.run /
-/// termux.run）。已装机设备的 root.md 与之一致时视为未定制，自动迁移
-/// 到当前默认（bash / termux_bash 多选命名）；用户改过则保持不动。
-const LEGACY_ROOT_AGENT_MDS: &[&str] = &[
+"#,
     // v2：双后端固定名（shell.run / termux.run）。
     r#"---
 id: root

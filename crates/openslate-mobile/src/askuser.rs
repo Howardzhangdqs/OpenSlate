@@ -18,8 +18,9 @@
 //!    以**与即时路径完全一致**的结果内容（迟到等价不变量，设计 §3 工程要点
 //!    7）经 `RunManager::resume_from_tool_result` 补全原 tool call 并续跑。
 //!    幂等首答者赢由 store 的原子状态迁移保证。
-//! 5. [`AskUserExemptApproval`]：Manual 全审模式下 ask_user 免审批
-//!    （「问个问题还要先批准才能问」是体验灾难，设计 §0）。
+//! 5. [`SideEffectFreeApproval`]（原 `AskUserExemptApproval`，长输出落盘
+//!    C4 起 general 为无副作用工具免审器）：ask_user 与 output_query 免
+//!    审批（Manual 全审模式同样免——见类型文档）。
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};
@@ -1615,35 +1616,42 @@ pub async fn startup_question_maintenance(
 }
 
 // ---------------------------------------------------------------------------
-// 审批豁免（Manual 全审模式下 ask_user 不触发审批，设计 §0）
+// 审批豁免（无副作用工具不触发审批）
 // ---------------------------------------------------------------------------
 
-/// 审批回调装饰器：ask_user 直通放行，其余委托内层回调。
+/// 免审工具集（无副作用——提问 / 纯读本会话已脱敏落盘的数据）。
+const APPROVAL_EXEMPT_TOOLS: &[&str] = &[ASK_USER_TOOL, crate::output_query::OUTPUT_QUERY_TOOL];
+
+/// 审批回调装饰器：命中的无副作用工具直通放行，其余委托内层回调。
+///
+/// - `ask_user`：Manual 全审模式下同样免审——「问个问题还要先批准才能
+///   问」是体验灾难（ask-user 设计 §0）；
+/// - `output_query`（长输出落盘 C4）：纯读已脱敏落盘的输出，Auto 缺省
+///   下启发式 Medium 会为每次查询付一次 AI 审查调用——读日志不该过审。
 ///
 /// 豁免实现点选最小侵入处——装饰 `manager.approval` 的 callback 槽
 /// （mobile 装配层），不动 core 审批逻辑、不动 `AppState.approval`
-/// （respond 通道照旧）。AutoExcept 默认门不含 ask_user，本装饰只对
-/// Manual 模式生效（其他模式 `needs_approval` 不会走到 callback）。
+/// （respond 通道照旧）。
 ///
 /// 内层泛化为 `Arc<dyn ApprovalCallback>`（tool-approval P1b）：mobile
-/// 装配链 `AskUserExemptApproval(AiReviewApproval(SessionApprovalBridge))`
+/// 装配链 `SideEffectFreeApproval(AiReviewApproval(SessionApprovalBridge))`
 /// ——审查装饰器包在桥外、豁免器再包审查器。
-pub struct AskUserExemptApproval {
+pub struct SideEffectFreeApproval {
     inner: Arc<dyn openslate_core::approval::ApprovalCallback>,
 }
 
-impl AskUserExemptApproval {
+impl SideEffectFreeApproval {
     pub fn new(inner: Arc<dyn openslate_core::approval::ApprovalCallback>) -> Self {
         Self { inner }
     }
 }
 
-impl openslate_core::approval::ApprovalCallback for AskUserExemptApproval {
+impl openslate_core::approval::ApprovalCallback for SideEffectFreeApproval {
     fn decide(
         &self,
         req: &openslate_core::approval::ApprovalRequest,
     ) -> openslate_core::approval::ApprovalDecision {
-        if req.tool_name == ASK_USER_TOOL {
+        if APPROVAL_EXEMPT_TOOLS.contains(&req.tool_name.as_str()) {
             return openslate_core::approval::ApprovalDecision::Approved;
         }
         self.inner.decide(req)
@@ -2212,7 +2220,7 @@ mod tests {
     // ── 审批豁免 ─────────────────────────────────────────────────────
 
     #[test]
-    fn approval_exempt_passes_ask_user_through() {
+    fn approval_exempt_passes_side_effect_free_tools_through() {
         use openslate_core::approval::{
             ApprovalCallback, ApprovalDecision, ApprovalRequest, ApprovalTrigger, RiskLevel,
         };
@@ -2240,9 +2248,9 @@ mod tests {
         }
 
         let bridge = SessionApprovalBridge::new(Arc::new(NoopSink));
-        let exempt = AskUserExemptApproval::new(StdArc::new(bridge));
-        let req = ApprovalRequest {
-            tool_name: ASK_USER_TOOL.into(),
+        let exempt = SideEffectFreeApproval::new(StdArc::new(bridge));
+        let req = |tool: &str| ApprovalRequest {
+            tool_name: tool.into(),
             arguments: serde_json::json!({}),
             agent_id: "root".into(),
             risk_level: RiskLevel::Medium,
@@ -2251,7 +2259,9 @@ mod tests {
             note: None,
         };
         // 若未豁免会阻塞在 mpsc recv（测试超时）；豁免则立即 Approved。
-        let decision = exempt.decide(&req);
-        assert_eq!(decision, ApprovalDecision::Approved);
+        // ask_user（先例）+ output_query（C4 纯读落盘输出）。
+        for tool in [ASK_USER_TOOL, crate::output_query::OUTPUT_QUERY_TOOL] {
+            assert_eq!(exempt.decide(&req(tool)), ApprovalDecision::Approved);
+        }
     }
 }

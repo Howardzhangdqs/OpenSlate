@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 android {
@@ -71,6 +72,9 @@ dependencies {
     implementation(libs.androidx.material.icons)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.kotlinx.coroutines.android)
+    // kotlinx.serialization：JsonDto.kt 试点（ask_user / config / 转写镜像；
+    // 事件泵热路径仍 org.json，见 docs/guide/06-mobile/mobile-ffi.md）。
+    implementation(libs.kotlinx.serialization.json)
     // Markdown 渲染（模型回复）：code 模块提供语法高亮代码块，coil3 模块提供
     // 图片加载（配 coil3 + SvgDecoder 支持 SVG）。
     implementation(libs.markdown.renderer)
@@ -98,4 +102,7 @@ dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
     debugImplementation(libs.androidx.ui.tooling)
+
+    // JVM 单测：JsonDto.kt 纯 Kotlin 解析层（bridge/JsonDtoTest.kt）。
+    testImplementation(libs.junit)
 }

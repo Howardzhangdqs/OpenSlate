@@ -7,6 +7,7 @@ activityCompose = "1.11.0"
 composeBom = "2026.09.00"
 navigation = "2.9.5"
 coroutines = "1.10.2"
+kotlinxSerialization = "1.9.0"
 coil = "3.6.0"
 syntaxmp = "0.3.0"
 haze = "2.0.1"
@@ -27,6 +28,11 @@ androidx-material3 = { group = "androidx.compose.material3", name = "material3" 
 androidx-material-icons = { group = "androidx.compose.material", name = "material-icons-extended" }
 androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigation" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+# kotlinx.serialization（JsonDto.kt 试点：ask_user 往返 / config 解析 / 本地转写镜像）。
+# runtime 版本独立演进；compiler 插件在 [plugins] 里与 Kotlin 同源（version.ref = "kotlin"）。
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+# JVM 单测（JsonDtoTest）。
+junit = { group = "junit", name = "junit", version = "4.13.2" }
 markdown-renderer = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-m3", version = "0.45.0" }
 markdown-renderer-core = { group = "com.mikepenz", name = "multiplatform-markdown-renderer", version = "0.45.0" }
 markdown-renderer-code = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-code", version = "0.45.0" }
@@ -44,3 +50,5 @@ telephoto-subsampling = { group = "me.saket.telephoto", name = "sub-sampling-ima
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+# 序列化 compiler 插件必须与 Kotlin 版本同源（2.4.20），与 AGP 内置 Kotlin 挂接。
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

@@ -240,40 +240,9 @@ data class ReviewedQuestionUi(
  */
 internal fun parseAskUserQuestions(questionsArr: JSONArray?): List<QuestionUi> {
     if (questionsArr == null) return emptyList()
-    val questions = mutableListOf<QuestionUi>()
-    for (i in 0 until questionsArr.length()) {
-        val q = questionsArr.optJSONObject(i) ?: continue
-        val storage = q.optJSONObject("storage")
-        questions.add(
-            QuestionUi(
-                id = q.optString("id").ifBlank { "q${i + 1}" },
-                header = q.optString("header").ifBlank { "问题 ${i + 1}" },
-                question = q.optString("question"),
-                type = q.optString("type", "choice").ifBlank { "choice" },
-                options = buildList {
-                    val os = q.optJSONArray("options") ?: return@buildList
-                    for (j in 0 until os.length()) {
-                        val o = os.optJSONObject(j) ?: continue
-                        val label = o.optString("label")
-                        if (label.isEmpty()) continue
-                        add(QuestionOptionUi(label, o.optString("description"), o.optBoolean("recommended")))
-                    }
-                },
-                multiSelect = q.optBoolean("multi_select"),
-                placeholder = if (q.has("placeholder") && !q.isNull("placeholder")) {
-                    q.optString("placeholder")
-                } else null,
-                optional = q.optBoolean("optional"),
-                storageKind = storage?.optString("kind")?.takeIf { it == "env" || it == "file" },
-                storageName = when (storage?.optString("kind")) {
-                    "env" -> storage.optString("name")
-                    "file" -> storage.optString("path").ifBlank { storage.optString("name") }
-                    else -> null
-                },
-            )
-        )
-    }
-    return questions
+    // kotlinx JsonDto 层解析（JsonDto.kt）：org.json 数组此处仅作载体（toString
+    // 后 decode），逐行容错语义与原手工 opt* 一致（非对象行跳过、缺键取默认）。
+    return decodeQuestionDtos(questionsArr.toString()).mapIndexed { i, dto -> dto.toQuestionUi(i) }
 }
 
 /**
@@ -333,50 +302,10 @@ internal fun buildRestoredPendingQuestion(
  * null = 无法还原（args 缺失 / 题目解析为空 / 无 answered outcome / answers
  * 为空），调用方退回旧答案弹窗兜底。
  */
-internal fun buildReviewedQuestion(args: String?, output: String?): ReviewedQuestionUi? {
-    val questionsArr = runCatching { JSONObject(args ?: "") }.getOrNull()
-        ?.optJSONArray("questions") ?: return null
-    val questions = parseAskUserQuestions(questionsArr)
-    if (questions.isEmpty()) return null
-    val o = runCatching { JSONObject(output ?: "") }.getOrNull() ?: return null
-    if (o.optString("outcome") != "answered") return null
-    val answersArr = o.optJSONArray("answers") ?: return null
-    if (answersArr.length() == 0) return null
-    val byId = HashMap<String, JSONObject>()
-    for (i in 0 until answersArr.length()) {
-        val a = answersArr.optJSONObject(i) ?: continue
-        byId[a.optString("id")] = a
-    }
-    val drafts = questions.map { q ->
-        val a = byId[q.id] ?: return@map QuestionDraft()
-        when {
-            a.optBoolean("skipped") -> QuestionDraft(skipped = true)
-            a.optBoolean("declined") -> QuestionDraft(declined = true)
-            a.has("secret") -> QuestionDraft(
-                remember = a.optJSONObject("secret")?.optBoolean("remember") ?: false,
-            )
-            q.type == "confirm" && a.has("confirm") -> QuestionDraft(confirm = a.optBoolean("confirm"))
-            a.has("selected") -> {
-                var selected = emptyList<String>()
-                var other = ""
-                val sa = a.optJSONArray("selected")
-                for (j in 0 until (sa?.length() ?: 0)) {
-                    val s = sa!!.optString(j).trim()
-                    when {
-                        s.isEmpty() -> Unit
-                        q.options.any { it.label == s } -> selected = selected + s
-                        // 未命中选项的自由文本 = 「其他」说明（提交时并入 selected）
-                        other.isEmpty() -> other = s
-                    }
-                }
-                QuestionDraft(selected = selected, otherChecked = other.isNotEmpty(), otherText = other)
-            }
-            a.has("value") -> QuestionDraft(text = a.optString("value"))
-            else -> QuestionDraft() // 未知形态：留空（只读页显示未填状态，不吞题）
-        }
-    }
-    return ReviewedQuestionUi(questions, drafts)
-}
+internal fun buildReviewedQuestion(args: String?, output: String?): ReviewedQuestionUi? =
+    // kotlinx JsonDto 层解析（decodeReviewedQuestion 纯函数，分支判定与映射
+    // 规则和本函数 doc 描述一一对应；decode 失败 → null 走调用方兜底）。
+    decodeReviewedQuestion(args, output)
 
 /**
  * 转写恢复仲裁：本地 transcript 文件（只在上个**完成** turn 落盘）何时允许
@@ -1655,60 +1584,12 @@ object RuntimeBridge {
     fun submitQuestionAnswers(requestId: Long) {
         val p = _state.value.pendingQuestion ?: return
         if (p.requestId != requestId || p.phase != "pending") return
-        val answers = JSONArray()
-        val display = JSONArray()
-        for ((i, q) in p.questions.withIndex()) {
-            val d = p.drafts[i]
-            val a = JSONObject().put("id", q.id)
-            val disp = JSONObject().put("id", q.id).put("header", q.header)
-            when {
-                d.skipped -> {
-                    a.put("skipped", true)
-                    disp.put("skipped", true)
-                }
-                d.declined -> {
-                    a.put("declined", true)
-                    disp.put("declined", true)
-                }
-                q.type == "choice" -> {
-                    val sel = d.selected.toMutableList()
-                    if (d.otherChecked && d.otherText.isNotBlank()) sel.add(d.otherText.trim())
-                    a.put("selected", JSONArray(sel))
-                    disp.put("selected", JSONArray(sel))
-                }
-                q.type == "secret" -> {
-                    // resolve：明文 + remember（仅 FFI 通道）；转写：仅引用。
-                    a.put("value", d.text).put("remember", d.remember)
-                    disp.put(
-                        "secret",
-                        JSONObject()
-                            .put("name", q.storageName ?: "")
-                            .put("kind", q.storageKind ?: "env")
-                            .put("remember", d.remember),
-                    )
-                }
-                q.type == "confirm" -> {
-                    val label = if (d.confirm == true) {
-                        q.options.getOrNull(0)?.label ?: "是"
-                    } else {
-                        q.options.getOrNull(1)?.label ?: "否"
-                    }
-                    a.put("confirm", d.confirm == true).put("selected", JSONArray(listOf(label)))
-                    disp.put("confirm", d.confirm == true).put("selected", JSONArray(listOf(label)))
-                }
-                else -> { // text（含未知题型兜底）
-                    a.put("value", d.text.trim())
-                    disp.put("value", d.text.trim())
-                }
-            }
-            answers.put(a)
-            display.put(disp)
-        }
-        val payload = JSONObject().put("outcome", "answered").put("answers", answers).toString()
-        val transcript = JSONObject().put("outcome", "answered").put("answers", display).toString()
+        // kotlinx JsonDto 层拼装（buildAskUserSubmitPayloads）：resolve 明文 /
+        // 脱敏转写两份 payload 字段集与旧手工 org.json 逐键一致（见 JsonDto.kt）。
+        val payloads = buildAskUserSubmitPayloads(p.questions, p.drafts)
         if (p.restored) {
             // 重启恢复卡：host call 通道已不存在，迟到答案走 question_reply 上行。
-            submitRestoredQuestionAnswer(requestId, p.argsKey, answers, transcript)
+            submitRestoredQuestionAnswer(requestId, p.argsKey, payloads.answers, payloads.displayJson)
             return
         }
         mutate {
@@ -1719,7 +1600,7 @@ object RuntimeBridge {
         scope.launch(Dispatchers.Default) {
             val runtime = runtimeRef.get()
             val ok = runtime != null && runCatching {
-                runtime.resolveHostCall(requestId.toULong(), true, payload)
+                runtime.resolveHostCall(requestId.toULong(), true, payloads.resolveJson)
             }.getOrDefault(false)
             if (!ok) {
                 // 发送失败（runtime 亡 / FFI 异常）：回滚到 pending 允许重试。
@@ -1737,7 +1618,7 @@ object RuntimeBridge {
             val stillOwned = _state.value.pendingQuestion
                 ?.let { it.requestId == requestId } == true
             if (stillOwned) {
-                writeAskUserOutcome(p.argsKey, transcript)
+                writeAskUserOutcome(p.argsKey, payloads.displayJson)
                 mutate {
                     val cur = pendingQuestion
                     if (cur != null && cur.requestId == requestId && cur.phase == "submitting") {
@@ -1760,19 +1641,18 @@ object RuntimeBridge {
      * Rust 广播 notice、卡不回滚；发送失败（runtime 亡 / FFI 异常）回滚
      * pending 允许重试。
      */
-    private fun submitRestoredQuestionAnswer(requestId: Long, argsKey: String, answers: JSONArray, transcript: String) {
+    private fun submitRestoredQuestionAnswer(requestId: Long, argsKey: String, answers: List<AnswerDto>, transcript: String) {
         mutate {
             val cur = pendingQuestion ?: return@mutate this
             if (cur.requestId != requestId) return@mutate this
             copy(pendingQuestion = cur.copy(phase = "submitting"))
         }
+        // question_reply 上行（answers 与 live resolve payload 的 answers 数组
+        // 同构；kotlinx QuestionReplyDto 拼装，字段集与旧 org.json 版一致）。
         val sent = sendJson(
-            JSONObject()
-                .put("type", "question_reply")
-                .put("request_id", requestId.toString())
-                .put("action", "accept")
-                .put("answers", answers)
-                .toString()
+            BridgeJson.encodeToString(
+                QuestionReplyDto(type = "question_reply", requestId = requestId.toString(), action = "accept", answers = answers),
+            )
         )
         if (!sent) {
             Log.w(TAG, "ask_user: late submit send failed (id=$requestId)")
@@ -2189,79 +2069,10 @@ object RuntimeBridge {
         }
     }
 
-    private fun parseConfig(c: JSONObject): ConfigUi {
-        val providers = buildList {
-            val ps = c.optJSONObject("providers") ?: return@buildList
-            for (name in ps.keys()) {
-                val p = ps.optJSONObject(name) ?: continue
-                add(
-                    ProviderUi(
-                        name = name,
-                        baseUrl = p.optString("base_url"),
-                        apiKeyEnv = p.optString("api_key_env"),
-                        adapter = if (p.has("adapter") && !p.isNull("adapter")) p.optString("adapter") else null,
-                        title = if (p.has("title") && !p.isNull("title")) p.optString("title") else null,
-                    )
-                )
-            }
-        }
-        val models = buildList {
-            val ms = c.optJSONObject("models") ?: return@buildList
-            for (entry in ms.keys()) {
-                val m = ms.optJSONObject(entry) ?: continue
-                fun optLong(k: String): Long? =
-                    if (m.has(k) && !m.isNull(k)) m.optLong(k) else null
-                fun optDouble(k: String): Double? =
-                    if (m.has(k) && !m.isNull(k)) m.optDouble(k) else null
-                fun optStr(k: String): String? =
-                    if (m.has(k) && !m.isNull(k)) m.optString(k) else null
-                add(
-                    ModelUi(
-                        entry = entry,
-                        provider = m.optString("provider"),
-                        modelId = m.optString("model"),
-                        maxContextTokens = optLong("max_context_tokens"),
-                        maxOutputTokens = optLong("max_output_tokens"),
-                        supportsToolCall = m.optBoolean("supports_tool_call", true),
-                        supportsVision = m.optBoolean("supports_vision"),
-                        supportsReasoning = m.optBoolean("supports_reasoning"),
-                        inputPricePerMtok = optDouble("input_price_per_mtok"),
-                        outputPricePerMtok = optDouble("output_price_per_mtok"),
-                        reasoningEffort = optStr("reasoning_effort"),
-                    )
-                )
-            }
-        }
-        val levels = buildMap {
-            val ls = c.optJSONObject("levels") ?: return@buildMap
-            for (k in ls.keys()) put(k, ls.optString(k))
-        }
-        val capabilities = buildMap {
-            val cs = c.optJSONObject("capabilities") ?: return@buildMap
-            for (k in cs.keys()) put(k, cs.optString(k))
-        }
-        // 审批规则视图（映射后生效规则；旧 runtime 无此键 → null，设置页
-        // 据此显示「尚未加载」而非空白默认值）。
-        val approval = c.optJSONObject("approval")?.let { a ->
-            fun strMap(key: String): Map<String, String> {
-                val m = a.optJSONObject(key) ?: return emptyMap()
-                return buildMap { for (k in m.keys()) put(k, m.optString(k)) }
-            }
-            ApprovalRulesUi(
-                defaultLevel = a.optString("default_level", "auto").ifBlank { "auto" },
-                toolLevels = strMap("tool_levels"),
-                serverLevels = strMap("server_levels"),
-            )
-        }
-        return ConfigUi(
-            providers = providers,
-            models = models,
-            levels = levels,
-            capabilities = capabilities,
-            approval = approval,
-            activeConfig = c.optString("active_config"),
-        )
-    }
+    private fun parseConfig(c: JSONObject): ConfigUi =
+        // kotlinx JsonDto 层解析（decodeConfigJson）：ConfigViewDto 投影的逐条目
+        // 容错（坏条目跳过、Option 双形态 null/缺键同义）与旧手工遍历一致。
+        decodeConfigJson(c.toString())
 
     private fun applyConfig(c: JSONObject) {
         mutate { copy(config = parseConfig(c)) }
@@ -3554,67 +3365,12 @@ object RuntimeBridge {
         }.onFailure { Log.w(TAG, "deleteTranscript failed for $runId", it) }
     }
 
-    private fun entryToJson(e: UiEntry): org.json.JSONObject {
-        val type = when (e) {
-            is UiEntry.User -> "user"
-            is UiEntry.Assistant -> "assistant"
-            is UiEntry.Reasoning -> "reasoning"
-            is UiEntry.Meta -> "meta"
-            is UiEntry.ToolCall -> "tool"
-            is UiEntry.Delegate -> "delegate"
-            is UiEntry.Approval -> "approval"
-            UiEntry.StepBreak -> "step"
-        }
-        val o = org.json.JSONObject().put("t", type)
-        when (e) {
-            is UiEntry.User -> {
-                o.put("x", e.text)
-                // 附件引用（照 applySnapshot 解析的 wire 形态：{id, mime,
-                // filename?, tokens?}）；空表不写键 → 镜像紧凑，恢复侧
-                // optJSONArray 缺键回落空表（旧镜像兼容）。
-                if (e.attachments.isNotEmpty()) {
-                    val atts = org.json.JSONArray()
-                    for (a in e.attachments) {
-                        val ao = org.json.JSONObject().put("id", a.id).put("mime", a.mime)
-                        a.filename?.let { ao.put("filename", it) }
-                        a.tokens?.let { ao.put("tokens", it) }
-                        atts.put(ao)
-                    }
-                    o.put("atts", atts)
-                }
-            }
-            is UiEntry.Assistant -> o.put("x", e.text)
-            is UiEntry.Reasoning -> {
-                o.put("x", e.text)
-                e.meta?.let { o.put("m", it) }
-            }
-            is UiEntry.Meta -> o.put("x", e.text)
-            is UiEntry.ToolCall -> o.put("n", e.name).put("a", e.argsPreview)
-                .put("s", e.status).put("f", e.fullArgs).put("o", e.output ?: "")
-                .put("c", e.callId ?: "")
-            is UiEntry.Delegate -> o.put("n", e.agent).put("d", e.done)
-            is UiEntry.Approval -> o.put("n", e.toolName).put("d", e.decision)
-            UiEntry.StepBreak -> {}
-        }
-        return o
-    }
+    private fun entryToJson(e: UiEntry): org.json.JSONObject =
+        // kotlinx 镜像 DTO 编码（EntryMirrorDto，短键形状与旧手工版本逐字节一致）；
+        // org.json JSONObject 在此仅作返回值载体（persistTranscriptAsync 装数组用）。
+        org.json.JSONObject(encodeEntryMirror(e))
 
-    private fun entryFromJson(o: org.json.JSONObject): UiEntry = when (o.optString("t")) {
-        // "atts" 复用 applySnapshot 的解析（同 wire 形态）；旧镜像无键 → 空表。
-        "user" -> UiEntry.User(o.optString("x"), parseAttachmentRefs(o.optJSONArray("atts")))
-        "assistant" -> UiEntry.Assistant(o.optString("x"))
-        "reasoning" -> UiEntry.Reasoning(o.optString("x"), o.optString("m", "").ifBlank { null })
-        "meta" -> UiEntry.Meta(o.optString("x"))
-        "tool" -> UiEntry.ToolCall(
-            name = o.optString("n"),
-            argsPreview = o.optString("a"),
-            status = o.optString("s", "done"),
-            fullArgs = o.optString("f"),
-            output = o.optString("o").ifBlank { null },
-            callId = o.optString("c").ifBlank { null }, // 旧镜像无此键 → null
-        )
-        "delegate" -> UiEntry.Delegate(o.optString("n"), o.optBoolean("d"))
-        "approval" -> UiEntry.Approval(o.optString("n"), o.optString("d"))
-        else -> UiEntry.StepBreak
-    }
+    private fun entryFromJson(o: org.json.JSONObject): UiEntry =
+        // decode 失败（含未知 t）→ StepBreak，对齐旧 when-else 兜底。
+        decodeEntryMirror(o.toString()) ?: UiEntry.StepBreak
 }

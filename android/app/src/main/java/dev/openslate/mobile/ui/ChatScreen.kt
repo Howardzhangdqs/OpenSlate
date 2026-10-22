@@ -54,6 +54,7 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -1009,6 +1010,70 @@ internal fun describeOutputQueryArgs(fullArgs: String): Pair<String, String>? = 
     null
 }
 
+/** 渲染钳制阈值：超过此长度（UTF-16 字符）的文本不整段进单个 Compose Text。 */
+private const val RENDER_CLAMP_THRESHOLD = 32 * 1024
+
+/** 渲染钳制头部保留量（UTF-16 单元，24 KB）。 */
+private const val RENDER_CLAMP_HEAD = 24 * 1024
+
+/** 渲染钳制尾部保留量（UTF-16 单元，8 KB）。 */
+private const val RENDER_CLAMP_TAIL = 8 * 1024
+
+/** 渲染钳制结果：display = 钳制后可渲染文本（头 + 换行 + 尾）；omissionNote
+ *  非空 = 发生了钳制，调用方在显示位置渲染一行该说明（null = 未超限，
+ *  display 即原文）。 */
+internal data class RenderClamp(val display: String, val omissionNote: String?)
+
+/**
+ * 渲染钳制：text 超过 RENDER_CLAMP_THRESHOLD（32K 字符）时返回头
+ * RENDER_CLAMP_HEAD（24K）+ 尾 RENDER_CLAMP_TAIL（8K）与省略说明行；
+ * 不超返回原串（omissionNote null）。说明行回答「完整输出存在哪」：
+ * 已压缩落盘（App 私有目录 files/outputs/）、可让模型用 output_query 按
+ * ref 分段查看、或点下方「复制完整输出」按钮；ref 可解析时附在
+ * output_query 后（调用方从输出标记/fullArgs 传入，null 不附）。
+ *
+ * 切点做 UTF-16 代理对保护（[Character.isHighSurrogate] 判缘回退/前进 1，
+ * emoji/增补平面字符不劈裂——同 TermuxExec.combined 先例）。KB 数按 UTF-16
+ * 单元计（÷1024）。**只影响显示**：字符统计与复制一律用未钳制原串。
+ */
+internal fun clampTextForRender(text: String, ref: String? = null): RenderClamp {
+    if (text.length <= RENDER_CLAMP_THRESHOLD) return RenderClamp(text, null)
+    // 头切点：前一 char 是高代理项 = 劈开代理对 → 回退 1。
+    var headEnd = RENDER_CLAMP_HEAD
+    if (Character.isHighSurrogate(text[headEnd - 1])) headEnd--
+    // 尾切点：前一 char 是高代理项（当前位是低代理项）→ 前进 1，
+    // 把这对代理整个留给省略段。
+    var tailStart = text.length - RENDER_CLAMP_TAIL
+    if (Character.isHighSurrogate(text[tailStart - 1])) tailStart++
+    val note = "[已显示前 ${RENDER_CLAMP_HEAD / 1024} KB + 后 ${RENDER_CLAMP_TAIL / 1024} KB" +
+        "（完整 ${text.length / 1024} KB）——完整输出已压缩存储在 App 私有目录 files/outputs/，" +
+        "可让模型用 output_query${if (ref != null) "（ref=$ref）" else ""}分段查看，" +
+        "或点下方「复制完整输出」]"
+    return RenderClamp(text.substring(0, headEnd) + "\n" + text.substring(tailStart), note)
+}
+
+/** 输出文本里 `[STORED OUTPUT ref="out-N" …]` 标记的 ref 提取（core 落盘预览）。 */
+private val STORED_REF_MARKER = Regex("""\[STORED OUTPUT ref="([^"]+)"""")
+
+/**
+ * 落盘输出引用解析（渲染钳制说明行用）：输出文本里的 `[STORED OUTPUT
+ * ref="out-N"` 标记优先（bash 类超大输出经 expand_stored_output 回填，
+ * 恒带标记）；output_query 工具的 fullArgs ref 参数兜底（其输出本身是
+ * 查询结果、不含标记，isOutputQuery=false 时不查——其他工具的 fullArgs
+ * 碰巧有 ref 字段不是落盘引用，不误认）。两处都没有返回 null。
+ */
+private fun storedOutputRef(output: String?, fullArgs: String, isOutputQuery: Boolean): String? =
+    STORED_REF_MARKER.find(output.orEmpty())?.groupValues?.get(1)
+        ?: if (isOutputQuery) {
+            try {
+                JSONObject(fullArgs).optString("ref").takeIf { it.isNotBlank() }
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+
 /**
  * 工具组容器：无外框，相邻工具条目紧贴堆叠、中间只留一条缝；
  * 首条目显示上方圆角、末条目显示下方圆角、中间方角，体现一体感。
@@ -1243,6 +1308,13 @@ private fun parseToolOut(raw: String): ToolOutParts {
  * 长者**显示——host 缓存可能比 DB 版本更长且未截断，DB 版有 secret 打
  * 码，两者都安全，丢任何一边都可能缺内容。旧条目无 callId / FFI 未命
  * 中（history 被压缩、子代理工具）→ 静默回退 preview，维持现状显示。
+ *
+ * 渲染钳制（真机卡死修复）：落盘全文经 expand_stored_output 回填后可达
+ * 512 KiB，单个 Compose Text 布局几十万字符直接冻结 UI——超 32K 字符的
+ * 分段经 [clampTextForRender] 只渲染头 24K + 尾 8K + 省略说明行（回答
+ * 「完整输出存在哪」：files/outputs/ 落盘 + output_query 按 ref 分段查看
+ * + 复制完整输出按钮）。钳制只影响显示：字符统计与底部「复制完整输出」
+ * （未钳制全文，输出非空才出现）均用原串。
  */
 @Composable
 private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
@@ -1277,6 +1349,19 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     // 非 bash 类或解析失败/空 fullArgs，命令区整块回退原始 JSON 展示。
     val bashCmd = remember(tc.name, tc.fullArgs) {
         if (isBashLikeTool(tc.name)) parseBashCommand(tc.fullArgs) else null
+    }
+    // 落盘输出引用（渲染钳制说明行用，remember 缓存）：输出文本的
+    // [STORED OUTPUT ref="out-N"] 标记优先，output_query 的 fullArgs 兜底。
+    val storedRef = remember(shownOut, tc.name, tc.fullArgs) {
+        storedOutputRef(shownOut, tc.fullArgs, tc.name == OUTPUT_QUERY_TOOL)
+    }
+    // 「复制完整输出」成功反馈：标签短暂切换「已复制」（同 CodeBlock 惯例）。
+    var fullCopied by remember { mutableStateOf(false) }
+    LaunchedEffect(fullCopied) {
+        if (fullCopied) {
+            delay(2000)
+            fullCopied = false
+        }
     }
 
     Dialog(
@@ -1463,16 +1548,32 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                             color = MaterialTheme.colorScheme.outline,
                         )
                     } else {
-                        SelectionContainer {
+                        // 渲染钳制（真机卡死修复）：当前分段超长（>32K 字符）时只
+                        // 渲染头 24K + 尾 8K + 说明行——单个 Compose Text 布局几十万
+                        // 字符即冻结 UI。钳制只影响显示：上方字符统计与底部复制
+                        // 仍用未钳制原串。
+                        val rawText = when {
+                            parts.stderr.isNotEmpty() && tab == 1 -> parts.stderr.ifBlank { "（空）" }
+                            parts.stdout.isNotBlank() -> parts.stdout
+                            else -> null
+                        }
+                        val clamp = remember(rawText, storedRef) {
+                            rawText?.let { clampTextForRender(it, storedRef) }
+                        }
+                        // 省略说明行（系统等宽、tertiary、居左）：超限才出现，
+                        // 置于内容上方（与输出头字符数统计同属元信息层）。
+                        clamp?.omissionNote?.let { note ->
                             Text(
-                                when {
-                                    parts.stderr.isNotEmpty() && tab == 1 ->
-                                        parts.stderr.ifBlank { "（空）" }
-                                    parts.stdout.isNotBlank() -> parts.stdout
-                                    else -> "（无输出）"
-                                },
-                                style = mono,
+                                note,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                ),
+                                color = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.padding(bottom = 6.dp),
                             )
+                        }
+                        SelectionContainer {
+                            Text(clamp?.display ?: "（无输出）", style = mono)
                         }
                     }
                 }
@@ -1480,10 +1581,13 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                     thickness = 0.5.dp,
                     color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                 )
-                // 底部动作行：整段一键复制（配合长按手动选择）。
+                // 底部动作行：整段一键复制（配合长按手动选择）。四枚按钮（命令/
+                // stdout/stderr/完整输出）在 360dp 屏放不下时横滑——同
+                // SettingsScreen 色板行的横滑先例，放得下时无感知。
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
@@ -1527,6 +1631,26 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                             )
                             Spacer(Modifier.width(4.dp))
                             Text("复制 stderr")
+                        }
+                    }
+                    // 复制完整输出：未钳制全文（与显示同源——fullOut 与 tc.output
+                    // 取更长者），渲染钳制只管显示不影响复制；输出非空才出现，
+                    // 成功反馈 = 标签短暂切「已复制」（CodeBlock 同款惯例）。
+                    if (!shownOut.isNullOrBlank()) {
+                        SoftButton(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(shownOut.orEmpty()))
+                                fullCopied = true
+                            },
+                            enabled = !running,
+                        ) {
+                            Icon(
+                                Icons.Filled.ContentCopy,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(if (fullCopied) "已复制" else "复制完整输出")
                         }
                     }
                 }

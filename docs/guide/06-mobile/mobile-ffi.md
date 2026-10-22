@@ -39,6 +39,8 @@
 
 JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**，协议 JSON / 结果信封 `{"ok":true,…}` / `{"ok":false,"error":"…"}` 直接透传，Kotlin 侧 `org.json` 解析。
 
+> **kotlinx.serialization 试点（2026-10）**：FFI「JSON 直通 + Kotlin 解析」的约定不变，但解析侧三个热点已迁 kotlinx.serialization——`bridge/JsonDto.kt`（纯 Kotlin DTO 层）：① ask_user 往返（questions[] 解析 / answers[] 提交拼装 / 已答回看，wire 对齐 `askuser.rs`）；② config 视图解析（对齐 protocol `ConfigViewDto`）；③ 本地转写镜像（短键格式不变）。**事件泵 handleEvent 热路径与其余 org.json 用点仍 org.json**（保序 / 零额外对象）；RuntimeBridge 六个入口签名不变，org.json 在这些入口仅作入参载体。详见 [android-app.md](android-app.md) §4 文件角色表 `JsonDto.kt` 行与 `src/test/…/JsonDtoTest.kt`。
+
 | 方法（Kotlin 名） | 行号 | 语义要点 |
 |------|------|---------|
 | `create(paths, callback)`（constructor） | 86-116 | 装配 + 首份 snapshot；失败抛 `MobileError.CreateFailed` |

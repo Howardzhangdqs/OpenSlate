@@ -76,7 +76,7 @@
 - `ToolDefinition`（:5）= name/description/parameters。
 - `GenerateRequest`（:12）= model_id/system_prompt?/messages/tools/max_tokens?/temperature?。
 - `ModelProvider` trait（:22，详见 [../01-architecture/traits-and-abstractions.md](../01-architecture/traits-and-abstractions.md) §1）。
-- `ProgressCallback` trait（:57，10 个回调，`on_input_estimate`/`on_reasoning`/`on_step_end` 默认 no-op 保持向后兼容）。`on_tool_start(name, args, call_id)` / `on_tool_end(name, bytes, truncated, preview, call_id)` 的 `call_id` 为 provider 分配的工具调用 id（`ToolCallId` newtype 内串），runtime 4 个发射点（串行/并行批 × start/end）均传 `&tc.id.0`；UI 层按其精确配对 start/end 与条目、并懒加载全量输出。
+- `ProgressCallback` trait（:57，10 个回调，`on_input_estimate`/`on_reasoning`/`on_step_end` 默认 no-op 保持向后兼容）。`on_tool_start(name, args, call_id)` / `on_tool_end(name, bytes, truncated, preview, call_id)` 的 `call_id` 为 provider 分配的工具调用 id（`ToolCallId` newtype 内串），runtime 4 个发射点（串行/并行批 × start/end）均传 `&tc.id.0`；UI 层按其精确配对 start/end 与条目、并懒加载全量输出。`on_tool_start` 的 args 经 `tool_args_for_event`（runtime.rs）按工具名分级：`ask_user` / `bash` / `termux_bash` **全量下发**（ask_user 供 Android 回看页重建问卷；bash 类参数是单 command 字符串，UI 需完整 JSON 才能解析命令渲染 Termux 芯片，截断会破坏 JSON 合法性），其余工具 120 字符预览（write 等大参数工具防事件洪泛）；日志路径恒用截断预览。
 - `list_remote_models(base_url, adapter, api_key)`（:104）：Provider 设置页"自动检测"。端点/鉴权矩阵（:96-103 注释）：openai `GET {base}/models` Bearer；anthropic `{base}/v1/models` x-api-key + anthropic-version（base 已带 `/v1` 后缀则不重复拼，:142-148）；gemini `{base}/v1beta/models` x-goog-api-key（剥已有后缀，:149-152）；ollama `/api/tags` 无鉴权。10s 超时；响应解析宽松（`data[].id` / `models[].name` / `models[].id` 都认，Gemini name 剥 `models/` 前缀，:180-198）；空结果 bail。Android 下 webpki 静态根证书（:117-128）；代理语义：`OPENSLATE_HTTP_PROXY` 显式启用否则 no_proxy（:131-138）。
 
 ## 3. tool.rs —— 工具抽象与注册表（708 行）

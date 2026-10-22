@@ -242,6 +242,11 @@ data class TermuxResult(
     /** Termux 错误码（result Bundle 的整型 "err"，如 allow-external-apps 未开 = 2）。 */
     val errCode: Int? = null,
 ) {
+    /**
+     * 合并输出。take 上限 65_536，与 Rust 侧 engine 的 max_output_bytes
+     * 64KB 预算对齐（默认 65_536）：engine 的 limit_tool_output 仍是总量
+     * 天花板，这里放宽只是不再在 Kotlin 侧提前截断，长输出可见全量。
+     */
     fun combined(): String = buildString {
         append(stdout ?: "")
         if (!stderr.isNullOrBlank()) {
@@ -252,7 +257,7 @@ data class TermuxResult(
             if (isNotEmpty()) append('\n')
             append("exit_code: ").append(exitCode)
         }
-    }.take(8_000)
+    }.take(65_536)
 }
 
 /**

@@ -1116,12 +1116,16 @@ pub async fn execute_run(
     }
 }
 
-/// tool_start 事件携带的参数：ask_user 全量下发（Android 已答回看页凭
-/// tool_start args 重建完整问卷结构；该工具经 schema 校验 ≤4 题、体积有
-/// 界），其余工具维持 120 字符预览（write 等大参数工具防事件洪泛）。日
-/// 志路径仍用截断预览。
+/// tool_start 事件携带的参数。以下工具全量下发（白名单）：
+/// - `ask_user`：Android 已答回看页凭 tool_start args 重建完整问卷结构
+///   （该工具经 schema 校验 ≤4 题、体积有界）；
+/// - `bash` / `termux_bash`：参数是单个 command 字符串，UI 侧（如
+///   Android 的 parseBashCommand）需完整 JSON 才能提取命令渲染 Termux
+///   样式芯片，截断会破坏 JSON 合法性。
+/// 其余工具维持 120 字符预览（write 等大参数工具防事件洪泛）。日志路径
+/// 仍用截断预览。
 fn tool_args_for_event<'a>(name: &str, args_str: &'a str) -> &'a str {
-    if name == "ask_user" {
+    if matches!(name, "ask_user" | "bash" | "termux_bash") {
         args_str
     } else {
         truncate_str(args_str, 120)
@@ -2213,6 +2217,24 @@ mod tests {
         assert_eq!(limits.max_context_bytes, 64_000);
         assert_eq!(limits.max_output_bytes, 65_536);
         assert_eq!(limits.max_empty_turns, DEFAULT_MAX_EMPTY_TURNS);
+    }
+
+    // ── tool_start args 白名单/截断 tests ──
+
+    #[test]
+    fn test_tool_args_whitelist_passes_long_bash_args_untruncated() {
+        // >120 字符的 bash command 序列化 JSON：白名单直通，否则 JSON 被
+        // 拦腰截断变非法，Android parseBashCommand 解析失败、芯片退化。
+        let long_command = "x".repeat(200);
+        let args = serde_json::json!({ "command": long_command }).to_string();
+        assert!(args.len() > 120, "precondition: serialized args exceed preview cap");
+        for name in ["bash", "termux_bash", "ask_user"] {
+            assert_eq!(tool_args_for_event(name, &args), args, "{name} must pass through");
+        }
+        // 非 bash 类工具照常 120 预览（write 等大参数防事件洪泛）。
+        let preview = tool_args_for_event("write_file", &args);
+        assert_eq!(preview.len(), 120);
+        assert!(preview.len() < args.len());
     }
 
     // ── Timeout enforcement tests ──

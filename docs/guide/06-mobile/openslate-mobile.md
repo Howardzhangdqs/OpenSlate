@@ -38,8 +38,9 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/attachments.rs` | ~1400 | `import_attachment`、`sniff_mime`、`normalize_image`（header 快速通道 + 迭代压缩）、`gate_submit_attachments`、`AttachmentDataProxy`、`refill_message_attachment_data` | 附件 ingest（多模态输入，存储 v5 §3）：magic-byte 嗅探 → sha256 content-addressing → 图像归一化（小图 JPEG/PNG header-only 零转码 passthrough；其余按用户双旋钮**迭代压缩达标** q85→70→55 → ×0.85 缩边，地板 1024）→ 视频 passthrough → 落盘；Submit 门控矩阵；请求路径字节装载代理（见 §12）。**导入纯本地零网络**（token 数由响应侧回填，见 §12.5）；全程分段耗时日志 |
 | `src/transcripts.rs` | ~640 | `SyncState`（`persist_range`/`flush_now`/`invalidate`）、`sync_loop`、`rebuild_transcript`、`heal_truncated_tail`、`DANGLING_TAIL_META`/`INCOMPLETE_TURN_META`/`HEAL_META` | transcript 持久化（存储 v5 §4 + 历史转写丢失修复 C1/C3）：SyncState 收口的增量同步 + 三个高危时刻的强制冲刷 + 两级重建（entries 优先 / 消息投影回退 / 截断自愈）+ 存储健康横幅（见 §13）；sync_loop 兼附件 tokens 回填消费点（见 §12.5） |
 | `src/attachment_tokens.rs` | ~330 | `AttachmentTokenBackfill`、`overlay_tokens_from_messages` | 附件 image tokens **响应侧回填**（协议 v5）：EventSink tap 闩首次调用值 → sync_loop 落 transcript → 重开经 messages.meta_json 重放（见 §12.5） |
-| `src/output_storer.rs` | ~200 | `MobileOutputStorer` | 长输出落盘 storer（长输出落盘 + output_query C3）：实现 core `ToolOutputStorer` 接缝——超限工具输出 sha256 寻址 → zstd-3 压缩 → store `tool_outputs` 行 + `files/outputs/{sha}.zst`；**ref = 会话内自增短 id `out-N`**（同 run 同 sha 幂等复用既有 ref，分配在 storer 串行路径、唯一索引兜底）；任何失败返回 `None`（core 回落旧截断路径，绝不失败回合）。store 经 `SharedStore`（OnceLock 后注，AttachmentDataProxy 同款接缝）在 assemble_state 后由 create_with 注入；进程级单槽 `set_tool_output_storer` 随进程生灭（shutdown 无需清理）；装配启动序列挂 `gc_orphan_output_files`（失败仅告警） |
-| `src/output_query.rs` | ~1200 | `OutputQueryTool`、`OUTPUT_QUERY_TOOL` | output_query 内置工具（长输出落盘 + output_query C4）：模型按 `[STORED OUTPUT ref=…]` 标记取回落盘全文的 head/tail/lines/grep/wc 五算子查询；**ref 会话内唯一短 id，`(run_id, ref)` 精确匹配严格会话隔离**（跨会话 ref 不可解析）；64KB 块式行迭代核心（改造自 uutils/coreutils head，MIT 署名）一份共用；累计封顶 = `max_output_bytes` 生效值；免审批（见 §15） |
+| `src/output_storer.rs` | ~300 | `MobileOutputStorer` | 长输出落盘 storer（长输出落盘 + output_query C3）：实现 core `ToolOutputStorer` 接缝——超限工具输出 sha256 寻址 → **v8 seekable 分块压缩**（委托 `output_range::encode_seekable`：64KiB 行边界帧 + 每帧 XXH64 校验 + 行级帧索引 BLOB）→ store `tool_outputs` 行 + `files/outputs/{sha}.zst`；**ref = 会话内自增短 id `out-N`**（同 run 同 sha 幂等复用既有 ref，分配在 storer 串行路径、唯一索引兜底）；任何失败返回 `None`（core 回落旧截断路径，绝不失败回合）。store 经 `SharedStore`（OnceLock 后注，AttachmentDataProxy 同款接缝）在 assemble_state 后由 create_with 注入；进程级单槽 `set_tool_output_storer` 随进程生灭（shutdown 无需清理）；装配启动序列挂 `gc_orphan_output_files`（失败仅告警） |
+| `src/output_range.rs` | ~700 | `OutputRangeReader`、`encode_seekable`、`FrameEntry`、`LineScanner` | seekable 分块压缩层（v8 存储）：写（`encode_seekable`——zeekstd RawEncoder 行边界断帧 + 帧索引 BLOB）与窗口化读（`OutputRangeReader`——File 直作 Seekable 源，帧索引二分定位 O(覆盖帧)/逐帧 grep/零解压 wc；文件尾魔数探测 legacy 回退）；`LineScanner`（uutils head 改造，MIT 署名）为 output_query legacy 路径与本模块共用的行迭代核心 |
+| `src/output_query.rs` | ~1500 | `OutputQueryTool`、`OUTPUT_QUERY_TOOL` | output_query 内置工具（长输出落盘 + output_query C4）：模型按 `[STORED OUTPUT ref=…]` 标记取回落盘全文的 head/tail/lines/grep/wc 五算子查询；**ref 会话内唯一短 id，`(run_id, ref)` 精确匹配严格会话隔离**（跨会话 ref 不可解析）；**v8 seekable 文件走窗口化路径、legacy 单帧整篇回退，两分支行为逐字面一致**（见 §15.4）；累计封顶 = `max_output_bytes` 生效值；免审批（见 §15） |
 | `src/registry.rs` | 541+ | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新）；`supports_video`（models.dev modalities 直读——Submit 门控的 video 维） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
 
@@ -414,10 +415,21 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 - **数据链**：`ref` 校验（`out-` + 1..16 位数字）→
   `find_tool_output(当前 run_id, ref)` → 无行返回 Error 文案（含期望格式 +
   「ref 仅本会话内有效」提示 + 从 `[STORED OUTPUT` 标记取 ref 的提示）→
-  `read_tool_output_bytes(sha64)` → zstd 解压（纯内存，≤1MiB 量级，对齐 storer 的不
-  spawn_blocking 约定）→ **`len == orig_bytes` 完整性校验**（不等报错——防半写文件/内容
-  错位被静默错读）→ 按 op 切片。参数校验错误（op 与字段不匹配 / start>end / n 越界 /
-  非法 regex 编译错误原文回显）一律普通文本 status=Error 回喂自纠。
+  `tool_output_file_path(sha64)` 取文件路径 → **文件尾 4 字节小端魔数
+  `0x8F92EAB1` 探测分叉**：
+  - **seekable 命中（v8 现行产物）** → `OutputRangeReader` 窗口化读取
+    （`output_range.rs`，见 §15.4）：head/tail/lines 帧索引二分定位
+    O(覆盖帧)、grep 逐帧流式、wc 零解压。完整性 = 每帧 XXH64 校验和
+    （解码器逐帧验证，崩坏帧报错不静默）+ grep full-pass 总字节核对
+    `== orig_bytes`；
+  - **未命中（legacy 单帧 zstd）** → `read_tool_output_bytes` →
+    zstd 整篇解压（纯内存，≤1MiB 量级，对齐 storer 的不 spawn_blocking
+    约定）→ **`len == orig_bytes` 完整性校验**（不等报错——防半写文件/
+    内容错位被静默错读）→ 按 op 切片。
+
+  两分支行为语义逐字面一致（1-based、越界钳制、返回封顶、错误文案），
+  只是引擎盖下从整篇换窗口。参数校验错误（op 与字段不匹配 / start>end /
+  n 越界 / 非法 regex 编译错误原文回显）一律普通文本 status=Error 回喂自纠。
 - **五算子**（flat schema，`additionalProperties:false`，required `ref`+`op`）：
   - `head` / `tail`：前/末 N 行（`n` 默认 50、上限 2000；tail 末行无换行也算一行，n ≥ 总行数返回全文）；
   - `lines`：`start..=end` 闭区间（1-based，start ≥ 1 且 ≤ end）；
@@ -426,7 +438,8 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
     封顶时 M < T 即截断提示；单行超 cap 的命中计数但不展示）；
   - `wc`：`lines: N, bytes: M`（+ `note: no trailing newline`，仅非空且末字节非 `\n` 时）。
 - **行迭代核心一份共用**（`LineScanner`，改造自 uutils/coreutils `head` take.rs，MIT 署名
-  保留在源码常量区）：head/tail/lines 走同一条「跳过 + 拷贝」通路（tail = 跳过
+  保留在 `output_range.rs` 源码常量区——v8 起随窗口化读取移驻，legacy 整篇路径与
+  seekable 窗口路径同一实现）：head/tail/lines 走同一条「跳过 + 拷贝」通路（tail = 跳过
   `total_line_count - n` 行，跳过量来自落盘行的 `line_count`——与已过完整性校验的原文同源）；
   grep/wc 逐块扫描。边界：恒定 64KB 读块复用不膨胀（超长单行只膨胀行缓冲）、读侧 EINTR
   重试、行跨块拼接、末行无换行亦算一行。行切分**只按 `\n`**：行内 `\r` 保留（CRLF 文件
@@ -442,12 +455,59 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
   列表尾，其余逐字不动——app 私有目录无编辑器可达，用户没有手动途径）。
   不在白名单 ≠ 报错，只是模型看不到该工具。
 
+### 15.4 v8 seekable 分块存储与窗口化查询（`output_range.rs`）
+
+长输出落盘的压缩层 v8（用户拍板 2026-10-22：数据只留 App 侧，为 GB 级极端条件做
+准备——**查询永不整篇解压、内存 O(帧)**）：
+
+- **写路径**（storer 委托 `encode_seekable`）：`zeekstd::RawEncoder`（level 3 +
+  每帧 XXH64 校验和）增量压缩，**按行边界手动断帧**——逐行喂入（`split_inclusive('\n')`），
+  累计 ≥64KiB（`FRAME_TARGET_BYTES`）且行完整时 `end_frame()`；产物 = 帧数据 + 尾部
+  skippable 帧内嵌 seek table（zstd seekable 格式，文件尾 4 字节小端魔数
+  `0x8F92EAB1`）。帧大小策略取 seekable 上限 1GiB（自动断帧仅对 ≥1GiB 单行生效且
+  不破坏正确性——帧边界不变量见下）。空内容 = 单空帧 + N=0 帧索引。
+- **行级帧索引**（`frame_index` BLOB，随 `tool_outputs` 行入库）：每帧一条
+  `(首行号 u32, 帧起始解压后偏移 u64)`，小端手写打包（布局见
+  [02-core/openslate-store-sqlite.md](../02-core/openslate-store-sqlite.md)）。
+  seek table 只有字节偏移，行号→帧的映射靠这份索引。
+- **帧边界不变量**（正确性根基）：索引记录的帧边界**恒为行边界**（写侧只在行完整处
+  断帧），因此「从条目偏移起解压」必从行首开始，行号映射无歧义；`read_lines` 二分
+  定位覆盖条目后从行边界起扫 + 裁剪到 [a,b]，帧/行边界不对齐的残余由裁剪吸收。
+- **读路径**（`OutputRangeReader`）：`std::fs::File` 直接作 zeekstd `Decoder` 的
+  Seekable 源（std feature 的 blanket impl：`Read + Seek` → `Seekable`——GB 级
+  压缩文件不进内存，无需自实现；构造即从文件尾解析 seek table），
+  `set_offset`/`set_offset_limit`（解压后字节偏移，帧内任意偏移由解码器 dummy
+  解压跳过）。各算子复杂度：
+  - `head`/`tail`/`lines`：帧索引二分（`partition_point`）定位覆盖条目 → 窗口解压 +
+    行扫描裁剪，内存 **O(覆盖帧 + 结果)**；tail 从帧索引尾部定位；
+  - `grep`：逐条目顺序流式扫描（正则逐行 + 行号累计），保留集受 cap 字节预算封顶
+    （total 全量计数），内存 **O(帧 + 保留结果)**；full-pass 顺带核对解压总字节数
+    `== orig_bytes`（完整性，替代 legacy 的整篇 len 校验）；
+  - `wc`：**零解压**——`line_count`/`orig_bytes` 直读 DB 行；trailing-newline 注记
+    仅解压最后 1 字节（CPU 最坏 dummy 跳过末帧 ≈ 一帧）。
+- **legacy 回退**：v8 前的普通单帧 zstd 文件无尾魔数 → 探测不命中 → 整篇解压路径
+  （`zstd::decode_all` 对 seekable 文件同样可用——libzstd 跳过 skippable 帧，故
+  C6 详情弹窗全文闭环 `tool_output_by_call_id` 不感知格式差异，未改）。
+- **传输上限不变**（本轮明确不动）：三腿 1MiB / 256KiB 上限、`output_store_threshold`
+  缺省 16KiB、`max_output_bytes` 封顶语义全部维持原值——v8 只换落盘格式与查询引擎。
+- **依赖**：`zeekstd = "0.6"`（纯 Rust，底层 zstd-safe 8.2 与 zstd 0.13 的 zstd-sys
+  统一解析 2.1.2，无 links 冲突；与既有 zstd crate 并存）。
+
 ### 15.3 测试面
 
-`output_query.rs` 内嵌 16 个用例：五算子矩阵、末行无换行、CRLF 保 `\r`、空输出、1MiB 单行
+`output_query.rs` 内嵌 21 个用例：五算子矩阵、末行无换行、CRLF 保 `\r`、空输出、1MiB 单行
 （含「命中行超 cap 计数不展示」钉死）、64KB 块边界跨行、多字节封顶劈裂（65536 切点落
 `中` 字节中间 → 65535 边界）、grep ignore_case、参数错误文案矩阵（16 组，含 ref 1..16
 位数字边界与旧 16hex 拒收）、未知 ref、**跨会话隔离**（run-2 查 run-1 的 ref → Error +
 会话隔离文案，run-1 对照组仍可解析）、orig_bytes 完整性失败、装配前错误（store 未注入 /
-无当前 run）、`LineScanner` 单元直测（空内容/空行/EOF 后 skip）。
-装配链回归：`tests/runtime_flow.rs` 默认白名单断言含 `output_query`。
+无当前 run）、**v8 窗口化等价性**（双 store 落 legacy/seekable 同内容，五算子 + 1MiB
+单行 + CRLF/末行无换行逐字节对比两分支输出一致；seekable 文件缺失 → missing 文案）。
+`output_range.rs` 内嵌 16 个用例（v8 编解码核心）：多帧写读往返等价（~7.8MB/120 帧，
+跨帧边界窗口采样）、64KiB 阈值落行中间字节、末行无换行、CRLF、300KB 单超长行、空内容、
+grep 逐帧 vs 整篇参考（命中集合+行号+总数）、grep 保留预算封顶全量计数、wc 零解压
+计量、帧索引二分边界（跨帧边界/帧内/越界 clamp/head·tail 超量全文）、legacy 探测回退、
+seekable+空索引报错、**崩坏帧报错不静默**（翻转压缩中段 1 字节 → 窗口读取与 full-pass
+grep 均报错）、LineScanner 单元直测、帧索引 BLOB 序列化/校验矩阵（版本/截断/不变量）。
+`output_storer.rs` 补 v8 产物断言（文件尾魔数 + 帧索引持久化 + 整篇解压兼容）与
+seekable 编码帧结构单测。装配链回归：`tests/runtime_flow.rs` 默认白名单断言含
+`output_query`。

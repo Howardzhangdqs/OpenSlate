@@ -29,6 +29,10 @@ uuid = { workspace = true }
 genai = { path = "../../vendor/genai" }
 # 模型元数据注册表本地存储压缩（数据源页面 / registry 模块）。
 zstd = "0.13"
+# 长输出落盘的 seekable 分块压缩（output_storer 写 / output_range 窗口
+# 读；纯 Rust，底层 zstd-safe 与 zstd 0.13 的 zstd-sys 统一解析，无
+# links 冲突）。
+zeekstd = "0.6"
 serde = { workspace = true }
 # 附件 content-addressing 哈希（attachments 模块，存储 v5 §3）。
 sha2 = "0.10"

@@ -3,7 +3,7 @@
 //! 长工具输出落盘后（[`crate::output_storer`]，C3），对话内只有头尾预览
 //! （`[STORED OUTPUT ref="out-…" …]` 标记，core `build_preview`）。本模块
 //! 是模型侧的取回通道：按 `ref` 查 `tool_outputs` 行 → 读
-//! `files/outputs/{sha256}.zst` → 校验完整性 → 按 `op` 切片返回
+//! `files/outputs/{sha256}.zst` → 按 `op` 切片返回
 //! （head / tail / lines / grep / wc 五算子）。
 //!
 //! ## 数据链（与 C6 详情弹窗 `tool_output_by_call_id` 同源）
@@ -11,21 +11,31 @@
 //! `ref` 校验（`out-` + 1..16 位数字）→ `find_tool_output(当前 run_id, ref)`
 //! （**严格会话隔离**：`(run_id, ref)` 精确匹配，一个 run 的 ref 不能被
 //! 其他 run 解析——用户拍板 2026-10-22）→ 无行返回 status=Error 文案
-//! （含期望格式与「ref 仅本会话内有效」提示）→
-//! `read_tool_output_bytes(sha64)` → zstd 解压（纯内存操作，量级 ≤1MiB
-//! 传输上限，对齐 output_storer 的「不单独 spawn_blocking」约定）→
-//! **校验 `len == orig_bytes`**（防半写文件/内容错位被静默错读）→ 切片。
+//! （含期望格式与「ref 仅本会话内有效」提示）→ 文件尾魔数探测分叉：
+//!
+//! - **v8 seekable 文件**（storer 现行产物，[`crate::output_range`]）：
+//!   `OutputRangeReader` 窗口化读取——head/tail/lines 帧索引二分定位
+//!   O(覆盖帧)，grep 逐帧流式 O(全量 CPU / O(帧+结果) 内存)，wc 零解压
+//!   直读行计量。完整性 = 每帧 XXH64 校验和（解码器逐帧验证）+ grep
+//!   full-pass 总字节核对；
+//! - **legacy 单帧文件**（v8 前 / 测试手工落盘）：
+//!   `read_tool_output_bytes(sha64)` → zstd 整篇解压（纯内存操作，量级
+//!   ≤1MiB 传输上限，对齐 output_storer 的「不单独 spawn_blocking」约定）
+//!   → **校验 `len == orig_bytes`**（防半写文件/内容错位被静默错读）→ 切片。
+//!
+//! 两分支行为语义逐字面一致（1-based、越界钳制、返回封顶、错误文案）。
 //!
 //! ## 行迭代核心（一份共用，改造自 uutils/coreutils `head`）
 //!
-//! 五个算子共用同一个 64KB 块式行迭代核心 [`LineScanner`]。边界处理
-//! 改造自 uutils coreutils `uu/head/src/take.rs`（MIT 许可，下文常量区
-//! 有署名与版权声明）：恒定 64KB 读块复用不膨胀（超长单行的累积只发生
-//! 在行缓冲，读块尺寸不变）、读侧 EINTR 重试、行跨块拼接、末行无换行
-//! 亦算一行。行的切分**只按 `\n`**：行内 `\r` 保留（CRLF 文件的 grep
-//! 输出行尾带 `\r`，工具 description 已注明；与 Rust `str::lines()` 会
-//! 剥掉 `\r\n` 的 `\r` 不同——行**计数**两种约定恒等，行**内容**我们保
-//! 留原字节，工具描述注明）。
+//! 五个算子共用同一个 64KB 块式行迭代核心（[`LineScanner`]，v8 起随
+//! 窗口化读取移驻 `output_range.rs`——legacy 整篇路径与 seekable 窗口
+//! 路径同一实现）。边界处理改造自 uutils coreutils `uu/head/src/take.rs`
+//! （MIT 许可，该模块文档有署名与版权声明）：恒定 64KB 读块复用不膨胀
+//! （超长单行的累积只发生在行缓冲，读块尺寸不变）、读侧 EINTR 重试、
+//! 行跨块拼接、末行无换行亦算一行。行的切分**只按 `\n`**：行内 `\r`
+//! 保留（CRLF 文件的 grep 输出行尾带 `\r`，工具 description 已注明；
+//! 与 Rust `str::lines()` 会剥掉 `\r\n` 的 `\r` 不同——行**计数**两种
+//! 约定恒等，行**内容**我们保留原字节，工具描述注明）。
 //!
 //! 注：设计初稿把 tail 记为 `copy_all_but_n_lines(total-n)`，但该函数
 //! 的 uutils 语义是「丢弃末 n 行、输出前缀」（`head -n -K`），直接套用
@@ -76,7 +86,6 @@
 // 切分语义），为 output_query 的五个算子改为「跳过 + 拷贝」形态。
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::io::{ErrorKind, Read};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
@@ -89,7 +98,7 @@ use openslate_session::state::AppState;
 use serde_json::{json, Value};
 
 use crate::attachments::SharedStore;
-
+use crate::output_range::{LineScanner, OutputRangeReader, RangeError};
 /// 工具注册名。
 pub const OUTPUT_QUERY_TOOL: &str = "output_query";
 
@@ -98,9 +107,6 @@ const DEFAULT_N: usize = 50;
 
 /// head/tail 的行数上限。
 const MAX_N: usize = 2000;
-
-/// 64KB 读块（uutils head `BUF_SIZE` 同值）。
-const READ_CHUNK: usize = 65_536;
 
 /// 工具 description（设计定稿文案 + CRLF 行为注明 + 会话隔离声明）。
 const OUTPUT_QUERY_DESCRIPTION: &str = "Query the full text of a stored tool output. Long tool outputs are not shown \
@@ -120,93 +126,6 @@ around them (e.g. start=120, end=140) for context. \
 this conversation can be queried. \
 - Lines are split on \\n only; a trailing \\r (CRLF file) stays at the end of \
 each returned line.";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 行迭代核心（head / tail / lines / grep / wc 一份共用）
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// 64KB 块式行迭代器。
-///
-/// 边界保证（uutils take.rs 改造，见模块文档署名）：
-/// - 读块恒定 64KB、`fill_chunk` 里 resize 复用（超长单行不膨胀读块）；
-/// - `read` 返回 [`ErrorKind::Interrupted`] 时重试（EINTR）；
-/// - 行跨块由调用方 `line` 缓冲拼接（行长即其上界）；
-/// - 末行无换行亦产出一行（返回 `true` 且 `line` 为该行内容）。
-struct LineScanner<R: Read> {
-    reader: R,
-    chunk: Vec<u8>,
-    pos: usize,
-    eof: bool,
-}
-
-impl<R: Read> LineScanner<R> {
-    fn new(reader: R) -> Self {
-        Self {
-            reader,
-            chunk: Vec::new(),
-            pos: 0,
-            eof: false,
-        }
-    }
-
-    /// 读下一块到 `chunk`（EINTR 重试；uutils `TakeAllBuffer::fill_buffer`
-    /// 同款），返回读取字节数（0 = EOF）。
-    fn fill_chunk(&mut self) -> std::io::Result<usize> {
-        self.chunk.resize(READ_CHUNK, 0);
-        self.pos = 0;
-        loop {
-            match self.reader.read(&mut self.chunk[..]) {
-                Ok(n) => {
-                    self.chunk.truncate(n);
-                    return Ok(n);
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// 下一行写入 `line`（不含 `\n`，**含行内 `\r`**）。返回 `false` =
-    /// EOF。空内容立即 `false`；末行无换行时该行照常产出。
-    fn next_line(&mut self, line: &mut Vec<u8>) -> std::io::Result<bool> {
-        line.clear();
-        loop {
-            if self.pos >= self.chunk.len() {
-                if self.eof {
-                    return Ok(!line.is_empty());
-                }
-                if self.fill_chunk()? == 0 {
-                    self.eof = true;
-                }
-                continue;
-            }
-            let rest = &self.chunk[self.pos..];
-            match rest.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    line.extend_from_slice(&rest[..i]);
-                    self.pos += i + 1;
-                    return Ok(true);
-                }
-                None => {
-                    line.extend_from_slice(rest);
-                    self.pos = self.chunk.len();
-                }
-            }
-        }
-    }
-
-    /// 跳过 `n` 行，返回实际跳过数（内容不足则提前停在 EOF）。
-    fn skip_lines(&mut self, n: usize, line: &mut Vec<u8>) -> std::io::Result<usize> {
-        let mut skipped = 0;
-        for _ in 0..n {
-            if !self.next_line(line)? {
-                break;
-            }
-            skipped += 1;
-        }
-        Ok(skipped)
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 参数解析
@@ -373,9 +292,11 @@ fn cap_with_notice(mut text: String, cap: usize) -> String {
 const GREP_NOTE_RESERVE: usize = 48;
 
 /// grep 输出：命中行（恒带行号）+ 尾注 `showing M of T matches`（M =
-/// 实际保留行数；封顶时 M < T 即截断提示）。`cap == 0` = 不限。
-fn grep_output(matches: &[String], cap: usize) -> String {
-    let total = matches.len();
+/// 实际保留行数；封顶时 M < T 即截断提示）。`total` 由调用方给（窗口
+/// 化路径只保留预算内的命中、全量计数旁路；legacy 路径 = 切片长度）。
+/// `cap == 0` = 不限。
+fn grep_output(matches: &[String], total: usize, cap: usize) -> String {
+    let total = if matches.len() > total { matches.len() } else { total };
     let mut out = String::new();
     let mut shown = 0;
     for m in matches {
@@ -547,10 +468,11 @@ impl Tool for OutputQueryTool {
             Err(e) => return Ok(error(format!("stored-output lookup failed: {e}"))),
         };
 
-        // ④ 读压缩文件 + 解压 + 完整性校验（len == orig_bytes，防半写
-        //    文件 / 内容错位被静默错读）。
-        let zst = match store.read_tool_output_bytes(&record.sha256).await {
-            Ok(Some(bytes)) => bytes,
+        // ④ 读取与切片：v8 seekable 文件走窗口化读取（帧索引二分定位，
+        //    查询永不整篇解压——GB 级防线）；legacy 单帧文件（v8 前写入
+        //    / 测试手工落盘）按文件尾魔数探测，回落整篇解压路径。
+        let path = match store.tool_output_file_path(&record.sha256).await {
+            Ok(Some(p)) => p,
             Ok(None) => {
                 return Ok(error(
                     "stored-output file is missing (it may have been cleaned up); \
@@ -560,49 +482,147 @@ impl Tool for OutputQueryTool {
             }
             Err(e) => return Ok(error(format!("stored-output file read failed: {e}"))),
         };
-        // 纯内存解压，≤1MiB 量级（三腿传输上限），对齐 output_storer 的
-        // 「不单独 spawn_blocking」约定。
-        let decoded = match zstd::decode_all(zst.as_slice()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                crate::alog!("output_query: zstd 解压失败 (ref={}): {e}", query.ref_id);
-                return Ok(error(format!(
-                    "stored-output decompression failed: {e}"
-                )));
+        match OutputRangeReader::open(
+            &path,
+            &record.frame_index,
+            record.line_count as usize,
+            record.orig_bytes as u64,
+        ) {
+            Ok(Some(reader)) => {
+                let result = run_op_windowed(&query, reader, cap);
+                let result = match result {
+                    Ok(text) => text,
+                    Err(msg) => return Ok(error(msg)),
+                };
+                // ⑥ 累计输出封顶 = max_output_bytes（0 = 不限）。
+                Ok(output(cap_with_notice(result, cap), ToolOutputStatus::Success))
             }
-        };
-        if decoded.len() != record.orig_bytes as usize {
-            crate::alog!(
-                "output_query: 完整性校验失败 (ref={}): decoded={} recorded={}",
-                query.ref_id,
-                decoded.len(),
-                record.orig_bytes
-            );
-            return Ok(error(format!(
-                "stored-output integrity check failed (decoded {} bytes, expected {}): \
-                 the stored file may be corrupted; do not trust partial reads",
-                decoded.len(),
-                record.orig_bytes
-            )));
+            // legacy：整篇读 + 解压 + 完整性校验（len == orig_bytes，防
+            // 半写文件 / 内容错位被静默错读）。
+            Ok(None) => {
+                let zst = match store.read_tool_output_bytes(&record.sha256).await {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        return Ok(error(
+                            "stored-output file is missing (it may have been cleaned up); \
+                             only the preview in the original tool result remains"
+                                .to_owned(),
+                        ))
+                    }
+                    Err(e) => return Ok(error(format!("stored-output file read failed: {e}"))),
+                };
+                // 纯内存解压，≤1MiB 量级（三腿传输上限），对齐 output_storer 的
+                // 「不单独 spawn_blocking」约定。
+                let decoded = match zstd::decode_all(zst.as_slice()) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        crate::alog!("output_query: zstd 解压失败 (ref={}): {e}", query.ref_id);
+                        return Ok(error(format!("stored-output decompression failed: {e}")));
+                    }
+                };
+                if decoded.len() != record.orig_bytes as usize {
+                    crate::alog!(
+                        "output_query: 完整性校验失败 (ref={}): decoded={} recorded={}",
+                        query.ref_id,
+                        decoded.len(),
+                        record.orig_bytes
+                    );
+                    return Ok(error(format!(
+                        "stored-output integrity check failed (decoded {} bytes, expected {}): \
+                         the stored file may be corrupted; do not trust partial reads",
+                        decoded.len(),
+                        record.orig_bytes
+                    )));
+                }
+                let text = match String::from_utf8(decoded) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        crate::alog!("output_query: 落盘内容非 UTF-8 (ref={}): {e}", query.ref_id);
+                        return Ok(error("stored-output content is not valid UTF-8".to_owned()));
+                    }
+                };
+
+                // ⑤ 按 op 切片（五算子共用一条「跳过 + 拷贝 / 逐块扫描」通路）。
+                // grep 在算子内自带 M-of-T 封顶尾注；head/tail/lines/wc 的累计
+                // 封顶在 ⑥ 统一处理。
+                let result = match run_op(&query, &text, record.line_count as usize, cap) {
+                    Ok(text) => text,
+                    Err(msg) => return Ok(error(msg)),
+                };
+
+                // ⑥ 累计输出封顶 = max_output_bytes（0 = 不限）。
+                Ok(output(cap_with_notice(result, cap), ToolOutputStatus::Success))
+            }
+            Err(e) => {
+                crate::alog!("output_query: seekable 打开失败 (ref={}): {e}", query.ref_id);
+                match e {
+                    RangeError::Io(ref io)
+                        if io.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Ok(error(
+                            "stored-output file is missing (it may have been cleaned up); \
+                             only the preview in the original tool result remains"
+                                .to_owned(),
+                        ))
+                    }
+                    RangeError::Integrity { decoded, expected } => Ok(error(format!(
+                        "stored-output integrity check failed (decoded {decoded} bytes, \
+                         expected {expected}): the stored file may be corrupted; \
+                         do not trust partial reads"
+                    ))),
+                    other => Ok(error(format!(
+                        "stored-output decompression failed: {other}"
+                    ))),
+                }
+            }
         }
-        let text = match String::from_utf8(decoded) {
-            Ok(text) => text,
-            Err(e) => {
-                crate::alog!("output_query: 落盘内容非 UTF-8 (ref={}): {e}", query.ref_id);
-                return Ok(error("stored-output content is not valid UTF-8".to_owned()));
+    }
+}
+
+/// 窗口化执行算子（v8 seekable 文件；行为语义与 [`run_op`] 逐字面一致：
+/// 1-based、越界钳制、返回封顶，只是引擎盖下从整篇换窗口）。
+///
+/// - head/tail/lines：帧索引二分定位覆盖条目 → `set_offset`/`set_offset_
+///   limit` 窗口解压 + 行扫描裁剪，内存 O(覆盖帧 + 结果)；
+/// - wc：**零解压**（line_count/orig_bytes 直读行；trailing-newline 注记
+///   仅解压最后 1 字节）；
+/// - grep：逐条目顺序流式扫描（正则逐行匹配 + 行号累计，保留集受 cap
+///   字节预算封顶；完整性 = 帧校验和逐帧验证 + 全量字节核对）。
+fn run_op_windowed(
+    query: &ParsedQuery,
+    mut reader: OutputRangeReader,
+    cap: usize,
+) -> Result<String, String> {
+    let map_err = |e: RangeError| match e {
+        RangeError::Io(io) => format!("stored-output read failed: {io}"),
+        RangeError::Zeek(z) => format!("stored-output decompression failed: {z}"),
+        RangeError::Utf8 => "stored-output content is not valid UTF-8".to_owned(),
+        RangeError::Index(msg) => format!("stored-output decompression failed: {msg}"),
+        RangeError::Integrity { decoded, expected } => format!(
+            "stored-output integrity check failed (decoded {decoded} bytes, expected \
+             {expected}): the stored file may be corrupted; do not trust partial reads"
+        ),
+    };
+    match query.op {
+        Op::Head => reader.read_head(query.n).map_err(map_err),
+        Op::Tail => reader.read_tail(query.n).map_err(map_err),
+        Op::Lines => reader.read_lines(query.start, query.end).map_err(map_err),
+        Op::Grep => {
+            let regex = query.pattern.as_ref().expect("parse_query 已编译");
+            let scan = reader.scan_grep(regex, cap).map_err(map_err)?;
+            Ok(grep_output(&scan.matches, scan.total, cap))
+        }
+        Op::Wc => {
+            let mut out = format!(
+                "lines: {}, bytes: {}",
+                reader.line_count(),
+                reader.orig_bytes()
+            );
+            if !reader.last_line_terminated().map_err(map_err)? {
+                out.push_str("\nnote: no trailing newline");
             }
-        };
-
-        // ⑤ 按 op 切片（五算子共用一条「跳过 + 拷贝 / 逐块扫描」通路）。
-        // grep 在算子内自带 M-of-T 封顶尾注；head/tail/lines/wc 的累计
-        // 封顶在 ⑥ 统一处理。
-        let result = match run_op(&query, &text, record.line_count as usize, cap) {
-            Ok(text) => text,
-            Err(msg) => return Ok(error(msg)),
-        };
-
-        // ⑥ 累计输出封顶 = max_output_bytes（0 = 不限）。
-        Ok(output(cap_with_notice(result, cap), ToolOutputStatus::Success))
+            Ok(out)
+        }
     }
 }
 
@@ -662,7 +682,7 @@ fn run_op(query: &ParsedQuery, text: &str, total_lines_hint: usize, cap: usize) 
                     matches.push(format!("{line_no}:{text_line}"));
                 }
             }
-            Ok(grep_output(&matches, cap))
+            Ok(grep_output(&matches, matches.len(), cap))
         }
         Op::Wc => {
             let mut lines: usize = 0;
@@ -720,8 +740,25 @@ mod tests {
         orig_bytes: usize,
         line_count: usize,
     ) -> String {
+        store_output_as(store, content, orig_bytes, line_count, false).await
+    }
+
+    /// 落盘一条输出，可选 v8 seekable 格式（`seekable = true` 走
+    /// `encode_seekable` + 帧索引入库；false = legacy 单帧 zstd，锻炼
+    /// 回退分支）。
+    async fn store_output_as(
+        store: &SqliteStore,
+        content: &str,
+        orig_bytes: usize,
+        line_count: usize,
+        seekable: bool,
+    ) -> String {
         let sha = format!("{:x}", Sha256::digest(content.as_bytes()));
-        let data_zst = zstd::encode_all(content.as_bytes(), 3).expect("zstd");
+        let (data_zst, frame_index) = if seekable {
+            crate::output_range::encode_seekable(content).expect("seekable zst")
+        } else {
+            (zstd::encode_all(content.as_bytes(), 3).expect("zst"), Vec::new())
+        };
         // 行 id 是 PRIMARY KEY（行级唯一），测试用 uuid 防冲突。
         let id = format!("out-{}", uuid::Uuid::new_v4().simple());
         // ref = 会话内自增序号（storer 同款：max + 1）
@@ -739,6 +776,7 @@ mod tests {
                 "bash",
                 orig_bytes as i64,
                 line_count as i64,
+                &frame_index,
                 &data_zst,
                 1000,
             )
@@ -1256,32 +1294,129 @@ model = "m"
         );
     }
 
-    // ── LineScanner 单元直测（EINTR 之外的结构性边界）──────────────
+    // ── v8 seekable 窗口化路径（与 legacy 分支的行为等价性）────────
 
-    #[test]
-    fn scanner_handles_empty_and_unterminated() {
-        let mut line = Vec::new();
-        let mut s = LineScanner::new(&b""[..]);
-        assert!(!s.next_line(&mut line).unwrap());
-        assert!(line.is_empty());
+    /// seekable 落盘后五算子全走窗口化路径，输出与 legacy 整篇路径
+    /// 逐字节一致。文件按 sha 跨 run 共享（同内容只一份文件），故
+    /// **双 store**：store1 落 legacy、store2 落 seekable（同内容不同
+    /// 文件目录），逐算子对比两工具输出。
+    #[tokio::test]
+    async fn seekable_ops_match_legacy_ops() {
+        let (_d1, s1) = setup_store().await;
+        let (_d2, s2) = setup_store().await;
+        // ~200KB 多帧文档（跨 64KiB 帧边界；26B/行 → 帧 0/1 边界 ≈ 行 2521）
+        let content: String = (0..8000)
+            .map(|i| format!("row-{i:05}-payloadpayload\n"))
+            .collect();
+        let (lines, bytes) = (content.lines().count(), content.len());
+        let legacy_ref = store_output_as(&s1, &content, bytes, lines, false).await;
+        let good_ref = store_output_as(&s2, &content, bytes, lines, true).await;
+        let (t1, t2) = (tool(&s1).await, tool(&s2).await);
 
-        let mut s = LineScanner::new(&b"a\n\nb"[..]);
-        assert!(s.next_line(&mut line).unwrap());
-        assert_eq!(line, b"a");
-        assert!(s.next_line(&mut line).unwrap());
-        assert_eq!(line, b"", "空行也是一行");
-        assert!(s.next_line(&mut line).unwrap());
-        assert_eq!(line, b"b");
-        assert!(!s.next_line(&mut line).unwrap());
+        let cases: Vec<(&str, Value)> = vec![
+            ("head", json!({ "n": 100 })),
+            ("head", json!({ "n": 2000 })),
+            ("tail", json!({ "n": 100 })),
+            ("lines", json!({ "start": 2500, "end": 2600 })),
+            ("lines", json!({ "start": 1, "end": 1 })),
+            ("lines", json!({ "start": 7999, "end": 8000 })),
+            ("grep", json!({ "pattern": "row-000(1|2)" })),
+            ("wc", json!({})),
+        ];
+        for (op, extra) in cases {
+            let legacy = run(&t1, args(&legacy_ref, op, extra.clone())).await;
+            assert_eq!(
+                legacy.status,
+                ToolOutputStatus::Success,
+                "op={op} legacy: {}",
+                legacy.content
+            );
+            let seekable = run(&t2, args(&good_ref, op, extra.clone())).await;
+            assert_eq!(
+                seekable.status,
+                ToolOutputStatus::Success,
+                "op={op} seekable: {}",
+                seekable.content
+            );
+            assert_eq!(legacy.content, seekable.content, "op={op} 两分支输出一致");
+        }
     }
 
-    #[test]
-    fn scanner_skip_lines_stops_at_eof() {
-        let mut line = Vec::new();
-        let mut s = LineScanner::new(&b"1\n2\n3\n"[..]);
-        assert_eq!(s.skip_lines(2, &mut line).unwrap(), 2);
-        assert!(s.next_line(&mut line).unwrap());
-        assert_eq!(line, b"3");
-        assert_eq!(s.skip_lines(10, &mut line).unwrap(), 0, "EOF 后跳 0");
+    /// seekable 单行 1MiB（超 cap）：head/tail 截断、grep 命中放不下
+    /// （M=0 of T=1）——与 legacy 行为一致（双 store，理由同上）。
+    #[tokio::test]
+    async fn seekable_single_megabyte_line_caps_like_legacy() {
+        let (_d1, s1) = setup_store().await;
+        let (_d2, s2) = setup_store().await;
+        let big = format!("x{}", "y".repeat(1_048_576));
+        let legacy_ref = store_output_as(&s1, &big, big.len(), 1, false).await;
+        let seekable_ref = store_output_as(&s2, &big, big.len(), 1, true).await;
+        let (t1, t2) = (tool(&s1).await, tool(&s2).await);
+
+        for (op, extra) in [
+            ("head", json!({ "n": 1 })),
+            ("tail", json!({ "n": 1 })),
+            ("wc", json!({})),
+            ("grep", json!({ "pattern": "^x" })),
+        ] {
+            let legacy = run(&t1, args(&legacy_ref, op, extra.clone())).await;
+            let seekable = run(&t2, args(&seekable_ref, op, extra.clone())).await;
+            assert_eq!(legacy.content, seekable.content, "op={op}");
+        }
+    }
+
+    /// seekable 末行无换行 + CRLF：wc 注记与 grep 行为与 legacy 一致
+    /// （双 store，理由同上）。
+    #[tokio::test]
+    async fn seekable_newline_and_crlf_edge_cases() {
+        let crlf: String = (0..3000).map(|i| format!("c-{i:03}\r\n")).collect();
+        let unterminated = "a\nb\nno-newline-tail".to_owned();
+        for content in [crlf, unterminated] {
+            let (_d1, s1) = setup_store().await;
+            let (_d2, s2) = setup_store().await;
+            let legacy_ref =
+                store_output_as(&s1, &content, content.len(), content.lines().count(), false).await;
+            let seekable_ref =
+                store_output_as(&s2, &content, content.len(), content.lines().count(), true).await;
+            let (t1, t2) = (tool(&s1).await, tool(&s2).await);
+            for (op, extra) in [
+                ("wc", json!({})),
+                ("tail", json!({ "n": 2 })),
+                ("grep", json!({ "pattern": "." })),
+            ] {
+                let legacy = run(&t1, args(&legacy_ref, op, extra.clone())).await;
+                let seekable = run(&t2, args(&seekable_ref, op, extra.clone())).await;
+                assert_eq!(legacy.content, seekable.content, "op={op} content");
+            }
+        }
+    }
+
+    /// seekable 文件被删（探测前缺失）→ 与 legacy 同款 missing 文案。
+    #[tokio::test]
+    async fn seekable_missing_file_reports_missing() {
+        let (_dir, store) = setup_store().await;
+        let content = "will be deleted\n".to_owned() + &"z".repeat(100);
+        let ref_id = store_output_as(&store, &content, content.len(), content.lines().count(), true).await;
+        let record = store
+            .find_tool_output("run-1", &ref_id)
+            .await
+            .expect("find")
+            .expect("row");
+        std::fs::remove_file(
+            store
+                .files_dir()
+                .expect("dir")
+                .join("outputs")
+                .join(format!("{}.zst", record.sha256)),
+        )
+        .expect("remove");
+        let t = tool(&store).await;
+        let out = run(&t, args(&ref_id, "wc", json!({}))).await;
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("file is missing"),
+            "got: {}",
+            out.content
+        );
     }
 }

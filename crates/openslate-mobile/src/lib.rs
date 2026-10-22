@@ -32,6 +32,7 @@ pub mod exec;
 pub mod hostcall;
 pub mod mcp_recovery;
 pub mod output_query;
+pub mod output_range;
 pub mod output_storer;
 pub mod provider;
 pub mod registry;

@@ -3851,7 +3851,8 @@ mod tests {
         };
 
         // sha + 行/文件（C1 API：zst 由调用方压好）。ref 用数字短 id
-        // （会话内自增序号形态；该 run 首条 → out-1）。
+        // （会话内自增序号形态；该 run 首条 → out-1）。legacy 单帧文件
+        // （frame_index 空 BLOB）——C6 全文闭环走整篇解压，与格式无关。
         use sha2::{Digest, Sha256};
         let sha_hex = format!("{:x}", Sha256::digest(full_text.as_bytes()));
         let ref_id = "out-1".to_owned();
@@ -3870,6 +3871,7 @@ mod tests {
                     "bash",
                     full_text.len() as i64,
                     full_text.lines().count() as i64,
+                    &[],
                     &data_zst,
                     2000,
                 )

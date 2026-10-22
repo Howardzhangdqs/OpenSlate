@@ -8,6 +8,15 @@
 //! `ref` 取回。ref 是**会话内唯一**的自增短 id（`out-N`，本模块分配；
 //! 严格会话隔离——见 `store` 实现）。
 //!
+//! ## 存储格式（v8：seekable 分块）
+//!
+//! 压缩层委托 [`crate::output_range::encode_seekable`]：zstd seekable
+//! 格式（64KiB 行边界帧 + 每帧 XXH64 校验和 + 尾部 seek table），行级
+//! 帧索引随行入 `tool_outputs.frame_index`（BLOB 布局见 store
+//! `schema.rs::DDL_TOOL_OUTPUTS`）。读取端（`output_query`）据此做窗口
+//! 化解压——GB 级文件查询不整篇进内存。legacy 单帧文件（v8 前写入）
+//! 由读取端按文件尾魔数探测回落整篇路径。
+//!
 //! ## 失败语义（绝不失败回合）
 //!
 //! `store` 任何一步失败（store 未注入 / 压缩 / 写文件 / 插行）都返回
@@ -35,10 +44,6 @@ use async_trait::async_trait;
 use openslate_core::output_store::{StoredOutput, ToolOutputStorer};
 use openslate_store_sqlite::store::SqliteStore;
 use sha2::{Digest, Sha256};
-
-/// 压缩等级（level 3：与 store `codec.rs` / `registry.rs` 同一先例，
-/// 手机档位收益/耗时平衡点）。
-const ZSTD_LEVEL: i32 = 3;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -97,10 +102,10 @@ impl ToolOutputStorer for MobileOutputStorer {
             }
         }
 
-        let data_zst = match zstd::encode_all(content.as_bytes(), ZSTD_LEVEL) {
-            Ok(z) => z,
+        let (data_zst, frame_index) = match crate::output_range::encode_seekable(content) {
+            Ok(pair) => pair,
             Err(e) => {
-                crate::alog!("output_storer: zstd 压缩失败，回落旧截断路径: {e}");
+                crate::alog!("output_storer: seekable zstd 压缩失败，回落旧截断路径: {e}");
                 return None;
             }
         };
@@ -130,6 +135,7 @@ impl ToolOutputStorer for MobileOutputStorer {
                 tool_name,
                 orig_bytes as i64,
                 line_count as i64,
+                &frame_index,
                 &data_zst,
                 now_ms(),
             )
@@ -200,13 +206,69 @@ mod tests {
             .expect("find")
             .expect("row");
         assert_eq!(record.orig_bytes as usize, content.len());
+        // v8：帧索引随行持久化（seekable 格式配套）
+        assert!(!record.frame_index.is_empty(), "多帧内容应有帧索引");
         let zst = store
             .read_tool_output_bytes(&record.sha256)
             .await
             .expect("read")
             .expect("file");
+        // 文件尾 4 字节 = seekable 魔数（小端）
+        let tail: [u8; 4] = zst[zst.len() - 4..].try_into().expect("tail 4 bytes");
+        assert_eq!(
+            u32::from_le_bytes(tail),
+            zeekstd::SEEKABLE_MAGIC_NUMBER,
+            "v8 产物应为 seekable 格式"
+        );
+        // 整篇解压兼容（libzstd 跳过 skippable 帧——C6 全文闭环同路径）
         let decoded = zstd::decode_all(zst.as_slice()).expect("decompress");
         assert_eq!(decoded, content.as_bytes(), "解压零损");
+    }
+
+    /// v8 存储格式单元：seekable 编码产物的帧结构（64KiB 行边界断帧、
+    /// 首条目 (1,0)、偏移递增、条目数 = 物理帧数）+ 帧索引可解析。
+    #[test]
+    fn seekable_encode_frames_and_index_layout() {
+        use crate::output_range::{encode_seekable, parse_frame_index};
+
+        // 3000 行 × ~26B ≈ 78KB → 2 帧（64KiB + 余量）
+        let content: String = (0..3000)
+            .map(|i| format!("line-{i:05}-paddingpadding\n"))
+            .collect();
+        let (zst, blob) = encode_seekable(&content).expect("encode");
+        let entries = parse_frame_index(&blob, content.len() as u64).expect("parse");
+        assert_eq!(entries.len(), 2, "78KB → 64KiB 帧 + 余量帧");
+        assert_eq!(entries[0].first_line, 1);
+        assert_eq!(entries[0].dstart, 0);
+        assert!(entries[1].dstart >= 64 * 1024 && entries[1].dstart < content.len() as u64);
+        // 首行号推算：每行 26B（"line-00000-paddingpadding\n"），帧 1 起始
+        // 偏移之前有 dstart/26 整行 → 帧 1 的首行号 = dstart/26 + 1。
+        assert_eq!(
+            entries[1].first_line as usize,
+            entries[1].dstart as usize / 26 + 1
+        );
+
+        // 帧索引与文件内 seek table 一致（条目数 = 物理帧数）
+        let decoder =
+            zeekstd::Decoder::new(zeekstd::BytesWrapper::new(&zst)).expect("decoder");
+        assert_eq!(decoder.seek_table().num_frames() as usize, entries.len());
+
+        // 空内容：单空帧 + N=0 条目（5 字节版本化头，与 legacy 空 BLOB
+        // 区分；读取端对空内容短路）
+        let (empty, empty_blob) = encode_seekable("").expect("encode empty");
+        let empty_entries = parse_frame_index(&empty_blob, 0).expect("parse empty");
+        assert!(empty_entries.is_empty(), "空内容帧索引为 N=0 条目");
+        assert_eq!(
+            zstd::decode_all(empty.as_slice()).unwrap(),
+            b"",
+            "空内容解压为空"
+        );
+
+        // 单行 < 64KiB：单帧 + 单条目 (1,0)
+        let (_one, one_blob) = encode_seekable("hello\nworld\n").expect("encode one");
+        let one_entries = parse_frame_index(&one_blob, 12).expect("parse one");
+        assert_eq!(one_entries.len(), 1);
+        assert_eq!((one_entries[0].first_line, one_entries[0].dstart), (1, 0));
     }
 
     /// 跨会话序号独立 + 隔离：run-2 的首条也从 out-1 起，且 run-1 的

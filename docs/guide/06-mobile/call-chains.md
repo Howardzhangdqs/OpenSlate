@@ -591,10 +591,13 @@ mask 全文（mask_tool_output 提前到 fork 之前——落盘的必须是脱�
         ▼
 T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user 豁免）
   超阈值 && 宿主注册了 storer（mobile = MobileOutputStorer，进程级单槽）
-    → sha256 内容寻址 → zstd-3 → files/outputs/{sha}.zst 先落文件
-    → 再插 tool_outputs 行（schema v7：(run_id, sha) 唯一 + (run_id, ref) 唯一；
-      ref = 会话内自增短 id out-N——先按 (run, sha) 查既有行命中则复用其 ref，
-      未命中 max 序号 +1 分配）
+    → sha256 内容寻址 → v8 seekable 分块压缩（output_range::encode_seekable：
+      zeekstd RawEncoder level-3 + 每帧 XXH64 校验，逐行喂入、累计 ≥64KiB 且行完整
+      时 end_frame——帧边界恒为行边界；帧索引 = 每帧 (首行号, 帧起始解压偏移) 小端
+      BLOB）→ files/outputs/{sha}.zst 先落文件
+    → 再插 tool_outputs 行（schema v8：(run_id, sha) 唯一 + (run_id, ref) 唯一 +
+      frame_index BLOB；ref = 会话内自增短 id out-N——先按 (run, sha) 查既有行命中
+      则复用其 ref，未命中 max 序号 +1 分配）
                                         【写序不变量：先文件后行后 message——
                                           崩溃窗口内行在则文件必在】
     → storer 返回 None（任何一步失败）→ core 回落旧 limit 截断路径，回合照常
@@ -608,21 +611,31 @@ T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user
         │     ref 校验（out-+数字）→ find_tool_output(当前 run_id, ref)
         │     【严格会话隔离：(run, ref) 精确匹配，跨 run 的 ref 不可解析
         │       ——错误文案注明 ref 仅本会话内有效】
-        │     → read_tool_output_bytes → zstd 解压 → len==orig_bytes 完整性校验
+        │     → tool_output_file_path → 文件尾 4 字节魔数 0x8F92EAB1 探测分叉：
+        │       ① seekable（v8 现行）→ OutputRangeReader 窗口化读取（GB 级不整篇
+        │          解压、内存 O(帧)）：head/tail/lines 帧索引二分 O(覆盖帧)、
+        │          grep 逐帧流式（total 全量计数 + full-pass 总字节核对）、
+        │          wc 零解压直读行计量；完整性 = 每帧 XXH64（解码器逐帧验证）
+        │       ② legacy 单帧（v8 前/测试）→ read_tool_output_bytes → zstd 整篇
+        │          解压 → len==orig_bytes 校验（两分支行为逐字面一致）
         │     → head/tail/lines/grep/wc 切片（64KB 块式行迭代，行内 \r 保留）
         │     → 累计封顶 = [limits].max_output_bytes 生效值（超限字符边界截断
         │       + [output_query: result truncated at N bytes …] 尾注；grep 用
         │       showing M of T matches）；免审批（SideEffectFreeApproval）
         │
         └─► UI 侧取回：详情弹窗 tool_output_by_call_id（见 §6；512KiB 封顶
-            头 448KiB + 省略行 + 尾 64KiB；任何失败回落预览原文）
+            头 448KiB + 省略行 + 尾 64KiB；任何失败回落预览原文；zstd 整篇
+            解压自动跳过 seekable 尾帧，不感知格式差异）
 ```
 
 锚点：core 分叉 `openslate-core/src/runtime.rs`（`fork_stored_output`）；预览/常量
 `openslate-core/src/output_store.rs`（`STORED_OUTPUT_MARKER` / `PREVIEW_EDGE_BYTES` /
-`build_preview`）；mobile 落盘 `openslate-mobile/src/output_storer.rs`（C3）；表结构
-`openslate-store-sqlite/src/schema.rs`（`DDL_TOOL_OUTPUTS`）与查询 `query.rs`
-（`find_tool_output` / `read_tool_output_bytes`）；output_query
+`build_preview`）；mobile 落盘 `openslate-mobile/src/output_storer.rs`（C3）与 seekable
+编解码 `openslate-mobile/src/output_range.rs`（v8：`encode_seekable` /
+`OutputRangeReader`，格式与复杂度见 openslate-mobile.md §15.4）；表结构
+`openslate-store-sqlite/src/schema.rs`（`DDL_TOOL_OUTPUTS`，v8 frame_index 布局）与
+查询 `query.rs`（`find_tool_output` / `read_tool_output_bytes` /
+`tool_output_file_path`）；output_query
 `openslate-mobile/src/output_query.rs`（C4，注册见 openslate-mobile.md §15）；弹窗闭环
 `openslate-mobile/src/runtime.rs`（`tool_output_by_call_id` / `expand_stored_output` /
 `cap_stored_full_text`，C6）。

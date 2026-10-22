@@ -52,10 +52,12 @@ pub type EnvSource = Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// 调用方可指定超时的上限（超出收敛）。
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
-/// 合并输出超过该大小即截断（保留头尾）。
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-/// 截断时头尾各保留的字节数。
-const KEEP_BYTES: usize = 24 * 1024;
+/// 合并输出超过该大小即截断（保留头尾）。1MiB（C5 抬升，原 64KB）：
+/// 进程内执行无传输约束，与 mcp-builtin shell / Termux 三腿统一心智；
+/// 保留上限防 OOM。core 的长输出落盘（C2）接管超限输出形态。
+const MAX_OUTPUT_BYTES: usize = 1_048_576;
+/// 截断时头尾各保留的字节数（256KiB）。
+const KEEP_BYTES: usize = 256 * 1024;
 
 /// bash 工具名（固定；白名单见 bootstrap DEFAULT_ROOT_AGENT_MD）。
 pub const BASH_TOOL: &str = "bash";
@@ -225,7 +227,7 @@ pub fn register_bash_tools(
             "Run a shell command inside the local Termux environment (Android) and return its \
              combined stdout/stderr. The Termux bootstrap (full coreutils, apt, python, ...) is \
              available; network access from Termux may be restricted by the device network. \
-             Avoid interactive commands. Output beyond ~8KB is truncated.",
+             Avoid interactive commands. Output beyond ~256KB is truncated (head and tail kept).",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -274,7 +276,7 @@ impl Tool for NativeShellTool {
          exit code with separated stdout/stderr. Works fully offline without Termux. The \
          toybox coreutils subset is available (ls, cat, grep, sed, ps, curl, ...); apt and \
          full GNU tools are NOT available. Commands run in the app workspace directory. \
-         Avoid interactive commands. Output beyond 64KB is truncated."
+         Avoid interactive commands. Output beyond 1MB is truncated (head and tail kept)."
     }
 
     fn parameters_schema(&self) -> Value {

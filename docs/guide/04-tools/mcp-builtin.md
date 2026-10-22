@@ -27,7 +27,7 @@
 由调用方显式传入**（host 侧从 `$PREFIX/bin/bash` 解析，PATH `bash` 兜底）——
 `$PREFIX` 是 Termux 环境知识，本 crate 保持零环境探测。执行语义与 `shell` **完全
 共享**：`shell::run_shell_command`（shell.rs，pub(crate)）一份实现供给两个工具
-（超时阶梯 / 64KB 头尾截断 / 敏感 env 脱敏 / exit_code+stdout/stderr 分节），
+（超时阶梯 / 1MiB 头尾截断（C5，头尾各保 256KiB）/ 敏感 env 脱敏 / exit_code+stdout/stderr 分节），
 防两份 ~250 行实现漂移。`bash`ism 回归测试（`[[ ]]`）保证走的确实是 bash 而非
 平台 `sh`。
 
@@ -122,14 +122,14 @@ tool-level error result（镜像 legacy `ToolError::SecurityError/ExecutionError
 ```rust
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;        // 默认命令超时
 const MAX_TIMEOUT_MS: u64 = 120_000;           // 调用方传值的钳制上限
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;     // 合并输出截断阈值
-const KEEP_BYTES: usize = 24 * 1024;           // 截断时保留的头/尾字节数
+const MAX_OUTPUT_BYTES: usize = 1_048_576;      // 合并输出截断阈值（1MiB，C5 抬升原 64KB）
+const KEEP_BYTES: usize = 256 * 1024;           // 截断时保留的头/尾字节数（256KiB）
 const DRAIN_GRACE: Duration = Duration::from_millis(200);  // 超时 kill 后的管道排水宽限
 ```
 
 - `effective_timeout(timeout_ms)`（L113-119）：`None` → 默认；调用方值
   `.clamp(1, MAX_TIMEOUT_MS)`——0 不会立即杀，超大值不能钉死 agent 循环。
-- `truncate_output`（L60-81）：>64KB 时保留头尾各 24KB，中间插
+- `truncate_output`（L60-81）：>1MiB 时保留头尾各 256KiB，中间插
   `\n... [truncated {dropped} bytes] ...\n`；**UTF-8 字符边界安全**（`is_char_boundary`
   回退/前进）。
 - 平台 shell（L272-278）：Unix `sh -c` / Windows `cmd /C`；`current_dir` 钉在 root、
@@ -182,7 +182,7 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);  // 超时 kill 后的
 - **body 上限 256KB**（`MAX_BODY_BYTES = 256 * 1024`，L37）：超限字符边界截断 +
   可见标记 `--- SKILL BODY TRUNCATED ({kept} of {total} bytes) ---`（`truncate_body`
   L51-64）。SKILL.md 整文件在发现时载入、从内存供给，一个病态多 MB body 单次工具调用
-  就会灌爆上下文，故设常量上限（与 shell 的 64KB 同理：限额不进 server 构造参数）。
+  就会灌爆上下文，故设常量上限（与 shell 的 1MiB 同理：限额不进 server 构造参数）。
 - **资源清单**（L139-159）：递归收集技能目录下文件（跳过 `SKILL.md` 本身与点前缀
   `.git`/`.DS_Store`），posix 分隔符，排序后取前 `MAX_RESOURCE_ENTRIES = 50` 条
   （L28）；超出标注 `(listing truncated, N more files)`。目录在快照后消失 → 清空清单，

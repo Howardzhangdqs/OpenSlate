@@ -3,7 +3,7 @@
 //! Executes via the platform shell (`sh -c` on Unix, `cmd /C` on Windows)
 //! with `current_dir` pinned to the workspace root, separate stdout/stderr
 //! capture, a configurable timeout (default 30s, capped at 120s) and output
-//! truncation (combined output above 64KB keeps the first and last 24KB).
+//! truncation (combined output above 1MiB keeps the first and last 256KiB).
 //!
 //! A non-zero exit code is reported as a tool-level error result — with the
 //! full output included — so the LLM can see what failed and self-correct.
@@ -31,10 +31,12 @@ use tokio::io::AsyncReadExt;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Upper bound for a caller-supplied timeout (larger values are clamped).
 const MAX_TIMEOUT_MS: u64 = 120_000;
-/// Combined output above this size is truncated.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-/// Bytes kept at the head and at the tail when truncating.
-const KEEP_BYTES: usize = 24 * 1024;
+/// Combined output above this size is truncated. 1MiB（C5 抬升，原 64KB）：
+/// 与 mobile NativeShellTool 统一心智；core 的长输出落盘（C2）接管
+/// 「超限输出进上下文」的形态后，传输层截断只需防无界缓冲。
+const MAX_OUTPUT_BYTES: usize = 1_048_576;
+/// Bytes kept at the head and at the tail when truncating（256KiB）。
+const KEEP_BYTES: usize = 256 * 1024;
 /// Grace period for draining pipe data after a timeout kill.
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 
@@ -487,14 +489,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn oversized_output_completes_and_is_truncated() {
-        // Deadlock canary: >64KB of pipe output with an explicit, short
+        // Deadlock canary: >1MiB of pipe output with an explicit, short
         // timeout. If wait-before-read ever regresses, the pipe fills, the
         // child blocks, and this fails after 5s (not the 30s default).
         let dir = tempfile::TempDir::new().unwrap();
         let client = client_in(&dir).await;
 
-        // ~109KB of numbered lines: distinctive head and tail.
-        let result = shell(&client, "seq 1 20000", Some(5000)).await;
+        // ~1.3MB of numbered lines: distinctive head and tail.（C5 后上限
+        // 1MiB——seq 1 20000 的 ~109KB 不再触发截断。）
+        let result = shell(&client, "seq 1 200000", Some(5000)).await;
         let text = first_text(&result);
         assert!(!is_error(&result), "{text}");
         assert!(text.contains("exit_code: 0"), "{text}");
@@ -502,8 +505,8 @@ mod tests {
         // Head kept: the very first numbers.
         assert!(text.contains("\n1\n2\n3\n"), "{text}");
         // Tail kept: the very last number.
-        assert!(text.contains("20000"), "{text}");
-        // Rough size check: comfortably below the untruncated ~109KB.
+        assert!(text.contains("200000"), "{text}");
+        // Rough size check: comfortably below the untruncated ~1.3MB.
         assert!(
             text.len() < MAX_OUTPUT_BYTES + 2 * 1024,
             "len={}",
@@ -675,7 +678,7 @@ mod tests {
     #[test]
     fn truncate_output_drops_exactly_middle_bytes() {
         // Known shape: ASCII (1 byte/char) so byte offsets are exact.
-        let total = MAX_OUTPUT_BYTES + 10 * 1024; // 74KB
+        let total = MAX_OUTPUT_BYTES + 10 * 1024; // ~1054KB
         let text = "x".repeat(total);
         let truncated = truncate_output(&text);
         let dropped = total - 2 * KEEP_BYTES;
@@ -690,13 +693,15 @@ mod tests {
 
     #[test]
     fn truncate_output_multibyte_cut_point_no_panic() {
-        // 3-byte chars with a 1-byte prefix, so the 24KB cut lands mid-char:
-        // the boundary walk must adjust instead of slicing panically.
-        let text = format!("a{}", "中".repeat(30_000)); // 1 + 90_000 bytes
+        // 3-byte chars with a 2-byte prefix, so the 256KiB cut lands
+        // mid-char: the boundary walk must adjust instead of slicing
+        // panically.（C5 后 KEEP_BYTES = 262_144：前缀 2B → 切点落在
+        // 第 87381 个「中」的中间字节。）
+        let text = format!("ab{}", "中".repeat(400_000)); // 2 + 1_200_000 bytes
         assert!(text.len() > MAX_OUTPUT_BYTES);
         let truncated = truncate_output(&text);
         // Head starts at the true beginning; tail ends with whole chars.
-        assert!(truncated.starts_with("a中中"), "head intact");
+        assert!(truncated.starts_with("ab中中中"), "head intact");
         assert!(truncated.ends_with('中'), "tail intact");
         assert!(truncated.contains("[truncated"), "marker present");
         // The kept head is a strict prefix of the original text (char-safe).

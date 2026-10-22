@@ -7,7 +7,7 @@
 //! `$PREFIX`，不依赖 openslate-core），所以 bash 可执行路径由调用方
 //! （openslate-mcp-host）显式传入。
 //!
-//! 执行语义（默认 30s / 上限 120s 超时、64KB 头尾字符边界安全截断、
+//! 执行语义（默认 30s / 上限 120s 超时、1MiB 头尾字符边界安全截断、
 //! 敏感环境变量脱敏、exit_code + stdout/stderr 分节输出）全部复用
 //! [`crate::shell::run_shell_command`] 共享核心——不复制实现，防漂移；
 //! 进程级环境注入（[`crate::shell::set_shell_env_source`]，ask_user
@@ -177,14 +177,15 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let client = client_in(&dir).await;
 
-        // ~109KB：头尾保留 + 截断标记（共享截断逻辑的 bash 侧回归）。
-        let result = bash(&client, "seq 1 20000", Some(5000)).await;
+        // ~1.3MB：头尾保留 + 截断标记（共享截断逻辑的 bash 侧回归；
+        // C5 后上限 1MiB，seq 1 20000 的 ~109KB 不再触发）。
+        let result = bash(&client, "seq 1 200000", Some(5000)).await;
         let text = first_text(&result);
         assert!(!is_error(&result), "{text}");
         assert!(text.contains("exit_code: 0"), "{text}");
         assert!(text.contains("[truncated"), "{text}");
         assert!(text.contains("\n1\n2\n3\n"), "{text}");
-        assert!(text.contains("20000"), "{text}");
+        assert!(text.contains("200000"), "{text}");
     }
 
     #[tokio::test]

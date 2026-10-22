@@ -194,8 +194,8 @@ host 启动时（bin/main）以 **in-process tuple transport** 拉起三台 buil
   `/data/data/com.termux/files/usr`）→ 都不存在时回退 PATH 上的 `bash`（解析延迟
   到 spawn，缺 bash 的环境在调用时以工具错误回喂 LLM）。`$PREFIX` 是 Termux 环境
   知识，不进通用的 mcp-builtin crate。
-- **执行语义**（30s/120s 超时阶梯、64KB 头尾截断、敏感 env 脱敏、exit_code +
-  stdout/stderr 分节）由 mcp-builtin 的 `shell::run_shell_command` 共享核心供给，
+- **执行语义**（30s/120s 超时阶梯、1MiB 头尾截断（头尾各保 256KiB，C5）、敏感 env 脱敏、
+  exit_code + stdout/stderr 分节）由 mcp-builtin 的 `shell::run_shell_command` 共享核心供给，
   与桌面端 `shell` 工具零漂移。
 - **失败语义**：in-process server 拉起失败 = 代码 bug（与环境无关）→ 硬错误退出，
   不像外部下游"失败即跳过"。调用期 JSON-RPC 错误（如空命令 invalid_params）不

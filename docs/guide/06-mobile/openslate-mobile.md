@@ -239,9 +239,9 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 | {termux}（UI OFF） | 不注册 | termux（HostTool 壳兜底） |
 | {native} / {}（旧存量/异常） | native shell / 不注册 | 不注册（`normalized()` 恒等、**不自动回退**） |
 
-- 常量（exec.rs）：`DEFAULT_TIMEOUT_MS = 30_000`、`MAX_TIMEOUT_MS = 120_000`（调用方可指定，超出 clamp）、`MAX_OUTPUT_BYTES = 64KiB`（超限截断保头尾）、`KEEP_BYTES = 24KiB`；`BASH_TOOL="bash"`、`TERMUX_BASH_TOOL="termux_bash"`；`ALL_BASH_NAMES`（pub）还含历史名 `"shell.run"` / `"termux.run"`（切换时统一清理；reload 的让位判定按它界定「bash 工具域」）。
+- 常量（exec.rs）：`DEFAULT_TIMEOUT_MS = 30_000`、`MAX_TIMEOUT_MS = 120_000`（调用方可指定，超出 clamp）、`MAX_OUTPUT_BYTES = 1MiB`（C5 抬升，原 64KiB；进程内执行无传输约束，与 mcp-builtin shell 统一心智，保留上限防 OOM）、`KEEP_BYTES = 256KiB`；`BASH_TOOL="bash"`、`TERMUX_BASH_TOOL="termux_bash"`；`ALL_BASH_NAMES`（pub）还含历史名 `"shell.run"` / `"termux.run"`（切换时统一清理；reload 的让位判定按它界定「bash 工具域」）。
 - `ExecSelection`（位标志 struct）+ `parse_csv`（未知值忽略，全未知 = 空）+ `ExecSelectionCell`（`Arc<AtomicU8>` 存 bits，FFI `set_exec_backends` 热更新）。
-- `register_bash_tools(registry, sel, workspace, router, mcp_owned)`：先清理全部旧名字（**MCP 已接管的名字除外**），再按需注册——native 注册 `NativeShellTool`；termux 注册 `HostTool`（描述里告知模型 Termux 有完整 coreutils/apt/python，输出超 ~8KB 截断）。`mcp_owned` 见下。
+- `register_bash_tools(registry, sel, workspace, router, mcp_owned)`：先清理全部旧名字（**MCP 已接管的名字除外**），再按需注册——native 注册 `NativeShellTool`；termux 注册 `HostTool`（描述里告知模型 Termux 有完整 coreutils/apt/python，输出超 ~256KB 截断——上限来自 Kotlin `TermuxExec.combined()` 的 Binder 预算，见 android-app.md）。`mcp_owned` 见下。
 - `NativeShellTool`（exec.rs）：进程内 shell，cwd 固定 workspace_dir；**Android 上必须用绝对路径 `/system/bin/sh`**（App 进程 PATH 不含它；desktop 测试回退 `/bin/sh`）；`kill_on_drop(true)`；stdout/stderr **并发读管道 + wait**（子进程输出超管道缓冲不并发即死锁）；超时杀进程后还有 **200ms 宽限**收敛已缓冲输出；环境变量**脱敏继承**——`SENSITIVE_ENV_MARKERS`（API_KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL/PRIVATE_KEY，子串匹配大写）命中的变量 `env_remove`（模型可经 `env` 读到继承变量，绝不下发敏感命名）；输出格式 `exit_code: N\n\n--- stdout ---\n…\n--- stderr ---\n…`（与桌面 builtin shell 一致），截断按 UTF-8 字符边界切。
 
 ### 7.1 MCP 接管（termux bash 降级阶梯的 host 侧半边）

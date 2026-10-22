@@ -243,21 +243,59 @@ data class TermuxResult(
     val errCode: Int? = null,
 ) {
     /**
-     * 合并输出。take 上限 65_536，与 Rust 侧 engine 的 max_output_bytes
-     * 64KB 预算对齐（默认 65_536）：engine 的 limit_tool_output 仍是总量
-     * 天花板，这里放宽只是不再在 Kotlin 侧提前截断，长输出可见全量。
+     * 合并输出，总上限 256 KiB 的头尾策略：超限时保留头 192 KiB + 省略
+     * 行 + 尾 64 KiB（C5；原 take(65_536) 平切）。
+     *
+     * - **Binder 预算**：Termux 结果经 PendingIntent 广播回传，Binder
+     *   共享事务缓冲约 1MB——单条广播负载（result Bundle 序列化后）
+     *   需显著低于该值，≤256KB 是留足余量的安全线；超过的部分在本侧
+     *   先丢，超限异常（TransactionTooLargeException）从不发生。
+     * - **exit_code 行保护**（修掉旧 take 的既有 wart）：exit_code 恒是
+     *   combined 的最后一段，头尾策略下必落在尾部 64 KiB 保留段内，
+     *   不再被平切掉。
+     * - **字符边界安全**：Kotlin String 按 UTF-16 代码单元索引，切点若
+     *   落在代理对中间（前一个 char 是高代理项），头切点回退 1、尾切点
+     *   前进 1（[Character.isHighSurrogate] 尾缘检查），emoji/增补平面
+     *   字符不劈裂。省略量按 UTF-16 单元诚实标注 chars。
+     * - Rust 侧对齐：mobile exec.rs NativeShellTool 1MiB/256KiB 常量是
+     *   进程内执行的上限；本函数只管 Termux→App 的 Binder 回传预算，
+     *   engine 的 limit_tool_output 仍是总量天花板。
      */
-    fun combined(): String = buildString {
-        append(stdout ?: "")
-        if (!stderr.isNullOrBlank()) {
-            if (isNotEmpty()) append('\n')
-            append("--- stderr ---\n").append(stderr)
+    fun combined(): String {
+        val combined = buildString {
+            append(stdout ?: "")
+            if (!stderr.isNullOrBlank()) {
+                if (isNotEmpty()) append('\n')
+                append("--- stderr ---\n").append(stderr)
+            }
+            if (exitCode != null && exitCode != 0) {
+                if (isNotEmpty()) append('\n')
+                append("exit_code: ").append(exitCode)
+            }
         }
-        if (exitCode != null && exitCode != 0) {
-            if (isNotEmpty()) append('\n')
-            append("exit_code: ").append(exitCode)
+        if (combined.length <= COMBINED_HEAD_CHARS + COMBINED_TAIL_CHARS) {
+            return combined
         }
-    }.take(65_536)
+        // 头切点：前一 char 是高代理项 = 劈开代理对 → 回退 1。
+        var headEnd = COMBINED_HEAD_CHARS
+        if (Character.isHighSurrogate(combined[headEnd - 1])) headEnd--
+        // 尾切点：前一 char 是高代理项（当前位是低代理项）→ 前进 1，
+        // 把这对代理整个留给省略段。
+        var tailStart = combined.length - COMBINED_TAIL_CHARS
+        if (Character.isHighSurrogate(combined[tailStart - 1])) tailStart++
+        val omitted = combined.length - headEnd - (combined.length - tailStart)
+        return combined.substring(0, headEnd) +
+            "\n[... " + omitted + " chars omitted ...]\n" +
+            combined.substring(tailStart)
+    }
+
+    companion object {
+        /** 头部保留量（UTF-16 单元，192 KiB）。 */
+        private const val COMBINED_HEAD_CHARS = 192 * 1024
+
+        /** 尾部保留量（UTF-16 单元，64 KiB）。 */
+        private const val COMBINED_TAIL_CHARS = 64 * 1024
+    }
 }
 
 /**

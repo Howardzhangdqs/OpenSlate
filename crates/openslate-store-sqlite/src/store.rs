@@ -192,6 +192,7 @@ impl SqliteStore {
                 2 => schema::migrate_v2_to_v3(&mut tx).await?,
                 3 => schema::migrate_v3_to_v4(&mut tx).await?,
                 4 => schema::migrate_v4_to_v5(&mut tx).await?,
+                5 => schema::migrate_v5_to_v6(&mut tx).await?,
                 v => {
                     return Err(StoreError::MigrationError(format!(
                         "未知的 schema 版本步进起点: v{v}"
@@ -1169,8 +1170,11 @@ mod tests {
         let store = SqliteStore::new(path_str).await.expect("open store");
         store.run_migrations().await.expect("v4 → v5");
 
-        // 版本
-        assert_eq!(store.user_version().await.expect("version"), 5);
+        // 版本（迁移恒升到最新；v6+ 步进为纯新增，v5 断言不受影响）
+        assert_eq!(
+            store.user_version().await.expect("version"),
+            schema::SCHEMA_VERSION
+        );
 
         // messages：清空 + 新 schema 就位（content_zst / meta_json 有、
         // content_json 无）
@@ -1266,6 +1270,71 @@ mod tests {
         assert!(dup.is_err(), "idx_transcript_run_seq 应拒绝重复 (run_id, seq)");
 
         // 幂等重跑不炸
+        store.run_migrations().await.expect("idempotent rerun");
+    }
+
+    /// v5 → v6 步进：建 `tool_outputs` 表 + sha256 索引；步进重跑幂等
+    ///（把 user_version 手工拨回 5 模拟「步进事务提交前崩溃重放」）。
+    #[tokio::test]
+    async fn test_v5_db_migrates_to_v6_and_step_rerun_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("v5_to_v6.sqlite");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        {
+            let store = SqliteStore::new(path_str).await.expect("store");
+            store.run_migrations().await.expect("migrate to v6 first");
+            // 塞一行 v5 时代数据 + 拨回版本 5，模拟 v5 存量库（步进 DDL
+            // 全 IF NOT EXISTS，v6 已建的表/索引就是重放结果）
+            store
+                .insert_run("v5-run", None, "root", "completed", "{}", 1000)
+                .await
+                .expect("seed run");
+            query("PRAGMA user_version = 5")
+                .execute(store.pool())
+                .await
+                .expect("stamp v5");
+        }
+
+        let store = SqliteStore::new(path_str).await.expect("reopen");
+        store.run_migrations().await.expect("v5 → v6 (rerun step)");
+
+        assert_eq!(store.user_version().await.expect("version"), 6);
+
+        // 表就位且数据完好
+        let tables: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("tables");
+        let mut expected: Vec<&str> = schema::TABLE_NAMES.to_vec();
+        expected.sort();
+        let mut actual = tables;
+        actual.sort();
+        assert_eq!(actual, expected, "tool_outputs 表应就位");
+
+        let run = store.get_run("v5-run").await.expect("get").expect("kept");
+        assert_eq!(run.status, "completed", "存量数据不受纯新增迁移影响");
+
+        // 索引就位 + 新表可写（行级；文件写走 insert_tool_output 属
+        // write.rs 测试范围）
+        let idx: Option<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tool_outputs_sha256'",
+        )
+        .fetch_optional(store.pool())
+        .await
+        .expect("idx check");
+        assert!(idx.is_some(), "idx_tool_outputs_sha256 应存在");
+        query(
+            "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('to-1', 'v5-run', 'abc', 'bash', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("insert on migrated db");
+
+        // 幂等重跑
         store.run_migrations().await.expect("idempotent rerun");
     }
 

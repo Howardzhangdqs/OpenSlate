@@ -1,9 +1,9 @@
 //! OpenSlate SQLite 存储的 schema 定义与版本化迁移。
 //!
-//! 全部 11 张表：`runs`、`execution_nodes`、`steps`、`messages`、
+//! 全部 12 张表：`runs`、`execution_nodes`、`steps`、`messages`、
 //! `prompt_snapshots`、`audit_log`、`trace_events`、`pending_questions`
 //! （v3）、`credentials`（v4）、`attachments`（v5）、`transcript_entries`
-//! （v5）。
+//! （v5）、`tool_outputs`（v6）。
 //!
 //! 迁移机制（见 [`crate::store::SqliteStore::run_migrations`]）：
 //! - 以 `PRAGMA user_version` 记录当前 schema 版本，目标版本为
@@ -41,13 +41,18 @@ use sqlx::{query, query_scalar, SqliteConnection};
 ///   `idx_messages_run_seq`（`idx_messages_run_seq_uq` 最左前缀完全覆盖，
 ///   不重建）。**破坏性**（用户拍板）：`messages` 历史随 DROP 丢弃，
 ///   存量脏数据（重复 seq）一并消失，新表 `UNIQUE(run_id, seq)` 必然可建。
-pub const SCHEMA_VERSION: i64 = 5;
+/// - `6`：新表 `tool_outputs`（长输出落盘 + output_query 设计 C1）——
+///   超限工具输出全文的 content-addressed 落盘（字节在
+///   `files/outputs/{sha256}.zst`，DB 存引用行 + 计量字段），行按 run
+///   独立、文件按 sha 跨 run 共享。
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 基线建表 DDL（v0 → v1 执行；全新库直接建成最终形态）。
 ///
 /// 顺序有意义：被外键引用的表必须先建。v5 的 `attachments` /
-/// `transcript_entries` 只引用 `runs`，追加在基线集合尾部；全新库随后
-/// 仍会逐版本步进到 v5（步进 DDL 全部 `IF NOT EXISTS`，幂等）。
+/// `transcript_entries` 与 v6 的 `tool_outputs` 只引用 `runs`，追加在
+/// 基线集合尾部；全新库随后仍会逐版本步进到 v6（步进 DDL 全部
+/// `IF NOT EXISTS`，幂等）。
 pub fn ddl_statements() -> Vec<&'static str> {
     vec![
         DDL_RUNS,
@@ -59,6 +64,7 @@ pub fn ddl_statements() -> Vec<&'static str> {
         DDL_TRACE_EVENTS,
         DDL_ATTACHMENTS,
         DDL_TRANSCRIPT_ENTRIES,
+        DDL_TOOL_OUTPUTS,
     ]
 }
 
@@ -292,6 +298,36 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
 );
 "#;
 
+/// 工具长输出落盘引用行（v6；长输出落盘 + output_query 设计 C1）。
+///
+/// 生命周期与布局对齐 `attachments` 的 content-addressed 模式，但有两点
+/// 刻意差异：**无 bind/引用计数**（行随工具执行直接带 run_id，不存在
+/// composer 暂存态）；文件在子目录 `files/outputs/{sha256}.zst`（调用方
+/// 传入已压缩字节，store 不复算）。
+///
+/// - 行按 run 独立：`UNIQUE(run_id, sha256)` run 内去重（同 run 同内容
+///   幂等刷新 `created_at`）；跨 run 同 sha 各自一行；
+/// - 文件按 sha 跨 run 共享：同内容只一份文件，`delete_run` 级联删行后
+///   末引用消失才删文件（sweep 同构 attachments）；
+/// - `orig_bytes` / `line_count`：原文计量（压缩前），详情弹窗全文闭环
+///   （C6）按 `orig_bytes` 校验解压完整性；
+/// - `ref_id`（`out-{sha256[..16]}`）是消息 content 里 `[STORED OUTPUT
+///   ref="out-…"` 标记携带的短引用，查询侧 `find_tool_output` 按前缀
+///   反查全 sha 行。
+const DDL_TOOL_OUTPUTS: &str = r#"
+CREATE TABLE IF NOT EXISTS tool_outputs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    orig_bytes INTEGER NOT NULL,
+    line_count INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(run_id, sha256),
+    FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+"#;
+
 // ---------------------------------------------------------------------------
 // v0 → v1：存量库补列用的 ALTER（先经 pragma_table_info 检查列存在）
 // ---------------------------------------------------------------------------
@@ -378,12 +414,18 @@ const IDX_ATTACHMENTS_SHA256: &str =
 const IDX_TRANSCRIPT_RUN_SEQ: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_run_seq ON transcript_entries(run_id, seq)";
 
+/// 长输出按内容寻址定位（v6）：`delete_run` / 启动 GC 的孤儿文件判定做
+/// 行级 `SELECT 1 FROM tool_outputs WHERE sha256 = ?`，走本索引。
+const IDX_TOOL_OUTPUTS_SHA256: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tool_outputs_sha256 ON tool_outputs(sha256)";
+
 // ---------------------------------------------------------------------------
 // 常量：测试校验用
 // ---------------------------------------------------------------------------
 
 /// 期望的表名（建表顺序）。含 v3 的 `pending_questions`、v4 的
-/// `credentials`、v5 的 `attachments` 与 `transcript_entries`。
+/// `credentials`、v5 的 `attachments` 与 `transcript_entries`、v6 的
+/// `tool_outputs`。
 pub const TABLE_NAMES: &[&str] = &[
     "runs",
     "execution_nodes",
@@ -396,11 +438,12 @@ pub const TABLE_NAMES: &[&str] = &[
     "credentials",
     "attachments",
     "transcript_entries",
+    "tool_outputs",
 ];
 
 /// 期望的索引名（测试校验用）。含 v2 的唯一索引、v3 的问卷状态索引、
-/// v5 的两个新索引；**不含** `idx_messages_run_seq`（v5 起随表重建消亡，
-/// uq 最左前缀覆盖）。
+/// v5 的两个新索引、v6 的 sha256 索引；**不含** `idx_messages_run_seq`
+/// （v5 起随表重建消亡，uq 最左前缀覆盖）。
 pub const INDEX_NAMES: &[&str] = &[
     "idx_runs_status",
     "idx_runs_started_at",
@@ -412,6 +455,7 @@ pub const INDEX_NAMES: &[&str] = &[
     "idx_pending_questions_status",
     "idx_attachments_sha256",
     "idx_transcript_run_seq",
+    "idx_tool_outputs_sha256",
 ];
 
 // ---------------------------------------------------------------------------
@@ -612,6 +656,24 @@ pub(crate) async fn migrate_v4_to_v5(conn: &mut SqliteConnection) -> Result<(), 
         .await
         .map_err(merr)?;
 
+    Ok(())
+}
+
+/// v5 → v6：`tool_outputs` 表 + sha256 索引（长输出落盘 + output_query
+/// 设计 C1；全部 `IF NOT EXISTS`，全新库与存量库同一路径，天然幂等）。
+///
+/// 纯新增、无数据搬移：已有库的历史工具输出不回填（超限输出此前已被
+/// 截断丢弃，无从恢复）；新表从零开始由 C3 的 storer 写入。
+pub(crate) async fn migrate_v5_to_v6(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
+    query(DDL_TOOL_OUTPUTS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_TOOL_OUTPUTS_SHA256)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
     Ok(())
 }
 

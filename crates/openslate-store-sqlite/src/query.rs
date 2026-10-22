@@ -114,6 +114,25 @@ pub struct TranscriptEntryRecord {
     pub created_at: i64,
 }
 
+/// A tool output record (v6). 元数据行——压缩字节在
+/// `files/outputs/{sha256}.zst`（content-addressed，跨 run 共享）；
+/// `orig_bytes` / `line_count` 是**压缩前**的原文计量（详情弹窗全文
+/// 闭环按 `orig_bytes` 校验解压完整性）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutputRecord {
+    /// `out-<uuid simple>`。
+    pub id: String,
+    pub run_id: String,
+    /// 全 64 hex；`ref_id = "out-" + sha256[..16]`。
+    pub sha256: String,
+    pub tool_name: String,
+    /// 原文字节数（压缩前）。
+    pub orig_bytes: i64,
+    /// 原文行数（`str::lines()` 语义）。
+    pub line_count: i64,
+    pub created_at: i64,
+}
+
 /// A prompt snapshot record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptSnapshotRecord {
@@ -315,6 +334,16 @@ type TranscriptEntryRow = (
     i64,    // created_at
 );
 
+type ToolOutputRow = (
+    String, // id
+    String, // run_id
+    String, // sha256
+    String, // tool_name
+    i64,    // orig_bytes
+    i64,    // line_count
+    i64,    // created_at
+);
+
 /// vault 启动镜像加载的凭据行（**含明文**；仅 vault 内部消费，绝不
 /// derive Debug / 打日志）。
 pub struct CredentialSecretEntry {
@@ -408,6 +437,18 @@ fn row_to_transcript_entry(row: TranscriptEntryRow) -> TranscriptEntryRecord {
         seq: row.2,
         entry_json: row.3,
         created_at: row.4,
+    }
+}
+
+fn row_to_tool_output(row: ToolOutputRow) -> ToolOutputRecord {
+    ToolOutputRecord {
+        id: row.0,
+        run_id: row.1,
+        sha256: row.2,
+        tool_name: row.3,
+        orig_bytes: row.4,
+        line_count: row.5,
+        created_at: row.6,
     }
 }
 
@@ -889,6 +930,72 @@ impl SqliteStore {
         .await
         .map_err(qerr)?;
         Ok(rows.into_iter().map(row_to_transcript_entry).collect())
+    }
+
+    // ── 工具长输出（v6）────────────────────────────────────────────
+
+    /// 按 `ref_id` 短引用前缀查长输出行（详情弹窗全文闭环 / output_query
+    /// 的数据源）。
+    ///
+    /// - `ref16`：`ref_id` 去掉 `out-` 前缀后的 **16 个 hex 字符**（消息
+    ///   content 里 `[STORED OUTPUT ref="out-…"` 标记携带）；格式非法
+    ///   直接报错（bind 传参，值不进 SQL 文本）；
+    /// - `prefer_run`：命中多行（同 sha 跨 run 各一行）时优先返回该 run
+    ///   的行（当前会话 run），否则按 `created_at DESC` 取最新；
+    /// - 未命中返回 `None`（调用方回落消息 content 原文）。
+    pub async fn find_tool_output(
+        &self,
+        ref16: &str,
+        prefer_run: Option<&str>,
+    ) -> Result<Option<ToolOutputRecord>, StoreError> {
+        if ref16.len() != 16 || !ref16.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StoreError::QueryError(format!(
+                "invalid tool output ref (expected 16 hex chars): '{ref16}'"
+            )));
+        }
+        let pool = self.pool();
+        // (run_id = ?) 对 NULL 参数求值为 NULL：prefer_run 缺失时全部行
+        // 同序，退化为纯 created_at DESC。
+        let row: Option<ToolOutputRow> = query_as(
+            "SELECT id, run_id, sha256, tool_name, orig_bytes, line_count, created_at \
+             FROM tool_outputs \
+             WHERE substr(sha256, 1, 16) = ? \
+             ORDER BY (run_id = ?) DESC, created_at DESC LIMIT 1",
+        )
+        .bind(ref16)
+        .bind(prefer_run)
+        .fetch_optional(pool)
+        .await
+        .map_err(qerr)?;
+        Ok(row.map(row_to_tool_output))
+    }
+
+    /// 读长输出压缩字节（`files/outputs/{sha256}.zst`）。
+    ///
+    /// `sha256` 必须为全 64 hex（防路径拼接，bind 场景外的文件名直接
+    /// 来自该值）；文件缺失返回 `Ok(None)`（崩溃窗口 / 手动清理后的
+    /// 正常回落路径），其他 IO 错误报错。**返回压缩字节**——解压与
+    /// `orig_bytes` 校验由调用方（mobile 全文闭环）负责。内存库无
+    /// files_dir → `Ok(None)`。
+    pub async fn read_tool_output_bytes(
+        &self,
+        sha256: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StoreError::QueryError(format!(
+                "invalid tool output sha256 (expected 64 hex chars): '{sha256}'"
+            )));
+        }
+        let Some(outputs_dir) = self.files_dir().map(|d| d.join("outputs")) else {
+            return Ok(None);
+        };
+        match std::fs::read(outputs_dir.join(format!("{sha256}.zst"))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::QueryError(format!(
+                "read tool output file for sha256 '{sha256}' failed: {e}"
+            ))),
+        }
     }
 }
 
@@ -1674,5 +1781,138 @@ mod tests {
                 .expect("empty")
                 .is_empty()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 工具长输出（v6）：find 前缀命中 / prefer_run / 校验 / 字节读取
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_find_tool_output_prefix_prefer_run_and_miss() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("to_query.sqlite");
+        let store = SqliteStore::new(path.to_str().expect("utf-8"))
+            .await
+            .expect("file store");
+        store.run_migrations().await.expect("migrations");
+        for (run, at) in [("run-a", 1000i64), ("run-b", 2000)] {
+            insert_run(&store.pool(), run, None, "root", "completed", "{}", at).await;
+        }
+
+        // 同 sha 前缀（a1b2…）跨 run 两行；不同前缀一行
+        let sha_shared: String = "a1b2".to_owned() + &"c".repeat(60);
+        let sha_other: String = "ffff".to_owned() + &"0".repeat(60);
+        for (id, run, sha, at) in [
+            ("out-a", "run-a", sha_shared.as_str(), 1500i64),
+            ("out-b", "run-b", sha_shared.as_str(), 2500),
+            ("out-c", "run-a", sha_other.as_str(), 3500),
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
+                 VALUES (?, ?, ?, 'bash', 10, 2, ?)",
+            )
+            .bind(id)
+            .bind(run)
+            .bind(sha)
+            .bind(at)
+            .execute(store.pool())
+            .await
+            .expect("seed tool output row");
+        }
+
+        // 前缀命中前置：非法 ref16（长度不足）直接 Err，不进 SQL
+        let err = store
+            .find_tool_output("a1b2c", None)
+            .await
+            .expect_err("ref16 必须 16 hex");
+        assert!(err.to_string().contains("16 hex"), "got: {err}");
+
+        let record = store
+            .find_tool_output(&sha_shared[..16], None)
+            .await
+            .expect("find")
+            .expect("hit");
+        assert_eq!(record.sha256, sha_shared);
+        assert_eq!(
+            record.run_id, "run-b",
+            "无 prefer_run → created_at 最新（run-b 的行）"
+        );
+        assert_eq!(record.tool_name, "bash");
+        assert_eq!(record.orig_bytes, 10);
+        assert_eq!(record.line_count, 2);
+
+        // 当前 run 优先：同 sha 两行，prefer run-a 拿 run-a 的行
+        let record = store
+            .find_tool_output(&sha_shared[..16], Some("run-a"))
+            .await
+            .expect("find")
+            .expect("hit");
+        assert_eq!(record.run_id, "run-a");
+        assert_eq!(record.created_at, 1500);
+
+        // 未知前缀 → None
+        assert!(
+            store
+                .find_tool_output("0000000000000000", None)
+                .await
+                .expect("find")
+                .is_none()
+        );
+
+        // 非法形状 → Err（长度 / 非 hex）
+        assert!(store.find_tool_output("short", None).await.is_err());
+        assert!(
+            store
+                .find_tool_output("zzzzzzzzzzzzzzzz", None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_output_bytes_roundtrip_and_missing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("to_read.sqlite");
+        let store = SqliteStore::new(path.to_str().expect("utf-8"))
+            .await
+            .expect("file store");
+        store.run_migrations().await.expect("migrations");
+        insert_run(&store.pool(), "run-1", None, "root", "running", "{}", 1000).await;
+
+        let sha: String = "ab".repeat(32);
+        let data = zst("long output body");
+        store
+            .insert_tool_output("out-1", "run-1", &sha, "bash", 16, 1, &data, 2000)
+            .await
+            .expect("insert");
+
+        let bytes = store
+            .read_tool_output_bytes(&sha)
+            .await
+            .expect("read")
+            .expect("file exists");
+        assert_eq!(bytes, data, "压缩字节零损往返");
+
+        // 文件缺失（行在、文件被手动清）→ Ok(None)
+        std::fs::remove_file(
+            store
+                .files_dir()
+                .expect("dir")
+                .join("outputs")
+                .join(format!("{sha}.zst")),
+        )
+        .expect("remove");
+        assert!(
+            store
+                .read_tool_output_bytes(&sha)
+                .await
+                .expect("read")
+                .is_none(),
+            "文件缺失返回 None（调用方回落）"
+        );
+
+        // 非法 sha 形状 → Err（防路径拼接）
+        assert!(store.read_tool_output_bytes("../etc/passwd").await.is_err());
+        assert!(store.read_tool_output_bytes("ab").await.is_err());
     }
 }

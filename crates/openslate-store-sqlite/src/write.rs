@@ -218,20 +218,27 @@ impl SqliteStore {
     /// 删除一个 run 及其全部子表数据，单事务内按依赖顺序显式删除。
     ///
     /// 删除顺序：messages → steps → prompt_snapshots → trace_events →
-    /// audit_log → attachments → transcript_entries → execution_nodes →
-    /// runs（先删引用方再删被引用方）。不依赖 `ON DELETE CASCADE` ——
-    /// 存量库的外键定义无法追加删除动作。
+    /// audit_log → attachments → transcript_entries → tool_outputs →
+    /// execution_nodes → runs（先删引用方再删被引用方）。不依赖
+    /// `ON DELETE CASCADE` —— 存量库的外键定义无法追加删除动作。
     ///
-    /// 事务提交后对受影响附件做**孤儿文件清扫**：逐 sha256 行级
-    /// `SELECT 1 FROM attachments WHERE sha256 = ?`，无行引用则删除
-    /// `files/{sha256}.*`（跨 run 复用的文件仅在最后一个引用消失时删除）。
+    /// 事务提交后对受影响附件与长输出文件做**孤儿文件清扫**：逐 sha256
+    /// 行级 `SELECT 1 FROM … WHERE sha256 = ?`，无行引用则删除对应文件
+    /// （跨 run 复用的文件仅在最后一个引用消失时删除）。
     ///
     /// 返回 runs 表的删除行数（`0` 表示 run 不存在；子表此时也不会有
     /// 残留——即使有，也会一并清掉）。
     pub async fn delete_run(&self, run_id: &str) -> Result<u64, StoreError> {
-        // GC 判定需要在删除前收集该 run 附件的 sha256（删后就无从得知）
+        // GC 判定需要在删除前收集该 run 附件 / 长输出的 sha256（删后就
+        // 无从得知）
         let affected_sha256s: Vec<String> =
             sqlx::query_scalar("SELECT DISTINCT sha256 FROM attachments WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| StoreError::QueryError(e.to_string()))?;
+        let affected_output_sha256s: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT sha256 FROM tool_outputs WHERE run_id = ?")
                 .bind(run_id)
                 .fetch_all(self.pool())
                 .await
@@ -247,6 +254,7 @@ impl SqliteStore {
             "DELETE FROM audit_log WHERE run_id = ?",
             "DELETE FROM attachments WHERE run_id = ?",
             "DELETE FROM transcript_entries WHERE run_id = ?",
+            "DELETE FROM tool_outputs WHERE run_id = ?",
             "DELETE FROM execution_nodes WHERE run_id = ?",
         ];
 
@@ -263,6 +271,8 @@ impl SqliteStore {
 
         // 事务外文件清扫（DB 行已是权威状态）
         self.sweep_orphan_files(&affected_sha256s).await?;
+        self.sweep_orphan_output_files(&affected_output_sha256s)
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -306,6 +316,85 @@ impl SqliteStore {
             }
         }
         Ok(())
+    }
+
+    /// 长输出孤儿文件清扫（与 [`Self::sweep_orphan_files`] 同构，目录不同）：
+    /// 对给定 sha256 集合逐一判定是否仍被任何 `tool_outputs` 行引用；无
+    /// 引用则删除 `files/outputs/{sha256}.zst`（跨 run 复用的文件仅在最后
+    /// 一个引用消失时删除）。
+    ///
+    /// 内存库无 files_dir → 无文件可扫，直接 Ok。
+    async fn sweep_orphan_output_files(&self, sha256s: &[String]) -> Result<(), StoreError> {
+        if sha256s.is_empty() {
+            return Ok(());
+        }
+        let Some(outputs_dir) = self.files_dir().map(|d| d.join("outputs")) else {
+            return Ok(());
+        };
+        for sha in sha256s {
+            let still_referenced: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM tool_outputs WHERE sha256 = ? LIMIT 1")
+                    .bind(sha)
+                    .fetch_optional(self.pool())
+                    .await
+                    .map_err(|e| StoreError::QueryError(e.to_string()))?;
+            if still_referenced.is_some() {
+                continue;
+            }
+            let path = outputs_dir.join(format!("{sha}.zst"));
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        target: "openslate_store",
+                        "failed to remove orphan tool output file {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 启动 GC：清扫 `files/outputs/` 下无任何 `tool_outputs` 行引用的
+    /// 文件（收敛「文件写成功、行未落」的崩溃窗口——两步非事务，崩溃
+    /// 后可能留下无行孤儿）。返回删除的文件数。
+    ///
+    /// 全量 read_dir ↔ `SELECT DISTINCT sha256` 比对（行集驱动，文件数
+    /// 量级 = 保留 run 数 × 每 run 超限输出数，全量可接受）。内存库无
+    /// files_dir / 目录不存在 → Ok(0)。
+    pub async fn gc_orphan_output_files(&self) -> Result<u64, StoreError> {
+        let Some(outputs_dir) = self.files_dir().map(|d| d.join("outputs")) else {
+            return Ok(0);
+        };
+        let referenced: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT sha256 FROM tool_outputs")
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| StoreError::QueryError(e.to_string()))?;
+        let Ok(entries) = std::fs::read_dir(&outputs_dir) else {
+            return Ok(0);
+        };
+        let mut removed = 0u64;
+        for entry in entries.flatten() {
+            // 只动本机制管辖的命名形状（{64hex}.zst），其余文件不碰。
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(".zst") else {
+                continue;
+            };
+            if !referenced.iter().any(|sha| sha == stem) {
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    tracing::warn!(
+                        target: "openslate_store",
+                        "gc: failed to remove orphan tool output file {}: {e}",
+                        entry.path().display()
+                    );
+                    continue;
+                }
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// 启动暂存清扫（GC）：删除 `run_id IS NULL AND created_at < now-7d`
@@ -602,6 +691,77 @@ impl SqliteStore {
         }
         let result = q.execute(self.pool()).await.map_err(werr)?;
         Ok(result.rows_affected())
+    }
+
+    // ── 工具长输出（v6；压缩字节 content-addressed 落 files/outputs/）──
+
+    /// 写长输出文件：`files/outputs/{sha256}.zst`（幂等——文件已存在则
+    /// 跳过，跨 run 共享同一份，见 `schema::DDL_TOOL_OUTPUTS`）。
+    fn write_tool_output_file(
+        outputs_dir: &std::path::Path,
+        sha256: &str,
+        data_zst: &[u8],
+    ) -> Result<(), StoreError> {
+        let path = outputs_dir.join(format!("{sha256}.zst"));
+        if path.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(outputs_dir)
+            .map_err(|e| StoreError::WriteError(format!("create outputs dir failed: {e}")))?;
+        std::fs::write(&path, data_zst).map_err(|e| {
+            StoreError::WriteError(format!(
+                "write tool output file {} failed: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// 写入一条工具长输出：压缩字节先落 `files/outputs/{sha256}.zst`
+    /// （不存在才写），再插 `tool_outputs` 行。
+    ///
+    /// - `data_zst`：**调用方传入的已压缩字节**（sha256 是原文的 sha，
+    ///   store 信任不复算、不感知压缩参数）；
+    /// - 同 run 同 sha 幂等：`ON CONFLICT(run_id, sha256) DO UPDATE` 仅
+    ///   刷新 `created_at`（同 sha ⇒ 同内容，其余计量字段必然一致）；
+    /// - 内存库（无 files_dir）明确报错（fail fast，对齐
+    ///   [`Self::insert_attachment`]——测试库不应静默丢全文）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_tool_output(
+        &self,
+        id: &str,
+        run_id: &str,
+        sha256: &str,
+        tool_name: &str,
+        orig_bytes: i64,
+        line_count: i64,
+        data_zst: &[u8],
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let outputs_dir = self.files_dir().map(|d| d.join("outputs")).ok_or_else(|| {
+            StoreError::WriteError(
+                "tool output writes require a file-backed store; in-memory store has no files_dir"
+                    .to_owned(),
+            )
+        })?;
+        Self::write_tool_output_file(&outputs_dir, sha256, data_zst)?;
+
+        query(
+            "INSERT INTO tool_outputs \
+             (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(run_id, sha256) DO UPDATE SET created_at = excluded.created_at",
+        )
+        .bind(id)
+        .bind(run_id)
+        .bind(sha256)
+        .bind(tool_name)
+        .bind(orig_bytes)
+        .bind(line_count)
+        .bind(created_at)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(())
     }
 
     // ── 转写条目（v5；entry_json 透传，store 不解析）──────────────────
@@ -1389,6 +1549,14 @@ mod tests {
         .execute(store.pool())
         .await
         .expect("victim transcript entry");
+        // v6 子表同上（tool_outputs 行级塞数据）
+        sqlx::query(
+            "INSERT INTO tool_outputs (id, run_id, sha256, tool_name, orig_bytes, line_count, created_at) \
+             VALUES ('victim-to', 'victim', 'sha-v-out', 'bash', 100, 5, 1500)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("victim tool output");
 
         let deleted = store.delete_run("victim").await.expect("delete");
         assert_eq!(deleted, 1, "runs 表删除 1 行");
@@ -1402,6 +1570,7 @@ mod tests {
             "audit_log",
             "attachments",
             "transcript_entries",
+            "tool_outputs",
             "execution_nodes",
         ] {
             let count: i64 = query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
@@ -1942,6 +2111,190 @@ mod tests {
             .insert_transcript_entry("te-4", "run-2", 1, "{}", 3100)
             .await
             .expect("cross-run same seq ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // 工具长输出（v6；幂等插入 / 跨 run 共享 / delete_run 级联 / GC）
+    // -----------------------------------------------------------------------
+
+    /// 64 个 'a' 的 sha 形状（合法 hex，内容任意——store 信任不复算）。
+    fn sha64(seed: char) -> String {
+        std::iter::repeat(seed).take(64).collect()
+    }
+
+    #[tokio::test]
+    async fn test_tool_output_insert_idempotent_same_run_same_sha() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-1", None, "root", "running", "{}", 1000)
+            .await
+            .expect("run");
+
+        let sha = sha64('a');
+        store
+            .insert_tool_output("out-1", "run-1", &sha, "bash", 100, 5, &[1, 2, 3], 2000)
+            .await
+            .expect("first insert");
+        // 同 run 同 sha：幂等——不报错、不新增行、仅刷新 created_at。
+        store
+            .insert_tool_output("out-2", "run-1", &sha, "bash", 100, 5, &[1, 2, 3], 3000)
+            .await
+            .expect("upsert insert");
+
+        let (count, created_at): (i64, i64) =
+            sqlx::query_as::<_, (i64, i64)>("SELECT COUNT(*), MAX(created_at) FROM tool_outputs")
+                .fetch_one(store.pool())
+                .await
+                .expect("count");
+        assert_eq!(count, 1, "同 run 同 sha 不新增行");
+        assert_eq!(created_at, 3000, "created_at 被刷新为最新值");
+    }
+
+    #[tokio::test]
+    async fn test_tool_output_cross_run_same_sha_single_file_two_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-a", None, "root", "completed", "{}", 1000)
+            .await
+            .expect("run a");
+        store
+            .insert_run("run-b", None, "root", "completed", "{}", 2000)
+            .await
+            .expect("run b");
+
+        let sha = sha64('b');
+        store
+            .insert_tool_output("out-a", "run-a", &sha, "bash", 10, 2, &[9, 9], 1500)
+            .await
+            .expect("run a output");
+        store
+            .insert_tool_output("out-b", "run-b", &sha, "bash", 10, 2, &[9, 9], 2500)
+            .await
+            .expect("run b output");
+
+        let count: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(count, 2, "行按 run 独立：两行");
+        let file = store
+            .files_dir()
+            .expect("dir")
+            .join("outputs")
+            .join(format!("{sha}.zst"));
+        assert!(file.exists(), "文件按 sha 共享：单文件");
+    }
+
+    /// 复刻 `test_delete_run_gc_shared_sha_file` 模式：删 run 级联删行 +
+    /// 末引用消失才删文件。
+    #[tokio::test]
+    async fn test_delete_run_gc_shared_output_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-a", None, "root", "completed", "{}", 1000)
+            .await
+            .expect("run a");
+        store
+            .insert_run("run-b", None, "root", "completed", "{}", 2000)
+            .await
+            .expect("run b");
+
+        let sha = sha64('c');
+        store
+            .insert_tool_output("out-a", "run-a", &sha, "bash", 16, 1, &[7; 8], 1500)
+            .await
+            .expect("out a");
+        store
+            .insert_tool_output("out-b", "run-b", &sha, "bash", 16, 1, &[7; 8], 2500)
+            .await
+            .expect("out b");
+        let file = store
+            .files_dir()
+            .expect("dir")
+            .join("outputs")
+            .join(format!("{sha}.zst"));
+        assert!(file.exists());
+
+        store.delete_run("run-a").await.expect("delete run a");
+        let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1, "run-a 行已级联删除，run-b 行保留");
+        assert!(
+            file.exists(),
+            "run-b 仍引用 → 文件必须保留（跨 run 共享）"
+        );
+
+        store.delete_run("run-b").await.expect("delete run b");
+        let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+        assert!(
+            !file.exists(),
+            "最后一个引用消失 → 孤儿文件被清扫"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gc_orphan_output_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-1", None, "root", "completed", "{}", 1000)
+            .await
+            .expect("run");
+
+        // 有行引用的文件（保留）与无行孤儿文件（清掉）
+        let sha_referenced = sha64('d');
+        store
+            .insert_tool_output(
+                "out-keep",
+                "run-1",
+                &sha_referenced,
+                "bash",
+                4,
+                1,
+                &[1, 2, 3, 4],
+                2000,
+            )
+            .await
+            .expect("referenced");
+        let outputs_dir = store.files_dir().expect("dir").join("outputs");
+        let sha_orphan = sha64('e');
+        std::fs::write(outputs_dir.join(format!("{sha_orphan}.zst")), b"junk").expect("orphan file");
+
+        let removed = store.gc_orphan_output_files().await.expect("gc");
+        assert_eq!(removed, 1, "只清无行引用的文件");
+        assert!(outputs_dir.join(format!("{sha_referenced}.zst")).exists());
+        assert!(!outputs_dir.join(format!("{sha_orphan}.zst")).exists());
+
+        // 幂等：再跑无东西可清
+        assert_eq!(store.gc_orphan_output_files().await.expect("gc again"), 0);
+    }
+
+    /// 内存库（无 files_dir）insert 必须明确报错（对齐 insert_attachment
+    /// 的 fail-fast）。
+    #[tokio::test]
+    async fn test_tool_output_in_memory_store_rejected() {
+        let store = setup_store().await;
+        store
+            .insert_run("run-1", None, "root", "running", "{}", 1000)
+            .await
+            .expect("run");
+        let err = store
+            .insert_tool_output("out-x", "run-1", &sha64('f'), "bash", 1, 1, &[1], 1)
+            .await
+            .expect_err("内存库必须明确拒绝");
+        assert!(
+            err.to_string().contains("files_dir"),
+            "错误应说明 files_dir 缺失, got: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------

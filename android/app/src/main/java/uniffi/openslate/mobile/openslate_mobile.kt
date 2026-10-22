@@ -703,6 +703,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_delete_session(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_persona(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_tool_visibility(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_attachment_thumbnail(
@@ -742,6 +744,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_resolve_host_call(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_send(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_agent_persona(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_agent_tool_visibility(
     ): Int
@@ -800,6 +804,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_delete_session(`ptr`: Long,`runId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_agent_persona(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_agent_tool_visibility(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_attachment_thumbnail(`ptr`: Long,`id`: RustBuffer.ByValue,`maxPx`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -840,6 +846,8 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_send(`ptr`: Long,`msg`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_agent_persona(`ptr`: Long,`body`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_agent_tool_visibility(`ptr`: Long,`tools`: RustBuffer.ByValue,`hiddenTools`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_api_key(`ptr`: Long,`provider`: RustBuffer.ByValue,`value`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -994,6 +1002,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_delete_session() and 0xFFFF) != 15461) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_persona() and 0xFFFF) != 45486) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_tool_visibility() and 0xFFFF) != 39909) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1052,6 +1063,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_send() and 0xFFFF) != 35897) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_agent_persona() and 0xFFFF) != 55648) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_agent_tool_visibility() and 0xFFFF) != 12769) {
@@ -1568,6 +1582,13 @@ public interface OpenSlateRuntimeInterface {
     fun `deleteSession`(`runId`: kotlin.String): kotlin.Boolean
     
     /**
+     * 读当前生效 agent（root）的角色定位正文（= 每回合 system prompt
+     * 的全量源；内存树快照，与 runner 每回合拼 system prompt 同源）。
+     * 同步、无副作用，可主线程调用。
+     */
+    fun `getAgentPersona`(): kotlin.String
+    
+    /**
      * 当前生效 agent（root）的工具可见性（JSON 对象）：
      * `{"tools":[…],"hidden_tools":[…]}`。
      */
@@ -1708,6 +1729,18 @@ public interface OpenSlateRuntimeInterface {
      * 发送 ClientMsg（JSON 文本）。非阻塞（内部 spawn）。
      */
     fun `send`(`msg`: kotlin.String)
+    
+    /**
+     * 全量覆写 root agent 的角色定位正文（= 下一回合 system prompt 的
+     * 全量源）并热生效：外科手术式替换 `agents/root.md` **正文**
+     * （frontmatter 逐字节保留——tools 白名单机制不受影响）→ 重装
+     * agent 树热替换——下一对话回合即用新 system prompt，无需重启
+     * app。skills catalog 由 runner 在正文之上追加，本编辑不触碰。
+     * 入参规范化（trim；空白回默认文案）。阻塞（文件读写 + 树重装），
+     * **IO 线程调用**。返回生效正文；失败抛 `MobileError`（reason 带
+     * `set_agent_persona:` 前缀）。
+     */
+    fun `setAgentPersona`(`body`: kotlin.String): kotlin.String
     
     /**
      * 全量覆写 root agent 的 `tools:` / `hidden_tools:`（工具对 agent
@@ -1934,6 +1967,24 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
         it,
         
         FfiConverterString.lower(`runId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 读当前生效 agent（root）的角色定位正文（= 每回合 system prompt
+     * 的全量源；内存树快照，与 runner 每回合拼 system prompt 同源）。
+     * 同步、无副作用，可主线程调用。
+     */override fun `getAgentPersona`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_agent_persona(
+        it,
+        _status)
 }
     }
     )
@@ -2316,6 +2367,31 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 }
     }
     
+    
+
+    
+    /**
+     * 全量覆写 root agent 的角色定位正文（= 下一回合 system prompt 的
+     * 全量源）并热生效：外科手术式替换 `agents/root.md` **正文**
+     * （frontmatter 逐字节保留——tools 白名单机制不受影响）→ 重装
+     * agent 树热替换——下一对话回合即用新 system prompt，无需重启
+     * app。skills catalog 由 runner 在正文之上追加，本编辑不触碰。
+     * 入参规范化（trim；空白回默认文案）。阻塞（文件读写 + 树重装），
+     * **IO 线程调用**。返回生效正文；失败抛 `MobileError`（reason 带
+     * `set_agent_persona:` 前缀）。
+     */
+    @Throws(MobileException::class)override fun `setAgentPersona`(`body`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_set_agent_persona(
+        it,
+        
+        FfiConverterString.lower(`body`),_status)
+}
+    }
+    )
+    }
     
 
     

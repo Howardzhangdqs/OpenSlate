@@ -99,6 +99,23 @@ pub fn set_mcp_host_token(token: &str) {
 - **`list_tools_json()`**（runtime.rs:792-820）：全部已注册工具，按 name 排序的 JSON 数组；`input_schema` 原样透传（无 schema 恒为 `{}`，键恒存在）；每项含 `server` = 审批作用域标识（tool-approval：聚合形态 = 下游 slug 如 `"github"`，host 内置裸名 = host 前缀，非 MCP 为 JSON null——反解走 core 权威实现 `mcp::server_slug_of`，namespace 取 registry `Tool::namespace()`）。Android 设置页「工具权限」tab 按它分组。
 - **`get_agent_tool_visibility_json()`**（runtime.rs:280-287）：读 root agent frontmatter 的 `{"tools":[…],"hidden_tools":[…]}`（含 glob，保持落盘顺序）。
 - **`set_agent_tool_visibility_json(tools, hidden)`**（runtime.rs:295-355）：①定位 root md（frontmatter `id:` 优先，`<id>.md` 文件名兜底，`find_agent_markdown` runtime.rs:942-970）→ ②外科手术式改写 frontmatter（`openslate_core::config::persist::set_agent_tool_lists`，其余字段与正文逐字节保留）→ ③重装 agent 树 + 热替换（manager 在家就换；回合进行中改 `inner.agent_tree`，引擎回收时自动对齐）。重装失败不回滚磁盘。下一回合即按新可见性过滤，无需重启。
+- **agent 角色定位（system prompt 编辑，runtime.rs:1283-1357）**——`get_agent_persona()` / `set_agent_persona(body) -> Result<String>`：编辑的是 root.md **正文**（`parse_agent_markdown` 的 `body.trim()` → `AgentConfig.default_prompt`），即每回合 system prompt 的**全量源**（runner.rs `with_skills_section(&root.default_prompt)`——skills catalog 由 runner 在其上追加，本编辑不触碰）。管线：
+
+  ```
+  设置页 UI（后续轨道）
+    → RuntimeBridge.setAgentPersona（Dispatchers.IO）
+    → FFI set_agent_persona → MobileRuntime::set_agent_persona
+    → persist::set_agent_prompt：外科替换 agents/root.md 正文
+      （frontmatter 逐字节保留——tools/hidden_tools 白名单机制不受影响；
+       入参 trim，空白回默认文案 "You are a helpful AI assistant."，幂等）
+    → parse_agents_dir 重装树 → 换 inner.agent_tree + manager.agent_tree
+      （manager 在家就换；回合进行中改 inner.agent_tree，回合边界兜底对齐）
+    → 下一回合 system_prompt = with_skills_section(新正文)，热生效
+    → 返回规范化生效正文（Kotlin 回显）；get_agent_persona 读内存树
+      root.default_prompt（装配期快照 + set 即时更新，同源）
+  ```
+
+  两种外科手术（frontmatter 的 `set_agent_tool_lists` / 正文的 `set_agent_prompt`）互不干扰，先后任意次序都保对方逐字节不变（集成测试 `mobile_runtime_agent_persona_roundtrip` 双向覆盖）。
 - **`resolve_host_call(id, ok, payload) -> bool`**（runtime.rs:359-361）：转发 `HostCallRouter::resolve`；false = 无此在途调用。
 - **`stats()`**（runtime.rs:364-366）：`SessionStatsDto` 快照。
 - **registry 域**（runtime.rs:439-515）：
@@ -280,7 +297,7 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 
 ## 10. 测试
 
-- 集成测试 `crates/openslate-mobile/tests/runtime_flow.rs`（desktop 可跑，无 Android 依赖）：`mobile_runtime_closed_loop_streaming`（scripted provider 流式回包闭环）、`mobile_runtime_host_call_roundtrip`（信封往返 + resolve）、`mobile_runtime_hello_version_check`（版本不匹配报错）、`mobile_runtime_shutdown_rejects_send`、`mobile_runtime_tool_visibility_roundtrip`。harness：`ScriptedProvider`（脚本化 `ModelStreamEvent` 流）+ `Collector`（事件采集 + `wait_for_count` 按类型计数等待）。
+- 集成测试 `crates/openslate-mobile/tests/runtime_flow.rs`（desktop 可跑，无 Android 依赖）：`mobile_runtime_closed_loop_streaming`（scripted provider 流式回包闭环）、`mobile_runtime_host_call_roundtrip`（信封往返 + resolve）、`mobile_runtime_hello_version_check`（版本不匹配报错）、`mobile_runtime_shutdown_rejects_send`、`mobile_runtime_tool_visibility_roundtrip`、`mobile_runtime_agent_persona_roundtrip`（角色定位 set/get 往返 + frontmatter 逐字保留 + 工具可见性手术互不干扰 + 新回合 system prompt 热生效——harness `ScriptedProvider` 记录每次请求的 system prompt）。harness：`ScriptedProvider`（脚本化 `ModelStreamEvent` 流 + system prompt 采集）+ `Collector`（事件采集 + `wait_for_count` 按类型计数等待）。
 - 审批集成测试 `crates/openslate-mobile/tests/approval_flow.rs`（tool-approval P1b 出口标准，六路径）：Manual 直问 / Auto+Low 跳过审查 / 审查 safe 静默放行 / risky 弹人（note 下发）/ 审查失败 fail-safe 弹人 / 超时 fail-safe 弹人 + 作用域语义（approve_all / session_mcp 会话放行、always_* 持久化热更、rules cell 共享防回归）。审查模型走 ScriptedProvider 注入。
 - 单元测试在各模块 `#[cfg(test)] mod tests`：runtime 生命周期 / 安全守卫（触达私有状态；DB 校验经独立 scratch 连接）、hostcall 四条路径（roundtrip/error/timeout/fail_all）、exec（注册矩阵 / 热切换 / native 执行 / 截断 / 脱敏 / MCP 接管判定与让位）、bootstrap（幂等 / realign 四场景）、provider（set/get 往返）。
 - 降级阶梯（runtime tests，手写 std::net MCP HTTP 挡板同 app wiring 集成测试模式）：`set_exec_backends` 热切换不误杀 MCP bash 工具、HostTool 在场 reload 升级接管（不撞名回滚）、reload 全败兜底在场、reload 真冲突回滚装回让位工具、termux-only 命名矩阵（仅 termux_bash 在场、`bash` 不注册；默认 / 自定义 builtin 模板，证明不硬编码）、builtin 模板 setter（校验 + 落盘 + 空串删键）。

@@ -524,6 +524,13 @@ object RuntimeBridge {
 
     private const val TAG = "OpenSlateBridge"
 
+    /**
+     * agent 角色定位的默认正文（= Rust bootstrap root.md / persist
+     * DEFAULT_AGENT_BODY 同一字面）。仅作 getAgentPersona 失败时的回显
+     * 兜底；真相源在 Rust 侧。
+     */
+    private const val DEFAULT_AGENT_PERSONA = "You are a helpful AI assistant."
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val eventChannel = Channel<String>(Channel.UNLIMITED)
 
@@ -949,6 +956,28 @@ object RuntimeBridge {
         }
         return ok
     }
+
+    /** 当前 agent 角色定位正文（= 每回合 system prompt 的全量源；Rust 内存
+     *  树快照，与 runner 拼 system prompt 同源）。同步无副作用，可主线程。
+     *  失败/运行时未就绪返回默认文案并 log。 */
+    fun getAgentPersona(): String {
+        val runtime = runtimeRef.get() ?: return DEFAULT_AGENT_PERSONA
+        return runCatching { runtime.getAgentPersona() }
+            .onFailure { Log.w(TAG, "getAgentPersona failed: ${it.message}") }
+            .getOrDefault(DEFAULT_AGENT_PERSONA)
+    }
+
+    /** 全量覆写 agent 角色定位（system prompt 源）并热生效：Rust 侧外科
+     *  替换 agents/root.md 正文（frontmatter 逐字节保留）→ 重装 agent 树，
+     *  下一对话回合即用新 system prompt。FFI 阻塞（文件 + 树重装），IO 线程。
+     *  返回规范化后的生效正文（入参 trim、空白回默认），null = 失败（已 log）。 */
+    suspend fun setAgentPersona(body: String): String? =
+        withContext(Dispatchers.IO) {
+            val runtime = runtimeRef.get() ?: return@withContext null
+            runCatching { runtime.setAgentPersona(body) }
+                .onFailure { Log.w(TAG, "setAgentPersona failed: ${it.message}") }
+                .getOrNull()
+        }
 
     // ── 模型选择（持久化已迁移到 [capabilities].main：设置页改绑即
     //    落盘 openslate.toml 并热切换；不再本地 SharedPreferences 重放，

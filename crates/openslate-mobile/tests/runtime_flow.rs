@@ -23,13 +23,20 @@ use openslate_session::state::ProviderFactory;
 #[derive(Clone)]
 struct ScriptedProvider {
     scripts: Arc<Mutex<VecDeque<Vec<ModelStreamEvent>>>>,
+    /// 每次流式请求收到的 system prompt（按到达顺序；热生效类测试断言用）。
+    seen_system_prompts: Arc<Mutex<Vec<String>>>,
 }
 
 impl ScriptedProvider {
     fn new(scripts: Vec<Vec<ModelStreamEvent>>) -> Self {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into())),
+            seen_system_prompts: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn seen_system_prompts(&self) -> Vec<String> {
+        self.seen_system_prompts.lock().unwrap().clone()
     }
 }
 
@@ -41,8 +48,11 @@ impl ModelProvider for ScriptedProvider {
 
     async fn generate_stream(
         &self,
-        _request: GenerateRequest,
+        request: GenerateRequest,
     ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+        if let Some(sp) = &request.system_prompt {
+            self.seen_system_prompts.lock().unwrap().push(sp.clone());
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
         tokio::spawn(async move {
@@ -406,6 +416,70 @@ fn mobile_runtime_tool_visibility_roundtrip() {
     assert!(md.contains("tools: []\n"));
     assert!(md.contains("hidden_tools:\n    - termux_bash\n"));
     assert!(md.contains("You are a helpful AI assistant."));
+
+    runtime.shutdown();
+}
+
+#[test]
+fn mobile_runtime_agent_persona_roundtrip() {
+    let (paths, dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![text_response("好。"), text_response("好。")]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted.clone())),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths, collector.clone(), opts).unwrap();
+
+    // 初始正文 = bootstrap 默认（get 与每回合 system prompt 同源）。
+    assert_eq!(
+        runtime.get_agent_persona(),
+        "You are a helpful AI assistant."
+    );
+
+    // 全量覆写（入参带冗余空白）→ 返回规范化生效文本；get 读回一致。
+    let root_md_path = dir.path().join("config/agents/root.md");
+    let md_before = std::fs::read_to_string(&root_md_path).unwrap();
+    let effective = runtime.set_agent_persona("  你是移动端编码专家。\n").unwrap();
+    assert_eq!(effective, "你是移动端编码专家。");
+    assert_eq!(runtime.get_agent_persona(), "你是移动端编码专家。");
+
+    // 落盘检查：frontmatter（含 tools 白名单）逐字节不变，正文已替换。
+    let md_after = std::fs::read_to_string(&root_md_path).unwrap();
+    let fm_before = &md_before[..md_before.find("\n---\n").expect("seed closing")];
+    let fm_after = &md_after[..md_after.find("\n---\n").expect("closing")];
+    assert_eq!(fm_before, fm_after, "frontmatter 必须逐字节保留");
+    assert!(md_after.ends_with("---\n你是移动端编码专家。\n"));
+
+    // set 后再走工具可见性外科改写仍成功（两种 frontmatter/body 手术互不干扰）。
+    let ret: serde_json::Value = serde_json::from_str(
+        &runtime.set_agent_tool_visibility_json(vec![], vec!["termux_bash".into()]),
+    )
+    .unwrap();
+    assert_eq!(ret["ok"], serde_json::json!(true), "tool visibility set 应成功: {ret}");
+    // persona 正文不受工具可见性改写影响。
+    assert_eq!(runtime.get_agent_persona(), "你是移动端编码专家。");
+
+    // 热生效：set 后的新回合，runner 发出的 system prompt 用新正文
+    //（skills catalog 由 runner 在其上追加——只断言正文被包含）。
+    runtime
+        .send(r#"{"type":"submit","text":"继续"}"#)
+        .unwrap();
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+    let seen = scripted.seen_system_prompts();
+    let last = seen.last().expect("provider 应已收到请求").as_str();
+    assert!(
+        last.contains("你是移动端编码专家。"),
+        "新回合 system prompt 应用新正文: {last}"
+    );
+
+    // 空正文 → 回默认文案（get/set 往返一致）。
+    let effective = runtime.set_agent_persona("   \n").unwrap();
+    assert_eq!(effective, "You are a helpful AI assistant.");
+    assert_eq!(
+        runtime.get_agent_persona(),
+        "You are a helpful AI assistant."
+    );
 
     runtime.shutdown();
 }

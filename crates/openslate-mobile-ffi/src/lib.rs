@@ -338,6 +338,35 @@ impl OpenSlateRuntime {
             .set_agent_tool_visibility_json(tools, hidden_tools)
     }
 
+    // ── 角色定位（system prompt 编辑；设置页）────────────────────────
+
+    /// 读当前生效 agent（root）的角色定位正文（= 每回合 system prompt
+    /// 的全量源；内存树快照，与 runner 每回合拼 system prompt 同源）。
+    /// 同步、无副作用，可主线程调用。
+    pub fn get_agent_persona(&self) -> String {
+        openslate_mobile::alog!("ffi: get_agent_persona");
+        self.inner.get_agent_persona()
+    }
+
+    /// 全量覆写 root agent 的角色定位正文（= 下一回合 system prompt 的
+    /// 全量源）并热生效：外科手术式替换 `agents/root.md` **正文**
+    /// （frontmatter 逐字节保留——tools 白名单机制不受影响）→ 重装
+    /// agent 树热替换——下一对话回合即用新 system prompt，无需重启
+    /// app。skills catalog 由 runner 在正文之上追加，本编辑不触碰。
+    /// 入参规范化（trim；空白回默认文案）。阻塞（文件读写 + 树重装），
+    /// **IO 线程调用**。返回生效正文；失败抛 `MobileError`（reason 带
+    /// `set_agent_persona:` 前缀）。
+    pub fn set_agent_persona(&self, body: String) -> Result<String, MobileError> {
+        openslate_mobile::alog!("ffi: set_agent_persona(len={})", body.len());
+        catch(
+            "set_agent_persona",
+            MobileError::SendFailed {
+                reason: String::new(),
+            },
+            || self.inner.set_agent_persona(&body).map_err(|e| anyhow::anyhow!("{e:#}")),
+        )
+    }
+
     /// 应答 host call。`ok=true` → payload 为结果 JSON；`ok=false` →
     /// payload 为错误说明。返回 false = 无此在途调用（超时/已答/关停）。
     pub fn resolve_host_call(&self, id: u64, ok: bool, payload: String) -> bool {

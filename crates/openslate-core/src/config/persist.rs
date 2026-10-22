@@ -866,6 +866,68 @@ pub fn set_agent_tool_lists(path: &Path, tools: &[String], hidden_tools: &[Strin
         .with_context(|| format!("Failed to write agent file '{}'", path.display()))
 }
 
+/// 默认 agent 正文（= system prompt 兜底文案）。与 bootstrap 默认
+/// root.md 的正文（openslate-mobile `DEFAULT_ROOT_AGENT_MD` /
+/// openslate-cli `DEFAULT_ROOT_AGENT_MD`）及 `prompt.rs` 的
+/// `BUILTIN_PROMPT` 字面一致——core 不依赖上层 crate，重复一行并在此
+/// 注明来源；三处若改动需同步。
+const DEFAULT_AGENT_BODY: &str = "You are a helpful AI assistant.";
+
+/// Rewrite ONLY the markdown body of an agent file, leaving the YAML
+/// frontmatter byte-for-byte untouched — the body-side counterpart of
+/// [`set_agent_tool_lists`] (which edits frontmatter and preserves body).
+///
+/// - Body normalization: `trim()`; a blank result falls back to
+///   [`DEFAULT_AGENT_BODY`]; a non-empty result is written as
+///   `{trimmed}\n`. This mirrors what `parse_agent_markdown` reads back
+///   (`body.trim()` → `default_prompt`), so the round trip is lossless.
+/// - Idempotent: when the file is already in the target state, nothing is
+///   written (byte-equal comparison of the reconstructed file).
+/// - Malformed files (no opening `---`, or no closing `\n---`) are an
+///   error, same split semantics as `parse_agent_markdown` /
+///   `set_agent_tool_lists`: the FIRST `\n---` closes the frontmatter.
+pub fn set_agent_prompt(path: &Path, body: &str) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read agent file '{}'", path.display()))?;
+
+    // Same frontmatter split as `parse_agent_markdown` (BOM tolerated,
+    // preserved on write-back).
+    let (bom, rest) = match content.strip_prefix('\u{feff}') {
+        Some(r) => ("\u{feff}", r),
+        None => ("", content.as_str()),
+    };
+    let after_open = rest.strip_prefix("---").ok_or_else(|| {
+        anyhow::anyhow!("agent file '{}': no frontmatter delimiter", path.display())
+    })?;
+    let close = after_open.find("\n---").ok_or_else(|| {
+        anyhow::anyhow!("agent file '{}': unclosed frontmatter (missing closing ---)", path.display())
+    })?;
+    let frontmatter = &after_open[..close];
+
+    let trimmed = body.trim();
+    let normalized = if trimmed.is_empty() {
+        DEFAULT_AGENT_BODY
+    } else {
+        trimmed
+    };
+
+    let mut file =
+        String::with_capacity(bom.len() + 4 + frontmatter.len() + 5 + normalized.len());
+    file.push_str(bom);
+    file.push_str("---");
+    file.push_str(frontmatter);
+    file.push_str("\n---\n");
+    file.push_str(normalized);
+    file.push('\n');
+
+    // Idempotent: target state already on disk → no write.
+    if file == content {
+        return Ok(());
+    }
+    fs::write(path, file)
+        .with_context(|| format!("Failed to write agent file '{}'", path.display()))
+}
+
 /// Top-level YAML key of a frontmatter line (`name: …`), or `None` for
 /// indented continuation lines, comments, blank lines, and anything that is
 /// not a `key:` at column 0.
@@ -1853,6 +1915,118 @@ You are a helpful AI assistant.
 
         // 不存在的文件 → 报错。
         assert!(set_agent_tool_lists(&dir.path().join("nope.md"), &[], &[]).is_err());
+    }
+
+    // ── set_agent_prompt（agent md 正文替换）───────────────────────────
+
+    #[test]
+    fn set_agent_prompt_replaces_body_preserving_frontmatter() {
+        let (dir, path) = agent_file();
+        set_agent_prompt(&path, "你是一个专注移动端的编码助手。").expect("rewrite");
+
+        let content = text_at(&path);
+        // frontmatter 逐字节保留（键序、注释、缩进、children 等全部原样）。
+        let fm_end = content.find("\n---\n").expect("closing delimiter");
+        assert_eq!(
+            &content[..fm_end],
+            &ROOT_MD[..ROOT_MD.find("\n---\n").expect("seed closing")],
+            "frontmatter must be byte-identical"
+        );
+        // 正文 = 规范化后的新值（trim + 单尾换行）。
+        assert!(content.ends_with("---\n你是一个专注移动端的编码助手。\n"));
+
+        // 回读语义正确（markdown 解析器视角）。
+        let agent = super::super::parse_agent_markdown(&content, "root.md").expect("reparse");
+        assert_eq!(agent.default_prompt, "你是一个专注移动端的编码助手。");
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_prompt_preserves_bom_and_frontmatter() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("root.md");
+        // BOM 变体：frontmatter 连 BOM 一起逐字节保留在原位。
+        let seeded = format!("\u{feff}{ROOT_MD}");
+        fs::write(&path, &seeded).expect("seed");
+
+        set_agent_prompt(&path, "New body.").expect("rewrite");
+
+        let content = text_at(&path);
+        assert!(content.starts_with('\u{feff}'), "BOM survives");
+        assert!(
+            content.starts_with(&seeded[..seeded.find("\n---\n").expect("seed closing")]),
+            "BOM + frontmatter byte-identical"
+        );
+        assert!(content.ends_with("---\nNew body.\n"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_prompt_trims_and_normalizes() {
+        let (dir, path) = agent_file();
+        // 前后空白被裁掉，落盘 = trim + 单尾换行。
+        set_agent_prompt(&path, "\n\n  多行\n正文行2  \n").expect("rewrite");
+        let content = text_at(&path);
+        assert!(content.ends_with("---\n多行\n正文行2\n"));
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_prompt_empty_body_falls_back_to_default() {
+        let (dir, path) = agent_file();
+        for blank in ["", "   \n\t  \n"] {
+            set_agent_prompt(&path, blank).expect("rewrite");
+            let content = text_at(&path);
+            assert!(
+                content.ends_with("---\nYou are a helpful AI assistant.\n"),
+                "blank {blank:?} must fall back to default body"
+            );
+        }
+        // 回读 = 默认正文（与 bootstrap root.md 一致）。
+        let agent =
+            super::super::parse_agent_markdown(&text_at(&path), "root.md").expect("reparse");
+        assert_eq!(agent.default_prompt, "You are a helpful AI assistant.");
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_prompt_is_idempotent() {
+        let (dir, path) = agent_file();
+        // 目标态即现态（ROOT_MD 正文已是默认文案，入参带冗余空白也
+        // normalize 到同一目标）→ 不写：内容与 mtime 均不动。
+        let mtime_before = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        set_agent_prompt(&path, "  You are a helpful AI assistant.\n\n").expect("no-op");
+        assert_eq!(text_at(&path), ROOT_MD, "file untouched");
+        let mtime_after = fs::metadata(&path).expect("meta").modified().expect("mtime");
+        assert_eq!(mtime_before, mtime_after, "already-normalized body → no write");
+
+        // 同参数重写 → 字节不变。
+        set_agent_prompt(&path, "Same body.").expect("first");
+        let once = text_at(&path);
+        set_agent_prompt(&path, "Same body.").expect("second");
+        assert_eq!(once, text_at(&path), "second call must not change the file");
+        let _ = dir;
+    }
+
+    #[test]
+    fn set_agent_prompt_rejects_malformed_files() {
+        // 无 frontmatter / 未闭合 frontmatter → 报错且文件不动（沿用
+        // set_agent_tool_lists 的切分语义：开头 `---` + 首个 `\n---` 为界，
+        // 不发明结构）。
+        let (dir, path) = agent_file();
+        let bare = dir.path().join("bare.md");
+        fs::write(&bare, "no frontmatter here\n").expect("seed");
+        assert!(set_agent_prompt(&bare, "x").is_err());
+        assert_eq!(text_at(&bare), "no frontmatter here\n", "untouched on error");
+
+        let unclosed = dir.path().join("unclosed.md");
+        fs::write(&unclosed, "---\nname: X\n").expect("seed");
+        assert!(set_agent_prompt(&unclosed, "x").is_err());
+        assert_eq!(text_at(&unclosed), "---\nname: X\n", "untouched on error");
+
+        // 不存在的文件 → 报错。
+        assert!(set_agent_prompt(&dir.path().join("nope.md"), "x").is_err());
+        let _ = path;
     }
 
     // ── set_approval_section（tool-approval P1a）────────────────────────

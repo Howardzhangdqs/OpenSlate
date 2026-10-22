@@ -166,7 +166,7 @@ pub struct RunManager {
 
 ### persist.rs
 
-- 格式保持写回（toml_edit：注释/布局存活）。API：`upsert_provider`（:163）/ `upsert_model`（:187）/ `set_level`（:225）/ `remove_level`（:254）/ `set_capability`（:279）/ `remove_model_entry` / `remove_provider` / `upsert_mcp_server` / `remove_mcp_server` / `upsert_env_key`（`.env` 0600）/ `set_agent_tool_lists` / **`set_approval_section`（:330，tool-approval：整段重写 `[approval]` 为新 schema——删除 legacy `policy`/`tools` 键（设置页写入即迁移）；只写非默认值（default=Allow 与缺省等价省略键、空 map 不写子表）；全默认（Allow + 两 map 空）**整段删除**；其余内容逐字节保真；幂等）**。
+- 格式保持写回（toml_edit：注释/布局存活）。API：`upsert_provider`（:163）/ `upsert_model`（:187）/ `set_level`（:225）/ `remove_level`（:254）/ `set_capability`（:279）/ `remove_model_entry` / `remove_provider` / `upsert_mcp_server` / `remove_mcp_server` / `upsert_env_key`（`.env` 0600）/ `set_agent_tool_lists` / `set_agent_prompt`（:889，agent md **正文**替换——`set_agent_tool_lists` 的对称面：frontmatter 逐字节保留、正文规范化（trim、空白回默认文案 `DEFAULT_AGENT_BODY`、单尾换行）、幂等（目标态即现态不写）；mobile 设置页编辑 agent 角色定位/system prompt 的落盘半边）/ **`set_approval_section`（:330，tool-approval：整段重写 `[approval]` 为新 schema——删除 legacy `policy`/`tools` 键（设置页写入即迁移）；只写非默认值（default=Allow 与缺省等价省略键、空 map 不写子表）；全默认（Allow + 两 map 空）**整段删除**；其余内容逐字节保真；幂等）**。
 - **红线**：配置写入永远走本模块，禁手拼 TOML 字符串。
 
 ### validation.rs

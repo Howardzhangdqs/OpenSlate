@@ -1280,6 +1280,76 @@ impl MobileRuntime {
         Ok(())
     }
 
+    // ── 角色定位（system prompt 编辑；设置页）────────────────────────
+
+    /// 读当前生效 agent（root）的角色定位正文。
+    ///
+    /// 正文 = 每回合 system prompt 的**全量源**（runner.rs
+    /// `with_skills_section(&root.default_prompt)`——skills catalog 由
+    /// runner 在其上追加，不由本编辑触碰）。这里读的是内存树 root 的
+    /// `default_prompt`（装配期从 root.md 装载的快照，`set_agent_persona`
+    /// 热替换后即时更新），与下一回合 system prompt 同源。树必然在
+    /// （AppState 装配即建），无需 fallback 分支之外的防御。
+    pub fn get_agent_persona(&self) -> String {
+        let inner = self.state.core.lock();
+        inner.agent_tree.get_root().default_prompt.clone()
+    }
+
+    /// 全量覆写 root agent 的角色定位正文（system prompt 源）并热生效：
+    /// 外科手术式替换 `agents/<root>.md` **正文**（frontmatter 逐字节
+    /// 保留——tools/hidden_tools 白名单机制不受影响）→ 重装 agent 树 →
+    /// 热替换（manager 在家就换；回合进行中改 `inner.agent_tree`，回合
+    /// 边界 finalize_turn 兜底对齐）。skills catalog 由 runner 在正文之
+    /// 上追加，本编辑不触碰。**下一对话回合**的 system prompt 即用新
+    /// 正文，无需重启 app。
+    ///
+    /// 返回规范化后的**生效正文**（入参 trim；空白回默认文案），供
+    /// Kotlin 回显。
+    pub fn set_agent_persona(&self, body: &str) -> Result<String> {
+        // 1) 定位 root agent 的 md（frontmatter `id:` 匹配，`<id>.md`
+        //    文件名兜底）。agents 目录 = 生效配置同级的 `agents/`。
+        let (agents_dir, root_id) = {
+            let inner = self.state.core.lock();
+            let active = inner.paths.active.clone();
+            let root_id = inner.agent_tree.get_root().id.0.clone();
+            (
+                active
+                    .parent()
+                    .context("生效配置路径无父目录")?
+                    .join("agents"),
+                root_id,
+            )
+        };
+        let root_md =
+            find_agent_markdown(&agents_dir, &root_id).context("定位 root agent md 失败")?;
+
+        // 2) 外科手术式落盘：正文替换（frontmatter 逐字节保留，含空白
+        //    规范化与空正文回默认——见 persist::set_agent_prompt）。
+        openslate_core::config::persist::set_agent_prompt(&root_md, body)?;
+
+        // 3) 重装 agent 树 + 热替换（同 set_agent_tool_visibility_impl：
+        //    重装失败不回滚磁盘，运行时保留旧树并报错）。
+        let agents =
+            openslate_core::config::parse_agents_dir(&agents_dir).context("重装 agents 失败")?;
+        let tree = openslate_core::agent_tree::AgentTree::from_configs(&agents.agents)
+            .context("重建 agent 树失败")?;
+        let effective = tree.get_root().default_prompt.clone();
+        {
+            let mut inner = self.state.core.lock();
+            inner.agents_cfg = agents;
+            inner.agent_tree = tree.clone();
+            if let Some(manager) = inner.manager.as_mut() {
+                manager.agent_tree = tree;
+            }
+        }
+        crate::alog!(
+            "agent persona updated: {} chars → {}",
+            effective.len(),
+            root_md.display()
+        );
+        Ok(effective)
+    }
+
     /// 宿主应答 host call。`ok=true` → `payload` 为结果 JSON；
     /// `ok=false` → `payload` 为错误说明。返回 false = 无此在途调用。
     pub fn resolve_host_call(&self, id: u64, ok: bool, payload: String) -> bool {

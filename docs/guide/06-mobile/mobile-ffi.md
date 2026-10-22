@@ -53,6 +53,8 @@ JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**�
 | `listTools(): String` | 159-162 | 工具清单 JSON 数组（name/description/input_schema，按 name 排序） |
 | `getAgentToolVisibility(): String` | 166-169 | `{"tools":[…],"hidden_tools":[…]}` |
 | `setAgentToolVisibility(tools, hiddenTools): String` | 175-180 | 全量覆写 + 热生效；返回 ok 信封 |
+| `getAgentPersona(): String` | 343-349 | 读 root agent 角色定位正文（= 每回合 system prompt 全量源；内存树快照，与 runner 拼 system prompt 同源）。同步无副作用，可主线程 |
+| `setAgentPersona(body: String): String`（throws `MobileError`） | 351-368 | 全量覆写 root agent 角色定位并热生效：外科替换 `agents/root.md` **正文**（frontmatter 逐字节保留）→ 重装 agent 树，**下一回合** system prompt 即用新正文；skills catalog 由 runner 在正文之上追加，本编辑不触碰。入参规范化（trim、空白回默认）。**阻塞（文件 + 树重装），IO 线程调用**。返回生效正文 |
 | `reloadMcpServers(): String` | — | 热重载外部 MCP：按最新落盘配置重连 `[mcp.servers]` 并重注册工具（scratch registry 先做批内冲突检查，撞名完整回滚）；返回 `{"ok","tools","servers":{name:count},"failed":[…],"error"?}`；设置页保存 MCP 清单后调用 |
 | `getMcpToolNameTemplate(): String` | — | 读当前生效工具名模板（落盘 `[mcp].tool_name_template`，缺省返回字面 `{prefix}_{server}__{tool}`；三占位符：prefix=前缀/服务键名、server=MCP 服务器名、tool=裸工具名） |
 | `getMcpBuiltinToolNameTemplate(): String` | — | 读当前生效 builtin（裸名）工具名模板（落盘 `[mcp].builtin_tool_name_template`，缺省/空白返回字面 `{prefix}_{tool}`；占位符仅 prefix/tool，禁 `{server}` 与字面 `__`）。作用于不含 `__` 的裸上游名——host-builtin 裸名与桌面直连裸名同一条展开分支；解析经 core `McpConfig::builtin_template_or_default()`（接缝契约）。Phase C Kotlin 侧（判断 MCP 名册中的 bash 名）经它读取 |

@@ -652,7 +652,12 @@ core runtime 发射 on_tool_start/on_tool_end（带 &tc.id.0）
             → withContext(IO) OpenSlateRuntime.toolOutputByCallId(callId)  【uniffi】
             → MobileRuntime::tool_output_by_call_id（mobile/runtime.rs）
                 锁 state.core → 扫 CoreInner.history
-                role==Tool && tool_call_id==Some(call_id) → clone content（纯内存，不碰 store）
+                role==Tool && tool_call_id==Some(call_id) → clone content（解锁后再展开）
+                content 带 [STORED OUTPUT ref="out-… 标记（长输出落盘预览，C6）→
+                  parse_stored_output_ref16（core STORED_OUTPUT_MARKER 定位，16 hex）
+                  → store.find_tool_output(ref16, 当前 run_id 优先)
+                  → read_tool_output_bytes(sha256) → zstd 解压 → len==orig_bytes 校验
+                  → 全文返回（封顶 512 KiB：头 448 KiB + 省略行 + 尾 64 KiB，字符边界安全）
       取更长者显示：longerOf(fullOut, tc.output)——host 工具的 Kotlin 缓存可能比
       DB 版更长且未截断，DB 版有 secret 打码，两者都安全，任何一边都不丢
       加载中显示极轻进度行（13dp CircularProgressIndicator + 「载入完整输出」），到货即隐
@@ -662,6 +667,8 @@ core runtime 发射 on_tool_start/on_tool_end（带 &tc.id.0）
 
 - 旧事件 / 旧本地镜像无 call_id → null → 跳过懒加载，维持现状显示。
 - FFI 未命中（call_id 未知 / history 被 auto_compact 换摘要 / call_agent 子代理工具——子代理
-  history 不在顶层会话）→ 返回 None → 回退 preview。
+  history 不在顶层会话）→ 返回 None → 回退 preview（**None 语义未随 C6 改变**）。
+- 长输出闭环失败链（无标记 / ref 无行 / 文件缺失 / 解压失败 / 长度不符 / shutdown 后无
+  runtime）→ **返回 content 原文**（落盘预览本身可读，语义与旧降级一致）。
 - **ask_user 条目绝不懒加载替换**：其条目输出是提交时写入的权威脱敏终态 JSON。
 - pendingToolOutputs 按名队列的同名并发错配是既有行为（host_call 信封带 call_id 列为后续改进）。

@@ -1373,26 +1373,97 @@ impl MobileRuntime {
             .map(|r| r.run_id.0.clone())
     }
 
-    /// 按 call_id 取该工具调用的完整输出（内存 history 直读，纯同步）。
+    /// 按 call_id 取该工具调用的完整输出（内存 history 直读 + 长输出
+    /// 落盘全文闭环，纯同步）。
     ///
     /// 数据流：ToolDetailDialog 打开时 Kotlin 经 FFI 调用此函数，把 UI
     /// 里的多层截断 preview（tool_end 事件 512 字符 / 恢复 2000 字符 /
     /// 折叠 8KB）替换为 DB/内存 history 里 max_output_bytes 上限内的
     /// 全量版本。命中条件：history 中存在 `role==Tool` 且
     /// `tool_call_id == call_id` 的消息。
+    ///
+    /// 长输出闭环（C6，零新 FFI 面）：命中消息的 content 若带
+    /// `[STORED OUTPUT ref="out-…"` 标记（core 分叉点替换的落盘预览），
+    /// 按 ref16 反查 `tool_outputs` 行 → 读 `files/outputs/{sha}.zst`
+    /// 解压 → 校验 `len == orig_bytes` → 返回全文（封顶 512 KiB：头
+    /// 448 KiB + 省略行 + 尾 64 KiB，UTF-8 字符边界安全截断）。
+    /// 行缺失 / 文件缺失 / 解压失败 / 长度不符 / 无标记 → **返回 content
+    /// 原文**（预览本身可读，现降级语义不变）。
+    ///
     /// `None`（miss）场景与降级：call_id 为空/未知；history 被
     /// auto_compact 换成摘要；call_agent 子代理的工具（子代理 history
-    /// 不在顶层会话）——调用方回退显示原 preview。
+    /// 不在顶层会话）——调用方回退显示原 preview。**None 语义未随 C6
+    /// 改变**。
     pub fn tool_output_by_call_id(&self, call_id: String) -> Option<String> {
         if call_id.is_empty() {
             return None;
         }
-        let inner = self.state.core.lock();
-        inner
-            .history
-            .iter()
-            .find(|m| m.role == MessageRole::Tool && m.tool_call_id.as_ref().is_some_and(|id| id.0 == call_id))
-            .map(|m| m.content.clone())
+        let (content, run_id) = {
+            let inner = self.state.core.lock();
+            let msg = inner
+                .history
+                .iter()
+                .find(|m| m.role == MessageRole::Tool && m.tool_call_id.as_ref().is_some_and(|id| id.0 == call_id))?;
+            (
+                msg.content.clone(),
+                inner.session_run.as_ref().map(|r| r.run_id.0.clone()),
+            )
+        }; // 先放 core 锁：慢路径（store 查询 + 读文件）不持锁。
+        Some(self.expand_stored_output(content, run_id.as_deref()))
+    }
+
+    /// 长输出全文展开（C6）：content 带落盘标记则取回全文（封顶截断），
+    /// 任何失败回落 content 原文。
+    fn expand_stored_output(&self, content: String, prefer_run: Option<&str>) -> String {
+        let Some(ref16) = parse_stored_output_ref16(&content) else {
+            return content; // 无标记：普通（截断）输出，原文返回
+        };
+        // store 未装配（无 DB 配置）→ 回落。
+        let Some(store) = self.state.core.lock().store.clone() else {
+            return content;
+        };
+        // rt 已收束（shutdown 后）→ 无异步执行环境，回落。
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let Some(rt) = guard.as_ref() else {
+                return content;
+            };
+            rt.handle().clone()
+        };
+        let expanded = handle.block_on(async move {
+            // 行缺失（ref 失效 / run 已删）→ None → 回落
+            let Some(record) = store
+                .find_tool_output(ref16, prefer_run)
+                .await
+                .ok()
+                .flatten()
+            else {
+                tracing::debug!(target: "openslate_mobile", ref_id = ref16, "stored output row missing; fallback to preview");
+                return None;
+            };
+            // 文件缺失（崩溃窗口 / 手动清理）→ None → 回落
+            let Some(zst) = store.read_tool_output_bytes(&record.sha256).await.ok().flatten() else {
+                tracing::debug!(target: "openslate_mobile", sha = %record.sha256, "stored output file missing; fallback to preview");
+                return None;
+            };
+            // 解压 + UTF-8 双失败 → 回落
+            let text = zstd::decode_all(zst.as_slice()).ok()?;
+            let text = String::from_utf8(text).ok()?;
+            // 完整性校验：解压长度必须与落盘时的 orig_bytes 一致（防半写
+            // 文件 / 内容错位静默展示）
+            if text.len() != record.orig_bytes as usize {
+                tracing::warn!(
+                    target: "openslate_mobile",
+                    ref_id = ref16,
+                    decoded = text.len(),
+                    recorded = record.orig_bytes,
+                    "stored output size mismatch; falling back to preview"
+                );
+                return None;
+            }
+            Some(cap_stored_full_text(text))
+        });
+        expanded.unwrap_or(content)
     }
 
     // ── Provider 模型自动检测（设置页 Provider 域）────────────────
@@ -1936,6 +2007,71 @@ async fn bind_landed_attachments(state: &Arc<AppState>, ids: &[String]) -> bool 
         Err(e) => crate::alog!("attachments: bind 失败（非致命，行保持暂存）: {e}"),
     }
     true
+}
+
+// ── 长输出全文闭环（C6；常量与解析/封顶助手）────────────────────────
+
+/// 详情弹窗全文封顶：512 KiB = 头 448 KiB + 省略行 + 尾 64 KiB（弹出层
+/// 一次性可读上限；更大规模交给 output_query 切片）。
+const STORED_FULL_TEXT_CAP: usize = 512 * 1024;
+const STORED_FULL_TEXT_HEAD: usize = 448 * 1024;
+const STORED_FULL_TEXT_TAIL: usize = 64 * 1024;
+/// 封顶省略行文案（与 core 预览省略行同风格）。
+const STORED_FULL_TEXT_OMISSION: &str = "[... use output_query for the rest ...]";
+
+/// 字节预算内的最大字符边界下标（向后回退；对齐 core output_store 与
+/// mcp-builtin shell.rs 的 head 截断先例：劈进多字节字符就退到前一边界）。
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    idx = idx.min(text.len());
+    while !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// 字节预算内的最小字符边界下标（向前推进，tail 截断先例）。
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    idx = idx.min(text.len());
+    while !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// 超限全文封顶：头 448 KiB + 省略行 + 尾 64 KiB（字符边界安全）。
+///
+/// 调用前提 `text.len() > CAP`（= HEAD + TAIL，头尾切点必然不重叠）。
+fn cap_stored_full_text(text: String) -> String {
+    if text.len() <= STORED_FULL_TEXT_CAP {
+        return text;
+    }
+    let head_end = floor_char_boundary(&text, STORED_FULL_TEXT_HEAD);
+    let tail_start = ceil_char_boundary(&text, text.len() - STORED_FULL_TEXT_TAIL);
+    format!(
+        "{}\n{}\n{}",
+        &text[..head_end],
+        STORED_FULL_TEXT_OMISSION,
+        &text[tail_start..]
+    )
+}
+
+/// 从 Tool 消息 content 解析首个落盘标记的 ref16（16 hex）。
+///
+/// 头行格式（core `build_preview` 冻结）：
+/// `[STORED OUTPUT ref="out-{16hex}" size=… lines=…]`。解析用 core 的
+/// `STORED_OUTPUT_MARKER` 常量定位 + 前缀逐段剥（不用正则：格式冻结、
+/// 单一形态，手工解析零依赖且更快）。无标记 / 形状不符 → `None`。
+fn parse_stored_output_ref16(content: &str) -> Option<&str> {
+    let marker = openslate_core::output_store::STORED_OUTPUT_MARKER;
+    let start = content.find(marker)?;
+    let rest = content[start + marker.len()..].trim_start();
+    let rest = rest.strip_prefix("ref=\"out-")?;
+    let ref16 = rest.get(..16)?;
+    if ref16.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(ref16)
+    } else {
+        None
+    }
 }
 
 /// 状态装配（server `build_state` 的 mobile 变体：origin / 显式路径 /
@@ -3642,6 +3778,209 @@ mod tests {
         // 未命中：未知 id / 空串 → None（UI 回退条目自带 preview）。
         assert!(runtime.tool_output_by_call_id("call-unknown".into()).is_none());
         assert!(runtime.tool_output_by_call_id(String::new()).is_none());
+        runtime.shutdown();
+    }
+
+    // ── 长输出全文闭环（C6）──────────────────────────────────────────
+
+    /// C6 测试脚手架：真装配 runtime（文件库）→ 直插 Tool 消息进内存
+    /// history + tool_outputs 行/文件进库（经 runtime 自身的 tokio handle
+    /// 驱动——`create_with` 内部也 block_on，不能再包一层外层 runtime）。
+    /// `delete_file = true` 模拟文件缺失（行在、文件被清）。返回
+    /// (runtime, sha_hex, 预览 content, TempDir)——**TempDir 必须由调用方
+    /// 持有到测试结束**（提前 drop = 整个库目录被删，SQLite 行读靠 fd
+    /// 仍活着、按路径的文件读全挂）。
+    #[allow(clippy::type_complexity)]
+    fn seed_stored_output_runtime(
+        full_text: &str,
+        delete_file: bool,
+    ) -> (
+        Arc<MobileRuntime>,
+        String,
+        String,
+        tempfile::TempDir,
+    ) {
+        let (paths, dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![]))
+            .expect("runtime");
+        let store = runtime
+            .state
+            .core
+            .lock()
+            .store
+            .clone()
+            .expect("文件库 store 应已装配");
+        let handle = {
+            let guard = runtime.rt.lock().expect("mobile runtime lock poisoned");
+            guard.as_ref().expect("runtime alive").handle().clone()
+        };
+
+        // sha + 行/文件（C1 API：zst 由调用方压好）
+        use sha2::{Digest, Sha256};
+        let sha_hex = format!("{:x}", Sha256::digest(full_text.as_bytes()));
+        let data_zst = zstd::encode_all(full_text.as_bytes(), 3).expect("zst");
+        handle.block_on(async {
+            store
+                .insert_run("run-c6", None, "root", "completed", "{}", 1000)
+                .await
+                .expect("run");
+            store
+                .insert_tool_output(
+                    "out-c6",
+                    "run-c6",
+                    &sha_hex,
+                    "bash",
+                    full_text.len() as i64,
+                    full_text.lines().count() as i64,
+                    &data_zst,
+                    2000,
+                )
+                .await
+                .expect("tool output row");
+        });
+        if delete_file {
+            std::fs::remove_file(
+                store
+                    .files_dir()
+                    .expect("dir")
+                    .join("outputs")
+                    .join(format!("{sha_hex}.zst")),
+            )
+            .expect("remove file");
+        }
+
+        // Tool 消息直插内存 history（core build_preview 冻结格式的头行 +
+        // 省略行 + 尾巴——解析只依赖头行；head/tail 切点走字符边界，
+        // 兼容多字节测试文本）
+        let head = &full_text[..floor_char_boundary(full_text, 32)];
+        let tail_start = ceil_char_boundary(full_text, full_text.len().saturating_sub(16));
+        let tail = &full_text[tail_start..];
+        let preview = format!(
+            "[STORED OUTPUT ref=\"out-{}\" size={} lines={}]\n{}\n[... {} bytes omitted ({} lines) — use output_query to inspect ...]\n{}",
+            &sha_hex[..16],
+            full_text.len(),
+            full_text.lines().count(),
+            head,
+            full_text.len() - head.len() - tail.len(),
+            full_text.lines().count(),
+            tail,
+        );
+        {
+            let mut inner = runtime.state.core.lock();
+            inner.history.push(Message {
+                attachments: None,
+                role: MessageRole::Tool,
+                content: preview.clone(),
+                tool_call_id: Some(openslate_core::types::ToolCallId("call-c6-1".into())),
+                name: Some("bash".into()),
+                tool_calls: None,
+                reasoning_content: None,
+            });
+        }
+        (runtime, sha_hex, preview, dir)
+    }
+
+    /// C6：有标记 → 行+文件齐全时取回全文（== 落盘原文）。
+    #[test]
+    fn tool_output_by_call_id_expands_stored_output() {
+        let full_text = format!("c6-head\n{}\nc6-tail", "m".repeat(20_000));
+        let (runtime, _sha, _preview, _dir) = seed_stored_output_runtime(&full_text, false);
+
+        let out = runtime
+            .tool_output_by_call_id("call-c6-1".into())
+            .expect("命中");
+        assert_eq!(out, full_text, "应返回落盘全文而非预览");
+        runtime.shutdown();
+    }
+
+    /// C6：无标记 / 未知 ref / 文件缺失 → 一律回落 content 原文（预览）。
+    #[test]
+    fn tool_output_by_call_id_stored_output_fallbacks() {
+        let full_text = "z".repeat(9000);
+
+        // ① 文件缺失（行在）：回落预览原文
+        let (runtime, _sha, preview, _dir) = seed_stored_output_runtime(&full_text, true);
+        let out = runtime
+            .tool_output_by_call_id("call-c6-1".into())
+            .expect("命中");
+        assert_eq!(out, preview, "文件缺失 → content 原文（预览）");
+        runtime.shutdown();
+
+        // ② 无标记：普通截断输出原样返回
+        let (runtime, _sha, _preview, _dir) = seed_stored_output_runtime(&full_text, false);
+        {
+            let mut inner = runtime.state.core.lock();
+            inner.history.last_mut().expect("tool msg").content =
+                "[TRUNCATED: original 9000 bytes, showing 16 bytes]\nzz…".into();
+        }
+        let out = runtime
+            .tool_output_by_call_id("call-c6-1".into())
+            .expect("命中");
+        assert!(
+            out.starts_with("[TRUNCATED:"),
+            "无 STORED OUTPUT 标记 → 原文直通, got: {}",
+            &out[..out.len().min(40)]
+        );
+        runtime.shutdown();
+
+        // ③ 标记 ref 无行（伪造 ref）：回落预览原文
+        let (runtime, _sha, _preview, _dir) = seed_stored_output_runtime(&full_text, false);
+        let fake_preview = format!(
+            "[STORED OUTPUT ref=\"out-0000000000000000\" size={} lines=1]\nzz…\n[... omitted — use output_query to inspect ...]",
+            full_text.len()
+        );
+        {
+            let mut inner = runtime.state.core.lock();
+            inner.history.last_mut().expect("tool msg").content = fake_preview.clone();
+        }
+        let out = runtime
+            .tool_output_by_call_id("call-c6-1".into())
+            .expect("命中");
+        assert_eq!(out, fake_preview, "未知 ref → content 原文（预览）");
+        runtime.shutdown();
+    }
+
+    /// C6：超限全文封顶——头 448 KiB + 省略行 + 尾 64 KiB，多字节字符不
+    /// 劈裂（「中」3B/字铺满，切点必然落在字符内部）。
+    #[test]
+    fn tool_output_by_call_id_caps_full_text_at_512k() {
+        // 600 KiB 的「中」（1_800_000B，非 3 的倍数切点全部落字符内）
+        let full_text = "中".repeat(600 * 1024 / 3);
+        assert!(full_text.len() > STORED_FULL_TEXT_CAP);
+        let (runtime, _sha, _preview, _dir) = seed_stored_output_runtime(&full_text, false);
+
+        let out = runtime
+            .tool_output_by_call_id("call-c6-1".into())
+            .expect("命中");
+        assert!(
+            out.contains(STORED_FULL_TEXT_OMISSION),
+            "超限必有省略行"
+        );
+        assert!(
+            out.len() < full_text.len(),
+            "封顶后必小于原文（{} < {}）",
+            out.len(),
+            full_text.len()
+        );
+        let mut lines = out.lines();
+        let head = lines.next().expect("head 行");
+        assert!(head.len() <= STORED_FULL_TEXT_HEAD, "头行不超 448 KiB 预算");
+        assert!(head.chars().all(|c| c == '中'), "头部字符不被劈裂");
+        assert_eq!(
+            head.len(),
+            floor_char_boundary(&full_text, STORED_FULL_TEXT_HEAD),
+            "头部为 448 KiB 预算内最大完整字符段（floor 边界）"
+        );
+        let tail = out.lines().last().expect("tail 行");
+        assert!(tail.len() <= STORED_FULL_TEXT_TAIL, "尾行不超 64 KiB 预算");
+        assert!(tail.chars().all(|c| c == '中'), "尾部字符不被劈裂");
+        assert_eq!(
+            tail.len(),
+            full_text.len()
+                - ceil_char_boundary(&full_text, full_text.len() - STORED_FULL_TEXT_TAIL),
+            "尾部为 64 KiB 预算内最大完整字符段（ceil 边界）"
+        );
         runtime.shutdown();
     }
 

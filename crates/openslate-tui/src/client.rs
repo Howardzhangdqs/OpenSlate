@@ -301,6 +301,7 @@ pub fn view_from_config(config: &openslate_core::config::OpenSlateConfig) -> Con
             max_context_messages: limits.max_context_messages,
             max_context_bytes: limits.max_context_bytes,
             max_output_bytes: limits.max_output_bytes,
+            output_store_threshold: limits.output_store_threshold,
             auto_compact: limits.auto_compact,
             parallel_tool_calls: limits.parallel_tool_calls,
         },

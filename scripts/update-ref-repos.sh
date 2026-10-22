@@ -22,6 +22,7 @@ REPOS=(
   "pi|https://github.com/badlogic/pi-mono"
   "minimax-code|https://github.com/MiniMax-AI/minimax-code"
   "deepseek-harness|https://github.com/deepseek-ai/deepseek-harness"
+  "coreutils|https://github.com/uutils/coreutils"
 )
 
 log()  { printf '\033[1;32m[update-ref]\033[0m %s\n' "$*"; }

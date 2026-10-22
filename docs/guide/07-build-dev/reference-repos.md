@@ -11,6 +11,7 @@
 | `.ref/pi` | [badlogic/pi-mono](https://github.com/badlogic/pi-mono) | pi coding agent monorepo |
 | `.ref/minimax-code` | [MiniMax-AI/minimax-code](https://github.com/MiniMax-AI/minimax-code) | MiniMax 终端 coding agent |
 | `.ref/deepseek-harness` | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | DeepSeek Harness（插件化 agent 框架） |
+| `.ref/coreutils` | [uutils/coreutils](https://github.com/uutils/coreutils) | Rust 版 GNU coreutils（109 个工具 crate；评估为 output_query 查询工具的库依赖候选） |
 
 ## 更新方式
 

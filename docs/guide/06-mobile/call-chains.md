@@ -30,6 +30,16 @@ ChatScreen Composer
 - `submit` 是**唯一乐观回显**的消息；其余设置类消息（`upsert_provider` / `set_level` / `set_capability` / `upsert_mcp_server` / `answer_approval` / `new_session` / `cancel`…）全部转 ClientMsg JSON 等 Rust 处理后经 `config_changed` / `snapshot` 事件回证。
 - FFI `send` 非阻塞：解析失败同步返回 Err（`MobileError.SendFailed`），解析成功即 spawn，处理结果全部走下行事件流。
 
+### 回合级断连重试（engine Err 分支；session engine.rs）
+
+移动网络的后台/抖动断连（reqwest decode 错 → genai WebStream → `ProviderError::ConnectionError`）会被 session 引擎自动兜住，用户通常无感：
+
+- **触发**：回合 Err 且分类为 Network（`classify_turn_error` 类型化下钻；adapter 层对「首个 Delta 后的流错误」不重试——部分文本已流出无法续传，只能整回合重跑，故本层兜底）。
+- **预算**：每回合 1 次；**冷却**：会话级 10s 窗（`last_network_retry`，防网络瘫痪逐回合空转；`/new` 新会话重置）。取消（token 已 cancelled）不重试。
+- **行为**：广播 `Notice(info)`「网络中断，正在自动重试…」；转写**保留**部分流出的 assistant/reasoning 条目并追加 `Meta`「网络中断，已重试本回合」（诚实展示，不删不藏）；重跑整个回合（user 消息在 history 未动 → 全新生成）；重试期间 `running` 保持 true（UI 转圈不停）。
+- **终态**：重试仍失败 → `turn_error`（`kind:"network"`，message 尾缀「（已自动重试 1 次）」）。非 Network（rate_limit/auth/model/other）、审批拒绝、工具失败（不进 Err 路径）一律不重试。
+- Kotlin 侧暂不消费 `kind` 字段（serde 忽略未知字段），重试期间的感知 = Notice toast + 转写 Meta 行 + 转圈不停。
+
 ## 1.1 附件链路（多模态输入，存储 v5 §3/§6；L4）
 
 ```text

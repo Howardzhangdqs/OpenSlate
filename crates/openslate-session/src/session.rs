@@ -211,6 +211,8 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
                 inner.history.clear();
                 inner.transcript.clear();
                 inner.session_id = new_session_id();
+                // 断连重试冷却随之重置（新会话 = 新的重试预算语境）。
+                inner.last_network_retry = None;
                 // v5 L2：终态聚合（cost + tokens）快照必须先于 stats 重置
                 // 读取——重置后读恒为 0（REPL /new 同款快照顺序回归）。
                 // stats 自上次 /new 起累计 = 该 run 生命周期累计（含
@@ -762,6 +764,7 @@ model = "m"
             stream: Default::default(),
             tool_timers: Default::default(),
             pending_step_meta: None,
+            last_network_retry: None,
         };
         let sink = Arc::new(RecordingSink::default());
         Arc::new(AppState {

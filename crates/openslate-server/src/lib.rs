@@ -167,6 +167,7 @@ pub async fn build_state(opts: &ServeOptions) -> Result<Arc<AppState>> {
         stream: Default::default(),
         tool_timers: Default::default(),
         pending_step_meta: None,
+        last_network_retry: None,
     };
 
     Ok(Arc::new(AppState {

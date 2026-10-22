@@ -836,6 +836,7 @@ model = "m"
             stream: Default::default(),
             tool_timers: Default::default(),
             pending_step_meta: None,
+            last_network_retry: None,
         };
         let sink: Arc<dyn openslate_session::state::MsgSink> = Arc::new(NopSink);
         let factory: ProviderFactory =

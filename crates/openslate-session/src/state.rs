@@ -134,6 +134,11 @@ pub struct CoreInner {
     /// RequestEnd 挂起的 usage 行（TUI fix-19 同款 hold：落在本步
     /// 工具行之下，无工具则在下一 RequestStart / 回合结束冲刷）。
     pub pending_step_meta: Option<String>,
+    /// 最近一次「回合级断连重试」发生时刻（会话级冷却窗判据：两次网络
+    /// 重试至少间隔 [`crate::engine::NETWORK_RETRY_COOLDOWN`]，防网络
+    /// 瘫痪时逐回合空转重试；照 mcp_recovery 的 10s 冷却先例）。
+    /// `None` / 会话新建时重置。
+    pub last_network_retry: Option<Instant>,
 }
 
 impl CoreInner {
@@ -699,6 +704,7 @@ model = "m"
             stream: Default::default(),
             tool_timers: Default::default(),
             pending_step_meta: None,
+            last_network_retry: None,
         }
     }
 

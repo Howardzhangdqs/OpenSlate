@@ -901,6 +901,7 @@ fast = "fast"
             stream: Default::default(),
             tool_timers: Default::default(),
             pending_step_meta: None,
+            last_network_retry: None,
         };
         let state = Arc::new(AppState {
             core: Arc::new(SessionCore::new(inner)),

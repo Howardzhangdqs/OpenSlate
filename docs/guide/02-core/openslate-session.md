@@ -88,13 +88,14 @@ pub struct CoreInner {
 - 事件映射：`on_request_start` 冲掉上一请求挂起 usage 行 + RequestStart；`on_delta`/`on_reasoning` 进 stream 缓冲 + 广播；`on_usage` 挂起 `pending_step_meta`（Meta 行落在本步工具行之下，fix-19 hold）；`on_tool_start/end` → `tool_start_entry`/`tool_end_entry` + 广播（preview 空串转 None；**call_id 透传**：条目落 id + `ServerMsg::ToolStart/ToolEnd.call_id` 携带，客户端按其精确配对与懒加载全量输出，空串转 None）；`on_step_end` 冲流 + 连续边界折叠为一个 StepBreak。
 - `usage_meta_line`（:149）：`↑in ↓out [⎓cached]`（TUI 的 ttft/速率装饰是客户端渲染层，不进协议数据）。
 
-### spawn_engine_turn（:169）与 engine_turn（:185）
+### spawn_engine_turn（:182）与 engine_turn（:272）
 
 - **spawn_blocking 专用线程 + `Handle::block_on`**：审批 `decide()` 是同步阻塞 trait、会等客户端应答；引擎执行期间还有多个同步回调。占 tokio worker 会饿死同 worker 上的转发/写任务（**实测复现过**）。阻塞池线程阻塞正是其设计用途；内层 future 经 Handle::block_on 驱动，tokio 定时器/通道/sqlx 均可用。
-- 收尾（持 core 锁）：`running=false`、`cancel=None`、深度/工具计数清零；**回家的 manager 采用最新 agent_tree**（`manager.agent_tree = inner.agent_tree.clone()`，:218——回合期间工具可见性热替换只改 inner.agent_tree，碰不到被 take 的 manager）；`inner.manager = Some(manager)`。
-- Ok：history 替换为 run 结果、flush、fold_tool_outcomes、stats 累计、广播 TurnOk。Err：flush、**保留 history 现状**（用户消息留着可重发）、广播 TurnError。
+- **回合级断连自动重试**（`classify_turn_error` :218 / `should_network_retry` :250）：Err 先经 `classify_turn_error` 分类（优先类型化下钻 `OpenSlateError::Provider(ProviderError)`；唯一字符串兜底 = `RetryExhausted.last`——adapter 层重试耗尽时内层只剩 Display 文本，文案变更会退化 Other，仅影响分类不影响正确性）。**Network 类**（`ConnectionError` / 内层为连接错误的 `RetryExhausted`）且预算未耗尽（每回合 1 次）+ 未取消（`cancel.is_cancelled()` 守卫，取消竞态尊重用户意图）+ 不在会话级冷却窗内（`CoreInner.last_network_retry` 距今 ≥ 10s，防网络瘫痪空转，照 mcp_recovery 冷却先例）→ **整回合重跑**：转写保留部分流出文本 + 追加 Meta「网络中断，已重试本回合」+ 广播 Notice(Info)「网络中断，正在自动重试…」+ 记冷却时间戳，重入 `execute_with_run_id`（Err 路径不动 inner.history，user 消息仍在——重跑即全新生成）；重试期间 running 保持 true（UI 转圈不停），manager 回收/运行态复位只在最终收尾做一次。重试仍失败或不可重试（RateLimit/Auth/Model/Other/取消）→ 终态 TurnError：`kind` 携带分类，重试用尽并入文案「（已自动重试 N 次）」。
+- 收尾（持 core 锁）：`running=false`、`cancel=None`、深度/工具计数清零；**回家的 manager 采用最新 agent_tree**（`manager.agent_tree = inner.agent_tree.clone()`——回合期间工具可见性热替换只改 inner.agent_tree，碰不到被 take 的 manager）；`inner.manager = Some(manager)`。
+- Ok：history 替换为 run 结果、flush、fold_tool_outcomes、stats 累计、广播 TurnOk。Err：flush、**保留 history 现状**（用户消息留着可重发）、广播 TurnError（含 kind / 重试次数文案）。
 
-### run_auto_compact（:253）
+### run_auto_compact（:377）
 
 pre-turn 摘要。history 整体搬出（std Mutex 守卫不能跨 await）→ `needs_compact` 判定 → capability=compact 计划（**代号选取：`[capabilities]` 显式绑定优先；未绑定 → 继承会话当前 `model_alias`**（同一 core 锁临界区取；历史上的"回退 fast 硬编码"已废止，不走 `capability_alias` 缺省）。resolve_model + provider_factory 任一失败 → None → 机械兜底）→ `compact()`（空白回复视作失败 → 机械兜底）→ 搬回。**compact 的 usage 计入会话累计（成本不计 run 行；token 在 session/server 的 RunFinal 口径下随 stats 进 run 行聚合——口径细节见 §5.1）**。`SUMMARY_SYSTEM_PROMPT`（:29）与 REPL/TUI **逐字一致**。
 

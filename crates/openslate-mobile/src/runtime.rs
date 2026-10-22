@@ -2457,6 +2457,7 @@ async fn assemble_state(
         stream: Default::default(),
         tool_timers: std::collections::HashMap::new(),
         pending_step_meta: None,
+        last_network_retry: None,
     };
 
     let core = Arc::new(SessionCore::new(inner));

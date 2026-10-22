@@ -10,16 +10,22 @@
 //!   （capability=compact 绑定的代号；未绑定 → 继承会话当前模型。
 //!   provider 失败/别名缺失 → 机械拼接兜底，core `compact()` 内建），
 //!   再进正式回合。compact 的 usage 计入会话累计（不计 run 行，同 TUI）。
+//! - **回合级断连重试**：Network 类失败（流中途连接断开，adapter 层
+//!   因「首个 Delta 后不重试」放行的链路）自动重跑整个回合——预算
+//!   每回合 1 次 + 会话级 10s 冷却窗；重试广播 Notice、转写追加 Meta
+//!   标记；用尽后 `TurnError` 携 `kind=network` 与重试次数文案。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use openslate_core::context_manager::compact::{compact, needs_compact};
+use openslate_core::error::OpenSlateError;
 use openslate_core::model_config::resolve_model;
 use openslate_core::provider::{GenerateRequest, ModelProvider, ProgressCallback};
 use openslate_core::run_manager::RunManager;
 use openslate_core::runtime::CostSpec;
 use openslate_core::types::{Message, MessageRole, RunId, Usage};
-use openslate_protocol::{EntryDto, ServerMsg, TurnSummaryDto};
+use openslate_protocol::{EntryDto, NoticeLevel, ServerMsg, TurnErrorKind, TurnSummaryDto};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{
@@ -189,6 +195,80 @@ pub fn spawn_engine_turn(
     })
 }
 
+/// 回合级断连重试预算：每回合至多 1 次自动重跑（后台/网络抖动 →
+/// reqwest decode 错 → `ProviderError::ConnectionError` 的链路在
+/// adapter 层「首个 Delta 后不重试」——部分文本已流出，只能整回合
+/// 重跑，见 model-genai retry.rs）。
+const NETWORK_RETRY_BUDGET: u32 = 1;
+
+/// 会话级网络重试冷却窗：两次网络重试至少间隔 10s，防网络瘫痪时
+/// 逐回合空转重试（照 mcp_recovery 的 10s 冷却先例）。存于
+/// [`crate::state::CoreInner::last_network_retry`]。
+pub(crate) const NETWORK_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// 断连重试的转写标记：部分流出文本保留在转写里（诚实展示），其后
+/// 追加本 Meta 说明该段输出已被重试作废。
+const RETRY_META_TEXT: &str = "网络中断，已重试本回合";
+
+/// 回合失败 → 机器可读分类（[`TurnErrorKind`]，随 `TurnError` 广播）。
+/// 优先类型化下钻（`OpenSlateError` → Provider 变体结构）；唯一的字符串
+/// 匹配兜底是 `RetryExhausted`——adapter 层重试耗尽时把最后一个错误
+/// Display 成纯文本（`last: String`），无类型可钻。脆弱点：内层文案
+/// 变更会让分类退化为 `Other`（只影响分类展示，不影响正确性）。
+fn classify_turn_error(e: &OpenSlateError) -> TurnErrorKind {
+    use openslate_core::error::{OpenSlateError as E, ProviderError as P, RuntimeError as R};
+    match e {
+        // 诊断链路的主形态：流中途传输失败（reqwest decode 错）。
+        E::Provider(P::ConnectionError(_)) => TurnErrorKind::Network,
+        E::Provider(P::RateLimit) | E::Provider(P::ServerError(429)) => TurnErrorKind::RateLimit,
+        E::Provider(P::AuthError(_))
+        | E::Provider(P::ServerError(401))
+        | E::Provider(P::ServerError(403)) => TurnErrorKind::Auth,
+        // 见 fn 文档：内层仅剩 Display 字符串，字符串匹配兜底。
+        E::Provider(P::RetryExhausted { last, .. }) => {
+            if last.contains("connection error") {
+                TurnErrorKind::Network
+            } else if last.contains("rate limit") || last.contains("429") {
+                TurnErrorKind::RateLimit
+            } else {
+                TurnErrorKind::Other
+            }
+        }
+        // 模型侧失败：响应畸形 / 模型不存在 / 空响应。
+        E::Provider(P::MalformedResponse(_)) | E::Provider(P::NotFound(_)) => TurnErrorKind::Model,
+        E::Runtime(R::EmptyResponse { .. }) => TurnErrorKind::Model,
+        _ => TurnErrorKind::Other,
+    }
+}
+
+/// 本次失败是否值得自动重跑整个回合。全部条件：
+/// - 分类为 `Network`（唯一可重试类别；RateLimit/Auth/Model/Other、
+///   审批拒绝、工具失败（不进 Err 路径）均不重试）；
+/// - 本回合重试预算未耗尽（[`NETWORK_RETRY_BUDGET`]）；
+/// - 用户未取消（取消与断连同刻竞态进 Err 分支时，尊重取消意图）；
+/// - 不在会话级冷却窗内（[`NETWORK_RETRY_COOLDOWN`]）。
+fn should_network_retry(
+    state: &Arc<AppState>,
+    e: &OpenSlateError,
+    retries_used: u32,
+    cancel: &CancellationToken,
+) -> bool {
+    if retries_used >= NETWORK_RETRY_BUDGET {
+        return false;
+    }
+    if cancel.is_cancelled() {
+        return false;
+    }
+    if classify_turn_error(e) != TurnErrorKind::Network {
+        return false;
+    }
+    let inner = state.core.lock();
+    match inner.last_network_retry {
+        Some(last) if last.elapsed() < NETWORK_RETRY_COOLDOWN => false,
+        _ => true,
+    }
+}
+
 async fn engine_turn(
     state: Arc<AppState>,
     mut manager: RunManager,
@@ -201,15 +281,44 @@ async fn engine_turn(
     let mut bridge = SessionProgressBridge {
         state: state.clone(),
     };
-    let result = manager
-        .execute_with_run_id(
-            run_id,
-            provider.as_ref(),
-            &history,
-            cancel,
-            Some(&mut bridge),
-        )
-        .await;
+    // 回合级断连重试循环：Err 时按 [`should_network_retry`] 判定是否整
+    // 回合重跑（user 消息在 history 未动——Err 路径不改 inner.history，
+    // 重跑即全新生成）。重试期间 running 保持 true（UI 转圈不停），
+    // manager 回收 / 运行态复位只在最终收尾做一次。
+    let mut network_retries: u32 = 0;
+    let result = loop {
+        let attempt = manager
+            .execute_with_run_id(
+                run_id.clone(),
+                provider.as_ref(),
+                &history,
+                cancel.clone(),
+                Some(&mut bridge),
+            )
+            .await;
+        match attempt {
+            Err(e) if should_network_retry(&state, &e, network_retries, &cancel) => {
+                network_retries += 1;
+                // 部分流出文本：保留 + Meta 标记（先改转写镜像、再广播，
+                // 与 ProgressCallback 同一顺序不变量），随后重跑回合。
+                {
+                    let mut inner = state.core.lock();
+                    flush_stream(&mut inner);
+                    inner.transcript.push(EntryDto::Meta {
+                        text: RETRY_META_TEXT.to_owned(),
+                    });
+                    inner.last_network_retry = Some(std::time::Instant::now());
+                }
+                crate::session_event!("turn error (network), retrying: {e}");
+                state.sink.broadcast(ServerMsg::Notice {
+                    text: "网络中断，正在自动重试…".into(),
+                    level: NoticeLevel::Info,
+                });
+                continue;
+            }
+            result => break result,
+        }
+    };
 
     // 回收：无论成败，manager 回家、运行态复位。
     let mut inner = state.core.lock();
@@ -247,10 +356,17 @@ async fn engine_turn(
         Err(e) => {
             // 失败保留 history 现状（TUI 同款：用户消息留着可重发）。
             flush_stream(&mut inner);
+            let kind = classify_turn_error(&e);
             crate::session_event!("turn error: {e}");
+            // 重试用尽的信息并入文案（协议 message 是人读通道，kind 是
+            // 机器通道）。
+            let mut message = e.to_string();
+            if network_retries > 0 {
+                message.push_str(&format!("（已自动重试 {network_retries} 次）"));
+            }
             state.sink.broadcast(ServerMsg::TurnError {
-                message: e.to_string(),
-                kind: None,
+                message,
+                kind: Some(kind),
             });
         }
     }
@@ -702,6 +818,7 @@ mod tests {
                 stream: Default::default(),
                 tool_timers: Default::default(),
                 pending_step_meta: None,
+                last_network_retry: None,
             };
             Arc::new(AppState {
                 core: Arc::new(SessionCore::new(inner)),
@@ -821,6 +938,489 @@ max_context_messages = 10
                 !history[0].content.contains(STUB_SUMMARY),
                 "no LLM call should happen for unresolvable alias"
             );
+        }
+    }
+
+    // ── 回合级断连自动重试（engine_turn Err 分支）──────────────────────
+
+    mod network_retry {
+        use super::*;
+        use crate::approval::SessionApprovalBridge;
+        use crate::state::{ConfigPaths, CoreInner, MsgSink, ProviderFactory, SessionCore};
+        use openslate_core::agent_tree::AgentTree;
+        use openslate_core::config::{parse_openslate_toml, AgentsConfig};
+        use openslate_core::error::ProviderError;
+        use openslate_core::provider::GenerateRequest;
+        use openslate_core::run_manager::RunManager;
+        use openslate_core::skills::SkillsCatalog;
+        use openslate_core::tool::ToolRegistry;
+        use openslate_core::types::{
+            AgentConfig, AgentId, ModelResponse, ModelStreamEvent, Usage,
+        };
+        use std::collections::VecDeque;
+        use std::sync::Mutex as StdMutex;
+        use tokio_util::sync::CancellationToken;
+
+        /// 一段流脚本：元素为流事件或流中途错误（错误即该次尝试失败）。
+        type Script = Vec<Result<ModelStreamEvent, ProviderError>>;
+
+        /// 断连注入 provider：每次 `generate_stream` 按序弹出一段脚本；
+        /// 调用计数走共享句柄供断言。`cancel_on_first` 在第一段脚本
+        /// 开播前取消 token（「取消不触发重试」用例）。
+        struct FlakyProvider {
+            scripts: StdMutex<VecDeque<Script>>,
+            calls: Arc<StdMutex<u32>>,
+            cancel_on_first: Option<CancellationToken>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for FlakyProvider {
+            async fn generate(
+                &self,
+                _req: GenerateRequest,
+            ) -> Result<ModelResponse, ProviderError> {
+                Err(ProviderError::ServerError(500))
+            }
+
+            async fn generate_stream(
+                &self,
+                _req: GenerateRequest,
+            ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+                let n = {
+                    let mut c = self.calls.lock().unwrap();
+                    *c += 1;
+                    *c
+                };
+                let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+                let token = self.cancel_on_first.clone();
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    if n == 1 {
+                        if let Some(t) = &token {
+                            t.cancel();
+                        }
+                    }
+                    for ev in script {
+                        let _ = tx.send(ev).await;
+                    }
+                });
+                rx
+            }
+
+            fn provider_name(&self) -> &str {
+                "flaky"
+            }
+        }
+
+        /// 记录型 sink：捕获 broadcast 供断言。
+        #[derive(Default)]
+        struct RecordingSink {
+            broadcasted: StdMutex<Vec<ServerMsg>>,
+        }
+
+        impl MsgSink for RecordingSink {
+            fn broadcast(&self, msg: ServerMsg) {
+                self.broadcasted.lock().unwrap().push(msg);
+            }
+            fn send_to(&self, _conn_id: u64, _msg: ServerMsg) -> bool {
+                true
+            }
+            fn conn_ids(&self) -> Vec<u64> {
+                vec![1]
+            }
+            fn count(&self) -> usize {
+                1
+            }
+            fn close_all(&self) {}
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        fn text_done(text: &str) -> Script {
+            vec![
+                Ok(ModelStreamEvent::Delta(text.to_owned())),
+                Ok(ModelStreamEvent::Usage(Usage {
+                    input_tokens: 8,
+                    output_tokens: 4,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                    image_tokens: None,
+                })),
+                Ok(ModelStreamEvent::Done(ModelResponse {
+                    content: Some(text.to_owned()),
+                    tool_calls: vec![],
+                    reasoning_content: None,
+                    usage: None,
+                    finish_reason: Some("stop".into()),
+                })),
+            ]
+        }
+
+        /// 流中途断连：先流出部分文本，再连接错误（诊断链路的复刻：
+        /// reqwest decode 错 → WebStream → ConnectionError）。
+        fn drop_mid_stream(partial: &str) -> Script {
+            vec![
+                Ok(ModelStreamEvent::Delta(partial.to_owned())),
+                Err(ProviderError::ConnectionError(
+                    "reqwest error: decode error".into(),
+                )),
+            ]
+        }
+
+        fn user_msg(content: &str) -> Message {
+            Message {
+                attachments: None,
+                role: MessageRole::User,
+                content: content.to_owned(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }
+        }
+
+        /// 装配可跑 engine_turn 的 state + manager（模型别名 main 必须
+        /// 可解析——execute_with_run_id 会 resolve 根代理的模型）。
+        /// provider 由调用方注入 engine_turn（脚本/取消形态各异）。
+        fn assemble() -> (Arc<AppState>, Arc<RecordingSink>, RunManager) {
+            let config = parse_openslate_toml(
+                r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#,
+            )
+            .expect("fixture parses");
+            let agents = AgentsConfig {
+                agents: vec![AgentConfig {
+                    hidden_tools: Vec::new(),
+                    id: AgentId("root".into()),
+                    name: "Root".into(),
+                    model: "main".into(),
+                    children: vec![],
+                    tools: vec![],
+                    default_prompt: "root prompt".into(),
+                }],
+            };
+            let agent_tree = AgentTree::from_configs(&agents.agents).expect("tree builds");
+            let manager = RunManager::new(
+                config.clone(),
+                AgentTree::from_configs(&agents.agents).expect("tree builds"),
+                ToolRegistry::new(),
+                SkillsCatalog::default(),
+            );
+            let sink = Arc::new(RecordingSink::default());
+            let factory: ProviderFactory = Arc::new(|_cfg, _alias| {
+                Err(anyhow::anyhow!("engine tests inject the provider directly"))
+            });
+            let inner = CoreInner {
+                session_id: "retry-test-session".into(),
+                session_label: "retry-test".into(),
+                history: vec![user_msg("继续")],
+                transcript: Vec::new(),
+                running: true,
+                compacting: false,
+                depth_cur: 0,
+                agents_running: 0,
+                tool_calls_cur: 0,
+                model_alias: "main".into(),
+                cancel: None,
+                config,
+                agents_cfg: agents,
+                agent_tree,
+                skills: Vec::new(),
+                store: None,
+                session_run: None,
+                manager: None,
+                engine_task: None,
+                paths: ConfigPaths {
+                    active: std::path::PathBuf::from("/dev/null"),
+                    global: None,
+                    local: None,
+                },
+                stats: Default::default(),
+                stream: Default::default(),
+                tool_timers: Default::default(),
+                pending_step_meta: None,
+                last_network_retry: None,
+            };
+            let state = Arc::new(AppState {
+                core: Arc::new(SessionCore::new(inner)),
+                sink: sink.clone() as Arc<dyn MsgSink>,
+                approval: Arc::new(SessionApprovalBridge::new(sink.clone() as Arc<dyn MsgSink>)),
+                auth_token: None,
+                provider_factory: factory,
+                origin: "test",
+                _mcp: Default::default(),
+            });
+            (state, sink, manager)
+        }
+
+        fn flaky(
+            scripts: Vec<Script>,
+            cancel_on_first: Option<CancellationToken>,
+        ) -> (Box<dyn ModelProvider>, Arc<StdMutex<u32>>) {
+            let calls = Arc::new(StdMutex::new(0u32));
+            (
+                Box::new(FlakyProvider {
+                    scripts: StdMutex::new(scripts.into()),
+                    calls: Arc::clone(&calls),
+                    cancel_on_first,
+                }),
+                calls,
+            )
+        }
+
+        /// 跑一个回合（engine_turn 直调；脚本注入 provider）。
+        async fn run_turn(
+            scripts: Vec<Script>,
+        ) -> (Arc<AppState>, Arc<RecordingSink>, Arc<StdMutex<u32>>) {
+            let (provider, calls) = flaky(scripts, None);
+            let (state, sink, manager) = assemble();
+            let history = state.core.lock().history.clone();
+            engine_turn(
+                state.clone(),
+                manager,
+                openslate_core::types::RunId("retry-test-run".into()),
+                provider,
+                history,
+                CancellationToken::new(),
+            )
+            .await;
+            (state, sink, calls)
+        }
+
+        fn turn_error(sink: &RecordingSink) -> Option<(String, Option<TurnErrorKind>)> {
+            sink.broadcasted.lock().unwrap().iter().find_map(|m| {
+                if let ServerMsg::TurnError { message, kind } = m {
+                    Some((message.clone(), *kind))
+                } else {
+                    None
+                }
+            })
+        }
+
+        fn has_retry_notice(sink: &RecordingSink) -> bool {
+            sink.broadcasted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMsg::Notice { text, .. } if text.contains("自动重试")))
+        }
+
+        fn transcript_texts(state: &Arc<AppState>) -> Vec<String> {
+            state.core
+                .lock()
+                .transcript
+                .iter()
+                .map(|e| match e {
+                    EntryDto::Meta { text }
+                    | EntryDto::Assistant { text }
+                    | EntryDto::Reasoning { text }
+                    | EntryDto::User { text, .. } => text.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn network_error_retries_and_succeeds() {
+            // 第一次流中途断连（部分文本已流出），第二次成功 → 回合成功、
+            // 转写保留部分文本 + Meta 标记、无 TurnError。
+            let (state, sink, calls) = run_turn(vec![
+                drop_mid_stream("部分流出"),
+                text_done("完整回答"),
+            ])
+            .await;
+
+            assert_eq!(*calls.lock().unwrap(), 2, "one retry after the drop");
+            assert!(
+                sink.broadcasted.lock().unwrap().iter().any(|m| matches!(m, ServerMsg::TurnOk { .. })),
+                "turn must succeed after retry"
+            );
+            assert!(turn_error(&sink).is_none(), "no TurnError expected");
+            assert!(has_retry_notice(&sink), "retry Notice broadcast");
+
+            let texts = transcript_texts(&state);
+            assert!(texts.contains(&"部分流出".to_owned()), "partial text kept: {texts:?}");
+            assert!(texts.contains(&RETRY_META_TEXT.to_owned()), "Meta marker: {texts:?}");
+            assert!(texts.contains(&"完整回答".to_owned()), "final answer: {texts:?}");
+
+            // 重跑是全新生成：history = user + 完整回答（部分文本不进
+            // history——Err 尝试的产物被丢弃）。
+            let history = state.core.lock().history.clone();
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[1].content, "完整回答");
+
+            // 冷却时间戳已记账（下一回合 10s 内不再网络重试）。
+            assert!(state.core.lock().last_network_retry.is_some());
+
+            // manager 回家、running 复位。
+            let inner = state.core.lock();
+            assert!(inner.manager.is_some());
+            assert!(!inner.running);
+        }
+
+        #[tokio::test]
+        async fn retry_budget_is_one() {
+            // 两次都断 → 重试 1 次后走终态：TurnError kind=network，
+            // message 含重试字样。
+            let (state, sink, calls) =
+                run_turn(vec![drop_mid_stream("甲"), drop_mid_stream("乙")]).await;
+
+            assert_eq!(*calls.lock().unwrap(), 2, "budget = 1 retry (2 attempts total)");
+            let (message, kind) = turn_error(&sink).expect("TurnError terminal");
+            assert_eq!(kind, Some(TurnErrorKind::Network));
+            assert!(message.contains("已自动重试 1 次"), "message: {message}");
+            assert!(has_retry_notice(&sink));
+            let texts = transcript_texts(&state);
+            assert!(texts.contains(&RETRY_META_TEXT.to_owned()), "Meta marker: {texts:?}");
+
+            // 失败保留 history 现状（user 消息仍在，可重发）。
+            let history = state.core.lock().history.clone();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].role, MessageRole::User);
+        }
+
+        #[tokio::test]
+        async fn non_network_error_does_not_retry() {
+            // Auth 错误（401/403/key 无效类）不重试：1 次调用即终态。
+            let (state, sink, calls) = run_turn(vec![vec![Err(ProviderError::AuthError(
+                "bad key".into(),
+            ))]])
+            .await;
+
+            assert_eq!(*calls.lock().unwrap(), 1, "auth errors are not retried");
+            let (message, kind) = turn_error(&sink).expect("TurnError terminal");
+            assert_eq!(kind, Some(TurnErrorKind::Auth));
+            assert!(!message.contains("已自动重试"), "message: {message}");
+            assert!(!has_retry_notice(&sink));
+            assert!(!transcript_texts(&state).contains(&RETRY_META_TEXT.to_owned()));
+        }
+
+        #[tokio::test]
+        async fn cooldown_window_suppresses_retry() {
+            // 会话级冷却：上一刻刚发生过网络重试（时间戳距今 < 10s 窗）
+            // → 本次断连不再重试，直接终态（防网络瘫痪时空转）。
+            let (provider, calls) = flaky(vec![drop_mid_stream("部分")], None);
+            let (state, sink, manager) = assemble();
+            state.core.lock().last_network_retry = Some(std::time::Instant::now());
+            let history = state.core.lock().history.clone();
+            engine_turn(
+                state.clone(),
+                manager,
+                openslate_core::types::RunId("cooldown-run".into()),
+                provider,
+                history,
+                CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(*calls.lock().unwrap(), 1, "cooldown suppresses the retry");
+            let (message, kind) = turn_error(&sink).expect("TurnError terminal");
+            assert_eq!(kind, Some(TurnErrorKind::Network));
+            assert!(!message.contains("已自动重试"), "message: {message}");
+            assert!(!has_retry_notice(&sink));
+            assert!(!transcript_texts(&state).contains(&RETRY_META_TEXT.to_owned()));
+        }
+
+        #[tokio::test]
+        async fn cancel_does_not_trigger_retry() {
+            // 取消与断连同刻竞态：token 在第一段脚本开播前被取消，脚本
+            // 仍报流中途 ConnectionError。无论 runtime 把它收成
+            // Interrupted（Ok 路径）还是 Err（ConnectionError），都不得
+            // 重试：恰好 1 次调用、无重试 Notice、无 Meta 标记。
+            let cancel = CancellationToken::new();
+            let (provider, calls) = flaky(vec![drop_mid_stream("部分")], Some(cancel.clone()));
+            let (state, sink, manager) = assemble();
+            let history = state.core.lock().history.clone();
+            engine_turn(
+                state.clone(),
+                manager,
+                openslate_core::types::RunId("cancel-run".into()),
+                provider,
+                history,
+                cancel,
+            )
+            .await;
+
+            assert_eq!(*calls.lock().unwrap(), 1, "cancel suppresses the retry");
+            assert!(!has_retry_notice(&sink));
+            assert!(!transcript_texts(&state).contains(&RETRY_META_TEXT.to_owned()));
+            // 回合必须收尾（TurnOk=Interrupted 或 TurnError，取决于
+            // select 竞态胜负——两者都是「不重试的终态」）。
+            let broadcasted = sink.broadcasted.lock().unwrap().clone();
+            assert!(
+                broadcasted
+                    .iter()
+                    .any(|m| matches!(m, ServerMsg::TurnOk { .. } | ServerMsg::TurnError { .. })),
+                "turn must terminate: {:?}",
+                broadcasted
+                    .iter()
+                    .map(|m| match m {
+                        ServerMsg::TurnOk { .. } => "turn_ok".to_owned(),
+                        ServerMsg::TurnError { .. } => "turn_error".to_owned(),
+                        ServerMsg::Notice { .. } => "notice".to_owned(),
+                        _ => "other".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // ── 分类（classify_turn_error）单元 ──────────────────────────
+
+        #[test]
+        fn classification_typed_drilldown() {
+            use openslate_core::error::{OpenSlateError as E, ProviderError as P, RuntimeError as R};
+            let cases: Vec<(E, TurnErrorKind)> = vec![
+                (E::from(P::ConnectionError("reset".into())), TurnErrorKind::Network),
+                (
+                    E::from(P::RetryExhausted {
+                        attempts: 3,
+                        last: "connection error: connection reset by peer".into(),
+                    }),
+                    TurnErrorKind::Network,
+                ),
+                (
+                    E::from(P::RetryExhausted {
+                        attempts: 3,
+                        last: "rate limit exceeded".into(),
+                    }),
+                    TurnErrorKind::RateLimit,
+                ),
+                (E::from(P::RateLimit), TurnErrorKind::RateLimit),
+                (E::from(P::ServerError(429)), TurnErrorKind::RateLimit),
+                (E::from(P::AuthError("bad key".into())), TurnErrorKind::Auth),
+                (E::from(P::ServerError(401)), TurnErrorKind::Auth),
+                (E::from(P::ServerError(403)), TurnErrorKind::Auth),
+                (
+                    E::from(P::MalformedResponse("bad json".into())),
+                    TurnErrorKind::Model,
+                ),
+                (E::from(P::NotFound("model-x".into())), TurnErrorKind::Model),
+                (
+                    E::from(R::EmptyResponse {
+                        step: 1,
+                        agent_id: "root".into(),
+                        model_alias: "main".into(),
+                    }),
+                    TurnErrorKind::Model,
+                ),
+                (
+                    E::from(R::MaxStepsExceeded { max: 100 }),
+                    TurnErrorKind::Other,
+                ),
+                (E::from(P::Timeout), TurnErrorKind::Other),
+                (E::Validation("bad".into()), TurnErrorKind::Other),
+            ];
+            for (err, want) in cases {
+                assert_eq!(classify_turn_error(&err), want, "error: {err}");
+            }
         }
     }
 }

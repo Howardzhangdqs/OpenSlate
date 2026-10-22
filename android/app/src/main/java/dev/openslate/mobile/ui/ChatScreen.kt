@@ -947,6 +947,9 @@ private const val NATIVE_BASH_TOOL = "bash"
 private fun isBashLikeTool(name: String): Boolean =
     name == TERMUX_BASH_TOOL || name == NATIVE_BASH_TOOL
 
+/** output_query 工具注册名（与 Rust 侧 OUTPUT_QUERY_TOOL 一一绑定）。 */
+private const val OUTPUT_QUERY_TOOL = "output_query"
+
 /**
  * 解析 bash 类工具 fullArgs 的 command 字段（参数形状 `{"command": "..."}`，
  * bash 另有可选 timeout_ms）。命中返回 (命令文本, 其余参数 pretty JSON)——
@@ -961,6 +964,46 @@ private fun parseBashCommand(fullArgs: String): Pair<String, String>? = try {
     } else {
         obj.remove("command")
         cmd to if (obj.length() > 0) obj.toString(2) else ""
+    }
+} catch (_: Exception) {
+    null
+}
+
+/**
+ * output_query 参数 → 人类可读摘要（参数形状与 Rust 侧 schema 一致：ref 必填，
+ * op ∈ head/tail/lines/grep/wc；head/tail 带可选 n（默认 50），lines 带
+ * start/end，grep 带 pattern / ignore_case）。命中返回 (ref, 摘要)——ref 是
+ * 会话内短 id，摘要已把它嵌进句子（如 `out-1 的第 120-140 行`）。fullArgs
+ * 空 / 非 JSON / 缺 ref / 未知或缺 op / 子参数不完整（如 lines 缺行号、grep
+ * 缺 pattern）返回 null（调用方回退原始 argsPreview 展示，信息不丢）。
+ */
+internal fun describeOutputQueryArgs(fullArgs: String): Pair<String, String>? = try {
+    val obj = JSONObject(fullArgs)
+    val ref = obj.optString("ref")
+    if (ref.isBlank()) {
+        null
+    } else {
+        val summary = when (obj.optString("op")) {
+            "head" -> "$ref 的开头 ${obj.optInt("n", 50)} 行"
+            "tail" -> "$ref 的结尾 ${obj.optInt("n", 50)} 行"
+            "lines" -> {
+                val start = obj.optInt("start", -1)
+                val end = obj.optInt("end", -1)
+                when {
+                    start < 0 || end < 0 -> null
+                    start == end -> "$ref 的第 $start 行"
+                    else -> "$ref 的第 $start-$end 行"
+                }
+            }
+            "grep" -> obj.optString("pattern").takeIf { it.isNotBlank() }?.let { pattern ->
+                val shown = if (pattern.length > 30) pattern.take(30) + "…" else pattern
+                val caseNote = if (obj.optBoolean("ignore_case", false)) "（忽略大小写）" else ""
+                "在 $ref 中搜索「$shown」$caseNote"
+            }
+            "wc" -> "$ref 的行数与字节统计"
+            else -> null
+        }
+        summary?.let { ref to it }
     }
 } catch (_: Exception) {
     null
@@ -1029,7 +1072,9 @@ private fun ToolGroupCard(parts: List<UiEntry>, onOpenTool: (UiEntry.ToolCall) -
  * 自动回退系统字体）。bash 类工具（termux_bash / bash）的摘要槽改显实际
  * 命令（解析 fullArgs 的 command 字段）：等宽单行截断 + 前缀区分执行环境
  * （termux_bash 挂 Termux 品牌 logo、bash 挂 `$` 提示符——命令文本语义，
- * 非图标）；解析失败回退原 argsPreview。
+ * 非图标）；output_query 的摘要槽改显人类可读摘要（自然语言句子，用默认
+ * 字体 labelSmall 而非 MonoFont——人话不是代码）。解析失败一律回退原
+ * argsPreview。
  */
 @Composable
 private fun ToolChipRow(
@@ -1062,6 +1107,11 @@ private fun ToolChipRow(
     // argsPreview 展示。
     val bashCmd = remember(tc.name, tc.fullArgs) {
         if (isBashLikeTool(tc.name)) parseBashCommand(tc.fullArgs) else null
+    }
+    // output_query 人类可读摘要（remember 缓存，照 bashCmd 同款）。null =
+    // 解析失败/参数不完整，回退原 argsPreview 展示。
+    val outputQueryDesc = remember(tc.name, tc.fullArgs) {
+        if (tc.name == OUTPUT_QUERY_TOOL) describeOutputQueryArgs(tc.fullArgs) else null
     }
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -1115,6 +1165,17 @@ private fun ToolChipRow(
             Text(
                 if (tc.name == NATIVE_BASH_TOOL) "\$ " + bashCmd.first else bashCmd.first,
                 style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFont),
+                color = MaterialTheme.colorScheme.outline,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        } else if (outputQueryDesc != null) {
+            // output_query 摘要：自然语言句子用默认字体（非 MonoFont——人话
+            // 不是代码）；摘要本身已把 ref 短 id 嵌进句子，直接展示不重复拼。
+            Text(
+                outputQueryDesc.second,
+                style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.outline,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,

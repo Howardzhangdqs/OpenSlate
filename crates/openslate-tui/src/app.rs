@@ -3091,6 +3091,9 @@ max_output_bytes = 10_000
                 max_context_messages: limits.map(|l| l.max_context_messages).unwrap_or(200),
                 max_context_bytes: limits.map(|l| l.max_context_bytes).unwrap_or(512000),
                 max_output_bytes: limits.map(|l| l.max_output_bytes).unwrap_or(65536),
+                output_store_threshold: limits
+                    .map(|l| l.output_store_threshold)
+                    .unwrap_or(16384),
                 auto_compact: limits.map(|l| l.auto_compact).unwrap_or(true),
                 parallel_tool_calls: limits.map(|l| l.parallel_tool_calls).unwrap_or(true),
             },

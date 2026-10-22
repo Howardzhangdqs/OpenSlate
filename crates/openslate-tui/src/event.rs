@@ -359,6 +359,7 @@ mod tests {
                 max_context_messages: 200,
                 max_context_bytes: 512000,
                 max_output_bytes: 65536,
+                output_store_threshold: 16384,
                 auto_compact: true,
                 parallel_tool_calls: true,
             },

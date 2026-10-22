@@ -615,7 +615,14 @@ pub fn fold_tool_outcomes(inner: &mut CoreInner, messages: &[Message]) {
                     };
                     *status = ToolStatusDto::Done {
                         bytes: msg.content.len(),
-                        truncated: msg.content.contains("[TRUNCATED:"),
+                        // 截断/落盘双标记：旧 limit 截断（"[TRUNCATED:"）或
+                        // 长输出落盘预览（core `STORED_OUTPUT_MARKER`，
+                        // C3——落盘预览同样意味着 UI 直读的不是全文，详情
+                        // 弹窗经 tool_output_by_call_id 全文闭环）。
+                        truncated: msg.content.contains("[TRUNCATED:")
+                            || msg
+                                .content
+                                .contains(openslate_core::output_store::STORED_OUTPUT_MARKER),
                         elapsed_ms: elapsed,
                     };
                 }

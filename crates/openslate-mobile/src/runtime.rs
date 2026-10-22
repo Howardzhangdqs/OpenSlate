@@ -190,6 +190,16 @@ impl MobileRuntime {
         // 从 files 按需回填 data（单点执行 max_inline_total_mb 封顶）。
         // store 装配后才存在 → OnceLock 后注。
         let attachment_store: crate::attachments::SharedStore = Arc::new(std::sync::OnceLock::new());
+        // 长输出落盘 storer（C3）：core 工具输出分叉点的宿主实现。store
+        // 同样经 OnceLock 后注（AttachmentDataProxy 同款接缝，共用
+        // SharedStore 类型）；进程级单槽注册一次全进程生效，**shutdown
+        // 无需清理**（mobile 单进程 App，随进程生灭；桌面端不注册，core
+        // 直通旧截断路径）。
+        let output_store_handle: crate::attachments::SharedStore =
+            Arc::new(std::sync::OnceLock::new());
+        openslate_core::output_store::set_tool_output_storer(Some(Arc::new(
+            crate::output_storer::MobileOutputStorer::new(output_store_handle.clone()),
+        )));
         let inner_factory = opts
             .provider_factory
             .unwrap_or_else(|| mobile_provider_factory(secrets.clone()));
@@ -235,6 +245,8 @@ impl MobileRuntime {
         // 的 store 同步后注（provider 工厂闭包持有 OnceLock）。
         if let Some(store) = state.core.lock().store.clone() {
             let _ = attachment_store.set(Arc::new(store.clone()));
+            // 长输出 storer 的 store 同步后注（与附件代理同一注入点）。
+            let _ = output_store_handle.set(Arc::new(store.clone()));
             rt.block_on(vault.attach_store(store));
         }
         // 输出脱敏接线：core 的进程级 masker 消费 vault 已知密钥值；
@@ -2079,6 +2091,13 @@ async fn assemble_state(
             Ok(n) if n > 0 => crate::alog!("attachments: GC 清扫 {n} 条过期暂存附件"),
             Ok(_) => {}
             Err(e) => crate::alog!("attachments: startup GC failed (non-fatal): {e}"),
+        }
+        // 长输出孤儿文件 GC（C3）：清 files/outputs 下无行引用的文件
+        //（收敛「文件写成功、行未落」的崩溃窗口）。失败仅告警。
+        match store.gc_orphan_output_files().await {
+            Ok(n) if n > 0 => crate::alog!("outputs: GC 清扫 {n} 个孤儿输出文件"),
+            Ok(_) => {}
+            Err(e) => crate::alog!("outputs: startup GC failed (non-fatal): {e}"),
         }
     }
 

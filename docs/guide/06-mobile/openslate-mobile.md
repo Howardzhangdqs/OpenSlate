@@ -21,7 +21,7 @@ Kotlin (UniFFI callback)◄──EventSink(单队列+泵线程)──┐
 MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ──► LLM
 ```
 
-## 2. 模块一览（11 个模块 + lib.rs）
+## 2. 模块一览（12 个模块 + lib.rs）
 
 | 模块 | 行数 | 关键导出 | 职责 |
 |------|------|---------|------|
@@ -38,6 +38,7 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/attachments.rs` | ~1400 | `import_attachment`、`sniff_mime`、`normalize_image`（header 快速通道 + 迭代压缩）、`gate_submit_attachments`、`AttachmentDataProxy`、`refill_message_attachment_data` | 附件 ingest（多模态输入，存储 v5 §3）：magic-byte 嗅探 → sha256 content-addressing → 图像归一化（小图 JPEG/PNG header-only 零转码 passthrough；其余按用户双旋钮**迭代压缩达标** q85→70→55 → ×0.85 缩边，地板 1024）→ 视频 passthrough → 落盘；Submit 门控矩阵；请求路径字节装载代理（见 §12）。**导入纯本地零网络**（token 数由响应侧回填，见 §12.5）；全程分段耗时日志 |
 | `src/transcripts.rs` | ~640 | `SyncState`（`persist_range`/`flush_now`/`invalidate`）、`sync_loop`、`rebuild_transcript`、`heal_truncated_tail`、`DANGLING_TAIL_META`/`INCOMPLETE_TURN_META`/`HEAL_META` | transcript 持久化（存储 v5 §4 + 历史转写丢失修复 C1/C3）：SyncState 收口的增量同步 + 三个高危时刻的强制冲刷 + 两级重建（entries 优先 / 消息投影回退 / 截断自愈）+ 存储健康横幅（见 §13）；sync_loop 兼附件 tokens 回填消费点（见 §12.5） |
 | `src/attachment_tokens.rs` | ~330 | `AttachmentTokenBackfill`、`overlay_tokens_from_messages` | 附件 image tokens **响应侧回填**（协议 v5）：EventSink tap 闩首次调用值 → sync_loop 落 transcript → 重开经 messages.meta_json 重放（见 §12.5） |
+| `src/output_storer.rs` | ~200 | `MobileOutputStorer` | 长输出落盘 storer（长输出落盘 + output_query C3）：实现 core `ToolOutputStorer` 接缝——超限工具输出 sha256 寻址 → zstd-3 压缩 → store v6 `tool_outputs` 行 + `files/outputs/{sha}.zst`；任何失败返回 `None`（core 回落旧截断路径，绝不失败回合）。store 经 `SharedStore`（OnceLock 后注，AttachmentDataProxy 同款接缝）在 assemble_state 后由 create_with 注入；进程级单槽 `set_tool_output_storer` 随进程生灭（shutdown 无需清理）；装配启动序列挂 `gc_orphan_output_files`（失败仅告警） |
 | `src/registry.rs` | 541+ | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新）；`supports_video`（models.dev modalities 直读——Submit 门控的 video 维） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
 
@@ -343,7 +344,7 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 
 ### 12.4 启动 GC
 
-`assemble_state` 启动清扫块末尾调 `store.gc_stale_unbound_attachments(now_ms)`：删 7 天前导入未发送的暂存行 + 对应文件清扫（失败仅告警）。
+`assemble_state` 启动清扫块末尾调 `store.gc_stale_unbound_attachments(now_ms)`：删 7 天前导入未发送的暂存行 + 对应文件清扫（失败仅告警）。其后调 `store.gc_orphan_output_files()`（长输出 C3）：清 `files/outputs/` 下无行引用的文件（收敛「文件写成功、行未落」崩溃窗口），失败仅告警。
 
 ### 12.5 附件 image tokens 响应侧回填（协议 v5，2026-10-21）
 

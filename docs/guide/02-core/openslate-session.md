@@ -77,7 +77,7 @@ pub struct CoreInner {
 | `flush_stream(inner)`（:321） | 冲刷 answer/reasoning 缓冲为条目（reasoning 先于 answer；空白丢弃）+ 冲 pending_step_meta |
 | `tool_start_entry(inner, name, args, call_id)`（:344） | call_agent 走 `Delegate{agent, done:false}` + 深度/计数增；其余 push `ToolCall{call_id, status: Running, detail.args=capped}` + tool_timers 计时 |
 | `tool_end_entry(inner, name, bytes, truncated, call_id)`（:372） | 配对**call_id 精确匹配优先**（身份匹配，不受状态限制），任一侧缺失 → 最后一条同名 Running（历史行为）；call_agent 额外 FIFO 完成最老未完成 Delegate |
-| `fold_tool_outcomes(inner, messages)`（:409） | 回合 Tool 消息折叠：`msg.tool_call_id == entry.call_id` **身份匹配优先**（回合全量历史重放幂等，Failed 条目折合自身不错位），任一侧缺失 → **名字 + FIFO**配对（游标 = 扫描起点，TUI 同款语义；旧「过滤后 nth(count)」双重计数会丢同名第 2+ 个结果，已随本轮修正）；成功精化保住 live elapsed；失败标记翻转 Failed；输出全文留存 8KB；孤儿结果 debug 日志丢弃 |
+| `fold_tool_outcomes(inner, messages)`（:409） | 回合 Tool 消息折叠：`msg.tool_call_id == entry.call_id` **身份匹配优先**（回合全量历史重放幂等，Failed 条目折合自身不错位），任一侧缺失 → **名字 + FIFO**配对（游标 = 扫描起点，TUI 同款语义；旧「过滤后 nth(count)」双重计数会丢同名第 2+ 个结果，已随本轮修正）；成功精化保住 live elapsed；失败标记翻转 Failed；输出全文留存 8KB；孤儿结果 debug 日志丢弃。`truncated` 判定 = `"[TRUNCATED:"`（旧 limit 截断）**或** core `STORED_OUTPUT_MARKER`（长输出落盘预览，C3——预览同样非全文，详情弹窗走全文闭环） |
 | `approval_summary(req)`（:470） | 转接 protocol 的 From |
 
 ## 2. engine.rs

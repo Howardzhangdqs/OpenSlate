@@ -595,7 +595,7 @@ T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user
   + 尾 ≤1024B；UTF-8 字符边界安全；status=Truncated）
         │
         ├─► 模型侧取回：output_query 工具（mobile output_query.rs，C4）
-        │     ref 校验（out-+1..16hex）→ find_tool_output(当前 run_id, ref)
+        │     ref 校验（out-+数字）→ find_tool_output(当前 run_id, ref)
         │     【严格会话隔离：(run, ref) 精确匹配，跨 run 的 ref 不可解析
         │       ——错误文案注明 ref 仅本会话内有效】
         │     → read_tool_output_bytes → zstd 解压 → len==orig_bytes 完整性校验
@@ -707,7 +707,7 @@ core runtime 发射 on_tool_start/on_tool_end（带 &tc.id.0）
                 锁 state.core → 扫 CoreInner.history
                 role==Tool && tool_call_id==Some(call_id) → clone content（解锁后再展开）
                 content 带 [STORED OUTPUT ref="out-… 标记（长输出落盘预览，C6）→
-                  parse_stored_output_ref（core STORED_OUTPUT_MARKER 定位，1..16 hex）
+                  parse_stored_output_ref（core STORED_OUTPUT_MARKER 定位，数字短 id）
                   → store.find_tool_output(当前 run_id, ref)
                     【严格会话隔离：(run, ref) 精确匹配；无当前 run / ref 属其他
                       会话 → 查无行 → 回落预览】

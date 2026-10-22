@@ -8,7 +8,7 @@
 //!
 //! ## 数据链（与 C6 详情弹窗 `tool_output_by_call_id` 同源）
 //!
-//! `ref` 校验（`out-` + 1..16 hex）→ `find_tool_output(当前 run_id, ref)`
+//! `ref` 校验（`out-` + 1..16 位数字）→ `find_tool_output(当前 run_id, ref)`
 //! （**严格会话隔离**：`(run_id, ref)` 精确匹配，一个 run 的 ref 不能被
 //! 其他 run 解析——用户拍板 2026-10-22）→ 无行返回 status=Error 文案
 //! （含期望格式与「ref 仅本会话内有效」提示）→
@@ -224,7 +224,7 @@ enum Op {
 
 /// 校验 + 归一化后的查询（错误文案直接回喂模型自纠）。
 struct ParsedQuery {
-    /// 完整 ref（`out-N` 会话内自增短 id；`out-` + 1..16 位 hex）。
+    /// 完整 ref（`out-N` 会话内自增短 id；`out-` + 1..16 位数字）。
     ref_id: String,
     op: Op,
     /// head/tail 行数（已含缺省 50 与 1..=2000 钳制校验）。
@@ -237,7 +237,7 @@ struct ParsedQuery {
 }
 
 /// `ref` 期望格式提示（参数错误与未知 ref 共用；注明会话内有效）。
-const REF_HINT: &str = "expected \"out-\" followed by 1 to 16 hex characters (e.g. \"out-3\") \
+const REF_HINT: &str = "expected \"out-\" followed by 1 to 16 digits (e.g. \"out-3\") \
 taken from the '[STORED OUTPUT ref=\"out-...\" ...]' marker in a previous tool result; \
 refs are only valid within the current session";
 
@@ -259,8 +259,8 @@ fn parse_query(args: &Value) -> Result<ParsedQuery, String> {
         .and_then(|r| r.as_str())
         .ok_or_else(|| format!("'ref' is required; {REF_HINT}"))?
         .to_owned();
-    let ref_ok = ref_id.strip_prefix("out-").is_some_and(|hex| {
-        !hex.is_empty() && hex.len() <= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    let ref_ok = ref_id.strip_prefix("out-").is_some_and(|digits| {
+        !digits.is_empty() && digits.len() <= 16 && digits.bytes().all(|b| b.is_ascii_digit())
     });
     if !ref_ok {
         return Err(format!("'ref' has an invalid format ({ref_id:?}); {REF_HINT}"));
@@ -1102,12 +1102,13 @@ model = "m"
         let t = tool(&store).await;
 
         let cases: Vec<(Value, &str)> = vec![
-            // ref 缺失 / 格式非法（1..16 hex 边界）。
+            // ref 缺失 / 格式非法（1..16 位数字边界；旧 16hex 不兼容）。
             (json!({ "op": "wc" }), "'ref' is required"),
             (args("not-a-ref", "wc", json!({})), "invalid format"),
             (args("out-zzzz", "wc", json!({})), "invalid format"),
             (args("out-", "wc", json!({})), "invalid format"),
-            (args(&format!("out-{}", "a".repeat(17)), "wc", json!({})), "invalid format"),
+            (args("out-ab12cd34ef56ab78", "wc", json!({})), "invalid format"),
+            (args(&format!("out-{}", "1".repeat(17)), "wc", json!({})), "invalid format"),
             // op 非法。
             (args(&ref_id, "middle", json!({})), "must be one of"),
             (json!({ "ref": ref_id }), "'op' is required"),

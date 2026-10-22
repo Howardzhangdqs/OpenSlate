@@ -167,7 +167,7 @@ ask_user 持久凭据（v4）：`upsert_credential`（:790，name 主键 upsert�
 | **`get_attachment(id)`** | :840（v5） | 单条附件元数据 |
 | **`list_run_attachments(run_id)`** | :857（v5） | run 的附件清单（created_at, id 稳定序） |
 | **`list_transcript_entries(run_id)`** | :878（v5） | run 的转写条目按 seq 升序；**空结果 = v5 前的 run 或无条目——调用方回退 message 投影（设计 §4 两级策略）** |
-| **`find_tool_output(run_id, ref_id)`** | v7 | **严格会话隔离**：`(run_id, ref)` 精确匹配（`WHERE run_id = ? AND ref = ?`）——一个 run 的 ref 不能被其他 run 解析，跨 run 同 ref（各自 `out-1`）互不可见，**无「当前 run 优先 / 任意 run 回落」路径**；ref 形状 = `out-` + 1..16 hex（格式非法 Err）；未命中 None（调用方回落消息 content 原文或报未知 ref） |
+| **`find_tool_output(run_id, ref_id)`** | v7 | **严格会话隔离**：`(run_id, ref)` 精确匹配（`WHERE run_id = ? AND ref = ?`）——一个 run 的 ref 不能被其他 run 解析，跨 run 同 ref（各自 `out-1`）互不可见，**无「当前 run 优先 / 任意 run 回落」路径**；ref 形状 = `out-` + 1..16 位数字（只收新形态，旧 16hex 不兼容；格式非法 Err）；未命中 None（调用方回落消息 content 原文或报未知 ref） |
 | **`find_tool_output_by_sha(run_id, sha256)`** | v7 | storer 幂等路径：同 run 同 sha 命中 → 带回该行真实 ref（同内容同 ref，序号不跳号）；sha 必须 64 hex |
 | **`max_tool_output_ref_num(run_id) -> i64`** | v7 | 该 run 现有 ref 序号最大值（无可解析行 → 0）；storer 分配下一个 ref 用 max+1（写入路径串行，撞号由唯一索引兜底） |
 | **`read_tool_output_bytes(sha256)`** | v6 | 读 `files/outputs/{sha256}.zst` **压缩字节**（解压与 orig_bytes 校验归调用方）；sha 必须全 64 hex（防路径拼接）；文件缺失 Ok(None)；内存库 Ok(None) |

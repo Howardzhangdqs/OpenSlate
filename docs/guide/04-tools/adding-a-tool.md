@@ -181,7 +181,7 @@ mcp-builtin 路线是两条不同的注册通路：没有 `[builtin_tools]` 开�
 
 | 参数 | 类型 | 语义 |
 |------|------|------|
-| `ref` | string | 落盘输出引用 `out-` + 1..16 hex（会话内自增短 id，如 `out-3`），取自**本会话**上一条工具结果里的 `[STORED OUTPUT ref="out-…" …]` 标记——**ref 仅在本会话内有效**，跨会话查询返回未知 ref 错误 |
+| `ref` | string | 落盘输出引用 `out-` + 1..16 位数字（会话内自增短 id，如 `out-3`），取自**本会话**上一条工具结果里的 `[STORED OUTPUT ref="out-…" …]` 标记——**ref 仅在本会话内有效**，跨会话查询返回未知 ref 错误 |
 | `op` | enum | `head`（前 N 行）/ `tail`（末 N 行）/ `lines`（行区间，1-based 闭区间）/ `grep`（带行号正则）/ `wc`（行/字节计数） |
 | `n` | int | head/tail 行数（默认 50，上限 2000） |
 | `start` / `end` | int | lines 区间（1-based，inclusive） |

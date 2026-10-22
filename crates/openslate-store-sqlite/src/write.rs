@@ -720,7 +720,8 @@ impl SqliteStore {
     /// （不存在才写），再插 `tool_outputs` 行。
     ///
     /// - `ref_id`：**会话内唯一**短 id（`out-N`，调用方 storer 按 run 内
-    ///   自增序号分配；查询侧收 `out-` + 1..16 hex 形态）；
+    ///   自增序号分配；查询侧收 `out-` + 1..16 位数字形态，不做旧
+    ///   16hex 兼容）；
     /// - `data_zst`：**调用方传入的已压缩字节**（sha256 是原文的 sha，
     ///   store 信任不复算、不感知压缩参数）；
     /// - 同 run 同 sha 幂等：`ON CONFLICT(run_id, sha256) DO UPDATE` 仅

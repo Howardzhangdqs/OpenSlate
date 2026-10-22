@@ -939,20 +939,20 @@ impl SqliteStore {
 
     // ── 工具长输出（v6 表 / v7 ref 列）──────────────────────────────
 
-    /// `ref` 形状校验（v7）：`out-` + **1..16 位 hex**（新序号 `out-3`
-    /// 与手工造的长形态都收；格式非法直接报错，bind 传参，值不进 SQL
-    /// 文本）。
+    /// `ref` 形状校验（v7）：`out-` + **1..16 位数字**（会话内自增序号；
+    /// 格式非法直接报错，bind 传参，值不进 SQL 文本）。不做旧 16hex
+    /// 形态兼容（开发期拍板：破坏性更新，不做兼容迁移）。
     fn validate_tool_output_ref(ref_id: &str) -> Result<(), StoreError> {
         match ref_id.strip_prefix("out-") {
-            Some(hex)
-                if !hex.is_empty()
-                    && hex.len() <= 16
-                    && hex.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            Some(digits)
+                if !digits.is_empty()
+                    && digits.len() <= 16
+                    && digits.bytes().all(|b| b.is_ascii_digit()) =>
             {
                 Ok(())
             }
             _ => Err(StoreError::QueryError(format!(
-                "invalid tool output ref (expected \"out-\" followed by 1-16 hex chars): '{ref_id}'"
+                "invalid tool output ref (expected \"out-\" followed by 1-16 digits): '{ref_id}'"
             ))),
         }
     }
@@ -1867,16 +1867,16 @@ mod tests {
         }
 
         // 两个 run 各自的 out-1（不同 sha）；run-a 另有 out-2 与一条
-        // 长形态 ref（16 hex）——格式上界一并覆盖。
+        // 长形态 ref（16 位数字）——格式上界一并覆盖。
         let sha_a: String = "a".repeat(64);
         let sha_b: String = "b".repeat(64);
         let sha_d: String = "d".repeat(64);
         let sha_legacy: String = "a1b2".to_owned() + &"c".repeat(60);
-        let legacy_ref = format!("out-{}", &sha_legacy[..16]);
+        let long_ref = "out-1234567890123456"; // 16 位数字（格式上界）
         for (id, run, ref_id, sha, at) in [
             ("out-a", "run-a", "out-1", sha_a.as_str(), 1500i64),
             ("out-b", "run-b", "out-1", sha_b.as_str(), 2500),
-            ("out-c", "run-a", legacy_ref.as_str(), sha_legacy.as_str(), 3500),
+            ("out-c", "run-a", long_ref, sha_legacy.as_str(), 3500),
             ("out-d", "run-a", "out-2", sha_d.as_str(), 4500),
         ] {
             sqlx::query(
@@ -1915,9 +1915,9 @@ mod tests {
         assert_eq!(record.run_id, "run-b");
         assert_eq!(record.sha256, sha_b);
 
-        // 长形态 ref（16 hex 上界）同样精确命中
+        // 长形态 ref（16 位数字上界）同样精确命中
         let record = store
-            .find_tool_output("run-a", &legacy_ref)
+            .find_tool_output("run-a", long_ref)
             .await
             .expect("find")
             .expect("hit");
@@ -1934,11 +1934,11 @@ mod tests {
         );
         assert!(
             store
-                .find_tool_output("run-b", &legacy_ref)
+                .find_tool_output("run-b", long_ref)
                 .await
                 .expect("find")
                 .is_none(),
-            "run-a 的 legacy ref 在 run-b 不可解析"
+            "run-a 的长形态 ref 在 run-b 不可解析"
         );
         // 双方都没有的 ref → None
         assert!(
@@ -1949,16 +1949,24 @@ mod tests {
                 .is_none()
         );
 
-        // 非法形状 → Err（缺前缀 / 空 hex / 超 16 位 / 非 hex）
+        // 非法形状 → Err（缺前缀 / 空 ref / 超上界 / 非数字——旧 16hex
+        // 形态不做兼容，含字母一律拒）
         assert!(store.find_tool_output("run-a", "out-").await.is_err());
         assert!(store.find_tool_output("run-a", "1").await.is_err());
         assert!(
             store
-                .find_tool_output("run-a", &format!("out-{}", "a".repeat(17)))
+                .find_tool_output("run-a", &format!("out-{}", "1".repeat(17)))
                 .await
                 .is_err()
         );
         assert!(store.find_tool_output("run-a", "out-zzzz").await.is_err());
+        assert!(
+            store
+                .find_tool_output("run-a", "out-ab12cd34ef56ab78")
+                .await
+                .is_err(),
+            "旧 16hex 形态（含字母）不做兼容"
+        );
     }
 
     /// 按 sha 幂等查找 + ref 序号 max：storer 的两条支撑查询。

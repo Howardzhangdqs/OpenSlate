@@ -411,7 +411,7 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
   行查找为 `find_tool_output(当前 run_id, ref)` 的 **`(run_id, ref)` 精确匹配**：
   一个 run 的 ref 不能被其他 run 解析（跨 run 同 ref 各自的行互不可见），无「当前
   run 优先 / 任意 run 回落」路径；无当前 run（未接线 / shutdown 后）返回明确错误。
-- **数据链**：`ref` 校验（`out-` + 1..16 hex）→
+- **数据链**：`ref` 校验（`out-` + 1..16 位数字）→
   `find_tool_output(当前 run_id, ref)` → 无行返回 Error 文案（含期望格式 +
   「ref 仅本会话内有效」提示 + 从 `[STORED OUTPUT` 标记取 ref 的提示）→
   `read_tool_output_bytes(sha64)` → zstd 解压（纯内存，≤1MiB 量级，对齐 storer 的不
@@ -446,8 +446,8 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 
 `output_query.rs` 内嵌 16 个用例：五算子矩阵、末行无换行、CRLF 保 `\r`、空输出、1MiB 单行
 （含「命中行超 cap 计数不展示」钉死）、64KB 块边界跨行、多字节封顶劈裂（65536 切点落
-`中` 字节中间 → 65535 边界）、grep ignore_case、参数错误文案矩阵（15 组，含 ref 1..16
-hex 边界）、未知 ref、**跨会话隔离**（run-2 查 run-1 的 ref → Error + 会话隔离文案，
-run-1 对照组仍可解析）、orig_bytes 完整性失败、装配前错误（store 未注入 / 无当前 run）、
-`LineScanner` 单元直测（空内容/空行/EOF 后 skip）。
+`中` 字节中间 → 65535 边界）、grep ignore_case、参数错误文案矩阵（16 组，含 ref 1..16
+位数字边界与旧 16hex 拒收）、未知 ref、**跨会话隔离**（run-2 查 run-1 的 ref → Error +
+会话隔离文案，run-1 对照组仍可解析）、orig_bytes 完整性失败、装配前错误（store 未注入 /
+无当前 run）、`LineScanner` 单元直测（空内容/空行/EOF 后 skip）。
 装配链回归：`tests/runtime_flow.rs` 默认白名单断言含 `output_query`。

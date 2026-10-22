@@ -2081,8 +2081,9 @@ fn cap_stored_full_text(text: String) -> String {
 /// 从 Tool 消息 content 解析首个落盘标记的 ref（完整 `out-…` 形态）。
 ///
 /// 头行格式（core `build_preview` 冻结）：
-/// `[STORED OUTPUT ref="out-{1..16 hex}" size=… lines=…]`。ref 是会话内
-/// 自增短 id（`out-3`；旧 16hex 形态同样可解析——格式上界 16 位）。
+/// `[STORED OUTPUT ref="out-{1..16 位数字}" size=… lines=…]`。ref 是
+/// 会话内自增短 id（`out-3`）；只收数字形态（开发期拍板：不做旧
+/// 16hex 兼容，含字母一律不解析 → 回落预览）。
 /// 解析用 core 的 `STORED_OUTPUT_MARKER` 常量定位 + 前缀逐段剥（不用
 /// 正则：格式冻结、单一形态，手工解析零依赖且更快）。无标记 / 形状
 /// 不符 → `None`。
@@ -2093,8 +2094,11 @@ fn parse_stored_output_ref(content: &str) -> Option<&str> {
     let after = rest.strip_prefix("ref=\"out-")?;
     // ref 以闭引号终结（短 id 如 out-3 的长度不固定）
     let end = after.find('"')?;
-    let hex = &after[..end];
-    if !hex.is_empty() && hex.len() <= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let digits = &after[..end];
+    if !digits.is_empty()
+        && digits.len() <= 16
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
         // 返回完整 ref（含 out- 前缀，与 store 的 ref 列同构）：
         // rest 此刻以 `ref="out-…` 开头，`"ref=\""` 占 5 字节。
         Some(&rest[5..5 + 4 + end])
@@ -3845,11 +3849,11 @@ mod tests {
             guard.as_ref().expect("runtime alive").handle().clone()
         };
 
-        // sha + 行/文件（C1 API：zst 由调用方压好）。ref 用旧 16hex 形态
-        // （sha 前 16 位）——顺带钉住短 id 之外的格式上界解析路径。
+        // sha + 行/文件（C1 API：zst 由调用方压好）。ref 用数字短 id
+        // （会话内自增序号形态；该 run 首条 → out-1）。
         use sha2::{Digest, Sha256};
         let sha_hex = format!("{:x}", Sha256::digest(full_text.as_bytes()));
-        let ref_id = format!("out-{}", &sha_hex[..16]);
+        let ref_id = "out-1".to_owned();
         let data_zst = zstd::encode_all(full_text.as_bytes(), 3).expect("zst");
         handle.block_on(async {
             store
@@ -3903,8 +3907,8 @@ mod tests {
         let tail_start = ceil_char_boundary(full_text, full_text.len().saturating_sub(16));
         let tail = &full_text[tail_start..];
         let preview = format!(
-            "[STORED OUTPUT ref=\"out-{}\" size={} lines={}]\n{}\n[... {} bytes omitted ({} lines) — use output_query to inspect ...]\n{}",
-            &sha_hex[..16],
+            "[STORED OUTPUT ref=\"{}\" size={} lines={}]\n{}\n[... {} bytes omitted ({} lines) — use output_query to inspect ...]\n{}",
+            ref_id,
             full_text.len(),
             full_text.lines().count(),
             head,
@@ -3927,33 +3931,36 @@ mod tests {
         (runtime, sha_hex, preview, dir)
     }
 
-    /// 落盘标记 ref 解析（短 id / 16hex 上界 / 非法形状）。
+    /// 落盘标记 ref 解析（数字短 id / 16 位上界 / 非法形状）。
     #[test]
-    fn parse_stored_output_ref_short_and_legacy_forms() {
-        let marker_of = |r: &str| {
-            format!("[STORED OUTPUT ref=\"{r}\" size=1 lines=1]\npreview")
-        };
+    fn parse_stored_output_ref_digit_forms() {
+        let marker_of = |r: &str| format!("[STORED OUTPUT ref=\"{r}\" size=1 lines=1]\npreview");
         // 短 id（v7 会话内自增序号）
         assert_eq!(parse_stored_output_ref(&marker_of("out-3")), Some("out-3"));
         assert_eq!(parse_stored_output_ref(&marker_of("out-42")), Some("out-42"));
-        // 16hex 长形态（格式上界）
+        // 16 位数字（格式上界）
         assert_eq!(
-            parse_stored_output_ref(&marker_of("out-ab12cd34ef56ab78")),
-            Some("out-ab12cd34ef56ab78")
+            parse_stored_output_ref(&marker_of("out-1234567890123456")),
+            Some("out-1234567890123456")
         );
         // 标记不在行首（前面有任意文本）也能定位
         assert_eq!(
             parse_stored_output_ref(&format!("noise\n{}", marker_of("out-7"))),
             Some("out-7")
         );
-        // 非法形状 → None
-        assert_eq!(parse_stored_output_ref(&marker_of("out-")), None, "空 hex");
+        // 非法形状 → None（含旧 16hex 形态：字母不做兼容 → 回落预览）
+        assert_eq!(parse_stored_output_ref(&marker_of("out-")), None, "空 ref");
         assert_eq!(
-            parse_stored_output_ref(&marker_of(&format!("out-{}", "a".repeat(17)))),
+            parse_stored_output_ref(&marker_of(&format!("out-{}", "1".repeat(17)))),
             None,
             "超 16 位"
         );
-        assert_eq!(parse_stored_output_ref(&marker_of("out-zzzz")), None, "非 hex");
+        assert_eq!(parse_stored_output_ref(&marker_of("out-zzzz")), None, "非数字");
+        assert_eq!(
+            parse_stored_output_ref(&marker_of("out-ab12cd34ef56ab78")),
+            None,
+            "旧 16hex 形态不解析（回落预览）"
+        );
         assert_eq!(parse_stored_output_ref("plain content"), None, "无标记");
     }
 

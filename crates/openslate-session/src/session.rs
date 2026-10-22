@@ -6,13 +6,15 @@
 
 use std::sync::Arc;
 
+use openslate_core::approval::ToolApprovalLevel;
 use openslate_protocol::{
     ApprovalAnswerChoice, ClientMsg, EntryDto, NoticeLevel, ServerMsg, SessionStatsDto,
 };
 
-use crate::config_ops::{apply_config_change, apply_set_api_key, ConfigChange};
+use crate::config_ops::{apply_approval_rules, apply_config_change, apply_set_api_key, ConfigChange};
 use crate::engine::{run_auto_compact, spawn_engine_turn};
 use crate::state::{build_snapshot, flush_stream, AppState};
+use openslate_store_sqlite::recorder::RunFinal;
 
 /// ClientMsg 派发。
 pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
@@ -25,7 +27,12 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
                 NoticeLevel::Info,
             );
         }
-        ClientMsg::Submit { text } => handle_submit(state, conn_id, text).await,
+        // v4 多模态：`attachments` 引用随 Submit 透传（L4 接线；门控在
+        // mobile dispatch 层，此处只构造消息/转写，不解释内容）。
+        ClientMsg::Submit {
+            text,
+            attachments,
+        } => handle_submit(state, conn_id, text, attachments).await,
         ClientMsg::ApprovalAnswer { id, choice } => {
             // 先 bridge（拿走首答权）再 core（推转写 + 广播）——锁序见
             // state.rs 模块文档。
@@ -35,6 +42,11 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
                         ApprovalAnswerChoice::Approve => "approved",
                         ApprovalAnswerChoice::Deny => "denied",
                         ApprovalAnswerChoice::ApproveAll => "approve-all",
+                        // v3 新 choice 的转写行文案（定稿线格式，
+                        // tool-approval P1a；行为接线在 P1b）。
+                        ApprovalAnswerChoice::AlwaysTool => "always-tool",
+                        ApprovalAnswerChoice::SessionMcp => "session-mcp",
+                        ApprovalAnswerChoice::AlwaysMcp => "always-mcp",
                     };
                     crate::session_event!("approval: {label} (conn {conn_id})");
                     {
@@ -49,6 +61,56 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
                         id,
                         choice: choice_str(choice).to_owned(),
                     });
+                    // (b)/(d) 一直允许 → 持久化 + rules 热更（tool-approval
+                    // P1b）。规则增量 = 当前生效 rules + 对应域写 Allow，
+                    // 经 config_ops 共享更新链落盘（整段重写为新 schema，
+                    // legacy policy/tools 键随之消除）。本次调用已由
+                    // bridge 按 Approved 放行，新规则作用于下一次 check。
+                    match choice {
+                        ApprovalAnswerChoice::AlwaysTool => {
+                            let mut rules = state.approval.rules_snapshot();
+                            rules
+                                .tools
+                                .insert(summary.tool_name.clone(), ToolApprovalLevel::Allow);
+                            if apply_approval_rules(state, conn_id, rules).is_none() {
+                                tracing::warn!(
+                                    target: "openslate_approval",
+                                    "always_tool persistence failed for '{}' (this call \
+                                     still approved)",
+                                    summary.tool_name
+                                );
+                            }
+                        }
+                        ApprovalAnswerChoice::AlwaysMcp => match summary.server.clone() {
+                            Some(server) => {
+                                let mut rules = state.approval.rules_snapshot();
+                                rules.servers.insert(server, ToolApprovalLevel::Allow);
+                                if apply_approval_rules(state, conn_id, rules).is_none() {
+                                    tracing::warn!(
+                                        target: "openslate_approval",
+                                        "always_mcp persistence failed for '{}' (this call \
+                                         still approved)",
+                                        summary.server.as_deref().unwrap_or_default()
+                                    );
+                                }
+                            }
+                            // server 缺失（非 MCP 请求发来了 always_mcp）：
+                            // 本次已放行，无作用域可持久化 → 定向 warn。
+                            None => {
+                                notice(
+                                    state,
+                                    conn_id,
+                                    format!(
+                                        "工具 {} 无 MCP server 作用域，「一直允许该 MCP」\
+                                         仅本次生效",
+                                        summary.tool_name
+                                    ),
+                                    NoticeLevel::Warn,
+                                );
+                            }
+                        },
+                        _ => {}
+                    }
                 }
                 None => {
                     notice(
@@ -111,8 +173,31 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
             }
         }
         ClientMsg::NewSession => {
-            let old_run = {
+            // 原 busy 守卫（先行拒绝，避免无谓冲刷）。
+            {
+                let inner = state.core.lock();
+                if inner.busy() {
+                    drop(inner);
+                    notice(
+                        state,
+                        conn_id,
+                        "回合进行中，无法新建会话（先取消）".into(),
+                        NoticeLevel::Warn,
+                    );
+                    return;
+                }
+            }
+            // 前置冲刷（历史转写丢失修复 C1）：清内存转写之前把未落库
+            // 尾部强制落库（含回合中推迟的 ToolCall 中断快照 + 收尾
+            // Meta 行，见 mobile transcripts.rs flush_now）。best-effort：
+            // 失败在实现内 log，不阻断新建会话。
+            if let Some(flusher) = state.core.transcript_flusher() {
+                flusher.flush(state.clone()).await;
+            }
+            let (old_run, final_cost, final_in, final_out) = {
                 let mut inner = state.core.lock();
+                // 二次 busy 守卫（C1）：flush 期间 submit 可能已起回合
+                //——此刻忙则拒绝，转写清空留给下一次（先取消）。
                 if inner.busy() {
                     drop(inner);
                     notice(
@@ -126,15 +211,42 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
                 inner.history.clear();
                 inner.transcript.clear();
                 inner.session_id = new_session_id();
+                // v5 L2：终态聚合（cost + tokens）快照必须先于 stats 重置
+                // 读取——重置后读恒为 0（REPL /new 同款快照顺序回归）。
+                // stats 自上次 /new 起累计 = 该 run 生命周期累计（含
+                // title/compact 侧调用，与 server shutdown 口径一致）。
+                let final_cost = inner.stats.total_cost_usd;
+                let final_in = inner.stats.total_input_tokens;
+                let final_out = inner.stats.total_output_tokens;
                 inner.stats = SessionStatsDto::default();
-                inner.session_run.take()
+                (
+                    inner.session_run.take(),
+                    final_cost,
+                    final_in,
+                    final_out,
+                )
             };
-            // 关掉旧 run 行（异步落库，不挡广播）。
+            // 会话作用域审批集合清空（approve_all / session_mcp 写入的
+            // 内存白名单；「当前会话」语义——P1a 摸底确认旧实现不清是
+            // 漏洞，P1b 补上）。bridge 自锁，在 core 锁外调用（锁序
+            // 红线：先 bridge 后 core）。持久化规则（always_*）不随会话
+            // 重置——「一直允许」跨会话。
+            state.approval.clear_session_scopes();
+            // 关掉旧 run 行（异步落库，不挡广播）。v5 L2：RunFinal 携带
+            // run 生命周期 token 聚合，落 runs.input_tokens/output_tokens。
             if let Some(run) = old_run {
-                let cost = { state.core.lock().stats.total_cost_usd };
                 let recorder = run.recorder.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = recorder.finish("completed", None, cost).await {
+                    if let Err(e) = recorder
+                        .finish_with(RunFinal {
+                            status: "completed".into(),
+                            output_json: None,
+                            cost_usd: final_cost,
+                            input_tokens: final_in,
+                            output_tokens: final_out,
+                        })
+                        .await
+                    {
                         tracing::warn!("failed to persist previous session run: {e}");
                     }
                 });
@@ -196,7 +308,12 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
 }
 
 /// submit 全流程（TUI start_turn 移植 + auto-compact）。
-async fn handle_submit(state: &Arc<AppState>, conn_id: u64, text: String) {
+async fn handle_submit(
+    state: &Arc<AppState>,
+    conn_id: u64,
+    text: String,
+    attachments: Option<Vec<openslate_protocol::AttachmentDto>>,
+) {
     let text_trimmed = text.trim().to_owned();
     if text_trimmed.is_empty() {
         return;
@@ -226,7 +343,20 @@ async fn handle_submit(state: &Arc<AppState>, conn_id: u64, text: String) {
                 repaired_dangling.len()
             );
         }
+        // v4 多模态（L4）：附件引用进 user 消息（持久化形状 = {id,mime,
+        // filename}，data 由 mobile 请求路径装载）；无附件行为不变。
+        let core_attachments = attachments.as_ref().map(|dtos| {
+            dtos.iter()
+                .map(|d| openslate_core::types::Attachment {
+                    id: d.id.clone(),
+                    mime: d.mime.clone(),
+                    filename: d.filename.clone(),
+                    data: None,
+                })
+                .collect::<Vec<_>>()
+        });
         let user_message = openslate_core::types::Message {
+            attachments: core_attachments,
             role: openslate_core::types::MessageRole::User,
             content: text_trimmed.clone(),
             tool_call_id: None,
@@ -235,7 +365,11 @@ async fn handle_submit(state: &Arc<AppState>, conn_id: u64, text: String) {
             reasoning_content: None,
         };
         inner.history.push(user_message.clone());
-        inner.transcript.push(EntryDto::User { text: text_trimmed });
+        // v4 多模态（L4）：transcript User 条目携带引用（UI 缩略图）。
+        inner.transcript.push(EntryDto::User {
+            text: text_trimmed,
+            attachments,
+        });
         inner.running = true;
         (user_message, repaired_dangling)
     };
@@ -481,7 +615,10 @@ async fn generate_session_title(state: &Arc<AppState>, run_id: String, first_pro
     state.sink.broadcast(ServerMsg::RunTitle { run_id, title });
 }
 
-fn new_session_id() -> String {
+/// 新会话 id（uuid v4 simple 形态）。pub 供 mobile open_session 的会话
+/// 身份轮换复用（C2：换 run 即换会话——session_id 变化驱动 ChatScreen
+/// 的会话揭示）。
+pub fn new_session_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
@@ -497,6 +634,11 @@ fn choice_str(choice: ApprovalAnswerChoice) -> &'static str {
         ApprovalAnswerChoice::Approve => "approve",
         ApprovalAnswerChoice::Deny => "deny",
         ApprovalAnswerChoice::ApproveAll => "approve_all",
+        // v3 新 choice 的广播拼写（ApprovalResolved.choice 值域扩展，
+        // tool-approval P1a 定稿线格式）。
+        ApprovalAnswerChoice::AlwaysTool => "always-tool",
+        ApprovalAnswerChoice::SessionMcp => "session-mcp",
+        ApprovalAnswerChoice::AlwaysMcp => "always-mcp",
     }
 }
 
@@ -748,6 +890,7 @@ model = "m"
         // 尾部悬挂的 ask_user 调用（进程中断恢复后的典型形状）。
         let history = vec![
             openslate_core::types::Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "which db?".into(),
                 tool_call_id: None,
@@ -756,6 +899,7 @@ model = "m"
                 reasoning_content: None,
             },
             openslate_core::types::Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -776,6 +920,7 @@ model = "m"
             1,
             ClientMsg::Submit {
                 text: "改用 sled".into(),
+                attachments: None,
             },
         )
         .await;

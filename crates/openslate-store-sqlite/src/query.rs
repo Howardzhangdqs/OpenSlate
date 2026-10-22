@@ -26,6 +26,10 @@ pub struct RunRecord {
     pub finished_at: Option<i64>,
     /// Accumulated model spend in USD (P2-3); 0.0 when unpriced.
     pub cost_usd: f64,
+    /// run 级 token 聚合（v5，来自 `RunRecorder::finish_with` 的
+    /// `RunFinal`）。存量 run（v5 前）无 meta → 保持 0，不回填。
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }
 
 /// An execution node record.
@@ -61,6 +65,11 @@ pub struct StepRecord {
 }
 
 /// A message record.
+///
+/// `content_json` 是 `content_zst` 列**解压后**的 JSON 文本（解压在
+/// store 侧完成后交付；损坏帧经 [`crate::codec::decode_content`] 报带
+/// 消息 id 的错误，绝不静默丢行）。`meta_json` 为 per-message 元数据
+/// 旁路通道（assistant 行的 `MessageMeta` serde JSON；user/tool 行 None）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRecord {
     pub id: String,
@@ -69,10 +78,39 @@ pub struct MessageRecord {
     pub agent_id: Option<String>,
     pub role: String,
     pub content_json: String,
+    pub meta_json: Option<String>,
     /// Per-run monotonic sequence number (writer-assigned). Readers order by
     /// it — `created_at` alone cannot order same-batch inserts, and a
     /// provider rejects shuffled `tool_calls`/tool-result pairs.
     pub seq: i64,
+    pub created_at: i64,
+}
+
+/// An attachment record (v5). 元数据行——字节在 `files/{sha256}.{ext}`
+/// （content-addressed）；本记录是引用形状，wire/DB 同构（设计 §3.1/§6.1）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentRecord {
+    /// `att-<uuid>`。
+    pub id: String,
+    /// `None` = 已导入未绑定（composer 暂存；Submit 时 `bind_attachments`）。
+    pub run_id: Option<String>,
+    pub sha256: String,
+    /// 归一化后的 mime（ingest 层保证白名单）。
+    pub mime: String,
+    pub filename: Option<String>,
+    /// 归一化后字节数。
+    pub size_bytes: i64,
+    pub created_at: i64,
+}
+
+/// A transcript entry record (v5). `entry_json` 为 `EntryDto` 的 serde
+/// JSON **透传**——store 不解析，重建/回放语义在 mobile/protocol 层。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptEntryRecord {
+    pub id: String,
+    pub run_id: String,
+    pub seq: i64,
+    pub entry_json: String,
     pub created_at: i64,
 }
 
@@ -165,6 +203,8 @@ type RunRow = (
     i64,            // started_at
     Option<i64>,    // finished_at
     f64,            // cost_usd
+    i64,            // input_tokens
+    i64,            // output_tokens
 );
 
 type ExecutionNodeRow = (
@@ -198,7 +238,8 @@ type MessageRow = (
     String,         // execution_node_id
     Option<String>, // agent_id
     String,         // role
-    String,         // content_json
+    Vec<u8>,        // content_zst（解压前字节）
+    Option<String>, // meta_json
     i64,            // seq
     i64,            // created_at
 );
@@ -256,6 +297,24 @@ type CredentialRow = (
     i64,    // updated_at
 );
 
+type AttachmentRow = (
+    String,         // id
+    Option<String>, // run_id
+    String,         // sha256
+    String,         // mime
+    Option<String>, // filename
+    i64,            // size_bytes
+    i64,            // created_at
+);
+
+type TranscriptEntryRow = (
+    String, // id
+    String, // run_id
+    i64,    // seq
+    String, // entry_json
+    i64,    // created_at
+);
+
 /// vault 启动镜像加载的凭据行（**含明文**；仅 vault 内部消费，绝不
 /// derive Debug / 打日志）。
 pub struct CredentialSecretEntry {
@@ -280,6 +339,8 @@ fn row_to_run(row: RunRow) -> RunRecord {
         started_at: row.6,
         finished_at: row.7,
         cost_usd: row.8,
+        input_tokens: row.9,
+        output_tokens: row.10,
     }
 }
 
@@ -312,16 +373,41 @@ fn row_to_step(row: StepRow) -> StepRecord {
     }
 }
 
-fn row_to_message(row: MessageRow) -> MessageRecord {
-    MessageRecord {
+/// 解压 `content_zst` 并组装 `MessageRecord`。损坏帧报带消息 id 的错误。
+fn row_to_message(row: MessageRow) -> Result<MessageRecord, StoreError> {
+    let (id, run_id, execution_node_id, agent_id, role, content_zst, meta_json, seq, created_at) = row;
+    Ok(MessageRecord {
+        content_json: crate::codec::decode_content(&id, &content_zst)?,
+        id,
+        run_id,
+        execution_node_id,
+        agent_id,
+        role,
+        meta_json,
+        seq,
+        created_at,
+    })
+}
+
+fn row_to_attachment(row: AttachmentRow) -> AttachmentRecord {
+    AttachmentRecord {
         id: row.0,
         run_id: row.1,
-        execution_node_id: row.2,
-        agent_id: row.3,
-        role: row.4,
-        content_json: row.5,
-        seq: row.6,
-        created_at: row.7,
+        sha256: row.2,
+        mime: row.3,
+        filename: row.4,
+        size_bytes: row.5,
+        created_at: row.6,
+    }
+}
+
+fn row_to_transcript_entry(row: TranscriptEntryRow) -> TranscriptEntryRecord {
+    TranscriptEntryRecord {
+        id: row.0,
+        run_id: row.1,
+        seq: row.2,
+        entry_json: row.3,
+        created_at: row.4,
     }
 }
 
@@ -405,7 +491,8 @@ impl SqliteStore {
     pub async fn get_run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd, \
+                    input_tokens, output_tokens \
              FROM runs WHERE id = ?",
         )
         .bind(id)
@@ -424,7 +511,8 @@ impl SqliteStore {
     pub async fn list_runs(&self, limit: i64, offset: i64) -> Result<Vec<RunRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd, \
+                    input_tokens, output_tokens \
              FROM runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
@@ -478,7 +566,7 @@ impl SqliteStore {
     ) -> Result<Vec<MessageRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<MessageRow> = query_as(
-            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at \
+            "SELECT id, run_id, execution_node_id, agent_id, role, content_zst, meta_json, seq, created_at \
              FROM messages WHERE execution_node_id = ? ORDER BY seq",
         )
         .bind(execution_node_id)
@@ -486,7 +574,7 @@ impl SqliteStore {
         .await
         .map_err(qerr)?;
 
-        Ok(rows.into_iter().map(row_to_message).collect())
+        rows.into_iter().map(row_to_message).collect()
     }
 
     /// List the full conversation of a run (all execution nodes merged),
@@ -502,7 +590,7 @@ impl SqliteStore {
     ) -> Result<Vec<MessageRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<MessageRow> = query_as(
-            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at \
+            "SELECT id, run_id, execution_node_id, agent_id, role, content_zst, meta_json, seq, created_at \
              FROM messages WHERE run_id = ? ORDER BY seq",
         )
         .bind(run_id)
@@ -510,7 +598,7 @@ impl SqliteStore {
         .await
         .map_err(qerr)?;
 
-        Ok(rows.into_iter().map(row_to_message).collect())
+        rows.into_iter().map(row_to_message).collect()
     }
 
     /// Keyset 分页读取一个 run 的会话：返回 `seq > after_seq` 的最早
@@ -527,7 +615,7 @@ impl SqliteStore {
     ) -> Result<Vec<MessageRecord>, StoreError> {
         let pool = self.pool();
         let rows: Vec<MessageRow> = query_as(
-            "SELECT id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at \
+            "SELECT id, run_id, execution_node_id, agent_id, role, content_zst, meta_json, seq, created_at \
              FROM messages WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
         )
         .bind(run_id)
@@ -537,7 +625,7 @@ impl SqliteStore {
         .await
         .map_err(qerr)?;
 
-        Ok(rows.into_iter().map(row_to_message).collect())
+        rows.into_iter().map(row_to_message).collect()
     }
 
     /// 一个 run 的消息总数（分页 UI 显示总量 / 测试用）。
@@ -625,7 +713,8 @@ impl SqliteStore {
     pub async fn get_last_interrupted_run(&self) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd, \
+                    input_tokens, output_tokens \
              FROM runs WHERE status = 'interrupted' \
              ORDER BY started_at DESC, id DESC LIMIT 1",
         )
@@ -644,7 +733,8 @@ impl SqliteStore {
     pub async fn get_last_resumable_run(&self) -> Result<Option<RunRecord>, StoreError> {
         let pool = self.pool();
         let row: Option<RunRow> = query_as(
-            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd \
+            "SELECT id, title, root_agent_id, status, input_json, output_json, started_at, finished_at, cost_usd, \
+                    input_tokens, output_tokens \
              FROM runs WHERE status != 'failed' \
              ORDER BY started_at DESC, id DESC LIMIT 1",
         )
@@ -743,6 +833,63 @@ impl SqliteStore {
             })
             .collect())
     }
+
+    // ── 附件（v5）───────────────────────────────────────────────────
+
+    /// 取单条附件元数据（不存在返回 `None`）。
+    pub async fn get_attachment(
+        &self,
+        id: &str,
+    ) -> Result<Option<AttachmentRecord>, StoreError> {
+        let pool = self.pool();
+        let row: Option<AttachmentRow> = query_as(
+            "SELECT id, run_id, sha256, mime, filename, size_bytes, created_at \
+             FROM attachments WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(qerr)?;
+        Ok(row.map(row_to_attachment))
+    }
+
+    /// 列出一个 run 的全部附件（按 `created_at, id` 稳定序）。
+    pub async fn list_run_attachments(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<AttachmentRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<AttachmentRow> = query_as(
+            "SELECT id, run_id, sha256, mime, filename, size_bytes, created_at \
+             FROM attachments WHERE run_id = ? ORDER BY created_at, id",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+        Ok(rows.into_iter().map(row_to_attachment).collect())
+    }
+
+    // ── 转写条目（v5）───────────────────────────────────────────────
+
+    /// 列出一个 run 的全部转写条目，按 `seq` 升序（行级顺序即转写顺序；
+    /// `entry_json` 透传不解析）。空结果 = v5 前的 run 或无条目——调用方
+    /// 回退 message 投影（设计 §4 两级策略）。
+    pub async fn list_transcript_entries(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TranscriptEntryRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<TranscriptEntryRow> = query_as(
+            "SELECT id, run_id, seq, entry_json, created_at \
+             FROM transcript_entries WHERE run_id = ? ORDER BY seq",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+        Ok(rows.into_iter().map(row_to_transcript_entry).collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +900,11 @@ impl SqliteStore {
 mod tests {
     use super::*;
     use sqlx::SqlitePool;
+
+    /// 测试插入用的合法压缩帧（读取端会真解码 content_zst）。
+    fn zst(s: &str) -> Vec<u8> {
+        crate::codec::encode_content(s)
+    }
 
     async fn setup_store() -> SqliteStore {
         let store = SqliteStore::new_in_memory().await.expect("store created");
@@ -957,17 +1109,19 @@ mod tests {
 
         // Same created_at on purpose: seq must be the order tiebreaker.
         sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('msg-1', 'run-1', 'en-1', 'root', 'user', '\"hello\"', 1, 1200)",
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+             VALUES ('msg-1', 'run-1', 'en-1', 'root', 'user', ?, 1, 1200)",
         )
+        .bind(zst("\"hello\""))
         .execute(pool)
         .await
         .expect("insert msg 1");
 
         sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('msg-2', 'run-1', 'en-1', 'root', 'assistant', '\"world\"', 2, 1200)",
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+             VALUES ('msg-2', 'run-1', 'en-1', 'root', 'assistant', ?, 2, 1200)",
         )
+        .bind(zst("\"world\""))
         .execute(pool)
         .await
         .expect("insert msg 2");
@@ -978,6 +1132,8 @@ mod tests {
         assert_eq!(msgs[0].id, "msg-1");
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].seq, 1);
+        assert_eq!(msgs[0].content_json, "\"hello\"", "解压后内容零损");
+        assert!(msgs[0].meta_json.is_none(), "未写 meta 的行为 NULL");
         assert_eq!(msgs[1].id, "msg-2");
         assert_eq!(msgs[1].role, "assistant");
         assert_eq!(msgs[1].seq, 2);
@@ -1009,27 +1165,24 @@ mod tests {
         // Interleaved across nodes, all sharing one timestamp; only seq
         // restores the true conversation order (a shuffled tool_call/tool
         // pair would be rejected by providers on resume).
-        sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('m-1', 'run-1', 'en-1', 'root', 'user', '\"q\"', 1, 1200)",
-        )
-        .execute(pool)
-        .await
-        .expect("insert m-1");
-        sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('m-2', 'run-1', 'en-2', 'child', 'assistant', '\"a\"', 2, 1200)",
-        )
-        .execute(pool)
-        .await
-        .expect("insert m-2");
-        sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('m-3', 'run-1', 'en-1', 'root', 'tool', '\"t\"', 3, 1200)",
-        )
-        .execute(pool)
-        .await
-        .expect("insert m-3");
+        for (id, node, role, content, seq) in [
+            ("m-1", "en-1", "user", "\"q\"", 1i64),
+            ("m-2", "en-2", "assistant", "\"a\"", 2),
+            ("m-3", "en-1", "tool", "\"t\"", 3),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+                 VALUES (?, 'run-1', ?, 'root', ?, ?, ?, 1200)",
+            )
+            .bind(id)
+            .bind(node)
+            .bind(role)
+            .bind(zst(content))
+            .bind(seq)
+            .execute(pool)
+            .await
+            .expect("insert interleaved message");
+        }
 
         let msgs = store
             .list_messages_by_run("run-1")
@@ -1045,9 +1198,10 @@ mod tests {
         )
         .await;
         sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('m-9', 'run-2', 'en-3', 'root', 'user', '\"other\"', 1, 2200)",
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+             VALUES ('m-9', 'run-2', 'en-3', 'root', 'user', ?, 1, 2200)",
         )
+        .bind(zst("\"other\""))
         .execute(pool)
         .await
         .expect("insert m-9");
@@ -1077,10 +1231,11 @@ mod tests {
 
         for (i, id) in ["m-1", "m-2", "m-3"].into_iter().enumerate() {
             sqlx::query(
-                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-                 VALUES (?, 'run-1', 'en-1', 'root', 'user', '\"x\"', ?, 1200)",
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+                 VALUES (?, 'run-1', 'en-1', 'root', 'user', ?, ?, 1200)",
             )
             .bind(id)
+            .bind(zst("\"x\""))
             .bind((i + 1) as i64)
             .execute(pool)
             .await
@@ -1271,19 +1426,21 @@ mod tests {
 
         for (i, seq) in (1..=5).enumerate() {
             sqlx::query(
-                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-                 VALUES (?, 'run-1', 'en-1', 'root', 'user', '\"x\"', ?, 1200)",
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+                 VALUES (?, 'run-1', 'en-1', 'root', 'user', ?, ?, 1200)",
             )
             .bind(format!("m-{i}"))
+            .bind(zst("\"x\""))
             .bind(seq)
             .execute(pool)
             .await
             .expect("insert run-1 message");
         }
         sqlx::query(
-            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES ('other-1', 'run-2', 'en-2', 'root', 'user', '\"y\"', 1, 2200)",
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+             VALUES ('other-1', 'run-2', 'en-2', 'root', 'user', ?, 1, 2200)",
         )
+        .bind(zst("\"y\""))
         .execute(pool)
         .await
         .expect("insert run-2 message");
@@ -1346,10 +1503,11 @@ mod tests {
 
         for i in 0..3 {
             sqlx::query(
-                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-                 VALUES (?, 'run-1', 'en-1', 'root', 'user', '\"x\"', ?, 1200)",
+                "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+                 VALUES (?, 'run-1', 'en-1', 'root', 'user', ?, ?, 1200)",
             )
             .bind(format!("cm-{i}"))
+            .bind(zst("\"x\""))
             .bind((i + 1) as i64)
             .execute(pool)
             .await
@@ -1424,5 +1582,97 @@ mod tests {
             .await
             .expect("list_audit_logs run-3");
         assert_eq!(logs_run3.len(), 0);
+    }
+
+    /// 损坏的 content_zst 帧：读取报带消息 id 的错误，绝不静默丢行。
+    #[tokio::test]
+    async fn test_corrupted_content_zst_fails_with_message_id() {
+        let store = setup_store().await;
+        let pool = store.pool();
+
+        insert_run(pool, "run-1", None, "root", "running", "{}", 1000).await;
+        insert_execution_node(
+            pool, "en-1", "run-1", "root", None, None, "running", "{}", 1100,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO messages (id, run_id, execution_node_id, agent_id, role, content_zst, seq, created_at) \
+             VALUES ('corrupt-1', 'run-1', 'en-1', 'root', 'user', x'00', 1, 1200)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert corrupted blob");
+
+        let err = store
+            .list_messages_by_run("run-1")
+            .await
+            .expect_err("corrupted frame must surface");
+        assert!(
+            err.to_string().contains("corrupt-1"),
+            "错误信息应携带消息 id, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attachment_and_transcript_entry_reads() {
+        let store = setup_store().await;
+        insert_run(&store.pool(), "run-1", None, "root", "running", "{}", 1000).await;
+
+        // 内存库没有 files_dir（insert_attachment 拒绝），读取测试直接塞行
+        sqlx::query(
+            "INSERT INTO attachments (id, run_id, sha256, mime, filename, size_bytes, created_at) \
+             VALUES ('att-1', 'run-1', 'abc', 'image/png', 'a.png', 3, 2000)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed attachment row");
+
+        let att = store
+            .get_attachment("att-1")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(att.run_id.as_deref(), Some("run-1"));
+        assert_eq!(att.sha256, "abc");
+        assert_eq!(att.mime, "image/png");
+        assert_eq!(att.filename.as_deref(), Some("a.png"));
+        assert_eq!(att.size_bytes, 3);
+
+        assert!(
+            store.get_attachment("ghost").await.expect("get").is_none(),
+            "不存在的附件返回 None"
+        );
+
+        let listed = store.list_run_attachments("run-1").await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "att-1");
+
+        for (id, seq, json) in [
+            ("te-1", 1i64, r#"{"kind":"user"}"#),
+            ("te-2", 2, r#"{"kind":"assistant"}"#),
+            ("te-0", 3, r#"{"kind":"meta"}"#),
+        ] {
+            store
+                .insert_transcript_entry(id, "run-1", seq, json, 3000)
+                .await
+                .expect("insert transcript entry");
+        }
+        let entries = store
+            .list_transcript_entries("run-1")
+            .await
+            .expect("list transcript");
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["te-1", "te-2", "te-0"],
+            "按 seq 升序而非插入序"
+        );
+        assert_eq!(entries[0].entry_json, r#"{"kind":"user"}"#);
+        assert!(
+            store
+                .list_transcript_entries("no-run")
+                .await
+                .expect("empty")
+                .is_empty()
+        );
     }
 }

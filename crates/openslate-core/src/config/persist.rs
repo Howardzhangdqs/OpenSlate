@@ -21,6 +21,7 @@
 //! `None`). Comments inside the upserted table body are therefore not
 //! preserved; comments everywhere else are.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -304,6 +305,101 @@ pub fn set_capability(path: &Path, cap: &str, alias: &str) -> Result<()> {
         .and_then(|item| item.as_table_mut())
         .expect("capabilities table was just ensured")
         .insert(cap, value(alias));
+    save_document(path, &doc)
+}
+
+// ── Approval（[approval] 整段重写为新 schema）───────────────────────────
+
+/// Comment placed above a newly created `[approval]` table.
+const APPROVAL_HEADER_COMMENT: &str =
+    "# Tool approval: default_level (manual/allow/auto) + per-tool/per-server overrides\n";
+
+/// 整段重写 `[approval]` 为新 schema（tool-approval P1a）。
+///
+/// - **删除 legacy `policy` / `tools` 键**——新键 `default_level` /
+///   `tool_levels` / `server_levels` 是完整真相源，混合两套 schema 会让
+///   `rules_from_config` 的推导结果难以推断（设置页写入即迁移）；
+/// - 只写非默认值：`default_level = Some(Allow)` 与缺省等价（省略键），
+///   空 map 不写子表；全默认（default=Allow 且两个 map 全空）时**整段
+///   删除**（段缺省即纯 Allow 基线，与 `rules_from_config` 对齐）；
+/// - 其余内容（其他 section、注释、排版）逐字节保真（toml_edit 往返）；
+/// - 幂等：同参数重复调用产生相同文件；全默认且段不存在 → 静默成功，
+///   不创建文件。
+///
+/// 红线：配置写入只走本模块，禁手拼 TOML——调用方传结构化值。
+pub fn set_approval_section(
+    path: &Path,
+    default_level: Option<&crate::approval::ToolApprovalLevel>,
+    tool_levels: &BTreeMap<String, crate::approval::ToolApprovalLevel>,
+    server_levels: &BTreeMap<String, crate::approval::ToolApprovalLevel>,
+) -> Result<()> {
+    use crate::approval::ToolApprovalLevel;
+
+    let all_default =
+        default_level.is_none_or(|level| *level == ToolApprovalLevel::Allow)
+            && tool_levels.is_empty()
+            && server_levels.is_empty();
+
+    let mut doc = load_document(path)?;
+    if let Some(item) = doc.as_table().get("approval") {
+        anyhow::ensure!(
+            item.is_table(),
+            "config section [approval] is not a standard TOML table; \
+             refusing to rewrite it"
+        );
+    }
+
+    if all_default {
+        // 整段删除（段不存在 → 静默成功且不落盘）。
+        if doc.as_table_mut().remove("approval").is_some() {
+            save_document(path, &doc)?;
+        }
+        return Ok(());
+    }
+
+    let has_content = doc_has_content(&doc);
+    let root = doc.as_table_mut();
+    if root.get("approval").is_none() {
+        let mut fresh = Table::new();
+        fresh
+            .decor_mut()
+            .set_prefix(if has_content {
+                format!("\n{APPROVAL_HEADER_COMMENT}")
+            } else {
+                APPROVAL_HEADER_COMMENT.to_owned()
+            });
+        root.insert("approval", Item::Table(fresh));
+    }
+    let table = root
+        .get_mut("approval")
+        .and_then(|item| item.as_table_mut())
+        .expect("[approval] was just ensured to be a table");
+
+    // 重建段体：清掉全部旧键（含 legacy policy/tools 与上次写的新键），
+    // 保留段头自身的 decor（上方注释 / 空行）。
+    let keys: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+    for key in keys {
+        table.remove(&key);
+    }
+    if let Some(level) = default_level {
+        if *level != ToolApprovalLevel::Allow {
+            table["default_level"] = value(level.as_str());
+        }
+    }
+    if !tool_levels.is_empty() {
+        let mut sub = Table::new();
+        for (name, level) in tool_levels {
+            sub[name.as_str()] = value(level.as_str());
+        }
+        table["tool_levels"] = Item::Table(sub);
+    }
+    if !server_levels.is_empty() {
+        let mut sub = Table::new();
+        for (slug, level) in server_levels {
+            sub[slug.as_str()] = value(level.as_str());
+        }
+        table["server_levels"] = Item::Table(sub);
+    }
     save_document(path, &doc)
 }
 
@@ -1757,5 +1853,142 @@ You are a helpful AI assistant.
 
         // 不存在的文件 → 报错。
         assert!(set_agent_tool_lists(&dir.path().join("nope.md"), &[], &[]).is_err());
+    }
+
+    // ── set_approval_section（tool-approval P1a）────────────────────────
+
+    use crate::approval::ToolApprovalLevel;
+
+    #[test]
+    fn set_approval_section_roundtrip() {
+        // 写入 → parse 回读：新 schema 键逐字段往返；其他 section 保真。
+        let (_dir, path) = temp_config();
+        upsert_provider(&path, "p", &provider("https://x", "K")).expect("seed provider");
+        let tool_levels = BTreeMap::from([
+            ("bash".to_owned(), ToolApprovalLevel::Manual),
+            ("read_file".to_owned(), ToolApprovalLevel::Allow),
+        ]);
+        let server_levels =
+            BTreeMap::from([("github".to_owned(), ToolApprovalLevel::Allow)]);
+        set_approval_section(
+            &path,
+            Some(&ToolApprovalLevel::Auto),
+            &tool_levels,
+            &server_levels,
+        )
+        .expect("write");
+
+        let config = super::super::parse_openslate_toml(&text_at(&path)).expect("reparse");
+        let approval = config.approval.as_ref().expect("section present");
+        assert_eq!(
+            approval.default_level,
+            Some(super::super::ToolApprovalLevelSetting::Auto)
+        );
+        assert_eq!(
+            approval.tool_levels,
+            BTreeMap::from([
+                ("bash".to_owned(), super::super::ToolApprovalLevelSetting::Manual),
+                ("read_file".to_owned(), super::super::ToolApprovalLevelSetting::Allow),
+            ])
+        );
+        assert_eq!(
+            approval.server_levels,
+            BTreeMap::from([(
+                "github".to_owned(),
+                super::super::ToolApprovalLevelSetting::Allow
+            )])
+        );
+        // 其他 section 不受影响。
+        assert!(config.providers.contains_key("p"));
+
+        // 幂等：同参数重写 → 字节不变。
+        let first = text_at(&path);
+        set_approval_section(
+            &path,
+            Some(&ToolApprovalLevel::Auto),
+            &tool_levels,
+            &server_levels,
+        )
+        .expect("rewrite");
+        assert_eq!(text_at(&path), first, "rewrite must be idempotent");
+    }
+
+    #[test]
+    fn set_approval_section_rewrites_legacy_keys() {
+        // legacy 段（policy/tools）→ 整段重写为新 schema，旧键消失。
+        let (_dir, path) = temp_config();
+        fs::write(
+            &path,
+            "[providers.p]\nbase_url = \"https://x\"\napi_key_env = \"K\"\n\n\
+             [approval]\npolicy = \"auto_except\"\ntools = [\"bash\"]\n",
+        )
+        .expect("seed legacy");
+
+        set_approval_section(
+            &path,
+            Some(&ToolApprovalLevel::Auto),
+            &BTreeMap::from([("bash".to_owned(), ToolApprovalLevel::Manual)]),
+            &BTreeMap::new(),
+        )
+        .expect("write");
+
+        let text = text_at(&path);
+        assert!(!text.contains("policy"), "{text}");
+        assert!(!text.contains("tools = "), "{text}");
+        let doc = parse_at(&path);
+        assert_eq!(
+            doc["approval"]["default_level"].as_str(),
+            Some("auto"),
+            "{text}"
+        );
+        assert_eq!(
+            doc["approval"]["tool_levels"]["bash"].as_str(),
+            Some("manual"),
+            "{text}"
+        );
+        assert!(
+            doc["approval"].as_table().unwrap().get("server_levels").is_none(),
+            "空 map 不写子表: {text}"
+        );
+        // providers 保真。
+        assert_eq!(
+            doc["providers"]["p"]["base_url"].as_str(),
+            Some("https://x")
+        );
+    }
+
+    #[test]
+    fn set_approval_section_all_default_removes_section() {
+        // 全默认（Allow + 空 maps）→ 整段删除；段不存在 → 静默不建文件。
+        let (_dir, path) = temp_config();
+        fs::write(
+            &path,
+            "[approval]\npolicy = \"manual\"\n",
+        )
+        .expect("seed legacy");
+        set_approval_section(&path, None, &BTreeMap::new(), &BTreeMap::new()).expect("clear");
+        let config = super::super::parse_openslate_toml(&text_at(&path)).expect("reparse");
+        assert!(config.approval.is_none(), "section must be removed");
+
+        // 显式 Some(Allow)（= 缺省值）同样视为全默认。
+        fs::write(&path, "[approval]\ndefault_level = \"manual\"\n").expect("seed");
+        set_approval_section(
+            &path,
+            Some(&ToolApprovalLevel::Allow),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("clear");
+        assert!(
+            !text_at(&path).contains("approval"),
+            "Some(Allow) must not be written: {}",
+            text_at(&path)
+        );
+
+        // 无文件的空文档上清空 → 静默成功，不创建文件；幂等。
+        let (_dir2, path2) = temp_config();
+        set_approval_section(&path2, None, &BTreeMap::new(), &BTreeMap::new())
+            .expect("clear on missing file ok");
+        assert!(!path2.exists(), "no file should be created on no-op clear");
     }
 }

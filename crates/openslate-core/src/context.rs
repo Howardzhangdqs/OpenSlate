@@ -55,6 +55,7 @@ pub fn build_child_context(
     // Always add child's own system prompt
     if let Some(prompt) = child_system_prompt {
         messages.push(Message {
+            attachments: None,
             role: MessageRole::System,
             content: prompt.to_owned(),
             tool_call_id: None,
@@ -83,6 +84,7 @@ pub fn build_child_context(
         // Generate a brief summary of parent's conversation
         let summary = generate_conversation_summary(parent_messages);
         messages.push(Message {
+            attachments: None,
             role: MessageRole::System,
             content: format!("[Parent conversation summary]\n{}", summary),
             tool_call_id: None,
@@ -94,6 +96,7 @@ pub fn build_child_context(
 
     // Always add the task from parent as a user message
     messages.push(Message {
+        attachments: None,
         role: MessageRole::User,
         content: task.to_owned(),
         tool_call_id: None,
@@ -149,6 +152,7 @@ mod tests {
 
     fn make_message(role: MessageRole, content: &str) -> Message {
         Message {
+            attachments: None,
             role,
             content: content.to_owned(),
             tool_call_id: None,

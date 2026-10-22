@@ -71,6 +71,7 @@ impl ContextManager {
     /// Append a user message to the history.
     pub fn add_user_message(&mut self, content: impl Into<String>) {
         self.messages.push(Message {
+            attachments: None,
             role: MessageRole::User,
             content: content.into(),
             tool_call_id: None,
@@ -83,6 +84,7 @@ impl ContextManager {
     /// Append an assistant message to the history.
     pub fn add_assistant_message(&mut self, content: impl Into<String>) {
         self.messages.push(Message {
+            attachments: None,
             role: MessageRole::Assistant,
             content: content.into(),
             tool_call_id: None,
@@ -95,6 +97,7 @@ impl ContextManager {
     /// Append a tool result message to the history.
     pub fn add_tool_message(&mut self, content: impl Into<String>, tool_call_id: ToolCallId) {
         self.messages.push(Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id),
@@ -112,6 +115,7 @@ impl ContextManager {
         name: Option<String>,
     ) {
         self.messages.push(Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id),
@@ -135,6 +139,7 @@ impl ContextManager {
         // Always include system prompt first
         if let Some(ref prompt) = self.system_prompt {
             let msg = Message {
+                attachments: None,
                 role: MessageRole::System,
                 content: prompt.clone(),
                 tool_call_id: None,
@@ -308,6 +313,7 @@ fn truncate_message(msg: &Message, max_bytes: usize) -> Option<Message> {
     };
 
     Some(Message {
+        attachments: None,
         role: msg.role.clone(),
         content,
         tool_call_id: msg.tool_call_id.clone(),
@@ -695,6 +701,7 @@ mod tests {
                     output_tokens: 7,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -725,6 +732,7 @@ mod tests {
                         model_id: "fast-model".to_owned(),
                         system_prompt: None,
                         messages: vec![Message {
+                            attachments: None,
                             role: MessageRole::User,
                             content: text,
                             tool_call_id: None,
@@ -767,6 +775,7 @@ mod tests {
                         model_id: "fast-model".to_owned(),
                         system_prompt: None,
                         messages: vec![Message {
+                            attachments: None,
                             role: MessageRole::User,
                             content: text,
                             tool_call_id: None,

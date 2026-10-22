@@ -55,7 +55,48 @@ pub trait ModelProvider: Send + Sync {
 | 文件 | 行数 | 内容 |
 |------|------|------|
 | `src/provider.rs` | 1277 | `GenaiConfig`（L56-126，10 字段，含 `reasoning_effort`）、`GenaiProvider` + 构造 + trait 实现；`retry_behaviour` 测试模块（L687 起） |
-| `src/convert.rs` | 704 | `to_chat_request` / `from_chat_response` / `from_stream_end`（OpenSlate 消息 ↔ genai ChatRequest/Response/StreamEnd） |
+| `src/convert.rs` | 704+ | `to_chat_request` / `from_chat_response` / `from_stream_end`（OpenSlate 消息 ↔ genai ChatRequest/Response/StreamEnd）；User 附件分支见 §2.1 |
+
+### 2.1 convert.rs User 附件分支（多模态输入侧，L3）
+
+`to_chat_message` 的 User 分支按 `Message.attachments`（core 类型，L0 落地）分两条路径：
+
+- **无附件**（`None` 或空 vec）→ `ChatMessage::user(text)`，wire 字节级不变
+  （`user_without_attachments_wire_unchanged` 钉死）。
+- **有附件** → `MessageContent::from_parts`：
+  1. `ContentPart::Text(content)` **永远第一**（provider 对 parts 顺序敏感）；
+  2. 随后每个 `data == Some` 的附件 → `ContentPart::Binary(Binary::from_base64(
+     mime, base64::STANDARD(data), filename))`——mime / filename 透传，
+     base64 标准字母表（`base64 = "0.22"`，与 vendor/genai 同版本）。
+  3. `data == None` 的引用（未回填的旧附件）→ 跳过 + `tracing::warn`，**绝不发空 Binary**；
+  4. 图像 >50 兜底（`MAX_IMAGES_PER_REQUEST = 50`，智谱事实）：超出跳过 + warn。
+     主门控在 mobile 层 Submit，此处防直接 API 调用路径；视频不占图像配额。
+
+vendor adapter 把 Binary part 映射为 `image_url` / `video_url` 块（§8 补丁②），
+`into_url()` 对 base64 source 产 `data:{mime};base64,…`（智谱要求 data 前缀）。
+
+### 2.2 convert.rs Tool 附件 1:N 展开（read_file 读图链路，2026-10-21）
+
+`to_chat_request` 的消息映射是 **1:N**（`expand_chat_message`）：genai 的
+`ToolResponse.content` 纯 String，tool 通道无法携带 Binary——wire 标准做法 =
+工具结果正文照发 + 图片字节走紧随的 user 消息。
+
+- **Tool 消息带非空 `attachments`**（core runtime 从 `ToolOutput.attachments` 装入）→
+  两条消息：
+  1. `ToolResponse`（content 原文、call_id/fn_name 语义不变，`to_chat_message` 原映射）；
+  2. 紧随 `ChatMessage::user(from_parts([Text, Binary…]))`——Text 说明打头（单张
+     `[read_file 返回的图片：{mime}]`，多张 `[read_file 返回的图片 ×N：mime1, mime2]`），
+     随后每个 `data == Some` 的附件一个 Binary（与 User 分支同款 base64/filename 透传、
+     >50 图兜底同常量）；`data == None` 跳过 + warn。
+- **全部跳过**（无附件 / 空 vec / 全为引用）→ **不追加空壳 user 消息**，ToolResponse
+  单条 wire 不变（`tool_without_live_attachments_wire_unchanged` 钉死）。
+- 其余消息 1:1（User/Assistant/System 分支不动）；相邻消息顺序保持（展开只在
+  Tool 消息位置原位插入，`expansion_preserves_surrounding_order` 钉死）。
+
+**智谱约束（GLM-5.3-Flash 官方文档，2026-10，记录在 convert.rs 注释防踩坑）**：
+`file` 块与 `image_url`/`video_url` 互斥；图/视频不混发（本轮附件纯图或纯视频，
+**门控在 mobile 层** Submit 处——设计 §3.4 单点常量，实测可放开）。本层永不构造
+`file` 块。Assistant 分支无附件；Tool 分支附件即本节 1:N 展开（工具产出侧多模态）。
 | `src/error.rs` | 119 | `GenaiBuildError`（L5-16，含 `UnknownAdapter`）、`map_error` → `ProviderError`（L31-76） |
 | `src/retry.rs` | 298 | `RetryPolicy`（L49）、`is_retryable`（L91）、`exhausted_error`（L143）、`backoff_or_consumer_gone`（L152） |
 
@@ -123,7 +164,7 @@ pub struct GenaiConfig {
    双写原因：genai 0.6.5 的流式路径会丢 client 默认头。E2E 单测
    `model_request_carries_openslate_user_agent`（provider.rs:556，mockito 同时匹配 UA + Bearer）。
 3. **usage 解析**：OpenAI 的 `usage.prompt_tokens_details.cached_tokens` 经 genai 进
-   `Usage::cached_input_tokens`；服务端不给 details 对象则为 `None`
+   `Usage::cached_input_tokens`；服务端不给 details 对象则为 `None`；`image_tokens` ← genai 顶层 `Usage::image_input_tokens`（补丁 #3，OpenAI 系 `prompt_tokens_details.image_tokens`；智谱无此字段恒 None）
    （单测 `usage_cached_tokens_parsed_from_wire`，L613）。
 
 ## 4. 谁构造 GenaiProvider（工厂，crates/openslate-app/src/provider.rs）
@@ -263,16 +304,46 @@ askama_derive = { ... } askama_macros = { ... } askama_parser = { ... }
 # rquickjs-sys 0.12.2 未随包发布 aarch64-linux-android 绑定（Android 编译硬失败）；
 # vendor 副本补充该绑定（照抄 gnu 版，quickjs 为纯 C ABI，二进制布局一致）。上游合入后可移除。
 rquickjs-sys = { path = "vendor/rquickjs-sys" }
-# genai 0.6.5 vendor：anthropic adapter 原本丢弃历史 ReasoningContent——
-# patch 为回传 thinking block（多轮 extended-thinking 语义）。
+# genai 0.6.5 vendor，本地补丁三条（升级 0.7 前先 rebase 这里）：
+# ① anthropic adapter 回传 thinking block（多轮 extended-thinking 语义）；
+# ② openai adapter User Binary 分支补 video_url（照抄上游 0.7.0 语义）；
+# ③ usage 解析补 image_input_tokens（openai prompt_tokens_details /
+#   openai_resp input_tokens_details 的 image_tokens → 顶层归一化计数）。
 genai = { path = "vendor/genai" }
 ```
 
-- **genai 补丁点**：`vendor/genai/src/adapter/adapters/anthropic/adapter_shared.rs:277-286`
-  （搜 `OpenSlate patch`）——assistant 消息里的 `ContentPart::ReasoningContent(rc)` 回传为
-  `{"type":"thinking","thinking":rc,"signature":""}`。signature 留空：兼容不校验的网关；
-  官方严格 API 若拒，上游应不携带 reasoning。补丁使多轮对话保留 thinking block
-  （Anthropic extended-thinking 语义）。
+**genai 本地补丁清单（三条，均搜 `OpenSlate patch` / `VENDOR PATCH`）：**
+
+1. **anthropic adapter**：`vendor/genai/src/adapter/adapters/anthropic/adapter_shared.rs:277-286`
+   ——assistant 消息里的 `ContentPart::ReasoningContent(rc)` 回传为
+   `{"type":"thinking","thinking":rc,"signature":""}`。signature 留空：兼容不校验的网关；
+   官方严格 API 若拒，上游应不携带 reasoning。补丁使多轮对话保留 thinking block
+   （Anthropic extended-thinking 语义）。
+2. **openai adapter（L3 多模态，照抄上游 0.7.0 语义）**：
+   - `vendor/genai/src/chat/binary.rs`：新增 `Binary::is_video()`（`content_type` 以
+     `video/` 开头，风格对齐既有 `is_image`/`is_audio`）；
+   - `vendor/genai/src/adapter/adapters/openai/adapter_shared.rs` User 分支
+     `ContentPart::Binary` 的 `is_image` 分支后插入 `else if is_video`：
+     `{"type":"video_url","video_url":{"url": binary.into_url()}}`。`into_url()` 对
+     Base64 source 产 `data:{mime};base64,…`（智谱要求 data 前缀）。
+     **不构造 `detail` 字段**（智谱无此参数）。wire 形态由 vendor 测试
+     `test_binary_image_and_video_serialize_to_url_blocks` 钉死（image_url / video_url /
+     无 detail）。
+   - ZAI adapter 委托 OpenAIAdapter → 自动获得；Gemini 视频透传是 lane 内验证项
+     （第二目标，不行则同型小补丁）。
+3. **usage 解析 image_input_tokens**（协议 v5 附件 token 响应侧回填）：
+   - `vendor/genai/src/chat/usage.rs`：`Usage` 新增顶层字段
+     `image_input_tokens: Option<u64>`（serde default + skip，非 openai adapter
+     构造点机械补 None）；
+   - openai chat 路径 `adapter_shared.rs::into_usage`：从原始 Value 取
+     `prompt_tokens_details.image_tokens` 抬升到顶层（正数才透传；raw Value 读取
+     对所有 OpenAI 兼容网关 + 流式路径统一生效）；
+   - openai_resp（Responses API）路径 `resp_usage.rs`：`InputTokensDetails` 新增
+     `image_tokens: Option<i32>`（serde 自动解析 + `is_empty` 纳入），
+     `From<RespUsage> for Usage` 抬升。
+   - 智谱 chat usage 不分模态 → 恒 None（mobile 侧回退文件大小显示，符合预期）。
+     测试：`test_image_input_tokens_lifted_from_prompt_tokens_details`（带/缺/
+     0/畸形矩阵）、`test_resp_usage_image_tokens_lift`。
 - **`vendor/genai` 被 workspace `exclude`**（根 Cargo.toml L21，它自带 `[workspace]` 表）；
   它的测试要在 vendor/genai 目录里独立跑（见 `07-build-dev/build-and-test.md`）。
 - `vendor/rquickjs-sys` 与模型层无关（PTC 的 Android 绑定补齐，见 `04-tools/ptc.md`）。

@@ -22,9 +22,10 @@
 //! | `builtin_tools` | `BuiltinToolsConfig` | no   | In-process builtin tool toggles    |
 //! | `skills`    | `SkillsConfig`      | no       | Skill discovery / injection        |
 //! | `ptc`       | `PtcConfig`         | no       | Programmatic Tool Calling settings |
-//! | `approval`  | `Option<ApprovalConfig>` | no  | Tool approval gating               |
+//! | `approval`  | `Option<ApprovalConfig>` | no  | Tool approval gating (legacy `policy`/`tools` + new `default_level`/`tool_levels`/`server_levels`) |
 //! | `tui`       | `TuiConfig`         | no       | TUI frontend (icon overrides)      |
 //! | `ask_user`  | `AskUserConfig`     | no       | ask_user tool behavior (timeout/masking) |
+//! | `attachments` | `AttachmentsConfig` | no     | Multimodal attachment ingest / send limits (multimodal input design §6.6) |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
 //!
@@ -118,6 +119,11 @@ pub struct OpenSlateConfig {
     /// 手拼 TOML（模块头约定），本 lane 未接写回。
     #[serde(default)]
     pub ask_user: AskUserConfig,
+    /// 附件（多模态输入）限额与实验开关（`[attachments]`，存储 v5 设计
+    /// §6.6；图片处理用户可配置：dim/处理后大小双旋钮）。validation
+    /// 边界：512 ≤ dim ≤ 6000、1 ≤ max_image_mb ≤ 5、其余 mb ≥ 1。
+    #[serde(default)]
+    pub attachments: AttachmentsConfig,
 }
 
 /// Project metadata.
@@ -525,11 +531,32 @@ pub enum ApprovalPolicySetting {
     AutoExcept,
 }
 
+/// `[approval]` 新 schema 的等级拼写（tool-approval P1a）。与运行时
+/// [`crate::approval::ToolApprovalLevel`] 一一对应，serde 形状同为
+/// snake_case（`"manual"` / `"allow"` / `"auto"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalLevelSetting {
+    /// 每次调用都询问。
+    Manual,
+    /// 从不询问，直接放行。
+    Allow,
+    /// 自动判断：启发式低风险放行，中/高风险进入审批链。
+    Auto,
+}
+
 /// Tool approval gating settings (`[approval]`).
 ///
 /// Controls whether tool calls require human approval before execution.
 /// Interactive sessions prompt via an approval callback; non-interactive
 /// runs install a high-risk gate unless `--yes` forces `auto`.
+///
+/// 双 schema 共存（tool-approval P1a）：legacy `policy`（+`tools`）保留
+/// 可解析——旧文件零破坏；新键 `default_level` / `tool_levels` /
+/// `server_levels` 经 [`crate::approval::rules_from_config`] 统一推导
+/// （推导序：legacy 映射铺底 → `default_level` 覆盖 → 两个 level map
+/// 逐键合并）。写回侧（`persist::set_approval_section`）整段重写为新
+/// schema 并删除 legacy 键。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalConfig {
@@ -540,6 +567,17 @@ pub struct ApprovalConfig {
     /// (case-insensitive exact names). Ignored under `auto` / `manual`.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// 新 schema：全局缺省等级（覆盖 legacy `policy` 的映射结果）。
+    /// `None` = 未配置（沿用 legacy 映射；两者都没写 → 规则基线 allow）。
+    #[serde(default)]
+    pub default_level: Option<ToolApprovalLevelSetting>,
+    /// 新 schema：工具名 → 等级（逐键覆盖 legacy `tools` 的映射结果）。
+    #[serde(default)]
+    pub tool_levels: BTreeMap<String, ToolApprovalLevelSetting>,
+    /// 新 schema：MCP server 作用域 → 等级。键 = 审批作用域标识
+    /// （聚合形态下游 slug / host 前缀，见 `mcp::server_slug_of`）。
+    #[serde(default)]
+    pub server_levels: BTreeMap<String, ToolApprovalLevelSetting>,
 }
 
 impl ApprovalConfig {
@@ -585,6 +623,54 @@ pub enum AskTimeout {
     /// 阈值秒数；超时回填 timeout 结果（模型收到「用户可能不在，
     /// 自行判断继续」后继续）。`0` 秒视为立即过期，由消费端容忍。
     Seconds(u64),
+}
+
+/// 附件（多模态输入）限额与实验开关（`[attachments]`，存储 v5 设计
+/// §6.6 最终形态；2026-10-21 起图片处理用户可配置）。
+///
+/// 默认值即安全值：图像等比缩到 `max_image_dim` 后**迭代压缩**到达
+/// `max_image_mb`（q85→70→55 降档、再 dim×0.85 缩边重试，见 mobile
+/// attachments.rs），单请求总内联 25MB，实验视频默认关。
+/// 校验边界（validation.rs）：`512 ≤ max_image_dim ≤ 6000`、
+/// `1 ≤ max_image_mb ≤ 5`（= ingest 出口硬校验的 5MB 公共分母）、
+/// 其余 `*_mb ≥ 1`。
+/// Deserialize-only：写回由 persist.rs 手拼 TOML（模块头约定）；
+/// mobile 侧 FFI setter（set_image_processing）经 toml_edit 原地改写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AttachmentsConfig {
+    /// 图像等比缩放目标：max(w,h) 上限（用户旋钮；只缩不放）。归一化
+    /// 迭代压缩以它为起点，超大小上限时逐档 ×0.85 收缩（地板 1024）。
+    pub max_image_dim: u32,
+    /// **处理后**图像大小上限（MB；用户旋钮）：快速通道 passthrough 与
+    /// 迭代压缩的达标线（q85→70→55 → 缩边重试）。语义自 2026-10-21
+    /// 由「ingest 入口源文件上限」迁移——入口防呆改固定宽裕常量
+    /// （mobile `MAX_SOURCE_IMAGE_BYTES` 50MB），归一化总能压到达标。
+    pub max_image_mb: u64,
+    /// 视频落盘上限（passthrough 不转码；文件先落盘可重发、跨 run
+    /// 复用，实际发送另受 `max_inline_video_mb` 约束）。
+    pub max_video_mb: u64,
+    /// 实际发送的内联视频上限（data:URL base64 内联量级，对齐 Gemini
+    /// inline 惯例；200MB 是智谱 URL 托管上限，不是内联该碰的）。
+    pub max_inline_video_mb: u64,
+    /// 单请求附件总字节上限（Submit 门控 fail-fast，报错列出实际总量）。
+    pub max_inline_total_mb: u64,
+    /// data:URL 视频实验开关（智谱端 base64 视频未文档化，设计 §3.5；
+    /// 默认关，开启后 Submit 门控才放行视频附件）。
+    pub experimental_video: bool,
+}
+
+impl Default for AttachmentsConfig {
+    fn default() -> Self {
+        Self {
+            max_image_dim: 2048,
+            max_image_mb: 5,
+            max_video_mb: 50,
+            max_inline_video_mb: 20,
+            max_inline_total_mb: 25,
+            experimental_video: false,
+        }
+    }
 }
 
 // ── Default helpers ──────────────────────────────────────────────────────────
@@ -817,6 +903,69 @@ model = "m"
         let config = parse_openslate_toml(toml).expect("should parse");
         assert_eq!(config.ask_user.default_timeout, AskTimeout::Never);
         assert!(config.ask_user.mask_secrets);
+    }
+
+    // ── [attachments]（多模态输入设计 §6.6）─────────────────────────────
+
+    #[test]
+    fn attachments_defaults_are_the_safe_values() {
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.attachments, AttachmentsConfig::default());
+        assert_eq!(config.attachments.max_image_dim, 2048);
+        // 2026-10-21 语义迁移：max_image_mb = 处理后大小上限（默认 5），
+        // 不再是 ingest 入口源文件上限（入口防呆改固定常量）。
+        assert_eq!(config.attachments.max_image_mb, 5);
+        assert_eq!(config.attachments.max_video_mb, 50);
+        assert_eq!(config.attachments.max_inline_video_mb, 20);
+        assert_eq!(config.attachments.max_inline_total_mb, 25);
+        assert!(!config.attachments.experimental_video);
+    }
+
+    #[test]
+    fn attachments_partial_override_fills_the_rest_from_default() {
+        // 容器级 #[serde(default)]：只写实验开关，其余字段回落默认值。
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[attachments]
+experimental_video = true
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert!(config.attachments.experimental_video);
+        assert_eq!(config.attachments.max_image_dim, 2048);
+        assert_eq!(config.attachments.max_inline_total_mb, 25);
+    }
+
+    #[test]
+    fn attachments_unknown_key_rejected() {
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[attachments]
+max_imege_dim = 1024
+"#;
+        assert!(parse_openslate_toml(toml).is_err(), "deny_unknown_fields 拒拼写错误键");
     }
 
     #[test]
@@ -1417,6 +1566,97 @@ policy = "ask_sometimes"
         assert!(
             msg.contains("ask_sometimes"),
             "error should name the bad variant, got: {msg}"
+        );
+    }
+
+    // ── [approval] 新 schema 解析（tool-approval P1a）────────────────────
+
+    #[test]
+    fn parse_approval_new_schema_keys() {
+        let toml = r#"
+[approval]
+default_level = "auto"
+
+[approval.tool_levels]
+bash = "manual"
+read_file = "allow"
+
+[approval.server_levels]
+github = "allow"
+termux = "manual"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        let approval = config.approval.as_ref().expect("section present");
+        assert_eq!(
+            approval.default_level,
+            Some(ToolApprovalLevelSetting::Auto)
+        );
+        assert_eq!(
+            approval.tool_levels,
+            BTreeMap::from([
+                ("bash".to_owned(), ToolApprovalLevelSetting::Manual),
+                ("read_file".to_owned(), ToolApprovalLevelSetting::Allow),
+            ])
+        );
+        assert_eq!(
+            approval.server_levels,
+            BTreeMap::from([
+                ("github".to_owned(), ToolApprovalLevelSetting::Allow),
+                ("termux".to_owned(), ToolApprovalLevelSetting::Manual),
+            ])
+        );
+        // legacy 键缺省仍可读（双 schema 共存）。
+        assert_eq!(approval.policy, ApprovalPolicySetting::Auto);
+        assert!(approval.tools.is_empty());
+    }
+
+    #[test]
+    fn parse_approval_legacy_and_new_keys_coexist() {
+        // 旧文件（只写 legacy 键）零破坏 + 新旧键同段混写可解析。
+        let legacy = r#"
+[approval]
+policy = "auto_except"
+tools = ["bash"]
+"#;
+        let config = parse_openslate_toml(legacy).expect("legacy file should parse");
+        let approval = config.approval.as_ref().expect("section present");
+        assert_eq!(approval.policy, ApprovalPolicySetting::AutoExcept);
+        assert_eq!(approval.tools, vec!["bash".to_owned()]);
+        assert_eq!(approval.default_level, None);
+        assert!(approval.tool_levels.is_empty());
+        assert!(approval.server_levels.is_empty());
+
+        let mixed = r#"
+[approval]
+policy = "manual"
+default_level = "auto"
+
+[approval.tool_levels]
+bash = "allow"
+"#;
+        let config = parse_openslate_toml(mixed).expect("mixed schema should parse");
+        let approval = config.approval.as_ref().expect("section present");
+        assert_eq!(approval.policy, ApprovalPolicySetting::Manual);
+        assert_eq!(
+            approval.default_level,
+            Some(ToolApprovalLevelSetting::Auto)
+        );
+        assert_eq!(
+            approval.tool_levels,
+            BTreeMap::from([("bash".to_owned(), ToolApprovalLevelSetting::Allow)])
+        );
+    }
+
+    #[test]
+    fn parse_approval_unknown_level_rejected() {
+        let toml = r#"
+[approval]
+default_level = "yolo"
+"#;
+        let err = parse_openslate_toml(toml).expect_err("unknown level must be rejected");
+        assert!(
+            err.to_string().contains("yolo"),
+            "error should name the bad variant, got: {err}"
         );
     }
 

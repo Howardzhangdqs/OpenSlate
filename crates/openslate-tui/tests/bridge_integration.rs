@@ -91,6 +91,7 @@ fn snapshot_dto(model_alias: &str) -> openslate_protocol::SnapshotDto {
 
 fn user_message(text: &str) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::User,
         content: text.to_owned(),
         tool_call_id: None,
@@ -114,6 +115,7 @@ async fn app_consumes_turn_events_and_merges_transcript() {
         messages: vec![
             user_message("go"),
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -126,6 +128,7 @@ async fn app_consumes_turn_events_and_merges_transcript() {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Tool,
                 content: "hi".into(),
                 tool_call_id: Some(ToolCallId("tc-1".into())),
@@ -134,6 +137,7 @@ async fn app_consumes_turn_events_and_merges_transcript() {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "All done!".into(),
                 tool_call_id: None,
@@ -257,6 +261,7 @@ async fn request_usage_meta_lines_flow_through_dispatch() {
         output_tokens: 10,
         cached_input_tokens: Some(3),
         reasoning_tokens: None,
+        image_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -353,6 +358,7 @@ async fn request_usage_meta_lines_flow_through_dispatch() {
         messages: vec![
             user_message("go"),
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "the answer".into(),
                 tool_call_id: None,
@@ -488,6 +494,7 @@ async fn tool_step_usage_meta_lands_below_the_tool_row() {
         output_tokens: 10,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        image_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -528,7 +535,8 @@ async fn turn_error_restores_pending_input_and_surfaces_error() {
     assert_eq!(
         link.take_sent(),
         vec![ClientMsg::Submit {
-            text: "hello".into()
+            text: "hello".into(),
+            attachments: None,
         }],
         "the submit left for the server"
     );
@@ -814,6 +822,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
         messages: vec![
             user_message("go"),
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -826,6 +835,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Tool,
                 content: "ok".into(),
                 tool_call_id: Some(ToolCallId("tc-1".into())),
@@ -834,6 +844,7 @@ async fn reasoning_and_tool_line_keep_event_order_in_live_view() {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "final".into(),
                 tool_call_id: None,
@@ -1030,6 +1041,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
         output_tokens: 10,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        image_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -1062,6 +1074,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
         output_tokens: 5,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        image_tokens: None,
     })))
     .await;
     app.dispatch(Action::Engine(TuiEvent::RequestEnd)).await;
@@ -1072,6 +1085,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
         messages: vec![
             user_message("go"),
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "checking".into(),
                 tool_call_id: None,
@@ -1084,6 +1098,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Tool,
                 content: "hi".into(),
                 tool_call_id: Some(ToolCallId("tc-1".into())),
@@ -1092,6 +1107,7 @@ async fn turn_done_ok_merge_keeps_thinking_meta_and_tool_rows() {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "final".into(),
                 tool_call_id: None,
@@ -1310,6 +1326,7 @@ fn tool_fold_turn_done(content: &str) -> TuiEvent {
         run_id: RunId("copy-tool".into()),
         status: openslate_core::types::RunStatus::Completed,
         messages: vec![Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.to_owned(),
             tool_call_id: None,
@@ -1674,6 +1691,7 @@ async fn snapshot_rebuilds_the_transcript_wholesale() {
     snap.transcript = vec![
         EntryDto::User {
             text: "history user".into(),
+            attachments: None,
         },
         EntryDto::Assistant {
             text: "history answer".into(),
@@ -1707,6 +1725,7 @@ async fn snapshot_rebuilds_the_transcript_wholesale() {
     let mut snap2 = snapshot_dto("main");
     snap2.transcript = vec![EntryDto::User {
         text: "only".into(),
+        attachments: None,
     }];
     link.emit(ServerMsg::Snapshot {
         session: Box::new(snap2),
@@ -1742,7 +1761,8 @@ async fn pending_input_auto_submits_after_turn_ok() {
     assert_eq!(
         link.take_sent(),
         vec![ClientMsg::Submit {
-            text: "second".into()
+            text: "second".into(),
+            attachments: None,
         }],
         "the queued input auto-submitted"
     );

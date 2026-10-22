@@ -86,6 +86,12 @@ dependencies {
     // Haze：弹层局部真实背景模糊（hazeSource / hazeBlur），Apache-2.0。
     implementation(libs.haze)
     implementation(libs.haze.blur)
+
+    // Telephoto：附件全屏查看器的缩放/平移手势 + 大图子采样（按解码区域
+    // 分块解码，2048px 级 JPEG 不再整张进内存）；okio 经 sub-sampling-image
+    // 传递引入，无需显式声明。
+    implementation(libs.telephoto.zoomable)
+    implementation(libs.telephoto.subsampling)
     // UniFFI 生成的 Kotlin 绑定依赖 JNA（com.sun.jna.*）。
     implementation("net.java.dev.jna:jna:5.17.0@aar")
     // Shizuku（设置页一键授权 Termux RUN_COMMAND；仅一次性 pm grant 用）。

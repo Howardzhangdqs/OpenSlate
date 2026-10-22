@@ -25,10 +25,36 @@ import uniffi.openslate.mobile.OpenSlateRuntime
 import java.util.concurrent.atomic.AtomicReference
 
 /**
+ * 附件引用（协议 `AttachmentDto` 的 UI 投影）：Submit JSON / transcript
+ * `EntryDto::User` 条目共用；id 指向 Rust 侧 attachments 行（content-
+ * addressed 字节在 files/，引用只有几百字节——设计 §6.1）。
+ */
+data class AttachmentRefUi(
+    val id: String,
+    val mime: String,
+    val filename: String? = null,
+    /**
+     * 图片 token 数（transcript `tokens` 可选键，持久化在 entries 里重启仍在；
+     * 只有该回合恰好带 1 张图片且模型响应 usage 顺带含图片 token（OpenAI 系）
+     * 时才有值——智谱下恒 null，旧快照缺键亦 null）。只读卡右下角徽标用，
+     * 草稿侧不用（草稿不产生该数据）。
+     */
+    val tokens: Long? = null,
+) {
+    /** chip 图标判定：归一化 mime 以 video/ 开头 = 视频（contract L4）。
+     *  值域 image/jpeg|png 与 video/mp4|x-matroska|quicktime。 */
+    val isVideo: Boolean get() = mime.startsWith("video/")
+}
+
+/**
  * UI 条目（transcript 的精简投影；完整镜像在 Rust 侧，UI 只保留渲染所需）。
  */
 sealed class UiEntry {
-    data class User(val text: String) : UiEntry()
+    /** attachments = 随行附件引用（v4 多模态；无附件恒空表）。 */
+    data class User(
+        val text: String,
+        val attachments: List<AttachmentRefUi> = emptyList(),
+    ) : UiEntry()
     data class Assistant(val text: String) : UiEntry()
     data class Reasoning(
         val text: String,
@@ -54,12 +80,67 @@ sealed class UiEntry {
     object StepBreak : UiEntry()
 }
 
+/**
+ * 工具调用审批请求（approval_requested 事件 / snapshot pending_approval 的投影）。
+ * summary 可选字段（server/trigger/note）缺键即 null，与 Rust Option 对齐。
+ */
 data class PendingApprovalUi(
     val id: Long,
     val toolName: String,
+    /** 参数预览（Rust 侧已单行化并截断 120 字符的 JSON）。 */
+    val arguments: String,
+    /** "low" | "medium" | "high"；未知值由 UI 兜底显示原始串。 */
     val riskLevel: String,
-    val reason: String,
+    /** MCP 下游 server slug（host 内置工具 = host 前缀，如 "termux"）；
+     *  null = 非 MCP 工具（不显示 MCP 组操作）。 */
+    val server: String? = null,
+    /** 本次询问触发来源："manual"（等级=全部手动）| "auto_risk"（AI 审查判定
+     *  高风险）；null = 协议缺省，按 manual 处理。 */
+    val trigger: String? = null,
+    /** AI 审查理由（trigger=auto_risk 时由 Rust 携带；manual 触发无）。 */
+    val note: String? = null,
 )
+
+/**
+ * 审批规则（ConfigViewDto.approval 的投影，映射后的生效规则）。
+ * level 值域："manual" | "allow" | "auto"（全部手动 / 全部允许 / 自动判断）。
+ */
+data class ApprovalRulesUi(
+    val defaultLevel: String = "auto",
+    /** 工具注册全名 → 等级（显式覆盖；未含键 = 跟随 server/default）。 */
+    val toolLevels: Map<String, String> = emptyMap(),
+    /** MCP server slug → 等级（组级覆盖；未含键 = 跟随默认）。 */
+    val serverLevels: Map<String, String> = emptyMap(),
+)
+
+/** 审批等级 → 中文文案（未知值兜底显示原始串）。 */
+internal fun approvalLevelLabel(level: String): String = when (level) {
+    "auto" -> "自动判断"
+    "allow" -> "全部允许"
+    "manual" -> "全部手动"
+    else -> level
+}
+
+/**
+ * 转写审批条目（UiEntry.Approval）decision → 中文文案；未知值兜底显示
+ * 原始串（协议新值 / 旧客户端残留都可见，不吞不猜）。
+ */
+internal fun approvalDecisionLabel(decision: String): String = when (decision) {
+    "approved" -> "已允许"
+    "denied" -> "已拒绝"
+    "approve-all" -> "本会话允许"
+    "always-tool" -> "已设为一直允许"
+    "session-mcp" -> "本会话允许（MCP）"
+    "always-mcp" -> "已设为一直允许（MCP）"
+    else -> decision
+}
+
+/**
+ * summary 可选字符串字段：缺键 / JSON null / 空串均归 null（org.json 的
+ * optString 对缺失返回空串，无法区分「有但空」，此处统一对齐 Rust Option）。
+ */
+internal fun JSONObject.optStringOrNull(key: String): String? =
+    if (has(key) && !isNull(key)) optString(key).takeIf { it.isNotEmpty() } else null
 
 // ── ask_user（Agent 向用户提问）的 UI 投影与草稿 ─────────────────────
 
@@ -363,6 +444,8 @@ data class ConfigUi(
     val levels: Map<String, String> = emptyMap(),
     /** 功能 → 代号（server 侧已并入缺省回退的生效值）。 */
     val capabilities: Map<String, String> = emptyMap(),
+    /** 审批规则视图（config 视图 `approval` 键；旧 runtime 无此键 → null）。 */
+    val approval: ApprovalRulesUi? = null,
     val activeConfig: String = "",
 )
 
@@ -382,6 +465,10 @@ data class ToolInfoUi(
     val description: String,
     /** input_schema 提取的参数（schema 缺失/空 → 空表）。 */
     val params: List<ToolParamUi> = emptyList(),
+    /** 所属 MCP server slug（host 内置 = host 前缀）；null = 非 MCP 工具。
+     *  旧 runtime 的清单无此键 → 调用方回退 [RuntimeBridge.mcpServerSlugOf]
+     *  推导（有则用，缺失兜底）。 */
+    val server: String? = null,
 )
 
 /** 工具可见性快照（getAgentToolVisibility FFI JSON 的投影）。
@@ -443,6 +530,9 @@ data class SessionSummaryUi(
     val status: String,
     val startedMs: Long,
     val costUsd: Double,
+    /** 聚合 token（v5 runs 列；存量 run = 0，UI 侧 0 时省略不显示）。 */
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
 )
 
 /** 模型元数据（registry 查询投影；字段可空 = 数据源未提供）。 */
@@ -511,8 +601,56 @@ object RuntimeBridge {
     /** 当前事件消费协程（单例泵：start 前取消旧泵，避免 shutdown→start 后双消费者竞态）。 */
     private var pumpJob: Job? = null
 
+    /**
+     * 最近一次 snapshot 携带的 run_id（C4：转写镜像键修复）。**只在
+     * applySnapshot（泵协程）里写**，读方（turn_error 落盘兜底）同在泵
+     * 协程——单协程 FIFO 保证读到的事件序与写入序一致，无需同步原语。
+     * 替代旧实现里 runtime.currentRunId() 的 FFI 旁路直读（open_session
+     * 在 Dispatchers.IO 与事件泵并发，直读实时态会产生 run 键错位）。
+     */
+    private var lastKnownRunId: String? = null
+
     private val _state = MutableStateFlow(RuntimeUiState())
     val state: StateFlow<RuntimeUiState> = _state.asStateFlow()
+
+    /**
+     * 附件提交终态信号（seq 单调递增；多模态输入契约）：带附件的 Submit
+     * 是异步门控（Rust 侧拒经 notice 通道回来），composer 据此决定清空
+     * 还是保留草稿与附件 chips——
+     * - accepted=true：引擎已接受（request_start）→ composer 清空；
+     * - accepted=false：门控拒绝（Error）/ 回合进行中（Warn）/ 会话切换
+     *   等意外终结 → composer **保留草稿**，错误文案经 [lastNotice] snackbar。
+     */
+    data class SubmitResolutionUi(val seq: Long, val accepted: Boolean)
+
+    private val _submitResolution = MutableStateFlow(SubmitResolutionUi(0, false))
+    val submitResolution: StateFlow<SubmitResolutionUi> = _submitResolution.asStateFlow()
+    private var resolutionSeq = 0L
+
+    /** notice 事件投影（含语义级别；level 值域 info|warn|error，serde
+     *  snake_case）。ChatScreen 据此把 error/warn 级提为 snackbar；纯
+     *  info 仍只进转写 Meta 行。 */
+    data class BridgeNoticeUi(val seq: Long, val level: String, val text: String)
+
+    private val _lastNotice = MutableStateFlow<BridgeNoticeUi?>(null)
+    val lastNotice: StateFlow<BridgeNoticeUi?> = _lastNotice.asStateFlow()
+    private var noticeSeq = 0L
+
+    /** 等待引擎接受的附件提交（request_start 后回显；拒绝/会话切换时
+     *  丢弃）。submit 在 UI 线程写、事件泵协程读写 → 原子引用。 */
+    private class PendingEchoSubmit(val text: String, val refs: List<AttachmentRefUi>)
+
+    private val pendingEcho = AtomicReference<PendingEchoSubmit?>(null)
+
+    private fun emitSubmitResolution(accepted: Boolean) {
+        resolutionSeq += 1
+        _submitResolution.value = SubmitResolutionUi(resolutionSeq, accepted)
+    }
+
+    /** 丢弃在途附件提交（accepted=false 结束 composer 等待）。 */
+    private fun dropPendingEcho() {
+        if (pendingEcho.getAndSet(null) != null) emitSubmitResolution(accepted = false)
+    }
 
     private val runtimeRef = AtomicReference<OpenSlateRuntime?>(null)
     private val startMutex = Mutex()
@@ -666,14 +804,48 @@ object RuntimeBridge {
 
     val isReady: Boolean get() = _state.value.ready
 
-    fun submit(text: String) {
+    /**
+     * 提交用户消息（可带附件引用）。
+     *
+     * - 无附件：保持既有乐观语义——sendJson 成功即本地回显 User 条目
+     *   （Rust 侧推 transcript 但不广播 User 事件，与桌面 TUI 同语义）。
+     * - 带附件：**不立即回显**。Submit 是异步门控（模态能力/数量/体积/
+     *   图视频互斥在 Rust 侧，拒绝经 Error 级 notice 返回），立即回显会
+     *   在拒绝后留下幽灵气泡。改为挂 [pendingEcho]，引擎接受
+     *   （request_start）后回显并广播 [submitResolution](accepted=true)；
+     *   拒绝/会话切换广播 accepted=false——composer 草稿与附件 chips 保
+     *   留，可修正后重发。
+     *
+     * 返回 false = 未送达（runtime 未就绪 / FFI 异常），调用方保留草稿。
+     */
+    fun submit(text: String, attachments: List<AttachmentRefUi> = emptyList()): Boolean {
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return
-        // 乐观本地回显（Rust 侧推 transcript 但不广播 User 事件——与桌面
-        // TUI 同语义）；失败保留气泡，与 TUI「可重发」行为一致。
-        if (sendJson(JSONObject().put("type", "submit").put("text", trimmed).toString())) {
-            mutate { copy(entries = entries + UiEntry.User(trimmed)) }
+        if (trimmed.isEmpty()) return false
+        val json = JSONObject().put("type", "submit").put("text", trimmed)
+        if (attachments.isNotEmpty()) {
+            // 契约（§7）：attachments = [{id, mime, filename?}]，mime/filename
+            // 用 import 返回值原样回填；filename null 跳键（serde Option）。
+            json.put(
+                "attachments",
+                JSONArray().apply {
+                    for (a in attachments) {
+                        put(
+                            JSONObject()
+                                .put("id", a.id)
+                                .put("mime", a.mime)
+                                .apply { a.filename?.takeIf { it.isNotEmpty() }?.let { put("filename", it) } },
+                        )
+                    }
+                },
+            )
         }
+        if (!sendJson(json.toString())) return false
+        if (attachments.isEmpty()) {
+            mutate { copy(entries = entries + UiEntry.User(trimmed)) }
+        } else {
+            pendingEcho.set(PendingEchoSubmit(trimmed, attachments))
+        }
+        return true
     }
 
     fun cancel() = sendJson(JSONObject().put("type", "cancel").toString())
@@ -755,7 +927,14 @@ object RuntimeBridge {
             if (name.isEmpty()) {
                 null
             } else {
-                ToolInfoUi(name, obj.optString("description"), parseToolParams(obj))
+                ToolInfoUi(
+                    name = name,
+                    description = obj.optString("description"),
+                    params = parseToolParams(obj),
+                    // server 字段（协议新增，有则用）：MCP slug / host 前缀；
+                    // 缺失（旧 runtime）→ null，调用方回退 mcpServerSlugOf 推导。
+                    server = obj.optStringOrNull("server"),
+                )
             }
         }
     }
@@ -1333,10 +1512,62 @@ object RuntimeBridge {
             counts
         }
 
-    /** 审批应答（choice: approve / deny / approve_all）。 */
+    /** 审批上行 choice 值域（协议 v3）。approve 为 TUI/兜底保留，mobile UI 只出 5 项。 */
+    object ApprovalChoice {
+        const val APPROVE = "approve" // TUI/兜底保留，UI 不出
+        const val DENY = "deny" // (e) 取消/禁止执行
+        const val APPROVE_ALL = "approve_all" // (a) 当前会话允许该工具
+        const val ALWAYS_TOOL = "always_tool" // (b) 一直允许该工具
+        const val SESSION_MCP = "session_mcp" // (c) 当前会话允许该 MCP
+        const val ALWAYS_MCP = "always_mcp" // (d) 一直允许该 MCP
+    }
+
+    /** 审批应答（原始 choice 入口；值域见 [ApprovalChoice]）。 */
     fun answerApproval(id: Long, choice: String) = sendJson(
         JSONObject().put("type", "approval_answer").put("id", id).put("choice", choice).toString()
     )
+
+    // ── 审批应答的语义化入口（聊天页审批卡专用；首答赢，重复发送无害）──
+
+    /** (a) 当前会话允许该工具。 */
+    fun approveForSession(id: Long) = answerApproval(id, ApprovalChoice.APPROVE_ALL)
+
+    /** (b) 一直允许该工具（Rust 侧落盘 + 广播 config_changed）。 */
+    fun approveAlways(id: Long) = answerApproval(id, ApprovalChoice.ALWAYS_TOOL)
+
+    /** (c) 当前会话允许该 MCP 服务器的全部工具。 */
+    fun approveMcpForSession(id: Long) = answerApproval(id, ApprovalChoice.SESSION_MCP)
+
+    /** (d) 一直允许该 MCP 服务器的全部工具。 */
+    fun approveMcpAlways(id: Long) = answerApproval(id, ApprovalChoice.ALWAYS_MCP)
+
+    /** (e) 取消/禁止执行。拒绝必须真正发送 deny——纯 UI 关闭会让 Rust 侧
+     *  审批等待永久挂起（turn 卡死）。 */
+    fun deny(id: Long) = answerApproval(id, ApprovalChoice.DENY)
+
+    /**
+     * 写审批规则（协议 set_approval_config：Rust 侧整段重写 [approval] 落盘 +
+     * 热替换 + 广播 config_changed）。全量覆写语义：默认级 + 两个 map 一次发齐，
+     * 「跟随上级/默认」（删除键）= 对应 map 里不带该键。
+     */
+    fun setApprovalConfig(
+        defaultLevel: String,
+        toolLevels: Map<String, String>,
+        serverLevels: Map<String, String>,
+    ) {
+        val tools = JSONObject()
+        for ((k, v) in toolLevels) tools.put(k, v)
+        val servers = JSONObject()
+        for ((k, v) in serverLevels) servers.put(k, v)
+        sendJson(
+            JSONObject()
+                .put("type", "set_approval_config")
+                .put("default_level", defaultLevel)
+                .put("tool_levels", tools)
+                .put("server_levels", servers)
+                .toString(),
+        )
+    }
 
     // ── ask_user：Agent 向用户提问（内联问卷卡 + 全屏作答）──────────────
     //
@@ -1726,6 +1957,8 @@ object RuntimeBridge {
             // 关停时取消事件泵（下次 start 会重建），防旧泵滞留消费。
             pumpJob?.cancel()
             pumpJob = null
+            // 在途附件提交失去落点：终结等待（composer 草稿保留）。
+            dropPendingEcho()
             TermuxExec.cancelAll()
             _state.value = RuntimeUiState()
         }
@@ -1836,6 +2069,12 @@ object RuntimeBridge {
                 }
             }
             "request_start" -> {
+                // 附件提交被引擎接受：回显 User 条目（携带附件引用）并广播
+                // accepted 终态（composer 清空草稿与 chips）。
+                pendingEcho.getAndSet(null)?.let { pe ->
+                    mutate { copy(entries = entries + UiEntry.User(pe.text, pe.refs)) }
+                    emitSubmitResolution(accepted = true)
+                }
                 // 恢复卡失效出清：新 turn 开启前 Rust 侧悬挂修复已把 pending 行
                 // superseded 关卷（迟到通道关闭）；且重启后 host call id 计数器
                 // 从 1 复位，恢复卡的数字 request_id 可能撞上新在途调用——
@@ -1859,16 +2098,36 @@ object RuntimeBridge {
             }
             "turn_ok" -> mutate {
                 copy(running = false, awaitingFirstToken = false)
-            }.also { finalizeAskUserOnTurnEnd(); persistTranscriptAsync() }
+            }.also {
+                finalizeAskUserOnTurnEnd()
+                // 落盘键取 TurnSummaryDto 自带的 run_id（wire 契约恒有），
+                // 与本事件同时到达 → 键与 _state.entries 严格同代；不读
+                // FFI 实时态（open_session 并发换 run 时会错位）。
+                persistTranscriptAsync(obj.optJSONObject("summary")?.optString("run_id")?.ifBlank { null })
+            }
             "turn_error" -> mutate {
                 copy(
                     running = false,
                     awaitingFirstToken = false,
                     entries = entries + UiEntry.Meta("⚠ " + obj.optString("message", "error")),
                 )
-            }.also { finalizeAskUserOnTurnEnd(); persistTranscriptAsync() }
-            "notice" -> mutate {
-                copy(entries = entries + UiEntry.Meta(obj.optString("text", "")))
+            }.also {
+                finalizeAskUserOnTurnEnd()
+                // turn_error 无 summary：兜底最近快照的 run_id（泵协程内，
+                // FIFO 保证它仍是本 run——见 persistTranscriptAsync 注释）。
+                persistTranscriptAsync(lastKnownRunId)
+            }
+            "notice" -> {
+                val level = obj.optString("level", "info")
+                val text = obj.optString("text", "")
+                mutate { copy(entries = entries + UiEntry.Meta(text)) }
+                // 级别化投影：error/warn 由 ChatScreen 提为 snackbar（附件
+                // 门控拒绝等即时反馈；info 仍只进转写）。
+                noticeSeq += 1
+                _lastNotice.value = BridgeNoticeUi(noticeSeq, level, text)
+                // 附件提交等待接受期间收到 warn/error = 提交未落地（门控
+                // 拒绝 Error / 回合进行中 Warn）→ 结束等待，草稿保留。
+                if (level == "error" || level == "warn") dropPendingEcho()
             }
             "error" -> mutate { copy(lastError = obj.optString("message", "protocol error")) }
             "approval_requested" -> {
@@ -1878,20 +2137,26 @@ object RuntimeBridge {
                         pendingApproval = PendingApprovalUi(
                             id = obj.optLong("id"),
                             toolName = summary?.optString("tool_name") ?: "?",
+                            arguments = summary?.optString("arguments").orEmpty(),
                             riskLevel = summary?.optString("risk_level") ?: "?",
-                            reason = summary?.optString("reason") ?: "",
+                            server = summary?.optStringOrNull("server"),
+                            trigger = summary?.optStringOrNull("trigger"),
+                            note = summary?.optStringOrNull("note"),
                         )
                     )
                 }
             }
             "approval_resolved" -> mutate { copy(pendingApproval = null) }
-            "session_reset" -> mutate {
-                copy(
-                    entries = emptyList(),
-                    pendingApproval = null,
-                    pendingQuestion = null,
-                    questionReview = null, // 回看页在场时随 null 自动 pop（页内 LaunchedEffect）
-                )
+            "session_reset" -> {
+                dropPendingEcho()
+                mutate {
+                    copy(
+                        entries = emptyList(),
+                        pendingApproval = null,
+                        pendingQuestion = null,
+                        questionReview = null, // 回看页在场时随 null 自动 pop（页内 LaunchedEffect）
+                    )
+                }
             }
             "model_changed" -> mutate { copy(modelAlias = obj.optString("alias")) }
             // run 标题生成完成：只递增版本号，历史页观察到后自行刷新
@@ -1904,6 +2169,26 @@ object RuntimeBridge {
     }
 
     /** 解析 ConfigViewDto → ConfigUi。 */
+    /** transcript User 条目的 attachments 数组 → 引用投影（缺键/旧快照 → 空表）。 */
+    private fun parseAttachmentRefs(arr: JSONArray?): List<AttachmentRefUi> {
+        if (arr == null) return emptyList()
+        return buildList {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                add(
+                    AttachmentRefUi(
+                        id = o.optString("id"),
+                        mime = o.optString("mime"),
+                        filename = o.optStringOrNull("filename"),
+                        // 可选键：缺键 / 类型异常 optLong 均落 -1 哨兵，统一
+                        // 收敛 null（同上一轮 importAttachment 写法）。
+                        tokens = o.optLong("tokens", -1L).takeIf { it >= 0 },
+                    ),
+                )
+            }
+        }
+    }
+
     private fun parseConfig(c: JSONObject): ConfigUi {
         val providers = buildList {
             val ps = c.optJSONObject("providers") ?: return@buildList
@@ -1955,11 +2240,25 @@ object RuntimeBridge {
             val cs = c.optJSONObject("capabilities") ?: return@buildMap
             for (k in cs.keys()) put(k, cs.optString(k))
         }
+        // 审批规则视图（映射后生效规则；旧 runtime 无此键 → null，设置页
+        // 据此显示「尚未加载」而非空白默认值）。
+        val approval = c.optJSONObject("approval")?.let { a ->
+            fun strMap(key: String): Map<String, String> {
+                val m = a.optJSONObject(key) ?: return emptyMap()
+                return buildMap { for (k in m.keys()) put(k, m.optString(k)) }
+            }
+            ApprovalRulesUi(
+                defaultLevel = a.optString("default_level", "auto").ifBlank { "auto" },
+                toolLevels = strMap("tool_levels"),
+                serverLevels = strMap("server_levels"),
+            )
+        }
         return ConfigUi(
             providers = providers,
             models = models,
             levels = levels,
             capabilities = capabilities,
+            approval = approval,
             activeConfig = c.optString("active_config"),
         )
     }
@@ -2332,6 +2631,12 @@ object RuntimeBridge {
 
     private fun applySnapshot(session: JSONObject?) {
         if (session == null) return
+        // 会话快照重挂（启动/打开会话）：在途附件提交已失去落点，静默终结
+        // （accepted=false；composer 草稿保留，但不再等待回显）。
+        dropPendingEcho()
+        // 快照内嵌 run 键（协议 run_id）：镜像仲裁用它，不读 FFI 实时态——
+        // 快照在泵协程 FIFO 内到达，键与本快照的 entries 天然同源同代。
+        lastKnownRunId = session.optString("run_id").ifBlank { null }
         val transcript = session.optJSONArray("transcript") ?: return
         // ask_user 恢复关联表：tool_call 条目的 call_id（仅 DB 重建条目携带，
         // live 条目恒缺省）→ fullArgs。pending_questions 回放按 tool_call_id
@@ -2341,7 +2646,13 @@ object RuntimeBridge {
             for (i in 0 until transcript.length()) {
                 val e = transcript.optJSONObject(i) ?: continue
                 when (e.optString("kind")) {
-                    "user" -> add(UiEntry.User(e.optString("text")))
+                    // attachments（v4 多模态）：缺键/旧快照 → 空表。
+                    "user" -> add(
+                        UiEntry.User(
+                            e.optString("text"),
+                            parseAttachmentRefs(e.optJSONArray("attachments")),
+                        ),
+                    )
                     "assistant" -> add(UiEntry.Assistant(e.optString("text")))
                     "reasoning" -> add(UiEntry.Reasoning(e.optString("text")))
                     "meta" -> add(UiEntry.Meta(e.optString("text")))
@@ -2408,11 +2719,15 @@ object RuntimeBridge {
             step = _state.value.step.takeIf { session.optBoolean("running") } ?: 0,
             toolCalls = session.optInt("tool_calls_cur", _state.value.toolCalls),
             pendingApproval = pending?.let {
+                val summary = it.optJSONObject("summary")
                 PendingApprovalUi(
                     id = it.optLong("id"),
-                    toolName = it.optJSONObject("summary")?.optString("tool_name") ?: "?",
-                    riskLevel = it.optJSONObject("summary")?.optString("risk_level") ?: "?",
-                    reason = it.optJSONObject("summary")?.optString("reason") ?: "",
+                    toolName = summary?.optString("tool_name") ?: "?",
+                    arguments = summary?.optString("arguments").orEmpty(),
+                    riskLevel = summary?.optString("risk_level") ?: "?",
+                    server = summary?.optStringOrNull("server"),
+                    trigger = summary?.optStringOrNull("trigger"),
+                    note = summary?.optStringOrNull("note"),
                 )
             },
             // ask_user pending 卡：live 卡优先（running 门控），否则回放
@@ -2421,7 +2736,8 @@ object RuntimeBridge {
         )
         // 本地 transcript（含思维链/⚡meta）按 durable 仲裁尝试覆盖镜像版
         //（DB 含恢复条目时不再让旧文件遮蔽，见 shouldRestoreLocalTranscript）。
-        tryRestoreLocalTranscript()
+        // 键 = 本快照的 run_id（与上方 entries 同代，泵 FIFO 内一致）。
+        tryRestoreLocalTranscript(lastKnownRunId)
         // 模型条目键迁移第二段：config 已入 state → 完成校验（幂等，无待
         // 校验则 no-op；先于第一段，首个 snapshot 时待校验必为空）。
         verifyModelEntryMigration()
@@ -2896,11 +3212,204 @@ object RuntimeBridge {
                             status = o.optString("status"),
                             startedMs = o.optLong("started_ms"),
                             costUsd = o.optDouble("cost_usd", 0.0),
-                        )
+                            // v5 聚合列；存量 run 无 meta → 0（UI 省略显示）。
+                            inputTokens = o.optLong("input_tokens", 0),
+                            outputTokens = o.optLong("output_tokens", 0),
+                        ),
                     )
                 }
             }
         }.getOrDefault(emptyList())
+    }
+
+    /**
+     * import_attachment FFI 结果投影（JSON {ok,id,mime,filename,size_bytes,
+     * orig_width?,orig_height?,orig_bytes?,width?,height?,processed?} |
+     * {ok:false,error}）。
+     */
+    sealed interface AttachmentImportUi {
+        data class Ok(
+            val id: String,
+            /** 归一化后 mime（webp/gif→jpeg 等；UI 判类型用它）。 */
+            val mime: String,
+            val filename: String?,
+            val sizeBytes: Long,
+            /**
+             * 处理对比（fix-11 可选契约——旧版 Rust 响应无这些键）：原图
+             * 尺寸/字节与处理后尺寸。缺键 / 类型异常 optInt/optLong 均落
+             * -1 哨兵收敛 null，如实透传由 UI 侧组装（全键齐备才出对比块）。
+             */
+            val origWidth: Int? = null,
+            val origHeight: Int? = null,
+            val origBytes: Long? = null,
+            val width: Int? = null,
+            val height: Int? = null,
+            /** passthrough | transcode | video_passthrough；缺键/null/空串 → null。 */
+            val processed: String? = null,
+        ) : AttachmentImportUi
+
+        /** error 文案可直接展示（不识别格式/图过大/视频过大/落盘失败）。 */
+        data class Failed(val message: String) : AttachmentImportUi
+    }
+
+    /**
+     * 导入附件（IO 线程调用——FFI 同步签名内部 block_on，registry 先例）。
+     * 调用方（ui/ComposerAttachments.kt）先完成拷贝与 HEIC 预转码，这里只
+     * 做薄包装：runtime 取用 + JSON 解析 + 异常收敛为 Failed。
+     *
+     * TODO(binding)：经反射调用 `importAttachment`——并行 lane 重跑
+     * uniffi-gen 的窗口内，工作树 binding 可能短暂缺该方法（2026-10-21 实
+     * 发：L6 再生成时 L4 导出被截掉，orchestrator 最终集成重跑后恢复）。
+     * 反射让 binding 就位即生效、零代码改动；binding 完整后可换直调。
+     */
+    fun importAttachment(sourcePath: String, declaredMime: String, filename: String): AttachmentImportUi {
+        val runtime = runtimeRef.get() ?: return AttachmentImportUi.Failed("运行时未就绪")
+        val json = runCatching {
+            val method = runCatching {
+                runtime.javaClass.getMethod(
+                    "importAttachment",
+                    String::class.java, String::class.java, String::class.java,
+                )
+            }.getOrNull()
+            if (method == null) {
+                Log.w(TAG, "importAttachment: binding not generated yet (uniffi-gen pending)")
+                return AttachmentImportUi.Failed("附件功能加载中（binding 未生成），请更新安装包")
+            }
+            method.invoke(runtime, sourcePath, declaredMime, filename) as? String
+        }.getOrElse {
+            Log.e(TAG, "importAttachment failed", it)
+            null
+        } ?: return AttachmentImportUi.Failed("导入失败")
+        return runCatching {
+            val o = JSONObject(json)
+            if (o.optBoolean("ok", false)) {
+                AttachmentImportUi.Ok(
+                    id = o.optString("id"),
+                    mime = o.optString("mime"),
+                    filename = o.optStringOrNull("filename"),
+                    sizeBytes = o.optLong("size_bytes", 0),
+                    // fix-11 处理对比（可选键，旧响应无）：-1 哨兵收敛 null，
+                    // processed 缺键/null/空串经 optStringOrNull 收敛 null。
+                    origWidth = o.optInt("orig_width", -1).takeIf { it >= 0 },
+                    origHeight = o.optInt("orig_height", -1).takeIf { it >= 0 },
+                    origBytes = o.optLong("orig_bytes", -1L).takeIf { it >= 0 },
+                    width = o.optInt("width", -1).takeIf { it >= 0 },
+                    height = o.optInt("height", -1).takeIf { it >= 0 },
+                    processed = o.optStringOrNull("processed"),
+                )
+            } else {
+                AttachmentImportUi.Failed(o.optString("error", "导入失败"))
+            }
+        }.getOrElse {
+            Log.e(TAG, "importAttachment response malformed: ${json.take(160)}", it)
+            AttachmentImportUi.Failed("导入失败：响应异常")
+        }
+    }
+
+    // ── 附件缩略图（transcript 只读 chips 预览；反射，同 importAttachment 模式）──
+
+    /**
+     * 附件缩略图字节（JPEG；IO 线程调用——FFI 同步签名）。null = runtime
+     * 未就绪 / binding 未生成 / 附件无缩略图 / 响应异常，调用方
+     * （ui/AttachmentThumbnails.kt）一律回退图标占位并记 missing 不重试。
+     *
+     * TODO(binding)：经反射调用 `getAttachmentThumbnail`——方法正由并行
+     * lane 添加，同 [importAttachment] 模式：binding 就位即生效、零代码
+     * 改动；binding 完整后可换直调。
+     */
+    fun attachmentThumbnail(id: String, maxPx: Int): ByteArray? {
+        val runtime = runtimeRef.get() ?: return null
+        val json = runCatching {
+            val method = runCatching {
+                runtime.javaClass.getMethod(
+                    "getAttachmentThumbnail",
+                    String::class.java, Int::class.java,
+                )
+            }.getOrNull()
+            if (method == null) {
+                Log.w(TAG, "getAttachmentThumbnail: binding not generated yet (uniffi-gen pending)")
+                return null
+            }
+            method.invoke(runtime, id, maxPx) as? String
+        }.getOrElse {
+            Log.w(TAG, "getAttachmentThumbnail failed", it)
+            null
+        } ?: return null
+        // 契约：{"ok":true,"data":"<base64 jpeg>","mime":"image/jpeg"} | {"ok":false}。
+        return runCatching {
+            val o = JSONObject(json)
+            if (!o.optBoolean("ok", false)) return@runCatching null
+            android.util.Base64.decode(o.optString("data"), android.util.Base64.DEFAULT)
+        }.getOrElse {
+            Log.w(TAG, "getAttachmentThumbnail response malformed: ${json.take(120)}", it)
+            null
+        }
+    }
+
+    // ── 实验性视频输入开关（设计 §3.5/§6.6；L6 FFI 已就位，直调）──
+
+    /** 读开关（runtime 未就绪 → false，与默认值一致；FFI 轻量读配置）。 */
+    fun experimentalVideoEnabled(): Boolean {
+        val runtime = runtimeRef.get() ?: return false
+        return runCatching { runtime.getExperimentalVideo() }
+            .onFailure { Log.w(TAG, "getExperimentalVideo failed", it) }
+            .getOrDefault(false)
+    }
+
+    /** 写开关（Rust 落 openslate.toml 并即时生效）。false = 写失败，调用方回滚 UI。 */
+    fun setExperimentalVideoEnabled(enabled: Boolean): Boolean {
+        val runtime = runtimeRef.get() ?: return false
+        return runCatching {
+            val o = JSONObject(runtime.setExperimentalVideo(enabled))
+            o.optBoolean("ok", false)
+        }.onFailure { Log.w(TAG, "setExperimentalVideo failed", it) }
+            .getOrDefault(false)
+    }
+
+    // ── 图片处理限制（设置页「处理图片」；fix-12 FFI 直调——2026-10-21
+    // 17:07 binding 已含 getImageProcessing/setImageProcessing 导出，反射
+    // 网关退役）──
+
+    /** 处理限制投影（getImageProcessing 响应字段）。 */
+    data class ImageProcessingUi(val maxDim: Long, val maxMb: Long)
+
+    /** setImageProcessing 写结果（[Ok] | [Failed]——error 文案可直接展示）。 */
+    sealed interface ImageProcessingWriteUi {
+        object Ok : ImageProcessingWriteUi
+        data class Failed(val message: String) : ImageProcessingWriteUi
+    }
+
+    /**
+     * 读处理限制（`getImageProcessing` → `{"max_image_dim":2048,"max_image_mb":5}`）。
+     * 返回 null = runtime 未就绪 / 响应异常（调用方显示「需更新应用」占位）。
+     */
+    fun imageProcessing(): ImageProcessingUi? {
+        val runtime = runtimeRef.get() ?: return null
+        return runCatching {
+            val o = JSONObject(runtime.getImageProcessing())
+            val maxDim = o.optLong("max_image_dim", -1L).takeIf { it >= 0 }
+                ?: return@runCatching null
+            val maxMb = o.optLong("max_image_mb", -1L).takeIf { it >= 0 }
+                ?: return@runCatching null
+            ImageProcessingUi(maxDim, maxMb)
+        }.onFailure { Log.w(TAG, "getImageProcessing failed", it) }
+            .getOrNull()
+    }
+
+    /**
+     * 写处理限制（`setImageProcessing(maxDim, maxMb)` → `{"ok":true}` |
+     * `{"ok":false,"error":"…"}`，非法值 Rust 返回 error）。[Failed] 的
+     * message = FFI error / 运行时未就绪，调用方 snackbar 展示 + 乐观值
+     * 回滚。
+     */
+    fun setImageProcessing(maxDim: Long, maxMb: Long): ImageProcessingWriteUi {
+        val runtime = runtimeRef.get() ?: return ImageProcessingWriteUi.Failed("运行时未就绪")
+        return runCatching {
+            val o = JSONObject(runtime.setImageProcessing(maxDim, maxMb))
+            if (o.optBoolean("ok", false)) ImageProcessingWriteUi.Ok
+            else ImageProcessingWriteUi.Failed(o.optString("error", "保存失败"))
+        }.onFailure { Log.w(TAG, "setImageProcessing failed", it) }
+            .getOrDefault(ImageProcessingWriteUi.Failed("保存失败"))
     }
 
     fun openSession(id: String): Boolean {
@@ -2936,11 +3445,23 @@ object RuntimeBridge {
     private fun transcriptFile(runId: String): java.io.File? =
         appContext?.let { java.io.File(java.io.File(it.filesDir, "transcripts"), "$runId.json") }
 
-    /** turn 结束后落盘当前聊天流（后台线程；tmp+rename 原子替换，
-     *  进程中途被杀不留截断 JSON）。 */
-    private fun persistTranscriptAsync() {
-        val runtime = runtimeRef.get() ?: return
-        val runId = runCatching { runtime.currentRunId() }.getOrNull() ?: return
+    /**
+     * turn 结束后落盘当前聊天流（后台线程；tmp+rename 原子替换，
+     *  进程中途被杀不留截断 JSON）。
+     *
+     *  run 键（C4）：由调用点从事件流内嵌值解析——turn_ok 取
+     *  summary.run_id，turn_error 兜底 [lastKnownRunId]（applySnapshot 写入）。
+     *  FIFO 正确性：open_session 有 busy 守卫，引擎在 core 锁内置
+     *  running=false 并广播 TurnOk（落镜像先于广播），事件入队序 =
+     *  TurnOk(旧run) → Snapshot(新run)；本函数与 applySnapshot 同在
+     *  单泵协程，处理 turn_ok 时 lastKnownRunId 仍是旧 run 且
+     *  _state.entries 属旧 run，两侧一致。旧 bug 根源是
+     *  runtime.currentRunId() 绕过 FIFO 直读 Rust 实时态（open_session
+     *  在 Dispatchers.IO 并发轮换 run 时读到新 run 键 + 旧 entries）。
+     *  取不到键 → 不落盘（宁缺勿错：错键文件会污染新会话的镜像仲裁）。
+     */
+    private fun persistTranscriptAsync(runId: String?) {
+        if (runId.isNullOrBlank()) return
         val snapshotEntries = _state.value.entries
         scope.launch(Dispatchers.IO) {
             runCatching {
@@ -2984,10 +3505,14 @@ object RuntimeBridge {
      * 条目（两侧同源持久化的种类）上不落后才允许以其更丰富的装饰覆盖；
      * DB 转写为空时本地兜底。live 会话的落盘逻辑（turn 结束写文件）不变。
      * 本函数只被 applySnapshot 末尾调用，比较时两者均已可见。
+     *
+     * run 键（C4）：改为 applySnapshot 传入的**快照 run_id**（泵协程 FIFO
+     * 内与本快照 entries 同代）。旧实现读 runtime.currentRunId() 是 FFI
+     * 旁路直读实时态——open_session（Dispatchers.IO）并发换 run 时，仲裁
+     * 两侧可能分属两个会话（read-skew）。键缺失（旧引擎快照）→ 不恢复。
      */
-    private fun tryRestoreLocalTranscript() {
-        val runtime = runtimeRef.get() ?: return
-        val runId = runCatching { runtime.currentRunId() }.getOrNull() ?: return
+    private fun tryRestoreLocalTranscript(snapshotRunId: String?) {
+        val runId = snapshotRunId ?: return
         val f = transcriptFile(runId) ?: return
         if (!f.exists()) return
         runCatching {
@@ -3042,7 +3567,22 @@ object RuntimeBridge {
         }
         val o = org.json.JSONObject().put("t", type)
         when (e) {
-            is UiEntry.User -> o.put("x", e.text)
+            is UiEntry.User -> {
+                o.put("x", e.text)
+                // 附件引用（照 applySnapshot 解析的 wire 形态：{id, mime,
+                // filename?, tokens?}）；空表不写键 → 镜像紧凑，恢复侧
+                // optJSONArray 缺键回落空表（旧镜像兼容）。
+                if (e.attachments.isNotEmpty()) {
+                    val atts = org.json.JSONArray()
+                    for (a in e.attachments) {
+                        val ao = org.json.JSONObject().put("id", a.id).put("mime", a.mime)
+                        a.filename?.let { ao.put("filename", it) }
+                        a.tokens?.let { ao.put("tokens", it) }
+                        atts.put(ao)
+                    }
+                    o.put("atts", atts)
+                }
+            }
             is UiEntry.Assistant -> o.put("x", e.text)
             is UiEntry.Reasoning -> {
                 o.put("x", e.text)
@@ -3060,7 +3600,8 @@ object RuntimeBridge {
     }
 
     private fun entryFromJson(o: org.json.JSONObject): UiEntry = when (o.optString("t")) {
-        "user" -> UiEntry.User(o.optString("x"))
+        // "atts" 复用 applySnapshot 的解析（同 wire 形态）；旧镜像无键 → 空表。
+        "user" -> UiEntry.User(o.optString("x"), parseAttachmentRefs(o.optJSONArray("atts")))
         "assistant" -> UiEntry.Assistant(o.optString("x"))
         "reasoning" -> UiEntry.Reasoning(o.optString("x"), o.optString("m", "").ifBlank { null })
         "meta" -> UiEntry.Meta(o.optString("x"))

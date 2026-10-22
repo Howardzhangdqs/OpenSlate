@@ -104,6 +104,7 @@ impl Tool for ChildAgentCallable {
         let content = format!("Child agent '{}' would execute: {}", self.agent_id.0, task);
         let bytes = content.len();
         Ok(ToolOutput {
+            attachments: None,
             content,
             bytes,
             duration_ms: 0,

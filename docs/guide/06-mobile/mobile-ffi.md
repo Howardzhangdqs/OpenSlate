@@ -7,6 +7,7 @@
 - 单库文件 `src/lib.rs`（296 行）+ bindgen 二进制 `src/bin/uniffi_bindgen.rs`（3 行：`fn main() { uniffi::uniffi_bindgen_main() }`）。
 - `Cargo.toml` 关键项：
   - `[lib] crate-type = ["cdylib", "lib"]`、`name = "openslate_mobile"` → 产物 `libopenslate_mobile.so`（cdylib 给 Android，lib 给 host bindgen 跑元数据）；
+  - `doctest = false`（L6）：lib 名与依赖 `openslate-mobile` 的 lib 目标同名（uniffi 脚手架要求），rustdoc `--test` 收到两条同名 `--extern` → E0464 编译失败（HEAD 即复现、与文件内容无关）；本 crate 无 runnable doctest，关闭零损失；
   - `uniffi = { version = "0.32", features = ["build"] }`；
   - `[[bin]] name = "uniffi-bindgen"`、`required-features = ["bindgen"]`；feature `bindgen = ["uniffi/cli"]` —— bindgen 只在显式开 feature 时可编译，不进常规构建。
 - `uniffi.toml`：
@@ -41,7 +42,9 @@ JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**�
 | 方法（Kotlin 名） | 行号 | 语义要点 |
 |------|------|---------|
 | `create(paths, callback)`（constructor） | 86-116 | 装配 + 首份 snapshot；失败抛 `MobileError.CreateFailed` |
-| `send(msg: String)` | 119-127 | ClientMsg JSON；非阻塞（内部 spawn） |
+| `send(msg: String)` | 119-127 | ClientMsg JSON；非阻塞（内部 spawn）。v4 起 Submit 可带 `attachments`（见 `importAttachment`） |
+| `importAttachment(sourcePath, declaredMime, filename): String` | — | **多模态附件导入（存储 v5 §3.6）**：宿主把 ContentResolver URI 拷到 cache 文件（HEIC/HEIF 先在 Kotlin 侧转码 JPEG——契约写死图像入参只接受 jpeg/png/webp/gif）后调这里；**路径传递，ByteArray/base64 不出现在边界**。同步签名内部 block_on + 图像归一化是 CPU 活——**IO 线程调用**。返回 `{"ok":true,"id":"att-…","mime":"image/jpeg","filename":"…","size_bytes":N,"orig_bytes":M,"processed":"passthrough|transcode|video_passthrough","orig_width":W,"orig_height":H,"width":w,"height":h}` 或 `{"ok":false,"error":"…"}`（不识别格式 / 超限 / 落盘失败）。对比信息供 chip 点击展开：`orig_*` = header 尺寸 + 源字节数，`width/height` = 处理后尺寸（passthrough 态与 orig 相等）；`processed` 三态——`passthrough`（小图零转码）/`transcode`（缩放重编码）/`video_passthrough`（视频；尺寸四键省略，容器头不重解析）。**导入纯本地零网络，恒无 `tokens` 键**（2026-10-21 方向调整：发起 API 请求之前附件数据绝不上行任何服务器；曾有的智谱 tokenizer 预估已移除）。附件 chip 的 token 数改经**响应侧回填**：单图 Submit 的回合结束后，transcript 快照/重启恢复的 `EntryDto::User.attachments[].tokens`（Long?，缺省回退文件大小；见 openslate-mobile.md §12.5、openslate-protocol.md v5）。`id` 存 composer 状态，Submit 时拼 `{"type":"submit","text":…,"attachments":[{"id":…,"mime":…,"filename":…}]}`；门控拒绝（模态/数量/体积/混发）经 notice 事件返回 |
+| `getAttachmentThumbnail(id: String, maxPx: Int): String` | — | **附件缩略图（des-2 Android lane 契约，2026-10-21）**：`id` = importAttachment 返回的附件 id；原图按 sha256 从 files 读出，长边缩到 `maxPx`（只缩不放；`<=0` 按 256、上限 2048）后 JPEG q80 编码。返回 `{"ok":true,"data":"<base64>","mime":"image/jpeg"}` 或 `{"ok":false,"error":"…"}`（附件不存在 / 视频等非图像 / 文件缺失 / 解码失败均走 error）。阻塞（磁盘 + 解码），**IO 线程调用**。注意只覆盖用户 ingest 附件（attachments 表有行）——read_file 工具附件（id `tool-N`）不落表，走 UI 已有的 tool 输出展示路径 |
 | `setApiKey(provider, value)` | 130-132 | 内存注入，不落盘 |
 | `setHttpProxy(url)` | 136-146 | 设/清（空串清除）进程级 `OPENSLATE_HTTP_PROXY` env；受限网络下宿主可经 adb reverse 共享电脑代理；**约定由宿主主线程在回合间调用** |
 | `setExecBackends(backends)` | 151-153 | CSV："native,termux" / "termux"（UI 单开关恒写含 termux 形态；名字与后端一一绑定：native⇒bash、termux⇒termux_bash）；热生效 |
@@ -55,8 +58,12 @@ JSON 字符串进出的方法占多数——**复杂结构不逐字段映射**�
 | `setMcpToolNameTemplate(template: String): String` | — | 校验（复用 core `validate_mcp_tool_name_template`，防 FFI 收下坏值致启动 fatal）+ 落盘（空串删键回默认）；返回 ok 信封；**不自动 reload**——调用方显式走 `reloadMcpServers` 热生效 |
 | `getMcpServerName(): String` | — | 读 `[mcp.servers]` 单键名（多键回退 termux，空/失败回退 termux）——**`{prefix}` 占位符的展开值** |
 | `setMcpServerName(name: String): String` | — | 校验（`validate_mcp_server_name`：非空、`[A-Za-z0-9_.-]`、不含 `__`）+ `rename_mcp_server` 整子表搬移（transport/headers 随迁，旧键消失）；幂等；返回 ok 信封；不自动 reload |
+| `setExperimentalVideo(enabled: Boolean): String` | — | **实验视频开关写入（存储 v5 §3.5，L6；签名与 L5 约定不可变）**：toml_edit 原地改写 openslate.toml `[attachments] experimental_video`（其余键/注释/格式零扰动，无该节则追加）+ **同步更新运行中内存配置**——Submit 附件门控读内存值，下一轮提交即生效，无需重启；落盘失败返回 `{"ok":false,"error":"…"}` 且内存不变（防内存/磁盘分叉）。返回 `{"ok":true}` / `{"ok":false,"error":"…"}` |
+| `setImageProcessing(maxDim: Long, maxMb: Long): String` | — | **图片处理双旋钮写入（设置页「图片最长边 / 处理后文件大小上限」）**：`maxDim` 值域 512–6000（等比缩放目标边长）、`maxMb` 值域 1–5（处理后大小上限 MB；归一化迭代压缩 q85→70→55 → ×0.85 缩边的达标线）。值域校验与 core validation 同源，非法值返回 `{"ok":false,"error":"…"}` 且不落盘；合法 → toml_edit 原地改写 `[attachments] max_image_dim` / `max_image_mb`（其余键/注释/格式零扰动，无该节则追加）+ 同步更新运行中内存配置——**下一次 importAttachment 即生效**，无需重启；落盘失败内存不变。返回 `{"ok":true}` / `{"ok":false,"error":"…"}` |
+| `getImageProcessing(): String` | — | 读图片处理双旋钮当前生效值（内存配置：装配期从落盘装载 + set 即时更新，与归一化消费的值同源）。返回 `{"max_image_dim":N,"max_image_mb":M}` |
+| `getExperimentalVideo(): Boolean` | — | 读实验视频开关**当前生效值**（内存配置：装配期从落盘装载 + set 即时更新，与门控消费值同源——回显即行为） |
 | `resolveHostCall(id: ULong, ok: Boolean, payload: String): Boolean` | 184-186 | false = 无此在途调用 |
-| `listSessions(offset: UInt): String` | 190-193 | 每页 50；offset 递增（0、50、100…） |
+| `listSessions(offset: UInt): String` | 190-193 | 每页 50；offset 递增（0、50、100…）；v5 起每项含 `input_tokens`/`output_tokens`（run 级聚合，存量 run 为 0） |
 | `listProviderModels(provider): String` | 198-201 | GET /models；**含 10s 超时，IO 线程调用** |
 | `registrySources(): String` | 206-209 | 数据源列表 + 本地状态 |
 | `registryUpdateSource(id): String` | 213-216 | **阻塞最长 120s，IO 线程调用** |

@@ -24,9 +24,14 @@ pub const CAP_MAIN: &str = "main";
 pub const CAP_COMPACT: &str = "compact";
 /// 功能 id：会话标题生成。
 pub const CAP_TITLE: &str = "title";
+/// 功能 id：审批 AI 审查（mobile 审批装饰器的 LLM 审查器，
+/// tool-approval P1a）。**不做 capability_alias 硬缺省**：未绑定时使用点
+/// 继承会话模型（compact 先例——`run_auto_compact` 不走本模块缺省），
+/// 消费方在 mobile 层（P1b）。
+pub const CAP_REVIEW: &str = "review";
 
 /// 全部功能 id（展示顺序即 UI 默认顺序）。
-pub const CAPABILITIES: &[&str] = &[CAP_MAIN, CAP_COMPACT, CAP_TITLE];
+pub const CAPABILITIES: &[&str] = &[CAP_MAIN, CAP_COMPACT, CAP_TITLE, CAP_REVIEW];
 
 /// 功能的中文名（UI 展示 / 事件文案）。
 pub fn capability_title(cap: &str) -> &'static str {
@@ -34,6 +39,7 @@ pub fn capability_title(cap: &str) -> &'static str {
         CAP_MAIN => "主对话",
         CAP_COMPACT => "上下文压缩",
         CAP_TITLE => "标题生成",
+        CAP_REVIEW => "审批审查",
         _ => "未知功能",
     }
 }
@@ -44,9 +50,12 @@ pub fn capability_title(cap: &str) -> &'static str {
 /// （`main`→"main"、`compact`/`title`→"fast"）。**注意**：`compact`
 /// 分支的 "fast" 缺省仅保留兼容旧调用方——session 引擎已不再依赖它，
 /// 未绑定 compact 时直接继承会话当前模型（openslate-session
-/// `engine.rs::run_auto_compact` 自行取值，不走本函数缺省）。返回的
-/// 代号交给 [`resolve_model`] 解析；解析失败由调用方按各功能自己的
-/// 兜底策略处理（compact → 机械拼接、title → prompt 截断）。
+/// `engine.rs::run_auto_compact` 自行取值，不走本函数缺省）。`review`
+/// 同款约定：`_` 兜底臂的 "fast" 仅为 map 通用展示（ConfigView 透出），
+/// 运行时未绑定 review 一律**继承会话模型**（mobile P1b 使用点决定），
+/// 不依赖本函数缺省。返回的代号交给 [`resolve_model`] 解析；解析失败
+/// 由调用方按各功能自己的兜底策略处理（compact → 机械拼接、title →
+/// prompt 截断）。
 pub fn capability_alias(config: &OpenSlateConfig, cap: &str) -> String {
     let fallback = match cap {
         CAP_MAIN => "main",
@@ -346,6 +355,18 @@ model = "m2"
         assert_eq!(capability_alias(&config, CAP_MAIN), "main");
         assert_eq!(capability_alias(&config, CAP_COMPACT), "fast");
         assert_eq!(capability_alias(&config, CAP_TITLE), "fast");
+        // review 无硬缺省：未绑定时仅落通用 `_` 兜底（ConfigView 展示用），
+        // 运行时使用点（mobile P1b）继承会话模型，不消费该值。
+        assert_eq!(capability_alias(&config, CAP_REVIEW), "fast");
+    }
+
+    #[test]
+    fn review_capability_registered() {
+        // tool-approval P1a：CAPABILITIES += review（SetCapability 校验 /
+        // ConfigView 透出自动放行），有中文标题。
+        assert!(CAPABILITIES.contains(&CAP_REVIEW));
+        assert_eq!(CAP_REVIEW, "review");
+        assert_eq!(capability_title(CAP_REVIEW), "审批审查");
     }
 
     #[test]
@@ -515,6 +536,7 @@ model = "ghost-model"
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             0.0
         );
@@ -543,6 +565,7 @@ output_price_per_mtok = 3.0
                 output_tokens: 1_000_000,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }) - 6.0f64)
                 .abs()
                 < 1e-12

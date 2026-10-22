@@ -284,6 +284,7 @@ impl ToolExecutor for ToolRegistry {
         match ToolRegistry::execute(self, name, args).await {
             Ok(output) => output,
             Err(e) => ToolOutput {
+                attachments: None,
                 content: format!("Error: {}", e),
                 bytes: 0,
                 duration_ms: 0,
@@ -310,6 +311,9 @@ pub fn limit_tool_output(output: ToolOutput, max_bytes: usize) -> ToolOutput {
     );
 
     ToolOutput {
+        // 截断只作用于文本 content；读图附件（attachments）与文本规模
+        // 无关，截断时原样保留（图片本就不占 content 字节）。
+        attachments: output.attachments,
         content: format!("{}{}", truncated_content, notice),
         bytes: truncated_content.len() + notice.len(),
         duration_ms: output.duration_ms,
@@ -474,6 +478,7 @@ mod limit_tests {
     #[test]
     fn test_limit_output_under_limit() {
         let output = ToolOutput {
+            attachments: None,
             content: "hello".to_string(),
             bytes: 5,
             duration_ms: 10,
@@ -488,6 +493,7 @@ mod limit_tests {
     #[test]
     fn test_limit_output_over_limit() {
         let output = ToolOutput {
+            attachments: None,
             content: "a".repeat(1000),
             bytes: 1000,
             duration_ms: 50,
@@ -503,6 +509,7 @@ mod limit_tests {
     fn test_limit_output_exact_limit() {
         let content = "hello";
         let output = ToolOutput {
+            attachments: None,
             content: content.to_string(),
             bytes: 5,
             duration_ms: 10,
@@ -517,6 +524,7 @@ mod limit_tests {
     #[test]
     fn test_limit_output_zero_max() {
         let output = ToolOutput {
+            attachments: None,
             content: "hello".to_string(),
             bytes: 5,
             duration_ms: 10,
@@ -530,6 +538,7 @@ mod limit_tests {
     #[test]
     fn test_create_audit_record_success() {
         let output = ToolOutput {
+            attachments: None,
             content: "result".to_string(),
             bytes: 6,
             duration_ms: 100,
@@ -550,6 +559,7 @@ mod limit_tests {
     #[test]
     fn test_create_audit_record_truncated() {
         let output = ToolOutput {
+            attachments: None,
             content: "truncated content".to_string(),
             bytes: 100,
             duration_ms: 50,
@@ -566,6 +576,7 @@ mod limit_tests {
     #[test]
     fn test_create_audit_record_serialization() {
         let output = ToolOutput {
+            attachments: None,
             content: "test".to_string(),
             bytes: 4,
             duration_ms: 25,
@@ -606,6 +617,7 @@ mod registry_tests {
         }
         async fn execute(&self, _args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput {
+                attachments: None,
                 content: String::new(),
                 bytes: 0,
                 duration_ms: 0,

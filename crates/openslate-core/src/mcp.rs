@@ -27,15 +27,18 @@
 //!   handler doesn't react to `notifications/tools/list_changed`).
 //! - Runtime connect/call failures are non-fatal (warn + skip that server).
 //! - `Resource`/`ResourceLink` content blocks emit placeholders (no implicit
-//!   `resources/read`); `Image`/`Audio` emit size placeholders (kept out of the
-//!   LLM context window).
+//!   `resources/read`); `Image` blocks are collected as message attachments
+//!   (see [`downgrade_content_blocks`]) while `Audio` emits a size placeholder
+//!   (kept out of the LLM context window).
 
 use std::path::Path;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use openslate_mcp_builtin::edit::EditServer;
 use openslate_mcp_builtin::fs::FsServer;
 use openslate_mcp_builtin::shell::ShellServer;
@@ -55,7 +58,7 @@ use tokio::process::Command;
 use crate::config::{BuiltinToolsConfig, McpServerConfig, TransportConfig};
 use crate::error::ToolError;
 use crate::tool::Tool;
-use crate::types::{ToolOutput, ToolOutputStatus};
+use crate::types::{Attachment, ToolOutput, ToolOutputStatus};
 
 /// Per-call timeout for an MCP tool invocation (matches rig's default; prevents
 /// a hung Streamable HTTP session from stalling the agent loop forever).
@@ -195,6 +198,40 @@ fn expand_template(template: &str, prefix: &str, server: Option<&str>, tool: &st
     out
 }
 
+/// 审批作用域的 server 反解（**权威实现**，tool-approval P1a）：registry
+/// 暴露名 → MCP server 标识。审批规则 `servers` 域的键、协议
+/// `ApprovalSummaryDto.server` 与 UI 的 (c)/(d) MCP 级选项都用它对齐语义。
+///
+/// - `namespace = None`（native bash / HostTool / in-process builtin）→
+///   `None`：非 MCP 工具没有 server 作用域；
+/// - 暴露名含 `__`（聚合下游形态，如 `termux_github__create_issue`）→
+///   取首个 `__` 前的段，剥掉 `{namespace}_` 前缀后非空则返回（例 →
+///   `"github"`）；剥后为空（或段本身为空）回退 `namespace`；
+/// - 不含 `__`（host 内置裸名形态，如 `termux_bash`）→ 返回 `namespace`
+///   本身（= host 前缀组：host 内全部工具共享一个审批作用域）。
+///
+/// **自定义模板的精度局限**：反解只认「首个 `__` 分界 + `{prefix}_` 前缀」
+/// 的形状（默认大模板 `{prefix}_{server}__{tool}` 的自然产物）。用户改了
+/// `tool_name_template`（如 `{server}.{tool}` → 暴露名 `github.create_issue`）
+/// 后 `__` 分界不复存在，会落到裸名分支返回 host 前缀——审批仍按 host
+/// 组生效，只是无法细分到下游 server；模板删掉 `{server}` 占位符时下游
+/// slug 干脆不在暴露名里，任何反解都无从恢复。Kotlin 侧
+/// `mcpServerSlugOf` 的大模板正则同理，两侧保持语义对齐。
+pub fn server_slug_of(exposed_name: &str, namespace: Option<&str>) -> Option<String> {
+    let namespace = namespace?;
+    if let Some((head, _)) = exposed_name.split_once("__") {
+        let prefix = format!("{namespace}_");
+        let slug = head.strip_prefix(&prefix).unwrap_or(head);
+        Some(if slug.is_empty() {
+            namespace.to_owned()
+        } else {
+            slug.to_owned()
+        })
+    } else {
+        Some(namespace.to_owned())
+    }
+}
+
 /// Convert the agent's tool-call arguments (`serde_json::Value`) into the
 /// `JsonObject` (`Map<String, Value>`) shape MCP's `call_tool` expects.
 /// Non-object values (null/scalar/array) map to `None` (= "no arguments").
@@ -203,22 +240,51 @@ fn args_to_json_object(args: &serde_json::Value) -> Option<JsonObject> {
 }
 
 /// Collapse an MCP `CallToolResult.content` (`Vec<ContentBlock>`) into the
-/// single `String` that `ToolOutput.content` requires.
+/// single `String` that `ToolOutput.content` requires, plus any image
+/// attachments decoded out of `Image` blocks.
 ///
-/// `Text` blocks are concatenated verbatim. Multimedia/resource blocks become
-/// compact placeholders so they stay out of the LLM context window while still
+/// `Text` blocks are concatenated verbatim. `Image` blocks are BOTH
+/// signalled in the text (compact placeholder, so the LLM still sees them
+/// inline) and collected as [`Attachment`]s (base64 decoded into
+/// `data`, id `tool-{n}` per result) — the runtime packs them into the Tool
+/// Message so multimodal providers can consume the actual pixels (read_file
+/// 读图链路，2026-10). Other multimedia/resource blocks become compact
+/// placeholders so they stay out of the LLM context window while still
 /// signalling their presence. See module docs for the v1 rationale.
-fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> String {
+fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> (String, Vec<Attachment>) {
     let mut out = String::new();
+    let mut attachments = Vec::new();
     for block in blocks {
         match block {
             ContentBlock::Text(t) => out.push_str(&t.text),
             ContentBlock::Image(img) => {
-                out.push_str(&format!(
-                    "[image: {}, {} bytes]",
-                    img.mime_type,
-                    img.data.len()
-                ));
+                match BASE64_STANDARD.decode(img.data.as_bytes()) {
+                    Ok(bytes) => {
+                        out.push_str(&format!(
+                            "[image: {}, {} bytes]",
+                            img.mime_type,
+                            bytes.len()
+                        ));
+                        attachments.push(Attachment {
+                            id: format!("tool-{}", attachments.len()),
+                            mime: img.mime_type.clone(),
+                            filename: None,
+                            data: Some(Arc::from(&bytes[..])),
+                        });
+                    }
+                    Err(e) => {
+                        // 畸形 base64：不中断整条结果——文本占位 + warn，
+                        // 图片丢弃（模型丢图不丢文本）。
+                        tracing::warn!(
+                            target: "openslate_mcp",
+                            "MCP image content block failed base64 decode; dropped: {e}"
+                        );
+                        out.push_str(&format!(
+                            "[image: {}, undecodable data]",
+                            img.mime_type
+                        ));
+                    }
+                }
             }
             ContentBlock::Audio(a) => {
                 out.push_str(&format!("[audio: {}, {} bytes]", a.mime_type, a.data.len()));
@@ -243,7 +309,7 @@ fn downgrade_content_blocks(blocks: Vec<ContentBlock>) -> String {
             }
         }
     }
-    out
+    (out, attachments)
 }
 
 // ── McpTool: one Tool per remote MCP tool ───────────────────────────────────
@@ -377,7 +443,7 @@ impl Tool for McpTool {
                 }
             };
 
-        let content = downgrade_content_blocks(result.content);
+        let (content, attachments) = downgrade_content_blocks(result.content);
         let bytes = content.len();
 
         // MCP's own is_error flag is surfaced as ToolOutputStatus::Error, NOT as
@@ -394,6 +460,13 @@ impl Tool for McpTool {
             bytes,
             duration_ms: started.elapsed().as_millis() as u64,
             status,
+            // 读图链路：Image block 解出的附件随输出上抛（空 → None 保持
+            // 旧行为），runtime 装进 Tool Message 的 attachments。
+            attachments: if attachments.is_empty() {
+                None
+            } else {
+                Some(attachments)
+            },
         })
     }
 }
@@ -813,7 +886,9 @@ mod tests {
             ContentBlock::Text(TextContent::new("hello ")),
             ContentBlock::Text(TextContent::new("world")),
         ];
-        assert_eq!(downgrade_content_blocks(blocks), "hello world");
+        let (s, atts) = downgrade_content_blocks(blocks);
+        assert_eq!(s, "hello world");
+        assert!(atts.is_empty());
     }
 
     #[test]
@@ -822,14 +897,36 @@ mod tests {
             ContentBlock::Image(ImageContent::new("AAAA", "image/png")),
             ContentBlock::Audio(AudioContent::new("BBBB", "audio/wav")),
         ];
-        let s = downgrade_content_blocks(blocks);
-        assert!(s.contains("[image: image/png, 4 bytes]"), "{s}");
+        let (s, atts) = downgrade_content_blocks(blocks);
+        assert!(s.contains("[image: image/png, 3 bytes]"), "{s}");
         assert!(s.contains("[audio: audio/wav, 4 bytes]"), "{s}");
+        // "AAAA" 解码为 3 字节 → 附件收集（读图链路），bytes 用解码后长度。
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].id, "tool-0");
+        assert_eq!(atts[0].mime, "image/png");
+        assert_eq!(atts[0].filename, None);
+        assert_eq!(&*atts[0].data.as_deref().unwrap(), b"\x00\x00\x00");
+    }
+
+    #[test]
+    fn downgrade_image_invalid_base64_dropped_not_fatal() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("prefix")),
+            ContentBlock::Image(ImageContent::new("!!!not-base64!!!", "image/png")),
+            ContentBlock::Text(TextContent::new("suffix")),
+        ];
+        let (s, atts) = downgrade_content_blocks(blocks);
+        assert!(s.contains("prefix"), "{s}");
+        assert!(s.contains("[image: image/png, undecodable data]"), "{s}");
+        assert!(s.contains("suffix"), "{s}");
+        assert!(atts.is_empty(), "畸形图片不产附件");
     }
 
     #[test]
     fn downgrade_empty_blocks_yields_empty_string() {
-        assert_eq!(downgrade_content_blocks(Vec::new()), "");
+        let (s, atts) = downgrade_content_blocks(Vec::new());
+        assert_eq!(s, "");
+        assert!(atts.is_empty());
     }
 
     #[test]
@@ -1267,6 +1364,53 @@ mod tests {
             format_tool_name("{prefix}_{server}__{tool}", "{prefix}_{tool}", "srv", "a{tool}b"),
             "srv_a{tool}b"
         );
+    }
+
+    // ── server_slug_of（审批作用域反解，tool-approval P1a）─────────────
+
+    #[test]
+    fn server_slug_of_table() {
+        // (exposed_name, namespace, expected) — 覆盖：非 MCP / 默认模板聚合
+        // 形态 / 无前缀自定义模板聚合形态 / host 内置裸名 / 桌面直连裸名。
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            // 非 MCP（native bash / HostTool / in-process builtin）→ None。
+            ("bash", None, None),
+            ("read_file", None, None),
+            ("termux_github__create_issue", None, None),
+            // 默认模板聚合形态：`__` 前段剥 `{namespace}_` 前缀 → 下游 slug。
+            (
+                "termux_github__create_issue",
+                Some("termux"),
+                Some("github"),
+            ),
+            (
+                "termux_Server_Memory__create_entities",
+                Some("termux"),
+                Some("Server_Memory"),
+            ),
+            // 无 `{prefix}` 的自定义模板：段不带前缀，原样即 slug。
+            ("github__create_issue", Some("termux"), Some("github")),
+            // 多个 `__`：首个为分界（与 format_tool_name 拆分一致）。
+            ("termux_a__b__c", Some("termux"), Some("a")),
+            // 剥前缀后为空（server 段恰为 namespace 本身）→ 回退 namespace。
+            ("termux___x", Some("termux"), Some("termux")),
+            // 段为空（暴露名以 `__` 开头）→ 回退 namespace。
+            ("__create_issue", Some("termux"), Some("termux")),
+            // host 内置裸名形态（builtin 小模板展开）→ host 前缀组。
+            ("termux_bash", Some("termux"), Some("termux")),
+            // 自定义小模板去掉前缀的裸名 → 仍是 host 组（精度局限：无从
+            // 分辨下游）。
+            ("bash", Some("termux"), Some("termux")),
+            // slug 与 namespace 同名（正常：server 名恰等于 host 前缀）。
+            ("termux_termux__x", Some("termux"), Some("termux")),
+        ];
+        for (name, ns, expected) in cases {
+            assert_eq!(
+                server_slug_of(name, *ns),
+                expected.map(str::to_owned),
+                "server_slug_of({name:?}, {ns:?})"
+            );
+        }
     }
 
     #[test]

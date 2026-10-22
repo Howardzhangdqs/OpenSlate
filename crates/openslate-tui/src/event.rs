@@ -277,6 +277,7 @@ mod tests {
             proto: 1,
             session_id: "s".into(),
             session_label: "l".into(),
+            run_id: None,
             transcript: vec![],
             running: false,
             depth_cur: 0,
@@ -302,6 +303,7 @@ mod tests {
                 output_tokens: 2,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             TuiEvent::RequestEnd,
             TuiEvent::StepEnd,
@@ -370,6 +372,7 @@ mod tests {
             active_config: "/x/openslate.toml".into(),
             global_config: None,
             local_config: None,
+            approval: None,
         }
     }
 }

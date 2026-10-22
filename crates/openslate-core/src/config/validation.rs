@@ -14,7 +14,8 @@
 use std::collections::HashSet;
 
 use crate::config::{
-    AgentsConfig, ApprovalPolicySetting, OpenSlateConfig, PtcConfig, TransportConfig,
+    AgentsConfig, ApprovalPolicySetting, AttachmentsConfig, OpenSlateConfig, PtcConfig,
+    TransportConfig,
 };
 
 /// Severity of a validation finding.
@@ -362,6 +363,68 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
         }
     }
 
+    // 20. `[attachments]` numeric floors（多模态输入设计 §6.6）：归一化
+    //     尺寸下限 512（再小连截图文字都保不住），各 mb 字段 ≥ 1（0 会
+    //     让对应模态完全不可用——需要禁用请用 experimental_video 开关
+    //     而不是把限额压到 0）。
+    errors.extend(attachments_floor_errors(&config.attachments));
+
+    errors
+}
+
+/// `[attachments]` 数值边界错误（下限 + 上限）。图片处理用户可配置
+/// （2026-10-21）后上限即旋钮值域：`512 ≤ max_image_dim ≤ 6000`
+/// （6000 = ingest 出口 ≤6000² 像素硬校验的边长上界）、
+/// `1 ≤ max_image_mb ≤ 5`（= 出口 ≤5MB provider 公共分母；归一化迭代
+/// 压缩以此为目标，达标是常态、地板是病态兜底）。其余 `*_mb ≥ 1`。
+pub fn attachments_floor_errors(att: &AttachmentsConfig) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if att.max_image_dim < 512 {
+        errors.push(ValidationError {
+            field: "attachments.max_image_dim".into(),
+            message: format!(
+                "max_image_dim must be >= 512 (got {}; smaller would destroy \
+                 screenshot text legibility)",
+                att.max_image_dim
+            ),
+        });
+    }
+    if att.max_image_dim > 6000 {
+        errors.push(ValidationError {
+            field: "attachments.max_image_dim".into(),
+            message: format!(
+                "max_image_dim must be <= 6000 (got {}; ingest exit asserts \
+                 <= 6000^2 pixels — the provider-safe common denominator)",
+                att.max_image_dim
+            ),
+        });
+    }
+    if att.max_image_mb > 5 {
+        errors.push(ValidationError {
+            field: "attachments.max_image_mb".into(),
+            message: format!(
+                "max_image_mb must be <= 5 (got {}; it is the processed-size \
+                 target — the ingest exit hard-asserts <= 5MB)",
+                att.max_image_mb
+            ),
+        });
+    }
+    for (field, value) in [
+        ("max_image_mb", att.max_image_mb),
+        ("max_video_mb", att.max_video_mb),
+        ("max_inline_video_mb", att.max_inline_video_mb),
+        ("max_inline_total_mb", att.max_inline_total_mb),
+    ] {
+        if value < 1 {
+            errors.push(ValidationError {
+                field: format!("attachments.{field}"),
+                message: format!(
+                    "{field} must be >= 1 (got {value}; use experimental_video = false \
+                     to disable video instead of a zero limit)"
+                ),
+            });
+        }
+    }
     errors
 }
 
@@ -992,6 +1055,80 @@ max_output_bytes = 65536
     fn valid_config_produces_zero_errors() {
         let errors = validate_config(&valid_config(), &valid_agents());
         assert!(errors.is_empty(), "expected no errors: {errors:?}");
+    }
+
+    // ── Rule 20: [attachments] numeric floors（多模态输入设计 §6.6）─────
+
+    #[test]
+    fn attachments_defaults_pass_floor_validation() {
+        assert!(attachments_floor_errors(&AttachmentsConfig::default()).is_empty());
+        let errors = validate_config(&valid_config(), &valid_agents());
+        assert!(
+            !errors.iter().any(|e| e.field.starts_with("attachments.")),
+            "默认配置不得触发 attachments 错误: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn attachments_below_floor_reports_each_violation() {
+        let att = AttachmentsConfig {
+            max_image_dim: 511,
+            max_image_mb: 0,
+            max_video_mb: 50,
+            max_inline_video_mb: 20,
+            max_inline_total_mb: 25,
+            experimental_video: false,
+        };
+        let errors = attachments_floor_errors(&att);
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec![
+                "attachments.max_image_dim",
+                "attachments.max_image_mb",
+            ],
+            "每个越界字段独立成条: {errors:?}"
+        );
+
+        // 恰好在下限上（512 / 1）= 合法。
+        let att = AttachmentsConfig {
+            max_image_dim: 512,
+            max_image_mb: 1,
+            ..AttachmentsConfig::default()
+        };
+        assert!(attachments_floor_errors(&att).is_empty());
+    }
+
+    /// 用户旋钮值域上限（2026-10-21 图片处理可配置）：dim ≤ 6000
+    /// （出口 ≤6000² 硬校验）、max_image_mb ≤ 5（出口 ≤5MB 公共分母）；
+    /// 恰好在上限上（6000 / 5）= 合法。
+    #[test]
+    fn attachments_above_ceiling_reports_each_violation() {
+        let att = AttachmentsConfig {
+            max_image_dim: 6001,
+            max_image_mb: 6,
+            ..AttachmentsConfig::default()
+        };
+        let errors = attachments_floor_errors(&att);
+        let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec![
+                "attachments.max_image_dim",
+                "attachments.max_image_mb",
+            ],
+            "上限越界独立成条: {errors:?}"
+        );
+        assert!(errors[0].message.contains("<= 6000"), "{errors:?}");
+        assert!(errors[1].message.contains("<= 5"), "{errors:?}");
+
+        // 恰好在上限上（6000 / 5）= 合法（= 默认 mb）。
+        let att = AttachmentsConfig {
+            max_image_dim: 6000,
+            max_image_mb: 5,
+            ..AttachmentsConfig::default()
+        };
+        assert!(attachments_floor_errors(&att).is_empty());
     }
 
     #[test]
@@ -2520,6 +2657,7 @@ transport = "carrier-pigeon"
         config.approval = Some(crate::config::ApprovalConfig {
             policy: ApprovalPolicySetting::AutoExcept,
             tools: vec![],
+            ..Default::default()
         });
         let (_errors, warnings) = validate_strict(&config, &valid_agents());
         assert!(
@@ -2536,6 +2674,7 @@ transport = "carrier-pigeon"
         config.approval = Some(crate::config::ApprovalConfig {
             policy: ApprovalPolicySetting::AutoExcept,
             tools: vec!["teleport".to_owned()],
+            ..Default::default()
         });
         let result = validate_config_full(&config, &valid_agents());
         assert!(
@@ -2572,6 +2711,7 @@ transport = "carrier-pigeon"
                 "run_code".to_owned(),
                 "github_list_prs".to_owned(),
             ],
+            ..Default::default()
         });
         let result = validate_config_full(&config, &agents);
         assert!(

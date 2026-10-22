@@ -440,6 +440,7 @@ mod tests {
 
     fn ok_out(content: &str) -> ToolOutput {
         ToolOutput {
+            attachments: None,
             bytes: content.len(),
             content: content.to_owned(),
             duration_ms: 1,

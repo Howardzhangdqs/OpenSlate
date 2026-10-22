@@ -46,9 +46,11 @@ async fn config(State(state): State<Arc<AppState>>, Query(q): Query<TokenQuery>)
     if !token_ok(&state, &q) {
         return unauthorized();
     }
+    // 审批规则快照先取（先 bridge 后 core 锁序），再投影视图。
+    let approval_rules = state.approval.rules_snapshot();
     let view = {
         let inner = state.core.lock();
-        build_config_view(&inner)
+        build_config_view(&inner, &approval_rules)
     };
     Json(view).into_response()
 }
@@ -95,6 +97,10 @@ async fn sessions(State(state): State<Arc<AppState>>, Query(q): Query<TokenQuery
                     started_at: r.started_at,
                     finished_at: r.finished_at,
                     cost_usd: r.cost_usd,
+                    // v5 L2 聚合列直达会话列表（存量 run / 旧 finish 记 0，
+                    // 与 DTO 的 None 容忍口径一致）。
+                    input_tokens: Some(r.input_tokens.max(0) as u64),
+                    output_tokens: Some(r.output_tokens.max(0) as u64),
                 })
                 .collect();
             Json(items).into_response()

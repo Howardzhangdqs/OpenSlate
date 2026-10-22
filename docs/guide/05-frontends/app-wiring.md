@@ -112,6 +112,17 @@ pub struct AppContext {
   + 无 --yes」时装上 + 一条启动 WARN。
 - server 侧（build_state）：`interactive=true` 推导后，再挂 `SessionApprovalBridge`
   回调（审批请求广播给 WS 客户端应答）。
+- **与规则引擎（tool-approval）的关系**：`apply_approval` 内部 `ApprovalManager::new(policy)`
+  已按 legacy 映射（P0-4：`Auto`→default=Allow / `Manual`→default=Manual /
+  `AutoExcept(list)`→default=Allow + tools[每项]=Manual）转入 `ApprovalRules`——
+  **CLI 行为零变化**（含 REPL 默认 AutoExcept 与 `--yes`/`NonInteractiveGate` 路径）。
+  server 侧**不做** `[approval]` 段缺省的 Auto opt-in（缺省 = Allow 从不问——
+  mobile 是唯一显式 opt-in `Auto` 的装配点，见 06-mobile §3.6）；session 装配的
+  `ApprovalManager::with_rules(bridge.rules_handle())` 共享 cell 热更
+  （always_* / set_approval_config）不经本函数。`[approval]` 新键
+  （`default_level`/`tool_levels`/`server_levels`）由 core
+  `rules_from_config` 单一推导，`default=Auto` 的自动判断语义 server 侧同样
+  支持（会走启发式 + 桥弹人，无 AI 审查装饰器——那是 mobile-only）。
 
 ## 5. 共享逻辑归属原则（新代码放哪）
 

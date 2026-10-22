@@ -14,6 +14,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 futures = "0.3"
+# 多模态：Attachment.data（Arc<[u8]>）→ Binary::from_base64 编码。
+# 版本与 vendor/genai 一致（0.22）。
+base64 = "0.22"
 
 # Android：rustls-platform-verifier 需要 JNI 宿主初始化（纯 .so 场景不可
 # 满足，TLS 一碰即 panic）。移动端改用 webpki 静态根证书的预配置 TLS。

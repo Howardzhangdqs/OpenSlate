@@ -47,12 +47,33 @@ pub const DEFAULT_MAX_EMPTY_TURNS: u32 = 3;
 pub trait MessageSink: Send + Sync {
     /// Persist `message` (called in conversation order).
     async fn append(&self, message: &Message);
+
+    /// v5 §2 per-message 元数据旁路：assistant 消息随本次模型调用的
+    /// 采集元数据（model_id / usage / finish_reason / latency_ms）一起
+    /// 交付，持久化层把它落 `messages.meta_json`（不进 [`Message`]
+    /// 本体——provider 回放路径零泄漏）。默认实现丢弃 meta 委托
+    /// [`Self::append`] —— 第三方 sink 不破坏。
+    async fn append_with_meta(&self, message: &Message, _meta: &MessageMeta) {
+        self.append(message).await;
+    }
 }
 
 /// Await the sink for a freshly appended message (no-op when unset).
 async fn sink_append(sink: Option<&dyn MessageSink>, message: &Message) {
     if let Some(sink) = sink {
         sink.append(message).await;
+    }
+}
+
+/// [`sink_append`] 的带 meta 形态：assistant 消息的采集点专用（见
+/// [`MessageSink::append_with_meta`]；no-op when unset）。
+async fn sink_append_with_meta(
+    sink: Option<&dyn MessageSink>,
+    message: &Message,
+    meta: &MessageMeta,
+) {
+    if let Some(sink) = sink {
+        sink.append_with_meta(message, meta).await;
     }
 }
 
@@ -94,6 +115,7 @@ async fn token_cancelled(cancel: Option<&CancellationToken>) {
 /// answer (see [`append_cancelled_tool_results`]).
 fn cancelled_tool_message(tc: &ToolCall) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::Tool,
         content: "[tool call cancelled before completion]".to_owned(),
         tool_call_id: Some(tc.id.clone()),
@@ -333,7 +355,10 @@ pub struct StepResult {
 /// - Multiple consecutive empty responses stop after max_empty_turns
 ///
 /// When `sink` is set, every appended assistant message and tool result is
-/// persisted through it before the loop continues (see [`MessageSink`]).
+/// persisted through it before the loop continues (see [`MessageSink`]);
+/// assistant messages additionally carry the call's collected metadata
+/// (model / usage / finish_reason / latency) via
+/// [`MessageSink::append_with_meta`].
 ///
 /// Tool batches (P2-1): when `config.parallel_tool_calls` is set (default),
 /// the direct tool calls of one step execute concurrently; batches that
@@ -487,6 +512,12 @@ pub async fn execute_run(
             );
         }
 
+        // v5 §2 捕获点计时起点：本次模型调用的端到端耗时（流式 =
+        // dispatch + 事件接收循环；非流式 = `generate` await），供
+        // assistant 消息的 `MessageMeta.latency_ms`。流式分支内部的
+        // `segment_start`（LLM-time 预算口径）保持独立，不受影响。
+        let call_start = Instant::now();
+
         let response = if let Some(cb) = progress.as_mut() {
             // --- Streaming path with progress callbacks ---
             cb.on_request_start(total_steps + 1, model_id);
@@ -636,6 +667,10 @@ pub async fn execute_run(
             resp
         };
 
+        // v5 §2 捕获点：本次调用的耗时快照（ms）——两条路径（流式/非流式）
+        // 在此汇合，assistant 消息的 meta 统一取这一份。
+        let call_latency_ms = call_start.elapsed().as_millis() as u64;
+
         if let Some(usage) = &response.usage {
             total_input_tokens += usage.input_tokens as u64;
             total_output_tokens += usage.output_tokens as u64;
@@ -654,6 +689,7 @@ pub async fn execute_run(
         let has_content = !assistant_content.is_empty();
 
         let assistant_msg = Message {
+            attachments: None,
             role: MessageRole::Assistant,
             content: assistant_content.clone(),
             tool_call_id: None,
@@ -668,8 +704,17 @@ pub async fn execute_run(
         };
         // Per-step incremental persistence: the assistant message is on
         // durable storage before any tool runs (crash mid-step leaves a
-        // resumable partial transcript).
-        sink_append(sink, &assistant_msg).await;
+        // resumable partial transcript). v5 §2：assistant 消息携带本次
+        // 调用的采集元数据走 `append_with_meta` 旁路（model_id 取当前
+        // 请求模型，usage/finish_reason 取 ModelResponse，latency 取上方
+        // 计时）；user/tool 消息维持无 meta 的 `append`。
+        let assistant_meta = MessageMeta {
+            model_id: Some(model_id.to_owned()),
+            usage: response.usage.clone(),
+            finish_reason: response.finish_reason.clone(),
+            latency_ms: Some(call_latency_ms),
+        };
+        sink_append_with_meta(sink, &assistant_msg, &assistant_meta).await;
         messages.push(assistant_msg);
 
         if has_tool_calls {
@@ -794,6 +839,10 @@ pub async fn execute_run(
                     }
 
                     let tool_msg = Message {
+                        // 读图链路：ToolOutput 附件（Image block 解出）随
+                        // Tool Message 走——持久化为引用形状（data
+                        // serde-skip），convert 层 1:N 展开喂多模态。
+                        attachments: output.attachments,
                         role: MessageRole::Tool,
                         content: output.content,
                         tool_call_id: Some(tc.id.clone()),
@@ -967,6 +1016,9 @@ pub async fn execute_run(
                                 );
                             }
                             let tool_msg = Message {
+                                // 同顺序路径：ToolOutput 附件随 Tool Message
+                                // 走（读图链路）。
+                                attachments: output.attachments,
                                 role: MessageRole::Tool,
                                 content: output.content,
                                 tool_call_id: Some(tc.id.clone()),
@@ -1163,6 +1215,7 @@ async fn execute_tool_safely(
                 },
             };
             ToolOutput {
+                attachments: None,
                 content: format!("Tool '{}' panicked: {}", name, reason),
                 bytes: 0,
                 duration_ms: 0,
@@ -1200,6 +1253,7 @@ fn truncate_context_if_needed(messages: &mut Vec<Message>, max_bytes: u32) {
     }
 
     let notice = Message {
+        attachments: None,
         role: MessageRole::System,
         content: "[Context truncated: older messages removed to stay within limit]".into(),
         tool_call_id: None,
@@ -1271,6 +1325,7 @@ mod tests {
     impl crate::tool::ToolExecutor for MockToolExecutor {
         async fn execute(&self, name: &str, args: &serde_json::Value) -> ToolOutput {
             ToolOutput {
+                attachments: None,
                 content: format!("executed {name} with {args:?}"),
                 bytes: 20,
                 duration_ms: 10,
@@ -1286,6 +1341,7 @@ mod tests {
             model_alias: "test-model".into(),
             system_prompt: None,
             initial_messages: vec![Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "hello".into(),
                 tool_call_id: None,
@@ -1403,6 +1459,7 @@ mod tests {
         impl crate::tool::ToolExecutor for LeakyExecutor {
             async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
                 ToolOutput {
+                    attachments: None,
                     content: "result: sk-core-mask-canary".to_owned(),
                     bytes: 27,
                     duration_ms: 1,
@@ -1546,6 +1603,7 @@ mod tests {
                     output_tokens: 20,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -1559,6 +1617,7 @@ mod tests {
                     output_tokens: 5,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -1579,6 +1638,188 @@ mod tests {
         assert_eq!(result.total_input_tokens, 250); // 100 + 150
         assert_eq!(result.total_output_tokens, 25); // 20 + 5
         assert_eq!(result.total_steps, 2);
+    }
+
+    // ── v5 §2: per-message meta 捕获 → sink 旁路 ──────────────────────
+
+    /// 收集型 sink：同时记录消息与随行的 meta（`None` = 经无 meta 的
+    /// `append` 抵达）。
+    struct MetaCapturingSink(std::sync::Mutex<Vec<(Message, Option<MessageMeta>)>>);
+
+    #[async_trait::async_trait]
+    impl MessageSink for MetaCapturingSink {
+        async fn append(&self, message: &Message) {
+            self.0
+                .lock()
+                .expect("sink poisoned")
+                .push((message.clone(), None));
+        }
+        async fn append_with_meta(&self, message: &Message, meta: &MessageMeta) {
+            self.0
+                .lock()
+                .expect("sink poisoned")
+                .push((message.clone(), Some(meta.clone())));
+        }
+    }
+
+    /// 脚本化两步对话（tool_calls → 最终回答），两条 assistant 响应都
+    /// 带 usage / finish_reason。
+    fn meta_script_responses() -> Vec<ModelResponse> {
+        vec![
+            ModelResponse {
+                reasoning_content: None,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-meta".into()),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                    image_tokens: None,
+                }),
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: Some(Usage {
+                    input_tokens: 150,
+                    output_tokens: 5,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                    image_tokens: None,
+                }),
+                finish_reason: Some("stop".into()),
+            },
+        ]
+    }
+
+    fn assert_meta_stream(observed: &[(Message, Option<MessageMeta>)]) {
+        // 消息序：assistant(tool_calls, meta) → tool(无 meta) →
+        // assistant(最终回答, meta)。
+        assert_eq!(observed.len(), 3, "两条 assistant + 一条 tool");
+        assert_eq!(observed[0].0.role, MessageRole::Assistant);
+        assert_eq!(observed[1].0.role, MessageRole::Tool);
+        assert_eq!(observed[2].0.role, MessageRole::Assistant);
+
+        // tool 消息维持无 meta 的 append 通道。
+        assert!(
+            observed[1].1.is_none(),
+            "tool 消息不走 meta 旁路: {:?}",
+            observed[1].1
+        );
+
+        for (i, expected_finish) in [(0usize, "tool_calls"), (2, "stop")] {
+            let meta = observed[i].1.as_ref().expect("assistant 消息必须携带 meta");
+            assert_eq!(
+                meta.model_id.as_deref(),
+                Some("model-x"),
+                "meta.model_id 取当前请求模型"
+            );
+            let usage = meta.usage.as_ref().expect("meta.usage 必须就位");
+            assert_eq!(usage.input_tokens, if i == 0 { 100 } else { 150 });
+            assert_eq!(usage.output_tokens, if i == 0 { 20 } else { 5 });
+            assert_eq!(
+                meta.finish_reason.as_deref(),
+                Some(expected_finish),
+                "meta.finish_reason 取 ModelResponse"
+            );
+            assert!(meta.latency_ms.is_some(), "meta.latency_ms 必须就位");
+        }
+    }
+
+    /// 非流式路径（progress=None）：assistant 消息的 meta 经
+    /// `append_with_meta` 抵达 sink，字段四件套齐全。
+    #[tokio::test]
+    async fn test_assistant_meta_reaches_sink_non_streaming() {
+        let provider = MockProvider::new(meta_script_responses());
+        let sink = MetaCapturingSink(std::sync::Mutex::new(Vec::new()));
+
+        let result = execute_run(
+            &provider,
+            default_config(),
+            "model-x",
+            &MockToolExecutor,
+            Some(&sink),
+            None,
+            None,
+        )
+        .await
+        .expect("run should succeed");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let observed = sink.0.lock().expect("sink poisoned").clone();
+        assert_meta_stream(&observed);
+    }
+
+    /// 流式路径（progress=Some）：汇合点同样构造 meta（默认
+    /// `generate_stream` 内联 await `generate`，MockProvider 即真实流）。
+    /// `NoopProgress` 复用本模块后文 Cancellation 区段的既有定义（把
+    /// execute_run 压进流式路径）。
+    #[tokio::test]
+    async fn test_assistant_meta_reaches_sink_streaming() {
+        let provider = MockProvider::new(meta_script_responses());
+        let sink = MetaCapturingSink(std::sync::Mutex::new(Vec::new()));
+        let mut progress = NoopProgress;
+
+        let result = execute_run(
+            &provider,
+            default_config(),
+            "model-x",
+            &MockToolExecutor,
+            Some(&sink),
+            Some(&mut progress),
+            None,
+        )
+        .await
+        .expect("run should succeed");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let observed = sink.0.lock().expect("sink poisoned").clone();
+        assert_meta_stream(&observed);
+    }
+
+    /// 默认实现兼容性：只 override `append` 的第三方 sink 在
+    /// `append_with_meta` 默认体委托下仍收到全部消息（不丢、不重）。
+    #[tokio::test]
+    async fn test_default_append_with_meta_delegates_to_append() {
+        #[derive(Default)]
+        struct AppendOnlySink(std::sync::Mutex<Vec<Message>>);
+        #[async_trait::async_trait]
+        impl MessageSink for AppendOnlySink {
+            async fn append(&self, message: &Message) {
+                self.0.lock().expect("sink poisoned").push(message.clone());
+            }
+        }
+
+        let provider = MockProvider::new(meta_script_responses());
+        let sink = AppendOnlySink::default();
+
+        let result = execute_run(
+            &provider,
+            default_config(),
+            "model-x",
+            &MockToolExecutor,
+            Some(&sink),
+            None,
+            None,
+        )
+        .await
+        .expect("run should succeed");
+
+        assert_eq!(result.status, RunStatus::Completed);
+        let observed = sink.0.lock().expect("sink poisoned").clone();
+        assert_eq!(
+            observed.len(),
+            3,
+            "默认委托下 append-only sink 仍收到全部消息"
+        );
+        assert_eq!(observed[1].role, MessageRole::Tool);
     }
 
     #[tokio::test]
@@ -1656,6 +1897,7 @@ mod tests {
         impl crate::tool::ToolExecutor for ErrorToolExecutor {
             async fn execute(&self, name: &str, _args: &serde_json::Value) -> ToolOutput {
                 ToolOutput {
+                    attachments: None,
                     content: format!("Error: tool '{}' not found", name),
                     bytes: 0,
                     duration_ms: 0,
@@ -1788,6 +2030,7 @@ mod tests {
     fn test_context_truncation() {
         let mut messages = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "hello".repeat(1000),
                 tool_call_id: None,
@@ -1796,6 +2039,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "response1".repeat(1000),
                 tool_call_id: None,
@@ -1804,6 +2048,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "followup".repeat(1000),
                 tool_call_id: None,
@@ -1812,6 +2057,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "response2".repeat(1000),
                 tool_call_id: None,
@@ -1820,6 +2066,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "final".repeat(100),
                 tool_call_id: None,
@@ -1844,6 +2091,7 @@ mod tests {
     fn test_context_no_truncation_when_under_limit() {
         let mut messages = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "hello".into(),
                 tool_call_id: None,
@@ -1852,6 +2100,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "hi".into(),
                 tool_call_id: None,
@@ -2115,6 +2364,7 @@ mod tests {
         async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
             tokio::time::sleep(Duration::from_millis(self.block_ms)).await;
             ToolOutput {
+                attachments: None,
                 content: "approved and ran".into(),
                 bytes: 18,
                 duration_ms: self.block_ms,
@@ -2403,6 +2653,7 @@ mod tests {
                 // Perform genuine async I/O to prove we're on a real async runtime.
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 ToolOutput {
+                    attachments: None,
                     content: format!("async tool {name} done, args={args}"),
                     bytes: 30,
                     duration_ms: 5,
@@ -2461,6 +2712,7 @@ mod tests {
     impl crate::tool::ToolExecutor for HugeOutputExecutor {
         async fn execute(&self, _name: &str, _args: &serde_json::Value) -> ToolOutput {
             ToolOutput {
+                attachments: None,
                 bytes: self.content.len(),
                 content: self.content.clone(),
                 duration_ms: 1,
@@ -2891,6 +3143,7 @@ mod tests {
             self.finished
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             ToolOutput {
+                attachments: None,
                 content: "never".into(),
                 bytes: 0,
                 duration_ms: 0,
@@ -3308,6 +3561,7 @@ mod tests {
             }
             self.active.fetch_sub(1, Ordering::SeqCst);
             ToolOutput {
+                attachments: None,
                 content: format!("done:{name}"),
                 bytes: 5 + name.len(),
                 duration_ms: delay,
@@ -3722,6 +3976,7 @@ mod tests {
                 output_tokens: 100_000,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }) - 1.6f64)
                 .abs()
                 < 1e-12
@@ -3734,6 +3989,7 @@ mod tests {
                 output_tokens: 999,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }) - 1.0f64)
                 .abs()
                 < 1e-12
@@ -3750,6 +4006,7 @@ mod tests {
                 output_tokens: 65_432,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             0.0,
             "unconfigured pricing must record cost 0"
@@ -3778,6 +4035,7 @@ mod tests {
                     output_tokens: 2_000,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -3790,6 +4048,7 @@ mod tests {
                     output_tokens: 4_000,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -3823,6 +4082,7 @@ mod tests {
                 output_tokens: 1_111,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);

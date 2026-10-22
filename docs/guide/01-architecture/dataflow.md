@@ -55,8 +55,11 @@ RunManager::execute_with_run_id → AgentRunner::run_root → runtime::execute_r
   │      step_end 时 flush_stream 落成条目；Usage 挂起为 pending_step_meta
   │      （落在本步工具行之下，fix-19 hold 语义）
   ├─ 模型给 tool_calls:
-  │    ├─ ApprovalManager.check（每个调用都过，无绕过路径）
-  │    │    高风险待批 → SessionApprovalBridge.decide()（§4.1）
+  │    ├─ ApprovalManager.check（每个调用都过，无绕过路径；server
+  │    │    作用域经 mcp::server_slug_of 反解注入）
+  │    │    待批（Manual 等级直问 / Auto 等级启发式风险 ≥Medium）→
+  │    │    回调链：mobile = AskUserExemptApproval(AiReviewApproval(
+  │    │    SessionApprovalBridge))，AI 审查环节见 §4.1
   │    │    决策审计 → tracing target=openslate_approval
   │    ├─ call_agent → AgentRunner 递归（CallerFrame 压栈；
   │    │    子上下文 = build_child_context 隔离构造：子代理自己的
@@ -132,26 +135,42 @@ resume 路径: list_messages_by_run 按 seq 读回 → 解码为 core::Message
 
 ## 4. 横切关注点
 
-### 4.1 审批桥时序（SessionApprovalBridge，session/approval.rs:107）
+### 4.1 审批链时序（AI 审查 + SessionApprovalBridge）
+
+**mobile 审批回调链（外→内）**：`AskUserExemptApproval(AiReviewApproval(SessionApprovalBridge))`（mobile runtime.rs 装配；ask_user 豁免保持最外层）。`AiReviewApproval::decide()`（mobile approval_review.rs）按序：
+
+1. **Manual 直通**（P0-2）：`trigger == Manual` 的请求直接进内层 bridge 弹人，**绝不进 AI 审查**（否则「全部手动」被审查器过滤，违背语义）；
+2. **会话作用域快路径**（P0-3）：`bridge.session_allows(req)` 命中（`allowed_tools ∪ allowed_servers`，见下）→ Approved——(a)/(c) 批准过的后续调用不再付一次 LLM 审查费；
+3. **verdict 缓存**：key=(tool_name, args hash)，容量 128 超限整清（safe/risky 都缓存）；
+4. **LLM 审查**（审查模型 = `[capabilities].review`，未绑定**继承会话当前模型**；prompt 带工具 description/schema/参数 JSON，max_tokens=128）：先广播 info Notice「正在 AI 审查…」（20s 空窗防「卡死」观感）→ **P0-1 红线：审查 future 经 `handle.spawn` 投递 + 本线程 std mpsc `recv_timeout`（默认 20s）阻塞等待——decide 已在 `Handle::block_on` 驱动的 poll 内，再 block_on 会 panic**；safe → 静默放行（只进 tracing，不弹人、不进转写）；risky → 弹人工（note 携带「AI 审查判定高风险：…」随 `ApprovalSummaryDto` 下发）；构建/请求/解析失败/超时 → **fail-safe 弹人，绝不因审查失败默认放行**。core 锁只在快照 config/model_alias 的短临界区内持有（不跨 await/阻塞），与「先 bridge 后 core」锁序红线相容。
+
+**SessionApprovalBridge::decide()**（session/approval.rs，引擎阻塞线程内联）：
 
 ```text
 引擎线程（decide 内联调用）                 客户端任务（dispatch）
-  1. 白名单快路径：allowlist 命中 → Approved
+  1. 会话作用域快路径（session_allows）：    ClientMsg::ApprovalAnswer{id, choice}
+     allowed_tools 含工具名 ∨                 → approval.respond(id, choice)
+     allowed_servers 含 server → Approved       拿走首答权（pending.remove）
   2. sink.count()==0 → Denied（无人可问即拒绝，不永久阻塞）
-  3. next_id++、std mpsc channel、
-     pending.push(Pending{id, summary, responder})
-  4. 广播 ServerMsg::ApprovalRequested{id, summary}        ──▶ UI 出横幅
-  5. rx.recv() 阻塞…（阻塞池线程，安全）
-                                                  ClientMsg::ApprovalAnswer{id, choice}
-                                                    → approval.respond(id, choice)
-                                                      拿走首答权（pending.remove）
-  6. Ok(choice) → Approved / Denied / ApproveAll   ◀── 迟到者拿 None → 定向
-     Err(_)（通道关闭）→ Denied("审批通道已关闭")       notice「已由其他客户端应答」
+  3. pending.push + 广播 ApprovalRequested      ──▶ 迟到者拿 None →
+     {id, summary}（summary 含 server/            定向 notice「已由其他客户端应答」
+     trigger/note，v3）          ──▶ UI 出审批卡
+  4. rx.recv() 阻塞…（阻塞池线程，安全）
+  5. Ok(choice) → choice_to_decision（六 choice 落点）：
+     approve = 单次放行；deny = Denied；
+     approve_all(a) = 写 allowed_tools（会话作用域）；
+     session_mcp(c) = 写 allowed_servers（server 缺失退化工具级，防御分支）；
+     always_tool(b) / always_mcp(d) = 本次放行但**不写会话集合**——
+     持久化与规则热更由 dispatch 层经 config_ops::apply_approval_rules
+     收敛链（persist 整段重写 [approval] → rules cell 热更 → 广播
+     config_changed），新规则作用于下一次 check
+  6. Err(_)（通道关闭）→ Denied("审批通道已关闭")
   7. 兜底清理 pending.retain(id)
 ```
 
-- `approve_all` 写**会话级**工具白名单（后续同名直接放行）。
 - 锁序红线：应答路径**先 `respond()` 释放 bridge 锁、再取 core 锁**推转写 `EntryDto::Approval`——反向（bridge → core）会与 snapshot 构成死锁环。
+- 会话作用域生命周期：`NewSession` 调 `clear_session_scopes()` 清空 `allowed_tools`/`allowed_servers` 双集合；持久化规则（always_*）不随会话重置（「一直允许」跨会话）。
+- watchdog 只对 deny 计数（连续同名 Denied 中止 run），放行类 choice 不触发。
 - 优雅停机：`deny_all()` 放行队列里所有阻塞请求为 deny，引擎才能解栈。
 
 ### 4.2 取消时序（CancellationToken 全树共享）

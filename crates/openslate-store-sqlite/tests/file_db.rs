@@ -231,7 +231,8 @@ async fn file_db_full_write_query_roundtrip() {
                 "rr-en",
                 Some("root"),
                 "user",
-                r#""hello""#,
+                &openslate_store_sqlite::codec::encode_content(r#""hello""#),
+                None,
                 1,
                 1300,
             )
@@ -245,7 +246,8 @@ async fn file_db_full_write_query_roundtrip() {
                 "rr-en",
                 Some("root"),
                 "assistant",
-                r#""world""#,
+                &openslate_store_sqlite::codec::encode_content(r#""world""#),
+                None,
                 2,
                 1400,
             )

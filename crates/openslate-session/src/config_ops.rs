@@ -17,9 +17,11 @@
 //! 并持久化在 Android Keystore（PLAN §18）。mobile 侧可在装配时决定
 //! 是否将本消息路由到这里。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use openslate_app::wiring::load_config_layered;
+use openslate_core::approval::{ApprovalRules, ToolApprovalLevel};
 use openslate_core::config::persist;
 use openslate_core::config::validation::validate_config;
 use openslate_protocol::{
@@ -71,6 +73,13 @@ pub enum ConfigChange {
         default_timeout: AskUserTimeoutDto,
         mask_secrets: bool,
     },
+    /// 工具审批规则写入（tool-approval P1b；值域校验在 apply_config_change
+    /// 守卫段做，非法 → 定向 error notice，不落盘）。
+    SetApprovalConfig {
+        default_level: Option<String>,
+        tool_levels: BTreeMap<String, String>,
+        server_levels: BTreeMap<String, String>,
+    },
     UpsertMcpServer {
         name: String,
         url: String,
@@ -101,6 +110,15 @@ impl ConfigChange {
             } => Some(Self::SetAskUserConfig {
                 default_timeout,
                 mask_secrets,
+            }),
+            ClientMsg::SetApprovalConfig {
+                default_level,
+                tool_levels,
+                server_levels,
+            } => Some(Self::SetApprovalConfig {
+                default_level,
+                tool_levels,
+                server_levels,
             }),
             ClientMsg::UpsertMcpServer { name, url, headers } => {
                 Some(Self::UpsertMcpServer { name, url, headers })
@@ -135,6 +153,10 @@ impl ConfigChange {
                     if *mask_secrets { "on" } else { "off" }
                 )
             }
+            ConfigChange::SetApprovalConfig { default_level, .. } => format!(
+                "set_approval_config default={}",
+                default_level.as_deref().unwrap_or("allow")
+            ),
             ConfigChange::UpsertMcpServer { name, .. } => {
                 format!("upsert_mcp_server {name}")
             }
@@ -308,6 +330,33 @@ pub fn apply_config_change(
                     return None;
                 }
             }
+            ConfigChange::SetApprovalConfig {
+                default_level,
+                tool_levels,
+                server_levels,
+            } => {
+                // 值域校验（定稿线格式："manual" | "allow" | "auto"）：
+                // 非法 → 定向 error notice，不落盘。
+                let mut bad: Option<&String> = None;
+                if let Some(v) = default_level.as_ref().filter(|v| parse_level_str(v).is_none()) {
+                    bad = Some(v);
+                }
+                if bad.is_none() {
+                    bad = tool_levels
+                        .values()
+                        .chain(server_levels.values())
+                        .find(|v| parse_level_str(v).is_none());
+                }
+                if let Some(v) = bad {
+                    notice(
+                        state,
+                        conn_id,
+                        format!("非法审批等级 '{v}'（可用：manual / allow / auto）"),
+                        NoticeLevel::Error,
+                    );
+                    return None;
+                }
+            }
             _ => {}
         }
     }
@@ -357,6 +406,33 @@ pub fn apply_config_change(
                 };
                 set_ask_user(&active, default_timeout, mask_secrets)
                     .map(|_| format!("[ask_user] timeout={t} mask_secrets={mask_secrets}"))
+            }
+            ConfigChange::SetApprovalConfig {
+                default_level,
+                tool_levels,
+                server_levels,
+            } => {
+                // 守卫段已校验值域；构造完整新规则（**整段重写**语义：
+                // 消息携带的是期望终态，非增量）走共享更新链。本链自带
+                // reload + 热替换 + rules 热更 + 广播，直接 return，不走
+                // 通用 reload_and_swap。
+                let rules = ApprovalRules {
+                    default_level: default_level
+                        .as_deref()
+                        .and_then(parse_level_str)
+                        .unwrap_or(ToolApprovalLevel::Allow),
+                    tools: tool_levels
+                        .into_iter()
+                        .map(|(k, v)| (k, parse_level_str(&v).expect("validated in guard")))
+                        .collect(),
+                    servers: server_levels
+                        .into_iter()
+                        .map(|(k, v)| (k, parse_level_str(&v).expect("validated in guard")))
+                        .collect(),
+                };
+                let what = apply_approval_rules(state, conn_id, rules)?;
+                crate::session_event!("config: {stdout_label}");
+                return Some(what);
             }
             ConfigChange::UpsertMcpServer { name, url, headers } => {
                 persist::upsert_mcp_server(&active, &name, &url, headers.as_ref())
@@ -537,8 +613,111 @@ pub fn apply_set_api_key(state: &Arc<AppState>, conn_id: u64, provider: &str, va
     }
 }
 
+/// 线格式 level 字符串 → 等级（值域 "manual" | "allow" | "auto"，同
+/// `ToolApprovalLevel::as_str` 的 snake_case 拼写）。
+fn parse_level_str(s: &str) -> Option<ToolApprovalLevel> {
+    match s {
+        "manual" => Some(ToolApprovalLevel::Manual),
+        "allow" => Some(ToolApprovalLevel::Allow),
+        "auto" => Some(ToolApprovalLevel::Auto),
+        _ => None,
+    }
+}
+
+/// 工具审批规则共享更新链（tool-approval P1b 的**单一收敛点**，oracle
+/// P1：设置页 `set_approval_config` 与审批应答 `always_tool` /
+/// `always_mcp`（经 session.rs dispatch 构造规则增量）两个入口共用）：
+///
+/// 1. `persist::set_approval_section` 整段重写 active 配置的 `[approval]`
+///    为新 schema（删 legacy `policy`/`tools` 键；全默认 → 删段）——与
+///    levels / capabilities / MCP 同写 active 的路由；
+/// 2. `load_config_layered` 重载 → validate 兜底 → 持 core 锁热替换
+///    `inner.config`（含在家的 manager，config_ops 既有模式）；
+/// 3. bridge rules cell 写入新规则（热生效——manager 经 `with_rules`
+///    挂同一 cell，**进行中回合**的下一次 check 即可见）；
+/// 4. 广播 `ServerMsg::ConfigChanged`（approval 视图 = 新规则，见
+///    `build_config_view`）。
+///
+/// 失败语义与通用链一致：落盘/重载/校验失败 → 定向 notice，返回 None
+/// （重载失败时磁盘已改、运行时保留旧配置）。
+pub fn apply_approval_rules(
+    state: &Arc<AppState>,
+    conn_id: u64,
+    new_rules: ApprovalRules,
+) -> Option<String> {
+    let (active, global, agents_cfg) = {
+        let inner = state.core.lock();
+        (
+            inner.paths.active.clone(),
+            inner.paths.global.clone(),
+            inner.agents_cfg.clone(),
+        )
+    };
+    // 1. 落盘（整段重写为生效规则——增量构造发生在调用方，本函数只
+    //    收终态）。
+    if let Err(e) = persist::set_approval_section(
+        &active,
+        Some(&new_rules.default_level),
+        &new_rules.tools,
+        &new_rules.servers,
+    ) {
+        notice(
+            state,
+            conn_id,
+            format!("审批配置写入失败：{e}"),
+            NoticeLevel::Error,
+        );
+        return None;
+    }
+    // 2. 重载 + 校验 + 热替换。
+    let merged = match load_config_layered(&active, global.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            notice(
+                state,
+                conn_id,
+                format!("配置重载失败（磁盘已写入，运行时保留旧配置）：{e}"),
+                NoticeLevel::Error,
+            );
+            return None;
+        }
+    };
+    if let Some(err) = validate_config(&merged, &agents_cfg)
+        .into_iter()
+        .next()
+        .map(|e| format!("{}: {}", e.field, e.message))
+    {
+        notice(
+            state,
+            conn_id,
+            format!("校验失败（磁盘已写入，运行时保留旧配置）：{err}"),
+            NoticeLevel::Error,
+        );
+        return None;
+    }
+    let view = {
+        let mut inner = state.core.lock();
+        inner.config = merged.clone();
+        if let Some(manager) = inner.manager.as_mut() {
+            manager.config = merged.clone();
+        }
+        // 视图用即将写入的新规则（此刻 cell 尚未更新，须传本地值）。
+        build_config_view(&inner, &new_rules)
+    };
+    // 3. rules cell 热更（core 锁已释放；cell 为叶子锁，无锁序影响）。
+    state.approval.set_rules(new_rules);
+    // 4. 广播。
+    state.sink.broadcast(ServerMsg::ConfigChanged {
+        config: Box::new(view),
+    });
+    Some("审批规则已更新".to_owned())
+}
+
 /// 重载 merged config → validate → 热替换（含在家的 manager）→ 广播。
 fn reload_and_swap(state: &Arc<AppState>, conn_id: u64, what: &str) -> Option<String> {
+    // 审批规则快照先取（先 bridge 后 core 的锁序；非审批 CRUD 不改
+    // 规则，此处只做视图投影）。
+    let approval_rules = state.approval.rules_snapshot();
     let (active, global, agents_cfg) = {
         let inner = state.core.lock();
         (
@@ -581,7 +760,7 @@ fn reload_and_swap(state: &Arc<AppState>, conn_id: u64, what: &str) -> Option<St
         if let Some(manager) = inner.manager.as_mut() {
             manager.config = merged.clone();
         }
-        build_config_view(&inner)
+        build_config_view(&inner, &approval_rules)
     };
     state.sink.broadcast(ServerMsg::ConfigChanged {
         config: Box::new(view),
@@ -748,6 +927,97 @@ fast = "fast"
             output_price_per_mtok: None,
             reasoning_effort: None,
         }
+    }
+
+    /// SetApprovalConfig（tool-approval P1b）：整段重写 [approval] →
+    /// rules cell 热更 → ConfigChanged 广播（approval 视图 = 新规则）；
+    /// 非法 level 值 → 定向 error notice，不落盘。
+    #[test]
+    fn set_approval_config_persists_hot_swaps_and_rejects_bad_levels() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (state, sink) = test_state(tmp.path(), FIXTURE_TOML);
+
+        // 非法值（tool_levels 里混入未知等级）：拒绝且不落盘。
+        let r = apply_config_change(
+            &state,
+            1,
+            ConfigChange::SetApprovalConfig {
+                default_level: Some("auto".into()),
+                tool_levels: BTreeMap::from([
+                    ("bash".to_owned(), "manual".to_owned()),
+                    ("read_file".to_owned(), "sometimes".to_owned()),
+                ]),
+                server_levels: BTreeMap::new(),
+            },
+        );
+        assert!(r.is_none(), "非法 level 必须被拒");
+        let errors = error_notices(&sink);
+        assert!(
+            errors
+                .iter()
+                .any(|t| t.contains("非法审批等级 'sometimes'")),
+            "定向 error 指名非法值: {errors:?}"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("openslate.toml")).unwrap();
+        assert!(!on_disk.contains("[approval"), "拒绝时不落盘: {on_disk}");
+
+        // 合法值：落盘（新 schema）+ rules cell 热更 + 广播。
+        let r = apply_config_change(
+            &state,
+            1,
+            ConfigChange::SetApprovalConfig {
+                default_level: Some("auto".into()),
+                tool_levels: BTreeMap::from([("bash".to_owned(), "manual".to_owned())]),
+                server_levels: BTreeMap::from([("github".to_owned(), "allow".to_owned())]),
+            },
+        );
+        assert!(r.is_some(), "合法规则必须成功");
+        let on_disk = std::fs::read_to_string(tmp.path().join("openslate.toml")).unwrap();
+        assert!(
+            on_disk.contains("default_level = \"auto\"")
+                && on_disk.contains("[approval.tool_levels]")
+                && on_disk.contains("bash = \"manual\"")
+                && on_disk.contains("[approval.server_levels]")
+                && on_disk.contains("github = \"allow\""),
+            "新 schema 整段落盘: {on_disk}"
+        );
+        // 内存 config 热替换（重载链）。
+        {
+            let inner = state.core.lock();
+            let approval = inner.config.approval.as_ref().expect("[approval] 重载可见");
+            assert!(matches!(
+                approval.default_level,
+                Some(openslate_core::config::ToolApprovalLevelSetting::Auto)
+            ));
+        }
+        // rules cell 热更（bridge 与引擎共享同一 cell）。
+        let rules = state.approval.rules_snapshot();
+        assert_eq!(rules.default_level, ToolApprovalLevel::Auto);
+        assert_eq!(
+            rules.tools.get("bash").copied(),
+            Some(ToolApprovalLevel::Manual)
+        );
+        assert_eq!(
+            rules.servers.get("github").copied(),
+            Some(ToolApprovalLevel::Allow)
+        );
+        // ConfigChanged 广播的 approval 视图 = 生效规则。
+        let sent = sink.sent.lock().unwrap();
+        let view = sent
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::ConfigChanged { config } => Some(config.approval.clone()),
+                _ => None,
+            })
+            .last()
+            .flatten()
+            .expect("config_changed 广播携带 approval 视图");
+        assert_eq!(view.default_level, "auto");
+        assert_eq!(view.tool_levels.get("bash").map(String::as_str), Some("manual"));
+        assert_eq!(
+            view.server_levels.get("github").map(String::as_str),
+            Some("allow")
+        );
     }
 
     #[test]

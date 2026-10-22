@@ -34,6 +34,7 @@ impl ModelProvider for FixedProvider {
                 output_tokens: 2,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         })

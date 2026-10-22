@@ -115,6 +115,7 @@ fn blank(width: usize) -> String {
 
 fn user_msg(content: &str) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::User,
         content: content.to_owned(),
         tool_call_id: None,
@@ -126,6 +127,7 @@ fn user_msg(content: &str) -> Message {
 
 fn assistant_msg(content: &str) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::Assistant,
         content: content.to_owned(),
         tool_call_id: None,
@@ -137,6 +139,7 @@ fn assistant_msg(content: &str) -> Message {
 
 fn assistant_call(id: &str, name: &str) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::Assistant,
         content: String::new(),
         tool_call_id: None,
@@ -152,6 +155,7 @@ fn assistant_call(id: &str, name: &str) -> Message {
 
 fn tool_result(id: &str, name: &str, content: &str) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::Tool,
         content: content.to_owned(),
         tool_call_id: Some(ToolCallId(id.to_owned())),
@@ -1063,6 +1067,7 @@ fn renders_request_meta_lines_dim_and_indented() {
             output_tokens: 10,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            image_tokens: None,
         }),
         Some(std::time::Duration::from_secs(2)),
         Some(std::time::Duration::from_millis(800)),
@@ -1103,6 +1108,7 @@ fn renders_single_merged_meta_line_for_empty_answer() {
             output_tokens: 96,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            image_tokens: None,
         }),
         Some(std::time::Duration::from_secs_f64(2.6)),
         Some(std::time::Duration::from_millis(900)),

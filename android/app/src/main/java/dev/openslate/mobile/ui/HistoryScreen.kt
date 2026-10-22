@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -151,16 +153,28 @@ fun HistoryScreen(onBack: () -> Unit, onOpened: () -> Unit) {
                                 maxLines = 1,
                             )
                             Text(
-                                "${fmt.format(Date(s.startedMs))} · ${statusLabel(s.status)}" +
-                                    if (s.costUsd > 0.0) " · $${"%.4f".format(s.costUsd)}" else "",
+                                buildString {
+                                    append(fmt.format(Date(s.startedMs)))
+                                    append(" · ")
+                                    append(statusLabel(s.status))
+                                    if (s.costUsd > 0.0) append(" · $${"%.4f".format(s.costUsd)}")
+                                    // token 摘要（v5 聚合列；存量 run 双 0 → 不显示，
+                                    // 不抢日期/状态的视觉层级）。
+                                    append(tokenSummary(s.inputTokens, s.outputTokens))
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.outline,
                             )
                         }
-                        Text(
-                            if (s.id == activeRunId) "●" else "",
-                            color = MaterialTheme.colorScheme.primary,
-                        )
+                        // 活动会话标记（Material 图标；ui.md 硬规范禁止 Unicode 字符）。
+                        if (s.id == activeRunId) {
+                            Icon(
+                                Icons.Filled.Circle,
+                                contentDescription = "当前会话",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(8.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -243,3 +257,16 @@ private fun statusLabel(status: String): String = when (status) {
     "failed" -> "失败"
     else -> status
 }
+
+/** token 数短格式：999 → "999"、12_345 → "12.3k"、1_250_000 → "1.3M"。 */
+private fun tokenCount(n: Long): String = when {
+    n >= 1_000_000 -> "%.1fM".format(n / 1_000_000.0)
+    n >= 1_000 -> "%.1fk".format(n / 1_000.0)
+    else -> "$n"
+}
+
+/** 次要信息行的 token 摘要（" · 12.3k in / 4.5k out"）；双 0（存量 run）
+ *  返回空串省略整段。 */
+private fun tokenSummary(inputTokens: Long, outputTokens: Long): String =
+    if (inputTokens <= 0 && outputTokens <= 0) ""
+    else " · ${tokenCount(inputTokens)} in / ${tokenCount(outputTokens)} out"

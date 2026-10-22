@@ -894,6 +894,7 @@ impl<'a> AgentRunner<'a> {
     fn success_output(&self, content: String) -> ToolOutput {
         let bytes = content.len();
         ToolOutput {
+            attachments: None,
             content,
             bytes,
             duration_ms: 0,
@@ -904,6 +905,7 @@ impl<'a> AgentRunner<'a> {
     fn error_output(&self, content: impl Into<String>) -> ToolOutput {
         let content = content.into();
         ToolOutput {
+            attachments: None,
             content,
             bytes: 0,
             duration_ms: 0,
@@ -1001,6 +1003,7 @@ impl<'a> AgentRunner<'a> {
                             // No ToolOutput on Err; audit a synthetic error
                             // record so the failed bridge call stays visible.
                             let failed = ToolOutput {
+                                attachments: None,
                                 content: format!("Error: {e}"),
                                 bytes: 0,
                                 duration_ms: 0,
@@ -1068,6 +1071,7 @@ impl<'a> AgentRunner<'a> {
         };
         let bytes = content.len();
         ToolOutput {
+            attachments: None,
             content,
             bytes,
             duration_ms: start.elapsed().as_millis() as u64,
@@ -1256,7 +1260,18 @@ impl<'a> ToolExecutor for AgentRunner<'a> {
         // model sees the refusal with guidance and self-heals; the
         // consecutive-denial watchdog aborts runs that keep retrying.
         let agent_id = self.current_agent_id();
-        if let ApprovalDecision::Denied(reason) = self.approval.check(name, args, &agent_id.0) {
+        // server 作用域（审批规则 `servers` 域的键，tool-approval P1a）：
+        // registry 命中工具的 namespace（McpTool 覆写 = [mcp.servers] 键，
+        // native / in-process builtin 为 None）经 `server_slug_of` 反解为
+        // 下游 slug（聚合形态）或 host 前缀（裸名形态）；非 MCP → None。
+        let namespace = self
+            .tool_registry
+            .get(name)
+            .and_then(|tool| tool.namespace());
+        let server = crate::mcp::server_slug_of(name, namespace.as_deref());
+        if let ApprovalDecision::Denied(reason) =
+            self.approval.check(name, server.as_deref(), args, &agent_id.0)
+        {
             return self.denied_output(name, args, reason);
         }
         self.clear_denials(name);
@@ -1314,6 +1329,7 @@ impl<'a> ToolExecutor for AgentRunner<'a> {
         let output = match self.tool_registry.execute(name, args).await {
             Ok(output) => output,
             Err(e) => ToolOutput {
+                attachments: None,
                 content: format!("Error: {}", e),
                 bytes: 0,
                 duration_ms: 0,
@@ -1398,6 +1414,7 @@ model = "mock-fast"
 
     fn user_message(content: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::User,
             content: content.into(),
             tool_call_id: None,
@@ -1462,6 +1479,7 @@ model = "mock-fast"
             args: &serde_json::Value,
         ) -> Result<ToolOutput, crate::error::ToolError> {
             Ok(ToolOutput {
+                attachments: None,
                 content: args.to_string(),
                 bytes: 0,
                 duration_ms: 0,
@@ -1714,6 +1732,7 @@ output_price_per_mtok = 1.0
                     output_tokens: 100,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 },
             ),
             response_with_usage(
@@ -1724,6 +1743,7 @@ output_price_per_mtok = 1.0
                     output_tokens: 50,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 },
             ),
             response_with_usage(
@@ -1734,6 +1754,7 @@ output_price_per_mtok = 1.0
                     output_tokens: 200,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 },
             ),
         ]);
@@ -2458,6 +2479,7 @@ output_price_per_mtok = 1.0
             _args: &serde_json::Value,
         ) -> Result<ToolOutput, crate::error::ToolError> {
             Ok(ToolOutput {
+                attachments: None,
                 content: "web results".into(),
                 bytes: 0,
                 duration_ms: 0,
@@ -2488,6 +2510,7 @@ output_price_per_mtok = 1.0
         ) -> Result<ToolOutput, crate::error::ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput {
+                attachments: None,
                 content: format!("echo:{}", args["x"]),
                 bytes: 0,
                 duration_ms: 0,
@@ -2784,6 +2807,7 @@ enabled = true
             self.calls.fetch_add(1, Ordering::SeqCst);
             let state = args["state"].as_str().unwrap_or("all");
             Ok(ToolOutput {
+                attachments: None,
                 content: format!("prs[{state}]=3"),
                 bytes: 0,
                 duration_ms: 0,
@@ -2813,6 +2837,7 @@ enabled = true
             _args: &serde_json::Value,
         ) -> Result<ToolOutput, crate::error::ToolError> {
             Ok(ToolOutput {
+                attachments: None,
                 content: "index hits".into(),
                 bytes: 0,
                 duration_ms: 0,
@@ -3226,6 +3251,7 @@ enabled = true
     #[test]
     fn truncate_bridge_output_under_limit_passes_through() {
         let output = ToolOutput {
+            attachments: None,
             content: "small".into(),
             bytes: 0, // tools that misreport bytes must not dodge the cap
             duration_ms: 7,
@@ -3240,6 +3266,7 @@ enabled = true
     #[test]
     fn truncate_bridge_output_over_limit_shares_engine_truncation() {
         let output = ToolOutput {
+            attachments: None,
             content: "z".repeat(10_000),
             bytes: 0,
             duration_ms: 3,
@@ -3651,6 +3678,7 @@ enabled = true
         ) -> Result<ToolOutput, crate::error::ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput {
+                attachments: None,
                 content: "other done".into(),
                 bytes: 11,
                 duration_ms: 1,

@@ -13,6 +13,8 @@ openslate-protocol = { path = "../openslate-protocol" }
 # run 持久化（RunRecorder / SqliteStore）。
 openslate-store-sqlite = { path = "../openslate-store-sqlite" }
 anyhow = { workspace = true }
+# TranscriptFlusher 的 BoxFuture 返回类型（历史转写丢失修复 C1）。
+futures = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }

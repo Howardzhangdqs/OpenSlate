@@ -10,20 +10,111 @@ ChatScreen Composer
       乐观本地回显 UiEntry.User（发送失败保留气泡可重发）
   → sendJson('{"type":"submit","text":…}')
   → OpenSlateRuntime.send(msg)                           [UniFFI/JNA 跨界，立即返回]
-  → MobileRuntime::send (runtime.rs:177)
+  → MobileRuntime::send (runtime.rs)
       ├ SetApiKey 消息 → 机制化封禁：广播 set_api_key_forbidden，不进 dispatch
       ├ Hello → 协议版本校验（不匹配广播 proto_mismatch）→ 补发 snapshot
       └ 其余 → rt.handle().clone().spawn
-  → openslate_session::session::dispatch(&state, MOBILE_CONN_ID=1, msg)
+          ├ Submit 带附件 → gate_submit_attachments（门控，见 §1.1）
+          │     拒绝 → Notice(Error)，不进 dispatch
+          │     通过 → dispatch 原样转发 → bind_landed_attachments（引擎 spawn 后绑 run）
+          └ session::dispatch(&state, MOBILE_CONN_ID=1, msg)
   → RunManager（openslate-app/core）回合引擎
+  → provider 工厂（装配期统一包 AttachmentDataProxy：请求前为附件引用从
+    files/{sha256}.{ext} 装载字节，单点执行 max_inline_total_mb 封顶）
   → mobile_provider_factory → MobileSecrets 取注入 key（无则 env，再无则报错）
-  → build_genai_provider → LLM（vendor/genai，流式）
+  → build_genai_provider → LLM（vendor/genai，流式；L3 convert 产 image_url/video_url）
 ```
 
 要点：
 
 - `submit` 是**唯一乐观回显**的消息；其余设置类消息（`upsert_provider` / `set_level` / `set_capability` / `upsert_mcp_server` / `answer_approval` / `new_session` / `cancel`…）全部转 ClientMsg JSON 等 Rust 处理后经 `config_changed` / `snapshot` 事件回证。
 - FFI `send` 非阻塞：解析失败同步返回 Err（`MobileError.SendFailed`），解析成功即 spawn，处理结果全部走下行事件流。
+
+## 1.1 附件链路（多模态输入，存储 v5 §3/§6；L4）
+
+```text
+[导入] Kotlin PickVisualMedia（Activity Result API）
+  → ContentResolver 拷 {cacheDir}/import-<ts>（HEIC/HEIF 在 Kotlin 预转码 JPEG；
+    API 26/27 无 HEIC 解码 → UI 报"不支持此格式"）
+  → RuntimeBridge.importAttachment(path, mime, name)  [IO 线程]
+      → OpenSlateRuntime.importAttachment               【uniffi，同步签名内部 block_on】
+      → MobileRuntime::import_attachment_json
+          → attachments::import_attachment（attachments.rs）
+              ① magic-byte 嗅探（不信任 declared_mime：jpeg/png/webp/gif/mp4/mkv/mov；
+                 heic brand 拒绝）
+              ② 入口防呆（图固定 50MB 常量 / 视频 max_video_mb；max_image_mb 已迁移为处理后上限）
+              ③ 图像归一化：PNG 且 ≤dim 且 ≤5MB → passthrough 保 PNG；否则缩到
+                 max_image_dim + JPEG q85（webp/gif 取首帧）；出口断言 ≤5MB、≤6000²
+                 视频 passthrough 不转码
+              ④ sha256 → files/{sha256}.{ext}（store insert_attachment，幂等覆盖）
+                 + 行（run_id NULL 暂存）
+  ← {"ok":true,"id":"att-…","mime":"image/jpeg","filename":…,"size_bytes":N}
+  → id 存 composer 状态（chips 渲染）
+
+[提交] Composer 发送（文本 + 附件 id 列表）
+  → sendJson('{"type":"submit","text":…,"attachments":[{"id":…,"mime":…,"filename":…}]}')
+  → MobileRuntime::send 的 spawn 内：
+      ① 逐 id get_attachment（缺失 → Notice 拒）+ sha256 去重
+      ② 门控矩阵 gate_submit_attachments（attachments.rs，纯函数）：
+           混发拒 / 图>50 拒 / 总字节>max_inline_total_mb 拒（列实际总量）/
+           图需 image 模态（registry lookup_local.supports_vision）/
+           视频需 video 模态（RegistryStore::supports_video：models.dev
+           modalities.input 直读）+ experimental_video 开关 + 单文件
+           ≤max_inline_video_mb / caps 未知放行 / 空文本拒
+      ③ dispatch：session handle_submit 把引用构进 user 消息（持久化形状
+         {id,mime,filename}，data 不进库）+ EntryDto::User（缩略图引用）
+      ④ 引擎 spawn 后 bind_landed_attachments → store.bind_attachments(ids, run_id)
+         （落地判定：history 尾部是本批 user 消息；busy/回滚不绑）
+
+[发送] 引擎每步请求（多步 / 迟到答案续跑 / resume 续聊同一路径）
+  → AttachmentDataProxy.fill（provider 工厂装饰器）
+      data=None 的引用从 files 读字节（Arc<[u8]>），总封顶 max_inline_total_mb
+  → L3 convert：ContentPart::Binary(mime, base64, filename) → vendor adapter
+      image_url / video_url（data: 前缀 base64）
+
+[恢复] open_session / 重启恢复（C1-C4 新序，runtime.rs open_session）
+  → busy 守卫：回合进行中拒切（notice Warn + bail——先取消再切，防撕裂
+     在途回合与 run 状态）
+  → flush_now(force) 旧 run：切换前把当前 run 的未落库尾部强制落库（含
+     回合中推迟的 ToolCall 中断快照 + INCOMPLETE_TURN_META 收尾行；此刻
+     busy=false 无并发 submit，内存转写即将被换出，不刷即丢）
+  → load：get_run + load_messages_keep_dangling（尾部带未答 tool_calls 的
+     assistant = 悬挂尾）
+  → pop + 回写删行：悬挂 assistant pop（显性化 Meta「上次回合未完成，已
+     丢弃待答复的工具调用」）+ 删 messages 尾行（max seq 语义）+ 全删该
+     run 的 transcript_entries 行 + 失效 SyncState 游标（sync_loop 下周期
+     自举 =0 全量写回；删干净后第二次 open 不再命中，防反复 pop / Meta
+     行累积）
+  → rebuild_transcript（两级：transcript_entries 行优先，空则回退 protocol
+     共享投影 project_from_messages（L6；runtime 侧薄委托 messages_to_transcript，
+     单份逻辑防漂移）——Approval/Delegate/StepBreak/Meta 只在 entries 行里；
+     截断自愈 heal_truncated_tail：entries 尾部落后于消息投影时对照补齐 +
+     HEAL_META 显性化，表不重写、重开内存自愈）
+  → refill_message_attachment_data：历史消息附件引用回填 data（总封顶；
+     超限 warn 跳过——模型丢图不丢文本，R5）
+  → swap（core 锁内）：history/transcript 换入 + session_run 换新 recorder；
+     !same_run 时轮换 session_id（ChatScreen 会话揭示依赖它变化）+ 清会话
+     作用域审批白名单（A 会话的 approve_all 不泄漏到 B；锁序先 bridge 后
+     core，对齐 NewSession）；旧 run 收束 "interrupted"（同 run 重开不
+     收束不轮换）
+  → 广播 snapshot（带 run_id：Kotlin 转写镜像键从快照取，见 §3.2）
+
+[实验视频开关] 设置页（L5 UI）↔ FFI set/getExperimentalVideo（L6）
+  → MobileRuntime::set_experimental_video
+      ① toml_edit 原地改写 openslate.toml [attachments] experimental_video
+         （其余键/注释零扰动，无节追加；实现在本 crate——core persist.rs 不动）
+      ② 同步更新 CoreInner.config.attachments.experimental_video
+  → 生效：下一轮 Submit 的 gate_submit_attachments 读内存配置即按新值
+     放行/拒绝视频附件（无需重启；get 也读内存——回显即行为）
+  → 落盘失败 → {"ok":false} 且内存不动（防分叉）
+
+[清扫] 启动 assemble_state → store.gc_stale_unbound_attachments(now)
+  → 删 7 天前 run_id IS NULL 的暂存行 + sha256 文件清扫
+```
+
+边界（文档化）：`[attachments]` 配置节（core config，默认即安全值：dim 2048 /
+图 10MB / 视频 50MB / 内联视频 20MB / 总 25MB / experimental_video=false）；
+重复导入同 sha256 时行仍新建、文件同字节幂等覆盖（store API 面无 row-only 插入）。
 
 ## 2. 下行（事件 → UI）
 
@@ -150,8 +241,17 @@ Termux 未启动/被冻结/停止态时，RUN_COMMAND 的结果 PendingIntent �
   stall 激活期间聊天页周期重探（2.5s；tracker CAS 单飞防抖）+ ON_RESUME
   立即重探（gateRefresh 同款门控；tracker 与面板可见性解耦——Ready
   收起面板后重探继续到 stall 清零，重发后再 stall 能被重新捕获）；composer
-  聚焦面板五灯子面板独立探测（McpLightsTracker：展开时 + ON_RESUME 展开态
-  refresh，autoRestartHost=true 顺手拉起 host，不经本 tracker）
+  聚焦面板五灯独立探测（McpLightsTracker：McpLightsUiState(result, probing)
+  快照 + CAS 单飞；驱动 = ChatScreen 初载/ON_RESUME 的 gateRefresh 与子面板
+  展开时 gateRefresh，均为与设置页 McpSection 同款智能门控——无快照/非全绿
+  （checked 未齐或五布尔任一 false）→ 全量重检含步骤 ⑦ 自动拉起 host（从
+  Termux 切回即自动确认恢复）、全绿→廉价 hostAliveDetail 比对翻转才重检、
+  在途不叠加；autoRestartHost=true 顺手拉起 host，不经本 tracker）；聚焦面板
+  首行 Termux 状态文案/颜色也由同一五灯快照推导（termuxLiveStatus：hostAlive
+  探活过=「Termux 运行中」、restartingHost/hostAlive 未过的拉起窗口=「MCP
+  host 启动中…」过渡态（secondary，host 未起不误报 Termux 未运行）、未装/
+  无权限/通道 NoResponse（=「Termux 未运行」）或其余通道失败/host 未装按五灯
+  终态分流 error 色）
   → 探测阶梯复用 detectTermuxStatus（MCP host 探活 → 安装/权限 →
     echo ok 通道往返），状态-动作矩阵：
       Checking      → spinner「正在探测 Termux…」
@@ -354,8 +454,24 @@ host call id 从 1 复位、恢复卡的数字 request_id 可能撞上新在途�
 总数压过含中断 turn 条目的 DB 权威镜像（悬挂的 user / ask_user 条目被
 抹掉）。新规则 `shouldRestoreLocalTranscript`（internal 纯函数）：本地在
 durable 条目（user/assistant/reasoning/tool/delegate/approval，两侧同源
-持久化）上不落后且总数更多才覆盖；DB 转写为空时本地兜底。live 会话的
-落盘逻辑（turn 结束写文件）不变。
+持久化）上不落后且总数更多才覆盖；DB 转写为空时本地兜底（run 键对齐后
+该兜底分支不再有跨会话污染面）。live 会话的落盘逻辑（turn 结束写文件）
+不变。
+
+**镜像 run 键（C4，修「历史转写丢失」的错位竞态）**：落盘/恢复的文件键
+（`filesDir/transcripts/<runId>.json`）不再读 FFI `currentRunId()`——那是
+绕过事件泵 FIFO 直读 Rust 实时态，open_session（Dispatchers.IO）与事件泵
+（单协程）并发换 run 时会错位：A 会话 entries 写进新 run 的文件（write-skew）
+/ 仲裁两侧分属两个会话（read-skew）。改取**事件流内嵌值**：turn_ok 落盘取
+`summary.run_id`（TurnSummaryDto 恒带）；turn_error 兜底 `lastKnownRunId`
+（仅 applySnapshot 在泵协程写入的私有字段）；恢复仲裁用快照 `session.run_id`
+（协议新增字段，serde default 双向兼容）。键与 entries 同代由单泵 FIFO 保证
+——引擎在 core 锁内置 running=false 并广播 TurnOk（先改镜像再广播），事件
+入队序 = TurnOk(旧run) → Snapshot(新run)，处理 turn_ok 时 lastKnownRunId
+仍是旧 run 且 `_state.entries` 属旧 run，两侧一致；三级都取不到键 → 不落盘
+（宁缺勿错：错键文件会污染新会话的仲裁）。FFI `currentRunId()` 本身保留，
+仅供 HistoryScreen 的删除守卫使用。镜像条目附带补 User 分支 `atts` 附件引用
+（照快照 wire 形态 `{id,mime,filename?,tokens?}`；旧镜像无键 → 空表兼容）。
 
 **Rust 侧迟到处理**：`MobileQuestionHandler` 双通路——在途 host call 先
 resolve（即时路径）；否则原子关卷（首答者赢）→ 与即时路径**同一格式化
@@ -397,6 +513,57 @@ outcome / answers 空）`openQuestionReview` 返回 false 不动 state，摘要�
 退回旧 AskAnswersDialog 兜底。投影退出即清（DisposableEffect）、
 session_reset 一并清除（页内 LaunchedEffect 自动 pop）。
 
+### 3.3 工具审批（AI 审查 + 审批卡交互链）
+
+Rust 侧规则引擎 / 桥语义见 [../02-core/openslate-session.md](../02-core/openslate-session.md) §3 与
+[../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1；mobile 装配 =
+`AskUserExemptApproval(AiReviewApproval(SessionApprovalBridge))`（openslate-mobile.md §3.6）。
+
+```text
+模型 tool call
+  → core ApprovalManager.check（规则引擎：tools > servers > default；
+     server 作用域经 mcp::server_slug_of 反解注入）
+  → 待批（Manual 直问 / Auto 等级启发式 ≥Medium）→ callback 链：
+     AiReviewApproval.decide（mobile approval_review.rs）
+       1. trigger=manual → 直通内层 bridge（不进 AI 审查，P0-2）
+       2. bridge.session_allows 命中（会话作用域快路径，P0-3）→ 放行
+       3. verdict 缓存命中 → 复用结论
+       4. 广播 info Notice「正在 AI 审查工具调用：…」
+         → handle.spawn(审查 LLM 请求) + recv_timeout 等待（P0-1 禁
+           block_on；默认 20s，RuntimeOptions.approval_review_timeout）
+         → 审查模型 = [capabilities].review（未绑定继承会话当前模型）
+         → safe  → 静默放行（仅 tracing，无 UI 事件）
+         → risky → 弹人工（note =「AI 审查判定高风险：…」）
+         → 失败/超时/解析失败 → fail-safe 弹人（绝不默认放行）
+  → SessionApprovalBridge.decide（弹人路径）
+     广播 approval_requested{id, summary（含 server/trigger/note）}
+  → Kotlin RuntimeBridge.handleEvent
+      pendingApproval = PendingApprovalUi（tool/args 全文/server/serverDisplayName/
+      trigger/note/riskLevel；旧协议缺新字段时退化为 manual + 3 选项）
+  → ChatScreen.ApprovalCard（对齐 ask_user 玻璃语言；风险 chip 用
+     StatusColors 三档语义色；MCP 级选项 (c)(d) 仅 server≠null 显示；
+     参数可展开；AI 审查 note 展示理由）
+  → 用户五选一（RuntimeBridge.answerApproval → approval_answer.choice）：
+      「本会话允许」   approve_all   → bridge 写 allowed_tools（会话作用域）
+      「一直允许」     always_tool   → dispatch 经 apply_approval_rules 落盘
+                                    [approval].tool_levels=allow + rules 热更
+      「本会话允许 MCP」session_mcp  → bridge 写 allowed_servers（会话作用域）
+      「一直允许 MCP」 always_mcp    → 落盘 [approval].server_levels=allow + 热更
+      「拒绝执行」     deny          → Denied（watchdog 仅对 deny 计数）
+  → 广播 approval_resolved{id, choice（连字符拼写）} + 转写行
+     EntryDto::Approval（decision 六值）→ 引擎继续/拒绝
+  → always_* 落盘成功 → config_changed（approval 视图回证，设置页
+     「工具权限」tab 同源刷新）
+```
+
+要点：
+
+- **「取消」必须回 deny**——纯 UI 关闭会让 Rust 侧 `rx.recv()` 永久阻塞。
+- NewSession 清会话作用域集合（allowed_tools/allowed_servers）——持久化规则
+  （always_*）跨会话保留。
+- 多客户端首答赢不变（本链路 mobile 单客户端，MOBILE_CONN_ID=1）。
+- 会话级放行 `run_code` 盖全脚本（一次审批盖整个脚本的既有语义）。
+
 ## 4. 生命周期
 
 ### 4.1 启动
@@ -414,7 +581,9 @@ MainActivity.onCreate
            → MobileRuntime::create_with 装配链（见 openslate-mobile.md §3.2）
               panic hook / ensure_layout / realign DB / EventSink / HostCallRouter /
               tools / RegistryStore / tokio(2 workers) / assemble_state（含启动清扫 +
-              重启续聊）/ register_bash_tools / emit_snapshot（create 即握手）
+              附件暂存 GC + 重启续聊两级转写重建 + 附件回填）/ register_bash_tools /
+              transcript 同步任务 spawn（transcripts.rs，行级落库 + 存储健康横幅）/
+              emit_snapshot（create 即握手）
       4. SecretStore.allProviders → 逐个 load → runtime.setApiKey
            （Ok=注入；Failed=告警「需重新录入」；Missing=跳过）
       5. restoreHttpProxy() / restoreExecBackend()

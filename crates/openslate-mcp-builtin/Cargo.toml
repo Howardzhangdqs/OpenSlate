@@ -14,6 +14,11 @@ thiserror = { workspace = true }
 # tokio base features come from the workspace (rt-multi-thread/macros/sync/
 # time/io-util/fs); `process` is added here for the shell server.
 tokio = { workspace = true, features = ["process"] }
+# read_file 读图（2026-10）：解码 / 缩放 / JPEG q85 重编码 + base64 出口。
+# 纯 Rust codec（与 openslate-mobile 同款四格式特性），Android 交叉编译
+# 无 C 依赖；归一化放 host 侧执行，避免原图 base64 走 JSON-RPC。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+base64 = "0.22"
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -18,20 +18,20 @@ use anyhow::{Context, Result};
 use openslate_app::wiring::{
     apply_approval, build_app_context_with, connect_external_mcp, load_config, AppContext,
 };
-use openslate_core::approval::ApprovalManager;
+use openslate_core::approval::{rules_from_config, ApprovalManager, ToolApprovalLevel};
 use openslate_core::error::ToolError;
 use openslate_core::mcp::McpConnectionGuard;
 use openslate_core::tool::Tool;
 use openslate_core::types::{Message, MessageRole, ToolOutput};
-use openslate_protocol::{
-    ClientMsg, EntryDto, NoticeLevel, ServerMsg, ToolStatusDto, PROTOCOL_VERSION,
-};
+use openslate_protocol::{ClientMsg, EntryDto, NoticeLevel, ServerMsg, PROTOCOL_VERSION};
 use openslate_session::approval::SessionApprovalBridge;
 use openslate_session::session as session_dispatch;
 use openslate_session::state::{
     build_snapshot, AppState, ConfigPaths, CoreInner, MsgSink, ProviderFactory, SessionCore,
 };
 
+use crate::approval_review::AiReviewApproval;
+use crate::attachment_tokens::AttachmentTokenBackfill;
 use crate::askuser::{
     AskUserContext, AskUserExemptApproval, AskUserTool, MobileQuestionHandler,
     startup_question_maintenance,
@@ -52,6 +52,9 @@ pub struct RuntimeOptions {
     /// 启动保留策略：装配期只保留最近 N 个 run，其余连同子表数据删除
     /// （默认 100，防历史库无限膨胀；0 = 清空，生产不建议）。
     pub run_retention: i64,
+    /// 审批 AI 审查等待上限（tool-approval P1b；默认 20s，测试注 200ms
+    /// 级别覆盖超时回退路径）。
+    pub approval_review_timeout: Duration,
 }
 
 impl Default for RuntimeOptions {
@@ -61,6 +64,7 @@ impl Default for RuntimeOptions {
             extra_tools: Vec::new(),
             host_call_timeout: HOST_CALL_TIMEOUT,
             run_retention: 100,
+            approval_review_timeout: crate::approval_review::DEFAULT_REVIEW_TIMEOUT,
         }
     }
 }
@@ -98,7 +102,15 @@ pub struct MobileRuntime {
     /// MCP host 死亡自愈共享上下文（所有 RecoveringMcpTool 装饰器共用：
     /// 单飞恢复闩 + 冷却 + 注册表弱引用；reload_mcp 迁移新工具时复用）。
     mcp_recovery: Arc<crate::mcp_recovery::RecoveryCtx>,
-    shutdown_flag: std::sync::atomic::AtomicBool,
+    /// 关停标志（Arc：transcript 同步任务与 shutdown 共享）。
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 转写同步共享状态（C1：sync_loop 周期写库与 NewSession / open_
+    /// session / shutdown 的强制冲刷共用同一游标表；见 transcripts.rs）。
+    sync: std::sync::Arc<crate::transcripts::SyncState>,
+    /// 附件 image tokens 响应侧回填（协议 v5）：EventSink tap 闩首次
+    /// 调用值，sync_loop 落 transcript，重开经 meta_json 重放。见
+    /// `attachment_tokens` 模块文档。
+    attachment_tokens: Arc<AttachmentTokenBackfill>,
 }
 
 impl MobileRuntime {
@@ -125,6 +137,13 @@ impl MobileRuntime {
         crate::alog!("create_with: layout ensured, config={:?}", config_path);
         let sink = EventSink::new(callback);
         crate::alog!("create_with: event sink started");
+        // 附件 image tokens 回填（协议 v5）：tap 收 Usage/TurnOk/TurnError
+        //（广播线程，只动自身 mutex，见模块文档）。
+        let attachment_tokens = AttachmentTokenBackfill::new();
+        {
+            let bf = attachment_tokens.clone();
+            sink.set_tap(Arc::new(move |msg: &ServerMsg| bf.on_event(msg)));
+        }
         let host_router = HostCallRouter::new(sink.clone(), opts.host_call_timeout);
 
         // ask_user secret 凭据库（会话内存 + store v4 持久层；装配完成后
@@ -166,9 +185,23 @@ impl MobileRuntime {
         // 久化偏好热注册。
 
         let secrets = Arc::new(MobileSecrets::default());
-        let factory = opts
+        // provider 工厂统一包一层附件字节装载代理（设计 §6.1 混合式）：
+        // history 里的 user 消息只带附件引用，请求进 provider 前由代理
+        // 从 files 按需回填 data（单点执行 max_inline_total_mb 封顶）。
+        // store 装配后才存在 → OnceLock 后注。
+        let attachment_store: crate::attachments::SharedStore = Arc::new(std::sync::OnceLock::new());
+        let inner_factory = opts
             .provider_factory
             .unwrap_or_else(|| mobile_provider_factory(secrets.clone()));
+        let factory_store = attachment_store.clone();
+        let factory: ProviderFactory = Arc::new(move |config, alias| {
+            let provider = inner_factory(config, alias)?;
+            Ok(Box::new(crate::attachments::AttachmentDataProxy::new(
+                provider,
+                factory_store.clone(),
+                config.attachments,
+            )) as Box<dyn openslate_core::provider::ModelProvider>)
+        });
         // 模型元数据注册表（数据源页面 / 自动补全；本地 ZSTD 持久化）。
         let model_registry = Arc::new(crate::registry::RegistryStore::new(&paths.config_dir));
 
@@ -185,9 +218,10 @@ impl MobileRuntime {
         let (state, mcp_external, mcp_tool_names) = rt.block_on(assemble_state(
             config_path.clone(),
             sink.clone(),
-            factory,
+            factory.clone(),
             extra_tools,
             opts.run_retention,
+            opts.approval_review_timeout,
         ))?;
         crate::alog!("create_with: state assembled, wiring approval + ask_user");
         // ask_user 接线：上下文注入 store/配置 + QuestionHandler 装配
@@ -197,8 +231,10 @@ impl MobileRuntime {
             .core
             .set_question_handler(Arc::new(MobileQuestionHandler::new(ask_ctx.clone())));
         // vault 持久层接线：加载 credentials 镜像（remember 凭据跨会话
-        // 可用——env 注入/lookup/脱敏值源全走镜像）。
+        // 可用——env 注入/lookup/脱敏值源全走镜像）。附件字节装载代理
+        // 的 store 同步后注（provider 工厂闭包持有 OnceLock）。
         if let Some(store) = state.core.lock().store.clone() {
+            let _ = attachment_store.set(Arc::new(store.clone()));
             rt.block_on(vault.attach_store(store));
         }
         // 输出脱敏接线：core 的进程级 masker 消费 vault 已知密钥值；
@@ -255,6 +291,10 @@ impl MobileRuntime {
                 mcp_tool_names.len()
             );
         }
+        let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // C1：转写前置冲刷钩子注册（NewSession 清转写前强制落库）；返回
+        // 的 SyncState 与 sync_loop 共享（同一游标表，写者收敛）。
+        let sync_state = crate::transcripts::install_flusher(&state.core);
         let runtime = Arc::new(Self {
             rt: std::sync::Mutex::new(Some(rt)),
             state,
@@ -271,8 +311,31 @@ impl MobileRuntime {
             ask: ask_ctx,
             bash_env: env_source,
             mcp_recovery,
-            shutdown_flag: std::sync::atomic::AtomicBool::new(false),
+            shutdown_flag: shutdown_flag.clone(),
+            sync: sync_state.clone(),
+            attachment_tokens,
         });
+
+        // transcript 持久化同步任务（设计 §4：行级增量落 transcript_
+        // entries + 存储健康横幅；详见 transcripts.rs）。随 shutdown_flag
+        // 退出；runtime drop 前最多再跑一个周期。
+        {
+            let handle = {
+                let guard = runtime.rt.lock().expect("mobile runtime lock poisoned");
+                guard
+                    .as_ref()
+                    .expect("runtime alive at create_with tail")
+                    .handle()
+                    .clone()
+            };
+            handle.spawn(crate::transcripts::sync_loop(
+                runtime.state.clone(),
+                runtime.sink.clone(),
+                shutdown_flag,
+                runtime.attachment_tokens.clone(),
+                runtime.sync.clone(),
+            ));
+        }
 
         // 首份 snapshot（create 即握手）。
         runtime.emit_snapshot();
@@ -314,6 +377,9 @@ impl MobileRuntime {
             }
             other => {
                 let state = self.state.clone();
+                let sink = self.sink.clone();
+                let model_registry = self.model_registry.clone();
+                let attachment_tokens = self.attachment_tokens.clone();
                 // 从 Option<Runtime> 借出 Handle spawn（不移动 runtime 本体）。
                 let handle = {
                     let guard = self.rt.lock().expect("mobile runtime lock poisoned");
@@ -321,7 +387,41 @@ impl MobileRuntime {
                     rt.handle().clone()
                 };
                 handle.spawn(async move {
-                    session_dispatch::dispatch(&state, MOBILE_CONN_ID, other).await;
+                    // Submit 附件预处理（多模态输入 §3.3/§3.4/§6.4）：门控
+                    // （模态能力 / 数量 / 体积 / 图视频互斥）→ 通过则原样
+                    // dispatch（session 侧把引用构进 user 消息）→ 引擎 spawn
+                    // 完成后把附件绑定到本 run。拒绝经 notice 通道返回。
+                    let (msg, bind_ids) =
+                        match gate_submit_attachments(&state, &sink, &model_registry, other).await
+                        {
+                            Some(v) => v,
+                            None => return, // 已 notice 拒绝，不进 dispatch
+                        };
+                    // 附件 image tokens 回填标记（协议 v5，dispatch 前设置
+                    // ——引擎首次 Usage 事件不会跑赢本地路径）：**单图**
+                    // Submit 才观测（多图 usage 不分图，回填哪个都是错）。
+                    let mark_single_image = match &msg {
+                        ClientMsg::Submit {
+                            attachments: Some(dtos),
+                            ..
+                        } if dtos.len() == 1 && dtos[0].mime.starts_with("image/") => {
+                            Some(dtos[0].id.clone())
+                        }
+                        _ => None,
+                    };
+                    let marked = mark_single_image.is_some();
+                    if let Some(id) = mark_single_image {
+                        attachment_tokens.mark_submit(id);
+                    }
+                    session_dispatch::dispatch(&state, MOBILE_CONN_ID, msg).await;
+                    if !bind_ids.is_empty() {
+                        if !bind_landed_attachments(&state, &bind_ids).await {
+                            // 提交未落地（busy/回滚）：本回合与该附件无关。
+                            attachment_tokens.clear_pending();
+                        }
+                    } else if marked {
+                        attachment_tokens.clear_pending();
+                    }
                 });
             }
         }
@@ -331,6 +431,167 @@ impl MobileRuntime {
     /// 注入 provider API key（内存；宿主负责 Keystore 持久化，PLAN §18）。
     pub fn set_api_key(&self, provider: &str, value: &str) {
         self.secrets.set(provider, value);
+    }
+
+    // ── 附件（多模态输入，设计 §3/§6/§7）───────────────────────────
+
+    /// 导入附件（FFI `import_attachment` 的后端；同步签名内部 block_on，
+    /// registry_update_source_json 先例——宿主须在 IO 线程调用）。
+    /// 返回 `{"ok":true,"id","mime","filename","size_bytes"}` 或
+    /// `{"ok":false,"error":"…"}`。**导入侧绝不发起任何网络请求**（附件
+    /// 字节只在真正发起模型请求时随请求上行）；token 数由回合结束后
+    /// 响应侧回填（[`crate::attachment_tokens`]，经
+    /// `EntryDto::User.attachments[].tokens` 呈现）。
+    pub fn import_attachment_json(
+        &self,
+        source_path: &str,
+        declared_mime: &str,
+        filename: &str,
+    ) -> String {
+        let t_start = std::time::Instant::now();
+        crate::alog!(
+            "attachment timing: import begin path={source_path:?} declared={declared_mime:?}"
+        );
+        let result = self.import_attachment_json_inner(source_path, declared_mime, filename);
+        crate::alog!(
+            "attachment timing: import end total={}ms ok={}",
+            t_start.elapsed().as_millis(),
+            serde_json::from_str::<serde_json::Value>(&result)
+                .ok()
+                .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+                .unwrap_or(false)
+        );
+        result
+    }
+
+    /// [`Self::import_attachment_json`] 的实现体（入口/出口耗时日志在
+    /// 外层包裹）。
+    fn import_attachment_json_inner(
+        &self,
+        source_path: &str,
+        declared_mime: &str,
+        filename: &str,
+    ) -> String {
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let Some(rt) = guard.as_ref() else {
+                return serde_json::json!({"ok": false, "error": "runtime 已关停"}).to_string();
+            };
+            rt.handle().clone()
+        };
+        let state = self.state.clone();
+        let source = source_path.to_owned();
+        let mime = declared_mime.to_owned();
+        let name = filename.to_owned();
+        handle.block_on(async move {
+            let (store, cfg) = {
+                let inner = state.core.lock();
+                (inner.store.clone(), inner.config.attachments)
+            };
+            let Some(store) = store else {
+                return serde_json::json!({
+                    "ok": false, "error": "存储不可用（内存库无附件支持）"
+                })
+                .to_string();
+            };
+            match crate::attachments::import_attachment(
+                &store,
+                &cfg,
+                std::path::Path::new(&source),
+                &mime,
+                if name.trim().is_empty() { None } else { Some(name.as_str()) },
+            )
+            .await
+            {
+                Ok(imported) => {
+                    // 成功 JSON 契约（chip 点击展开的对比信息）：
+                    // `{"ok","id","mime","filename","size_bytes","orig_bytes",
+                    //   "processed","orig_width","orig_height","width","height"}`；
+                    // 尺寸四键图像恒在（快速通道 = 原图尺寸、转码 = 缩放
+                    // 后），视频省略（嗅探层不解析容器头）；`processed` =
+                    // "passthrough" | "transcode" | "video_passthrough"。
+                    let mut env = serde_json::json!({
+                        "ok": true,
+                        "id": imported.dto.id,
+                        "mime": imported.dto.mime,
+                        "filename": imported.dto.filename,
+                        "size_bytes": imported.size_bytes,
+                        "orig_bytes": imported.orig_bytes,
+                        "processed": imported.processed,
+                    });
+                    if let Some(w) = imported.orig_width {
+                        env["orig_width"] = serde_json::json!(w);
+                        env["orig_height"] =
+                            serde_json::json!(imported.orig_height.expect("成对出现"));
+                    }
+                    if let Some(w) = imported.width {
+                        env["width"] = serde_json::json!(w);
+                        env["height"] = serde_json::json!(imported.height.expect("成对出现"));
+                    }
+                    env.to_string()
+                }
+                Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
+            }
+        })
+    }
+
+    /// 附件缩略图（FFI `getAttachmentThumbnail` 后端，des-2 Android
+    /// lane 契约；同步签名内部 block_on，import_attachment_json 先例
+    /// ——宿主须在 IO 线程调用）。id → files 原图 → 长边缩到 max_px
+    /// （只缩不放）→ JPEG q80 → base64。返回
+    /// `{"ok":true,"data":"<b64>","mime":"image/jpeg"}` 或
+    /// `{"ok":false,"error":"…"}`（附件不存在 / 视频 / 文件缺失 /
+    /// 解码失败均走 error）。
+    pub fn get_attachment_thumbnail_json(&self, id: &str, max_px: i32) -> String {
+        let handle = {
+            let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+            let Some(rt) = guard.as_ref() else {
+                return serde_json::json!({"ok": false, "error": "runtime 已关停"}).to_string();
+            };
+            rt.handle().clone()
+        };
+        let state = self.state.clone();
+        let id = id.to_owned();
+        handle.block_on(async move {
+            let store = {
+                let inner = state.core.lock();
+                inner.store.clone()
+            };
+            let Some(store) = store else {
+                return serde_json::json!({
+                    "ok": false, "error": "存储不可用（内存库无附件支持）"
+                })
+                .to_string();
+            };
+            match crate::attachments::attachment_thumbnail_base64(&store, &id, max_px).await {
+                Ok(b64) => serde_json::json!({
+                    "ok": true,
+                    "data": b64,
+                    "mime": "image/jpeg",
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
+            }
+        })
+    }
+
+    /// 当前会话模型的附件模态能力（§6.4 门控数据源）：
+    /// image = registry 合并 meta 的 `supports_vision`；video = models.dev
+    /// 条目的 input modalities（`ModelMeta` 无 video 维，见 registry.rs）。
+    /// `None` = caps 未知（手填模型无元数据）→ 门控放行，provider 错误
+    /// 原样透出。
+    fn attachment_caps(
+        model_registry: &crate::registry::RegistryStore,
+        config: &openslate_core::config::OpenSlateConfig,
+        alias: &str,
+    ) -> (Option<bool>, Option<bool>) {
+        let Ok(resolved) = openslate_core::model_config::resolve_model(config, alias) else {
+            return (None, None);
+        };
+        let meta = model_registry.lookup_local(&resolved.model_id);
+        let image = if meta.is_empty() { None } else { meta.supports_vision };
+        let video = model_registry.supports_video(&resolved.model_id);
+        (image, video)
     }
 
     /// 设置 bash 工具后端多选（逗号分隔："native"、"termux"、
@@ -773,13 +1034,115 @@ impl MobileRuntime {
         }
     }
 
+    // ── 实验开关（设置页「实验性功能」；存储 v5 §3.5）────────────────
+
+    /// 读实验视频开关当前生效值。读**内存配置**（`CoreInner.config`）：
+    /// 装配期从落盘 openslate.toml 装载、[`Self::set_experimental_video`]
+    /// 写入时同步更新——内存值即 Submit 门控实际消费的值，回显与行为
+    /// 恒一致（get_mcp_* 系列读盘是因为它们的生效走显式 reload；本开
+    /// 关没有 reload 概念，内存即真相）。
+    pub fn get_experimental_video(&self) -> bool {
+        let value = self.state.core.lock().config.attachments.experimental_video;
+        crate::alog!("get_experimental_video: {value}");
+        value
+    }
+
+    /// 写实验视频开关（FFI `set_experimental_video` 的 mobile 侧实现，
+    /// L4→L6 交接；签名与 L5 已约定不可变）。两步：
+    /// 1. **落盘**：toml_edit 原地改写 openslate.toml
+    ///    `[attachments] experimental_video`（其余键/注释/格式零扰动；
+    ///    无该节则追加）。实现在本 crate（`persist_experimental_video`）
+    ///    而非 core persist.rs——core 侧不在本 lane 写权限内，语义与
+    ///    persist 层同一套守卫（非表节点拒绝改写）；
+    /// 2. **内存生效**：同步更新 `CoreInner.config.attachments`——
+    ///    Submit 附件门控（`gate_submit_attachments`）读内存值，下一轮
+    ///    提交即按新开关放行/拒绝视频附件，无需重启。
+    /// 落盘失败 → `{"ok":false,"error":"…"}` 且**不动内存**（避免内存
+    /// 与磁盘分叉：重启后开关回跳旧值比「看似生效实未持久」可预期）。
+    pub fn set_experimental_video(&self, enabled: bool) -> String {
+        crate::alog!("set_experimental_video({enabled})");
+        if let Err(e) = persist_experimental_video(&self.config_path, enabled) {
+            let error = format!("写入配置失败: {e:#}");
+            crate::alog!("set_experimental_video: {error}");
+            return serde_json::json!({ "ok": false, "error": error }).to_string();
+        }
+        self.state.core.lock().config.attachments.experimental_video = enabled;
+        crate::alog!("set_experimental_video: 已落盘并即时生效 ({enabled})");
+        serde_json::json!({ "ok": true }).to_string()
+    }
+
+    /// 读图片处理双旋钮当前生效值（FFI `get_image_processing` 的 mobile
+    /// 侧）。读**内存配置**（与 `get_experimental_video` 同理：装配期从
+    /// 落盘 openslate.toml 装载、setter 写入时同步更新——归一化/快速
+    /// 通道消费的就是内存值，回显与行为恒一致）。
+    /// 返回 `{"max_image_dim":N,"max_image_mb":M}`（u32/u64）。
+    pub fn get_image_processing(&self) -> String {
+        let att = self.state.core.lock().config.attachments;
+        crate::alog!("get_image_processing: dim={} mb={}", att.max_image_dim, att.max_image_mb);
+        serde_json::json!({
+            "max_image_dim": att.max_image_dim,
+            "max_image_mb": att.max_image_mb,
+        })
+        .to_string()
+    }
+
+    /// 写图片处理双旋钮（FFI `set_image_processing`；设置页「图片最长
+    /// 边 / 处理后大小上限」）。语义见 [`crate::attachments::
+    /// normalize_image`]：等比缩放目标边长 + 迭代压缩（q85→70→55 →
+    /// ×0.85 缩边）达标线。三步：
+    /// 1. **值域校验**（core validation 同源：512 ≤ dim ≤ 6000、
+    ///    1 ≤ mb ≤ 5）——非法值 `{"ok":false,"error":…}` 且不落盘；
+    /// 2. **落盘**：toml_edit 原地改写 `[attachments]` 两键（其余键/
+    ///    注释/格式零扰动；无该节则追加）；
+    /// 3. **内存生效**：同步更新 `CoreInner.config.attachments`——
+    ///    下一次 `import_attachment` 即按新旋钮走快速通道/迭代压缩，
+    ///    无需重启。落盘失败 → `{"ok":false}` 且不动内存（内存与磁盘
+    ///    不分叉，同 set_experimental_video 语义）。
+    pub fn set_image_processing(&self, max_dim: i64, max_mb: i64) -> String {
+        crate::alog!("set_image_processing(dim={max_dim}, mb={max_mb})");
+        // 值域校验走 core validation（单一真相源）：构造临时配置跑
+        // attachments 边界检查，错误逐条拼进 error。
+        let candidate = openslate_core::config::AttachmentsConfig {
+            max_image_dim: max_dim.try_into().unwrap_or(u32::MAX),
+            max_image_mb: max_mb.try_into().unwrap_or(u64::MAX),
+            ..openslate_core::config::AttachmentsConfig::default()
+        };
+        let errors =
+            openslate_core::config::validation::attachments_floor_errors(&candidate);
+        if !errors.is_empty() {
+            let msg = errors
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            crate::alog!("set_image_processing: 非法值：{msg}");
+            return serde_json::json!({ "ok": false, "error": msg }).to_string();
+        }
+        let (dim, mb) = (max_dim as u32, max_mb as u64);
+        if let Err(e) = persist_image_processing(&self.config_path, dim, mb) {
+            let error = format!("写入配置失败: {e:#}");
+            crate::alog!("set_image_processing: {error}");
+            return serde_json::json!({ "ok": false, "error": error }).to_string();
+        }
+        {
+            let mut inner = self.state.core.lock();
+            inner.config.attachments.max_image_dim = dim;
+            inner.config.attachments.max_image_mb = mb;
+        }
+        crate::alog!("set_image_processing: 已落盘并即时生效 (dim={dim}, mb={mb})");
+        serde_json::json!({ "ok": true }).to_string()
+    }
+
     // ── 工具可见性（工具管理页）──────────────────────────────────────
 
     /// 全部已注册工具清单（JSON 数组，按 name 排序；宿主渲染工具管理页，
     /// 展开项展示详细参数）：
-    /// `[{"name":"bash","description":"…","input_schema":{…}}, …]`——
+    /// `[{"name":"bash","description":"…","input_schema":{…},"server":…}, …]`——
     /// `input_schema` 为该工具参数的 JSON Schema 对象原样（无 schema 时
-    /// 为 `{}`，键恒存在）。
+    /// 为 `{}`，键恒存在）；`server` 为审批作用域标识（tool-approval
+    /// P1b：聚合形态 = 下游 slug 如 `"github"`，host 内置裸名 = host 前
+    /// 缀，非 MCP 工具为 JSON null）——Android 设置页「工具权限」按它
+    /// 分组（有则用）。
     pub fn list_tools_json(&self) -> String {
         let mut defs = self.registry.definitions();
         defs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -794,10 +1157,18 @@ impl MobileRuntime {
                 } else {
                     d.parameters.clone()
                 };
+                // 审批作用域反解走 core 权威实现（namespace = [mcp.servers]
+                // 键；native / in-process builtin = None → null）。
+                let server = self
+                    .registry
+                    .get(&d.name)
+                    .and_then(|tool| tool.namespace())
+                    .and_then(|ns| openslate_core::mcp::server_slug_of(&d.name, Some(&ns)));
                 serde_json::json!({
                     "name": d.name,
                     "description": d.description,
                     "input_schema": input_schema,
+                    "server": server,
                 })
             })
             .collect::<Vec<_>>())
@@ -906,6 +1277,22 @@ impl MobileRuntime {
         self.host_router.fail_all("runtime shutting down");
         self.state.approval.deny_all();
         self.sink.close_all();
+        // C1：关停前把当前 run 的转写尾部强制落库（force——含回合中推迟
+        // 的 ToolCall 中断快照 + INCOMPLETE_TURN_META 收尾行）。必须在
+        // 下方 rt.take() 之前同步完成：此后无 runtime 可执行异步，内存
+        // 转写随收束蒸发。
+        {
+            let handle = {
+                let guard = self.rt.lock().expect("mobile runtime lock poisoned");
+                // 幂等标志已挡住重入；rt 必然还在（take 在本块之后）。
+                guard
+                    .as_ref()
+                    .expect("runtime already shut down")
+                    .handle()
+                    .clone()
+            };
+            handle.block_on(self.sync.flush_now(&self.state, true));
+        }
         // run 终态必须先于 runtime 收束落库：此刻不 finish，recorder 随
         // runtime 一起消失后该 run 永远停留在 running（僵尸记录，只能
         // 等下次启动的 mark_running_runs_interrupted 清扫）。关停语义 =
@@ -1158,6 +1545,9 @@ impl MobileRuntime {
                     "status": r.status,
                     "started_ms": r.started_at,
                     "cost_usd": r.cost_usd,
+                    // run 级 token 聚合（存储 v5 §2；存量 run 无采集 = 0）。
+                    "input_tokens": r.input_tokens.max(0),
+                    "output_tokens": r.output_tokens.max(0),
                 }));
             }
             serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned())
@@ -1232,7 +1622,12 @@ impl MobileRuntime {
             guard.as_ref().expect("runtime shut down").handle().clone()
         };
         let state = self.state.clone();
+        // C1：切换前把当前 run 的未落库尾部强制落库（force——含回合中
+        // 推迟的 ToolCall 中断快照）。此刻 busy=false（守卫已过），无
+        // 并发 submit；当前 run 的内存转写即将被换出，不刷即丢。
+        let sync = self.sync.clone();
         handle.block_on(async move {
+            sync.flush_now(&state, true).await;
             let store = state
                 .core
                 .lock()
@@ -1244,10 +1639,57 @@ impl MobileRuntime {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .ok_or_else(|| anyhow::anyhow!("会话 {run_id} 不存在"))?;
-            let messages =
-                openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &run.id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // 保留悬挂加载 + 手动执行 load_messages 的经典丢弃（尾部带
+            // 未答 tool_calls 的 assistant）——手动是为了拿到"丢弃发生"
+            // 的显式信号（§5：丢弃要显性化为转写 Meta 行）。
+            let mut messages =
+                openslate_store_sqlite::recorder::RunRecorder::load_messages_keep_dangling(
+                    &store, &run.id,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut popped_dangling = false;
+            if matches!(
+                messages.last(),
+                Some(m) if m.role == MessageRole::Assistant
+                    && m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
+            ) {
+                messages.pop();
+                popped_dangling = true;
+                // C2 pop 回写 DB（修「只改内存不回写 → 反复重开反复 pop、
+                // ⚡Meta 行累积」）：删被 pop 的 messages 尾行（load 返回
+                // 不带 seq，按 max seq 语义删尾部）+ 全删该 run 的
+                // transcript_entries 行（重建走消息投影，无悬挂条目），
+                // 再失效 SyncState 游标——sync_loop 下周期自举 = 0，把
+                // 完整重建转写全量写回（幂等；悬挂是罕见路径，一次全量
+                // 重写可接受）。删行失败 best-effort（下次重开再试）；
+                // 删干净后第二次 open 不再命中本分支（G-1）。
+                match store.max_message_seq(&run.id).await {
+                    Ok(max_seq) => {
+                        match store.delete_messages_from_seq(&run.id, max_seq).await {
+                            Ok(n) => crate::alog!(
+                                "open_session: pop 回写删除 run {} 尾部消息 {n} 行",
+                                run.id
+                            ),
+                            Err(e) => crate::alog!(
+                                "open_session: 删除悬挂尾消息失败（非致命）: {e}"
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        crate::alog!("open_session: 查询 max seq 失败（非致命）: {e}")
+                    }
+                }
+                if let Err(e) = store.delete_transcript_entries_for_run(&run.id).await {
+                    crate::alog!("open_session: 清空转写条目行失败（非致命）: {e}");
+                }
+                sync.invalidate(&run.id).await;
+                tracing::warn!(
+                    target: "openslate_store",
+                    "run {}: dropped trailing dangling assistant on open_session (已回写 DB 删除)",
+                    run.id
+                );
+            }
             // ── 存量 run 标题治愈 ──
             // 旧版本的 run 标题是占位值（None / "mobile session"），历史
             // 会话列表只能显示占位。messages 已在手，零额外查询取首条
@@ -1267,7 +1709,7 @@ impl MobileRuntime {
             }
             let root_agent_id = state.core.lock().agent_tree.get_root().id.0.clone();
             let recorder = openslate_store_sqlite::recorder::RunRecorder::resume(
-                store,
+                store.clone(),
                 openslate_core::types::RunId(run.id.clone()),
                 &root_agent_id,
             )
@@ -1277,8 +1719,10 @@ impl MobileRuntime {
             // 对旧 run 而言本次切换是被打断 → "interrupted"（与
             // NewSession 的 "completed" 语义不同）；不收束则会留下永远
             // running 的僵尸记录。同一 run 重开无需收束（状态无谓抖动）。
+            // C2：same_run 判定上提——供会话身份轮换复用（!same_run 时
+            // 换 session_id + 清会话作用域审批白名单）。
             // 错误仅告警，不阻断切换。
-            let (old_run, old_cost) = {
+            let (old_run, old_cost, same_run) = {
                 let mut inner = state.core.lock();
                 let same_run = inner
                     .session_run
@@ -1289,17 +1733,51 @@ impl MobileRuntime {
                 } else {
                     inner.session_run.take()
                 };
-                (old_run, inner.stats.total_cost_usd)
+                (old_run, inner.stats.total_cost_usd, same_run)
             }; // guard 随块结束释放，之后的 await 不持锁。
             if let Some(old_run) = old_run {
                 if let Err(e) = old_run.recorder.finish("interrupted", None, old_cost).await {
                     crate::alog!("open_session: finish previous run failed (non-fatal): {e}");
                 }
             }
-            let transcript = messages_to_transcript(&messages);
+            // C2：会话身份轮换（!same_run）——换 run 即换会话。session_id
+            // 变化驱动 ChatScreen 的会话揭示；会话作用域审批白名单
+            // （approve_all / session_mcp 写入的内存集合）随之清空：A 会
+            // 话的 approve_all 不能泄漏到 B。锁序对齐 NewSession 先例
+            // （session.rs）：clear_session_scopes 在 core 锁外调用（先
+            // bridge 后 core）。同一 run 重开不轮换不清（会话未换）。
+            if !same_run {
+                state.approval.clear_session_scopes();
+            }
+            // 转写两级重建（设计 §4）：优先 transcript_entries 行（v5 真
+            // 相源——Approval/Meta/StepBreak 等投影拿不到的条目都在）；
+            // 空（v5 前的 run）→ protocol 共享投影回退（L6 已切换：
+            // `project_from_messages`，经 runtime 侧薄委托调用）。pop 过
+            // 且非空 → 追加 Meta 显性化（§5）。
+            let mut transcript =
+                crate::transcripts::rebuild_transcript(&store, &run.id, &messages).await;
+            if popped_dangling && !transcript.is_empty() {
+                transcript.push(EntryDto::Meta {
+                    text: crate::transcripts::DANGLING_TAIL_META.to_owned(),
+                });
+            }
+            // 附件 resume 回填（设计 §6.1）：历史图随每轮重发，总字节封
+            // 顶 max_inline_total_mb。
+            let attachments_cfg = state.core.lock().config.attachments;
+            crate::attachments::refill_message_attachment_data(
+                &store,
+                &attachments_cfg,
+                &mut messages,
+            )
+            .await;
             let cost = run.cost_usd;
             {
                 let mut inner = state.core.lock();
+                // C2：会话身份轮换（!same_run）——ChatScreen 的会话揭示
+                // 依赖 session_id 变化；同一 run 重开保持不变。
+                if !same_run {
+                    inner.session_id = session_dispatch::new_session_id();
+                }
                 inner.history = messages;
                 inner.transcript = transcript;
                 inner.session_run = Some(openslate_session::state::SessionRun {
@@ -1315,6 +1793,137 @@ impl MobileRuntime {
         self.emit_snapshot();
         Ok(())
     }
+}
+
+/// Submit 附件门控（设计 §3.3/§3.4/§6.4；`send` 的 spawn 内调用）。
+///
+/// 非 Submit 或无附件 → 原样放行（`bind_ids` 空）。带附件：
+/// 1. 空文本拒绝（session 侧空文本静默丢弃，用户会无感知——fail fast）；
+/// 2. 逐 id 加载 attachments 行（不存在/已过期拒绝）+ sha256 去重；
+/// 3. 矩阵门控（[`crate::attachments::gate_submit_attachments`]）。
+///
+/// 返回 `Some((msg, bind_ids))` = 放行（msg 原样进 dispatch；ids 待
+/// run 落定后 bind）；`None` = 已 notice 拒绝。
+async fn gate_submit_attachments(
+    state: &Arc<AppState>,
+    sink: &Arc<EventSink>,
+    model_registry: &Arc<crate::registry::RegistryStore>,
+    msg: ClientMsg,
+) -> Option<(ClientMsg, Vec<String>)> {
+    let ClientMsg::Submit {
+        text,
+        attachments,
+    } = msg
+    else {
+        return Some((msg, Vec::new()));
+    };
+    let Some(dtos) = attachments else {
+        return Some((
+            ClientMsg::Submit {
+                text,
+                attachments: None,
+            },
+            Vec::new(),
+        ));
+    };
+    if dtos.is_empty() {
+        // 空数组 ≡ 无附件：剥字段转发，session 侧少一层无谓构造。
+        return Some((
+            ClientMsg::Submit {
+                text,
+                attachments: None,
+            },
+            Vec::new(),
+        ));
+    }
+    let notice = |text: String| {
+        sink.broadcast(ServerMsg::Notice {
+            text,
+            level: NoticeLevel::Error,
+        });
+    };
+    if text.trim().is_empty() {
+        notice("请为附件输入文字说明后再发送".into());
+        return None;
+    }
+    let (store, config, alias) = {
+        let inner = state.core.lock();
+        (
+            inner.store.clone(),
+            inner.config.clone(),
+            inner.model_alias.clone(),
+        )
+    };
+    let Some(store) = store else {
+        notice("存储不可用，无法发送附件".into());
+        return None;
+    };
+    let mut records = Vec::with_capacity(dtos.len());
+    for dto in &dtos {
+        match store.get_attachment(&dto.id).await {
+            Ok(Some(row)) => records.push(row),
+            _ => {
+                notice(format!(
+                    "附件不存在或已过期，请重新添加（id={}）",
+                    dto.id
+                ));
+                return None;
+            }
+        }
+    }
+    let records = crate::attachments::dedupe_records(records);
+    let (image_cap, video_cap) =
+        MobileRuntime::attachment_caps(model_registry, &config, &alias);
+    if let Err(reason) = crate::attachments::gate_submit_attachments(
+        &config.attachments,
+        &records,
+        image_cap,
+        video_cap,
+    ) {
+        crate::alog!("submit gate: 拒绝附件提交：{reason}");
+        notice(reason);
+        return None;
+    }
+    let ids = records.iter().map(|r| r.id.clone()).collect();
+    Some((
+        ClientMsg::Submit {
+            text,
+            attachments: Some(dtos),
+        },
+        ids,
+    ))
+}
+
+/// dispatch 返回后（引擎已 spawn、run 已落定）把本批附件绑定到当前 run
+/// （`attachments.run_id` NULL → run id；设计 §3.1）。绑定成功的判定：
+/// history 尾部是刚落地的带附件 user 消息（数量一致）——busy 拒绝 /
+/// provider 构建失败回滚等未落地路径不绑定（暂存行留给下次或 7 天 GC）。
+/// 返回是否落地（false 时调用方清理附件 token 回填标记）。
+async fn bind_landed_attachments(state: &Arc<AppState>, ids: &[String]) -> bool {
+    let (store, run_id, landed) = {
+        let inner = state.core.lock();
+        let landed = matches!(inner.history.last(), Some(m) if m.role == MessageRole::User
+            && m.attachments.as_ref().is_some_and(|a| a.len() == ids.len()));
+        (
+            inner.store.clone(),
+            inner.session_run.as_ref().map(|r| r.run_id.0.clone()),
+            landed,
+        )
+    };
+    if !landed {
+        crate::alog!("attachments: 提交未落地（busy/回滚），跳过 bind（{ids:?}）");
+        return false;
+    }
+    let (Some(store), Some(run_id)) = (store, run_id) else {
+        crate::alog!("attachments: 无 store/run，跳过 bind（{ids:?}）");
+        return false;
+    };
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    match store.bind_attachments(&refs, &run_id).await {
+        Ok(n) => crate::alog!("attachments: {n} 个附件已绑定到 run {run_id}"),
+        Err(e) => crate::alog!("attachments: bind 失败（非致命，行保持暂存）: {e}"),
+    }
+    true
 }
 
 /// 状态装配（server `build_state` 的 mobile 变体：origin / 显式路径 /
@@ -1356,6 +1965,7 @@ async fn assemble_state(
     provider_factory: ProviderFactory,
     extra_tools: Vec<Box<dyn Tool>>,
     run_retention: i64,
+    review_timeout: Duration,
 ) -> Result<(Arc<AppState>, McpConnectionGuard, Vec<String>)> {
     let config_flag = config_path.to_str().map(|s| s.to_owned());
     crate::alog!("assemble: build_app_context begin");
@@ -1378,13 +1988,37 @@ async fn assemble_state(
     } = ctx;
 
     apply_approval(&mut manager, &config, true, false);
-    let policy = manager.approval.policy().clone();
     let approval_bridge = Arc::new(SessionApprovalBridge::new(sink.clone()));
-    // ask_user 审批豁免（设计 §0）：Manual 全审模式下提问不触发审批
-    // （「问个问题还要先批准才能问」是体验灾难）；respond 通道照旧走
-    // 原 bridge（AppState.approval 不动）。
-    manager.approval = ApprovalManager::new(policy)
-        .with_callback(Arc::new(AskUserExemptApproval::new(approval_bridge.clone())));
+    // 初始审批规则（tool-approval P1b，P0-4）：`rules_from_config` 单一
+    // 推导 + **mobile 专属的 [approval] 段缺省 opt-in**（default=Auto
+    // 自动判断 = 启发式预过滤 + AI 审查，设计 v3 用户拍板）；显式配置
+    // （legacy 或新键）按映射保持原行为。规则写入 bridge 的共享 cell，
+    // manager 经 with_rules 挂**同一 cell**——always_* / set_approval_
+    // config 的热更直达引擎（游离副本 = 热更失效且无编译错误，P0-5）。
+    let mut initial_rules = rules_from_config(&config);
+    if config.approval.is_none() {
+        initial_rules.default_level = ToolApprovalLevel::Auto;
+    }
+    approval_bridge.set_rules(initial_rules);
+    // AI 审查装饰器（设计 v3，mobile-only）：AutoRisk 请求先过 LLM 审查
+    // （safe 静默放行 / risky 弹人 / 失败 fail-safe 弹人）；ask_user 豁免
+    // 保持最外层。SessionCore 此刻尚不存在（manager 要先进 CoreInner、
+    // 装饰器又要快照 core 的 config/model_alias）——wire 后注，
+    // AskUserContext.wire 同款防环先例。
+    let sink_dyn: Arc<dyn MsgSink> = sink.clone();
+    let review_approval = Arc::new(
+        AiReviewApproval::new(
+            approval_bridge.clone(),
+            sink_dyn,
+            provider_factory.clone(),
+            manager.tool_registry.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_timeout(review_timeout),
+    );
+    manager.approval = ApprovalManager::with_rules(approval_bridge.rules_handle()).with_callback(
+        Arc::new(AskUserExemptApproval::new(review_approval.clone())),
+    );
 
     // 初始会话模型：capabilities.main（用户在设置页改的主对话模型）
     // 优先；无该节/代号不可解析时回退 root agent 的别名（旧配置行为）。
@@ -1438,6 +2072,13 @@ async fn assemble_state(
             }
             Ok(_) => {}
             Err(e) => crate::alog!("retention prune failed (non-fatal): {e}"),
+        }
+        // 附件启动 GC（设计 §3.1）：清 7 天前导入仍未发送的暂存行
+        // （composer 选了图没提交），连同其 sha256 文件清扫。失败仅告警。
+        match store.gc_stale_unbound_attachments(now_ms).await {
+            Ok(n) if n > 0 => crate::alog!("attachments: GC 清扫 {n} 条过期暂存附件"),
+            Ok(_) => {}
+            Err(e) => crate::alog!("attachments: startup GC failed (non-fatal): {e}"),
         }
     }
 
@@ -1502,6 +2143,7 @@ async fn assemble_state(
                         // （迟到答案 / TTL 过期合成收尾的补全点，pop 不可
                         // 逆）。查询失败保守保留——多留的悬挂由下一 turn
                         // 前的修复收口，安全；误 pop 则无法挽回。
+                        let mut popped_dangling = false;
                         if !keep_dangling {
                             match store.list_pending_questions().await {
                                 Ok(pending) => {
@@ -1511,6 +2153,46 @@ async fn assemble_state(
                                         .collect();
                                     if may_pop_dangling_tail(&restored_history, &pending_ids) {
                                         restored_history.pop();
+                                        popped_dangling = true;
+                                        // C2 pop 回写 DB（与 open_session
+                                        // 同款）：删被 pop 的尾消息行 + 全删
+                                        // 该 run 的 transcript_entries 行，
+                                        // 下方重建走消息投影。此刻
+                                        // SyncState 尚未构造（create_with
+                                        // 尾部才装配），游标表为空 → 无需
+                                        // 失效，sync_loop 首周期自会从 DB
+                                        // 行数（=0）自举后全量写回。注意
+                                        // recorder 已在上方建好（last_seq
+                                        // 偏大）：后续写入留下 seq 空洞，
+                                        // 无害（单调唯一即可）。
+                                        match store.max_message_seq(&run.id).await {
+                                            Ok(max_seq) => {
+                                                if let Err(e) = store
+                                                    .delete_messages_from_seq(&run.id, max_seq)
+                                                    .await
+                                                {
+                                                    crate::alog!(
+                                                        "restore: 删除悬挂尾消息失败（非致命）: {e}"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => crate::alog!(
+                                                "restore: 查询 max seq 失败（非致命）: {e}"
+                                            ),
+                                        }
+                                        if let Err(e) = store
+                                            .delete_transcript_entries_for_run(&run.id)
+                                            .await
+                                        {
+                                            crate::alog!(
+                                                "restore: 清空转写条目行失败（非致命）: {e}"
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            target: "openslate_store",
+                                            "run {}: dropped dangling tail on restart (已回写 DB 删除)",
+                                            run.id
+                                        );
                                     }
                                 }
                                 Err(e) => crate::alog!(
@@ -1518,7 +2200,26 @@ async fn assemble_state(
                                 ),
                             }
                         }
-                        restored_transcript = messages_to_transcript(&restored_history);
+                        // 附件 resume 回填（设计 §6.1）：历史图随每轮重发，
+                        // 总字节封顶 max_inline_total_mb（超限 warn 跳过——
+                        // 模型丢图不丢文本）。
+                        crate::attachments::refill_message_attachment_data(
+                            &store,
+                            &config.attachments,
+                            &mut restored_history,
+                        )
+                        .await;
+                        // 转写两级重建（设计 §4）：优先 transcript_entries
+                        // 行；空（v5 前的 run）→ 消息投影回退。pop 过且
+                        // 转写非空 → 追加 Meta 显性化（设计 §5）。
+                        restored_transcript =
+                            crate::transcripts::rebuild_transcript(&store, &run.id, &restored_history)
+                                .await;
+                        if popped_dangling && !restored_transcript.is_empty() {
+                            restored_transcript.push(EntryDto::Meta {
+                                text: crate::transcripts::DANGLING_TAIL_META.to_owned(),
+                            });
+                        }
                     }
                     Ok(_) => crate::alog!("restore: last run has no messages; fresh session"),
                     Err(e) => crate::alog!("restore: load_messages failed: {e}; fresh session"),
@@ -1570,9 +2271,12 @@ async fn assemble_state(
         pending_step_meta: None,
     };
 
+    let core = Arc::new(SessionCore::new(inner));
+    // AI 审查装饰器接线（core 晚于 manager 存在，见上方装配注释）。
+    review_approval.wire(&core);
     Ok((
         Arc::new(AppState {
-            core: Arc::new(SessionCore::new(inner)),
+            core,
             sink,
             approval: approval_bridge,
             auth_token: None,
@@ -1663,73 +2367,79 @@ fn meta_to_json(m: &openslate_core::model_registry::ModelMeta) -> String {
     .to_string()
 }
 
-/// 恢复的 history → transcript 镜像投影（User/Assistant/Tool 三类核心
-/// 条目；reasoning/meta 不在持久化里，从简）。
-fn messages_to_transcript(messages: &[Message]) -> Vec<EntryDto> {
-    let mut out = Vec::new();
-    for m in messages {
-        match m.role {
-            MessageRole::User => out.push(EntryDto::User {
-                text: m.content.clone(),
-            }),
-            MessageRole::Assistant => {
-                // 思维链随消息持久化——恢复时还原为折叠的 Reasoning 条目。
-                if let Some(rc) = m.reasoning_content.as_ref().filter(|r| !r.is_empty()) {
-                    out.push(EntryDto::Reasoning { text: rc.clone() });
-                }
-                if let Some(tcs) = m.tool_calls.as_ref() {
-                    for tc in tcs {
-                        out.push(EntryDto::ToolCall {
-                            name: tc.name.clone(),
-                            args: tc
-                                .arguments
-                                .to_string()
-                                .chars()
-                                .take(40)
-                                .collect::<String>(),
-                            call_id: Some(tc.id.0.clone()),
-                            status: ToolStatusDto::Done {
-                                bytes: 0,
-                                truncated: false,
-                                elapsed_ms: None,
-                            },
-                            detail: openslate_protocol::ToolEntryDetailDto {
-                                args: tc.arguments.to_string(),
-                                output: None,
-                            },
-                        });
-                    }
-                }
-                if !m.content.trim().is_empty() {
-                    out.push(EntryDto::Assistant {
-                        text: m.content.clone(),
-                    });
-                }
-            }
-            MessageRole::Tool => {
-                // 工具结果并入上一条同名 ToolCall（简化：追加 output）。
-                if let Some(EntryDto::ToolCall { detail, .. }) =
-                    out.iter_mut().rev().find_map(|e| {
-                        if let EntryDto::ToolCall { name, call_id, .. } = e {
-                            if call_id.as_deref() == m.tool_call_id.as_ref().map(|x| x.0.as_str())
-                                || (m.tool_call_id.is_none()
-                                    && name == m.name.as_deref().unwrap_or(""))
-                            {
-                                return Some(e);
-                            }
-                            None
-                        } else {
-                            None
-                        }
-                    })
-                {
-                    detail.output = Some(m.content.chars().take(2000).collect::<String>());
-                }
-            }
-            _ => {}
-        }
+/// `[attachments]` 键值对的 toml_edit 原地改写（`set_experimental_video`
+/// / `set_image_processing` 的落盘半边共用）。读 → 改值 → 写回：其余
+/// 键/注释/排版零扰动（toml_edit 往返保真）；无 `[attachments]` 节则
+/// 追加（文档已有内容时前置空行分隔）。`[attachments]` 存在但不是标准
+/// 表节点 → 拒绝改写并报错（与 core persist 层同一套守卫语义）。
+fn persist_attachments_keys(
+    path: &std::path::Path,
+    pairs: Vec<(&'static str, toml_edit::Item)>,
+) -> Result<()> {
+    use toml_edit::{Item, Table};
+
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("读取配置失败：{}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .with_context(|| format!("解析 {} 失败", path.display()))?;
+    if let Some(item) = doc.as_table().get("attachments") {
+        anyhow::ensure!(
+            item.is_table(),
+            "config section [attachments] is not a standard TOML table; refusing to rewrite it"
+        );
     }
-    out
+    let has_content = !doc.to_string().is_empty();
+    let root = doc.as_table_mut();
+    if root.get("attachments").is_none() {
+        let mut fresh = Table::new();
+        if has_content {
+            fresh.decor_mut().set_prefix("\n");
+        }
+        root.insert("attachments", Item::Table(fresh));
+    }
+    let table = root
+        .get_mut("attachments")
+        .and_then(|item| item.as_table_mut())
+        .expect("[attachments] was just ensured to be a table");
+    // insert 覆盖旧值：反复设置不产生重复键。
+    for (key, value) in pairs {
+        table.insert(key, value);
+    }
+    std::fs::write(path, doc.to_string())
+        .with_context(|| format!("写入 {} 失败", path.display()))?;
+    Ok(())
+}
+
+/// `[attachments] experimental_video` 落盘（语义与守卫见
+/// [`MobileRuntime::set_experimental_video`]）。
+fn persist_experimental_video(path: &std::path::Path, enabled: bool) -> Result<()> {
+    persist_attachments_keys(path, vec![("experimental_video", toml_edit::value(enabled))])
+}
+
+/// `[attachments] max_image_dim` / `max_image_mb` 落盘（图片处理双旋钮，
+/// [`MobileRuntime::set_image_processing`] 的落盘半边；toml_edit 零扰动
+/// 同 [`persist_experimental_video`]）。
+fn persist_image_processing(
+    path: &std::path::Path,
+    max_dim: u32,
+    max_mb: u64,
+) -> Result<()> {
+    persist_attachments_keys(
+        path,
+        vec![
+            ("max_image_dim", toml_edit::value(i64::from(max_dim))),
+            ("max_image_mb", toml_edit::value(i64::try_from(max_mb).unwrap_or(i64::MAX))),
+        ],
+    )
+}
+
+/// 恢复的 history → transcript 镜像投影（薄委托 → protocol 共享投影
+/// `project_from_messages`，存储 v5 §4 / L6；原实现已搬迁至 protocol，
+/// 双份逻辑防漂移）。仅供 `transcripts::rebuild_transcript` 的回退路径
+/// 调用——新代码请直接用 protocol 函数。
+pub(crate) fn messages_to_transcript(messages: &[Message]) -> Vec<EntryDto> {
+    openslate_protocol::project_from_messages(messages)
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -1887,6 +2597,7 @@ mod tests {
                 output_tokens: 4,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             ModelStreamEvent::Done(ModelResponse {
                 content: Some(text.to_owned()),
@@ -2119,6 +2830,56 @@ mod tests {
             s4.expect("seed-4 在保留窗口内").status,
             "completed",
             "非 running 状态不应被清扫改动"
+        );
+
+        runtime.shutdown();
+    }
+
+    /// P0-5 防回归：装配后 bridge 的 rules cell 与引擎 manager 的
+    /// approval 共享同一 cell——直接写 bridge 规则，引擎读到的必须同步
+    /// 变化（游离副本会让 always_* / set_approval_config 热更永远到不了
+    /// 引擎，且无编译错误）。顺带锚定 mobile 的 [approval] 段缺省
+    /// opt-in Auto（P0-4：装配层显式 opt-in，core 段缺省 = Allow）。
+    #[test]
+    fn approval_rules_cell_shared_between_bridge_and_engine() {
+        let (paths, _dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths, collector, scripted_opts(vec![])).unwrap();
+
+        // 装配初始值：无 [approval] 段 → rules_from_config 基线 + Auto。
+        assert_eq!(
+            runtime.state.approval.rules_snapshot().default_level,
+            openslate_core::approval::ToolApprovalLevel::Auto,
+            "mobile [approval] 缺省必须 opt-in Auto（P0-4）"
+        );
+
+        // 经 bridge cell 写入 → 引擎 manager 读到同一份（共享证明）。
+        let engine_handle = {
+            let inner = runtime.state.core.lock();
+            let manager = inner.manager.as_ref().expect("manager at home");
+            manager.approval.rules_handle()
+        };
+        assert!(
+            Arc::ptr_eq(&runtime.state.approval.rules_handle(), &engine_handle),
+            "bridge 与引擎必须共享同一 rules cell（P0-5）"
+        );
+        let mut rules = runtime.state.approval.rules_snapshot();
+        rules.default_level = openslate_core::approval::ToolApprovalLevel::Manual;
+        runtime.state.approval.set_rules(rules);
+        let engine_rules = {
+            let inner = runtime.state.core.lock();
+            inner
+                .manager
+                .as_ref()
+                .expect("manager at home")
+                .approval
+                .rules()
+        };
+        assert_eq!(
+            engine_rules.default_level,
+            openslate_core::approval::ToolApprovalLevel::Manual,
+            "bridge 写入对引擎热生效（游离副本 = 热更失效）"
         );
 
         runtime.shutdown();
@@ -2727,6 +3488,12 @@ mod tests {
         )
         .unwrap();
         collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        // bash（启发式 High）在 P1b 的 Auto 缺省下会进审查链弹人；本
+        // 测试聚焦 secret 注入/脱敏，先把审批缺省放开为 allow。
+        runtime
+            .send(r#"{"type":"set_approval_config","default_level":"allow","tool_levels":{},"server_levels":{}}"#)
+            .unwrap();
+        collector.wait_for(&rx, "config_changed", Duration::from_secs(10));
         runtime.set_exec_backends("native");
 
         runtime
@@ -2835,6 +3602,11 @@ mod tests {
         )
         .unwrap();
         collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        // 同上：bash 直跑场景放开审批缺省（本测试聚焦懒加载 FFI 后端）。
+        runtime
+            .send(r#"{"type":"set_approval_config","default_level":"allow","tool_levels":{},"server_levels":{}}"#)
+            .unwrap();
+        collector.wait_for(&rx, "config_changed", Duration::from_secs(10));
         runtime.set_exec_backends("native");
 
         runtime
@@ -2889,6 +3661,7 @@ mod tests {
                     .await
                     .unwrap();
                 let user_msg = Message {
+                    attachments: None,
                     role: MessageRole::User,
                     content: "选个数据库".into(),
                     tool_call_id: None,
@@ -2897,6 +3670,7 @@ mod tests {
                     reasoning_content: None,
                 };
                 let assistant_msg = Message {
+                    attachments: None,
                     role: MessageRole::Assistant,
                     content: String::new(),
                     tool_call_id: None,
@@ -2925,7 +3699,10 @@ mod tests {
                         &format!("{run_id_str}-persist"),
                         Some("root"),
                         "user",
-                        &serde_json::to_string(&user_msg).unwrap(),
+                        &openslate_store_sqlite::codec::encode_content(
+                            &serde_json::to_string(&user_msg).unwrap(),
+                        ),
+                        None,
                         1,
                         now_ms - 59_000,
                     )
@@ -2938,7 +3715,10 @@ mod tests {
                         &format!("{run_id_str}-persist"),
                         Some("root"),
                         "assistant",
-                        &serde_json::to_string(&assistant_msg).unwrap(),
+                        &openslate_store_sqlite::codec::encode_content(
+                            &serde_json::to_string(&assistant_msg).unwrap(),
+                        ),
+                        None,
                         2,
                         now_ms - 58_000,
                     )
@@ -3042,12 +3822,1483 @@ mod tests {
         runtime.shutdown();
     }
 
+    // ── 附件（多模态输入，存储 v5 §3/§6/§7）───────────────────────────
+
+    /// 捕获型 scripted provider：记录每次请求的 messages 快照（附件
+    /// data 已由 AttachmentDataProxy 装载）+ 流式回脚本回复。
+    struct CapturingProvider {
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        scripts: Arc<Mutex<VecDeque<Vec<ModelStreamEvent>>>>,
+    }
+
+    impl Clone for CapturingProvider {
+        fn clone(&self) -> Self {
+            Self {
+                requests: self.requests.clone(),
+                scripts: self.scripts.clone(),
+            }
+        }
+    }
+
+    impl CapturingProvider {
+        fn new(scripts: Vec<Vec<ModelStreamEvent>>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                scripts: Arc::new(Mutex::new(scripts.into())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl openslate_core::provider::ModelProvider for CapturingProvider {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
+            Err(ProviderError::ServerError(500))
+        }
+
+        async fn generate_stream(
+            &self,
+            request: GenerateRequest,
+        ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+            self.requests.lock().unwrap().push(request.messages);
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+            tokio::spawn(async move {
+                for event in script {
+                    let _ = tx.send(Ok(event)).await;
+                }
+            });
+            rx
+        }
+
+        fn provider_name(&self) -> &str {
+            "capturing"
+        }
+    }
+
+    /// 写一张小 PNG 到临时文件，返回路径与字节。
+    fn write_tiny_png(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
+        let mut png = Vec::new();
+        let img = image::RgbImage::from_pixel(48, 32, image::Rgb([10, 200, 30]));
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = dir.join("shot.png");
+        std::fs::write(&path, &png).unwrap();
+        (path, png)
+    }
+
+    /// 伪 MP4（ftyp/isom 头 + 填充）。
+    fn write_fake_mp4(dir: &std::path::Path) -> std::path::PathBuf {
+        let mut mp4 = vec![0, 0, 0, 0];
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend(std::iter::repeat(7u8).take(4096));
+        let path = dir.join("clip.mp4");
+        std::fs::write(&path, &mp4).unwrap();
+        path
+    }
+
+    /// 预置本地 models_dev registry 数据（门控 caps 数据源）。
+    fn seed_registry_models_dev(paths: &MobilePaths, json: serde_json::Value) {
+        let dir = paths.config_dir.join("registry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::to_vec(&json).unwrap();
+        let zst = zstd::encode_all(raw.as_slice(), 3).unwrap();
+        std::fs::write(dir.join("models_dev.json.zst"), zst).unwrap();
+    }
+
+    /// models.dev 条目样例（默认会话模型 glm-5.3-flash）。
+    fn models_dev_entry(input: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "zhipuai/glm-5.3-flash": {
+                "name": "GLM-5.3-Flash",
+                "limit": {"context": 200000, "output": 8192},
+                "modalities": {"input": input, "output": ["text"]},
+                "reasoning": true,
+                "tool_call": true
+            }
+        })
+    }
+
+    /// e2e：import（FFI JSON）→ Submit 带附件 → 捕获 provider 收到
+    /// data=Some 的附件（代理装载）→ 落库绑定 + 消息持久化带引用 →
+    /// transcript User 条目带引用（快照 + 持久化行）。
+    #[test]
+    fn attachments_submit_e2e_delivers_data_parts() {
+        let (paths, _dir) = temp_paths();
+        let provider = CapturingProvider::new(vec![text_response("看到了，图上是绿色方块。")]);
+        let probe = provider.clone();
+        let opts = RuntimeOptions {
+            provider_factory: Some(Arc::new(move |_c, _a| {
+                Ok(Box::new(provider.clone()) as Box<dyn openslate_core::provider::ModelProvider>)
+            })),
+            ..Default::default()
+        };
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        // 1) import（同 FFI 后端）：小 PNG → passthrough png。
+        let (png_path, png_bytes) = write_tiny_png(_dir.path());
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "shot.png"),
+        )
+        .unwrap();
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(env["mime"].as_str().unwrap(), "image/png");
+        assert_eq!(env["filename"].as_str().unwrap(), "shot.png");
+        assert_eq!(env["size_bytes"].as_u64().unwrap(), png_bytes.len() as u64);
+        let att_id = env["id"].as_str().unwrap().to_owned();
+
+        // 2) Submit 带附件（caps 未知 → 放行）→ turn_ok。
+        runtime
+            .send(&format!(
+                r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png","filename":"shot.png"}}]}}"#
+            ))
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+        // 3) 捕获的请求：最后一条 user 消息带 1 个附件且 data 已装载
+        //    （字节与文件一致）——AttachmentDataProxy 生效。
+        {
+            let reqs = probe.requests.lock().unwrap();
+            let last = reqs.last().expect("至少一次模型请求");
+            let user = last
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::User)
+                .expect("请求里有 user 消息");
+            let atts = user.attachments.as_ref().expect("user 消息带附件引用");
+            assert_eq!(atts.len(), 1);
+            assert_eq!(atts[0].id, att_id);
+            let data = atts[0].data.as_ref().expect("data 已由代理装载");
+            assert_eq!(&**data, &png_bytes[..], "装载字节与文件一致");
+        }
+
+        // 4) 落库：附件行绑定到 run；user 消息持久化带引用（data 不进库）。
+        let run_id = runtime.current_run_id().expect("run 已打开");
+        let (srt, store) = scratch_store(&paths);
+        srt.block_on(async {
+            let row = store.get_attachment(&att_id).await.unwrap().unwrap();
+            assert_eq!(row.run_id.as_deref(), Some(run_id.as_str()), "Submit 后绑定");
+            let msgs =
+                openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &run_id)
+                    .await
+                    .unwrap();
+            let user = msgs
+                .iter()
+                .find(|m| m.role == MessageRole::User)
+                .expect("user 消息已入库");
+            let atts = user.attachments.as_ref().expect("持久化带附件引用");
+            assert_eq!(atts.len(), 1);
+            assert_eq!(atts[0].id, att_id);
+            assert!(atts[0].data.is_none(), "data 不进持久化");
+        });
+
+        // 5) transcript 持久化：同步任务把 User 条目（带引用）落行。
+        {
+            let start = std::time::Instant::now();
+            loop {
+                let n = srt.block_on(async {
+                    store
+                        .list_transcript_entries(&run_id)
+                        .await
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                });
+                if n >= 2 {
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(5), "transcript 行未落库");
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+        let (srt3, store3) = scratch_store(&paths);
+        let (user_entry_json, kinds) = srt3.block_on(async {
+            let rows = store3.list_transcript_entries(&run_id).await.unwrap();
+            let kinds: Vec<String> = rows
+                .iter()
+                .filter_map(|r| serde_json::from_str::<EntryDto>(&r.entry_json).ok())
+                .map(|e| match e {
+                    EntryDto::User { .. } => "user".into(),
+                    EntryDto::Assistant { .. } => "assistant".into(),
+                    EntryDto::Meta { .. } => "meta".into(),
+                    _ => "other".into(),
+                })
+                .collect();
+            let user_json = rows
+                .iter()
+                .map(|r| r.entry_json.clone())
+                .find(|j| j.contains("\"kind\":\"user\""))
+                .expect("User 条目已持久化");
+            (user_json, kinds)
+        });
+        assert!(kinds.contains(&"user".to_owned()), "{kinds:?}");
+        assert!(kinds.contains(&"assistant".to_owned()), "{kinds:?}");
+        assert!(
+            user_entry_json.contains(&format!("\"id\":\"{att_id}\"")),
+            "User 条目带附件引用: {user_entry_json}"
+        );
+
+        runtime.shutdown();
+    }
+
+    /// 门控矩阵（notice 通道拒绝；引擎零调用）：
+    /// 纯文本模型发图拒 / 图视频混发拒 / 实验视频关拒 / 未知 id 拒 /
+    /// 空文本拒；多模态（image+video caps）+ 开关开 + mp4 放行。
+    #[test]
+    fn attachments_gate_rejections_via_notice() {
+        // (a) registry 声明纯文本 → 图像被拒。
+        {
+            let (paths, _dir) = temp_paths();
+            paths.ensure_layout().unwrap();
+            seed_registry_models_dev(&paths, models_dev_entry(&["text"]));
+            let provider = CapturingProvider::new(vec![text_response("ok")]);
+            let probe = provider.clone();
+            let opts = RuntimeOptions {
+                provider_factory: Some(Arc::new(move |_c, _a| {
+                    Ok(Box::new(provider.clone())
+                        as Box<dyn openslate_core::provider::ModelProvider>)
+                })),
+                ..Default::default()
+            };
+            let (collector, rx) = Collector::new();
+            let runtime = MobileRuntime::create_with(paths, collector.clone(), opts).unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let (png_path, _) = write_tiny_png(_dir.path());
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "a.png"),
+            )
+            .unwrap();
+            let att_id = env["id"].as_str().unwrap();
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png"}}]}}"#
+                ))
+                .unwrap();
+            let events = collector.wait_for(&rx, "notice", Duration::from_secs(10));
+            let notice = events.iter().rev().find(|e| e["type"] == "notice").unwrap();
+            assert!(notice["text"].as_str().unwrap().contains("不支持图像输入"), "{notice}");
+            assert!(
+                probe.requests.lock().unwrap().is_empty(),
+                "拒绝后引擎零调用"
+            );
+            runtime.shutdown();
+        }
+
+        // (b) caps 未知：混发拒 / 实验视频关拒 / 空文本拒 / 未知 id 拒。
+        {
+            let (paths, _dir) = temp_paths();
+            let provider = CapturingProvider::new(vec![text_response("ok")]);
+            let opts = RuntimeOptions {
+                provider_factory: Some(Arc::new(move |_c, _a| {
+                    Ok(Box::new(provider.clone())
+                        as Box<dyn openslate_core::provider::ModelProvider>)
+                })),
+                ..Default::default()
+            };
+            let (collector, rx) = Collector::new();
+            let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let (png_path, _) = write_tiny_png(_dir.path());
+            let mp4_path = write_fake_mp4(_dir.path());
+            let img_id: String = {
+                let env: serde_json::Value = serde_json::from_str(
+                    &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "a.png"),
+                )
+                .unwrap();
+                env["id"].as_str().unwrap().to_owned()
+            };
+            let vid_id: String = {
+                let env: serde_json::Value = serde_json::from_str(
+                    &runtime.import_attachment_json(mp4_path.to_str().unwrap(), "video/mp4", "c.mp4"),
+                )
+                .unwrap();
+                env["id"].as_str().unwrap().to_owned()
+            };
+            // notice 逐条递增等待（wait_for 只等"≥1 条"，会拿到旧的）。
+            let mut notice_count = 0usize;
+            let expect_notice = |notice_count: &mut usize, substr: &str| {
+                *notice_count += 1;
+                let events =
+                    collector.wait_for_count(&rx, "notice", *notice_count, Duration::from_secs(10));
+                let n = events
+                    .iter()
+                    .filter(|e| e["type"] == "notice")
+                    .nth(*notice_count - 1)
+                    .unwrap();
+                assert!(n["text"].as_str().unwrap().contains(substr), "{n}");
+            };
+            // 混发。
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"混","attachments":[{{"id":"{img_id}","mime":"image/png"}},{{"id":"{vid_id}","mime":"video/mp4"}}]}}"#
+                ))
+                .unwrap();
+            expect_notice(&mut notice_count, "图像与视频请分开发送");
+            // 实验视频关（默认）。
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"视频","attachments":[{{"id":"{vid_id}","mime":"video/mp4"}}]}}"#
+                ))
+                .unwrap();
+            expect_notice(&mut notice_count, "实验性功能");
+            // 空文本。
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"  ","attachments":[{{"id":"{img_id}","mime":"image/png"}}]}}"#
+                ))
+                .unwrap();
+            expect_notice(&mut notice_count, "请为附件输入文字说明");
+            // 未知 id。
+            runtime
+                .send(r#"{"type":"submit","text":"图","attachments":[{"id":"att-nope","mime":"image/png"}]}"#)
+                .unwrap();
+            expect_notice(&mut notice_count, "附件不存在或已过期");
+            runtime.shutdown();
+        }
+
+        // (c) 多模态 + 实验开关开（改 toml）→ 视频放行到引擎。
+        {
+            let (paths, _dir) = temp_paths();
+            paths.ensure_layout().unwrap();
+            seed_registry_models_dev(&paths, models_dev_entry(&["text", "image", "video"]));
+            // 开实验视频开关（追加 [attachments] 节）。
+            let cfg_path = paths.config_file();
+            let mut body = std::fs::read_to_string(&cfg_path).unwrap();
+            body.push_str("\n[attachments]\nexperimental_video = true\n");
+            std::fs::write(&cfg_path, body).unwrap();
+            let provider = CapturingProvider::new(vec![text_response("收到视频。")]);
+            let probe = provider.clone();
+            let opts = RuntimeOptions {
+                provider_factory: Some(Arc::new(move |_c, _a| {
+                    Ok(Box::new(provider.clone())
+                        as Box<dyn openslate_core::provider::ModelProvider>)
+                })),
+                ..Default::default()
+            };
+            let (collector, rx) = Collector::new();
+            let runtime = MobileRuntime::create_with(paths, collector.clone(), opts).unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let mp4_path = write_fake_mp4(_dir.path());
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(mp4_path.to_str().unwrap(), "video/mp4", "c.mp4"),
+            )
+            .unwrap();
+            let vid_id = env["id"].as_str().unwrap();
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"看视频","attachments":[{{"id":"{vid_id}","mime":"video/mp4"}}]}}"#
+                ))
+                .unwrap();
+            collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+            let reqs = probe.requests.lock().unwrap();
+            let user = reqs
+                .last()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::User)
+                .unwrap();
+            assert_eq!(
+                user.attachments.as_ref().unwrap()[0].mime, "video/mp4",
+                "视频过门控且字节已装载"
+            );
+            assert!(user.attachments.as_ref().unwrap()[0].data.is_some());
+        }
+    }
+
+    /// 实验视频开关（L4→L6 交接，FFI set/get 的 mobile 侧语义）：
+    /// set 落盘（toml 其余内容零扰动）+ 内存即时生效 + 重启后从落盘
+    /// 配置装载；反复切换改值不产生重复键。
+    #[test]
+    fn experimental_video_switch_persists_and_takes_effect() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        // 手工塞一行注释进配置：set 的写回必须零扰动保留它。
+        let cfg_path = paths.config_file();
+        let mut body = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(!body.contains("experimental_video"), "{body}");
+        body.push_str("# marker comment\n");
+        std::fs::write(&cfg_path, &body).unwrap();
+
+        {
+            let (collector, rx) = Collector::new();
+            let runtime =
+                MobileRuntime::create_with(paths.clone(), collector.clone(), Default::default())
+                    .unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            assert!(!runtime.get_experimental_video(), "默认关");
+            let resp: serde_json::Value =
+                serde_json::from_str(&runtime.set_experimental_video(true)).unwrap();
+            assert_eq!(resp["ok"], serde_json::json!(true), "{resp}");
+            assert!(runtime.get_experimental_video(), "内存即时生效");
+            runtime.shutdown();
+        }
+        // 落盘断言：注释保留 + 节就位 + 值正确。
+        let body = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(body.contains("# marker comment"), "{body}");
+        assert!(body.contains("experimental_video = true"), "{body}");
+        // 重启后从落盘配置装载；关回 false 是改值而非追加。
+        {
+            let (collector, rx) = Collector::new();
+            let runtime =
+                MobileRuntime::create_with(paths.clone(), collector.clone(), Default::default())
+                    .unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            assert!(runtime.get_experimental_video(), "重启后仍开");
+            let resp: serde_json::Value =
+                serde_json::from_str(&runtime.set_experimental_video(false)).unwrap();
+            assert_eq!(resp["ok"], serde_json::json!(true), "{resp}");
+            assert!(!runtime.get_experimental_video());
+            runtime.shutdown();
+        }
+        let body = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(
+            body.matches("experimental_video").count(),
+            1,
+            "改值不追加：{body}"
+        );
+        assert!(body.contains("experimental_video = false"), "{body}");
+        assert!(body.contains("# marker comment"), "{body}");
+    }
+
+    /// 确定性噪点 JPEG（同 attachments.rs 测试的 LCG 像素源）。
+    fn write_noise_jpeg(dir: &std::path::Path, w: u32, h: u32, q: u8) -> std::path::PathBuf {
+        let mut px = image::RgbImage::new(w, h);
+        let mut state = 0x2545F4914F6CDD1Du64;
+        for y in 0..h {
+            for x in 0..w {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let v = (state >> 33) as u8;
+                px.put_pixel(x, y, image::Rgb([v, (v >> 1) as u8 | 0x80, 255 - v]));
+            }
+        }
+        let mut jpeg = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, q);
+        image::DynamicImage::ImageRgb8(px)
+            .write_with_encoder(enc)
+            .unwrap();
+        let path = dir.join(format!("noise-{w}x{h}-q{q}.jpg"));
+        std::fs::write(&path, &jpeg).unwrap();
+        path
+    }
+
+    /// 图片处理双旋钮（FFI set/get_image_processing 的 mobile 侧语义）：
+    /// 非法值拒（core validation 同源：dim 512–6000、mb 1–5）、合法值
+    /// 落盘（toml 其余内容零扰动）+ 内存即时生效 + 重启装载 + **下一次
+    /// 导入即按新旋钮走**（快速通道边界随用户 dim）。
+    #[test]
+    fn image_processing_knobs_persist_and_take_effect_on_next_import() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        // 手工塞一行注释进配置：set 的写回必须零扰动保留它。
+        let cfg_path = paths.config_file();
+        let mut body = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(!body.contains("max_image_dim"), "{body}");
+        body.push_str("# marker comment\n");
+        std::fs::write(&cfg_path, &body).unwrap();
+
+        // 1600×1200 噪点 JPEG（~300KB，远低于大小上限）：默认旋钮下只看
+        // dim 维——passthrough；旋钮 dim=1024 后 → transcode。
+        let src = write_noise_jpeg(_dir.path(), 1600, 1200, 60);
+
+        {
+            let (collector, rx) = Collector::new();
+            let runtime =
+                MobileRuntime::create_with(paths.clone(), collector.clone(), scripted_opts(vec![]))
+                    .unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+            // 默认值回显（2048 / 5）。
+            let get: serde_json::Value =
+                serde_json::from_str(&runtime.get_image_processing()).unwrap();
+            assert_eq!(get["max_image_dim"], serde_json::json!(2048), "{get}");
+            assert_eq!(get["max_image_mb"], serde_json::json!(5), "{get}");
+
+            // 默认旋钮：1600px 小文件 → passthrough。
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(src.to_str().unwrap(), "image/jpeg", "knob.jpg"),
+            )
+            .unwrap();
+            assert_eq!(env["processed"], serde_json::json!("passthrough"), "{env}");
+
+            // 非法值矩阵：dim 100/7000、mb 0/6 → ok:false 且值不动内存。
+            for (d, m) in [(100i64, 5i64), (7000, 5), (2048, 0), (2048, 6)] {
+                let resp: serde_json::Value =
+                    serde_json::from_str(&runtime.set_image_processing(d, m)).unwrap();
+                assert_eq!(resp["ok"], serde_json::json!(false), "{d}/{m}: {resp}");
+                assert!(
+                    resp["error"].as_str().is_some_and(|e| !e.is_empty()),
+                    "{d}/{m}: {resp}"
+                );
+            }
+            let get: serde_json::Value =
+                serde_json::from_str(&runtime.get_image_processing()).unwrap();
+            assert_eq!(get["max_image_dim"], serde_json::json!(2048), "非法值不动内存");
+            assert_eq!(get["max_image_mb"], serde_json::json!(5));
+
+            // 合法旋钮 dim=1024：同一文件下一次导入 → transcode（缩到
+            // ≤1024；1600×1200 → 1024×768）。
+            let resp: serde_json::Value =
+                serde_json::from_str(&runtime.set_image_processing(1024, 5)).unwrap();
+            assert_eq!(resp["ok"], serde_json::json!(true), "{resp}");
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(src.to_str().unwrap(), "image/jpeg", "knob2.jpg"),
+            )
+            .unwrap();
+            assert!(env["ok"].as_bool().unwrap(), "{env}");
+            assert_eq!(env["processed"], serde_json::json!("transcode"), "{env}");
+            assert_eq!(env["width"], serde_json::json!(1024), "{env}");
+            assert_eq!(env["height"], serde_json::json!(768), "{env}");
+            runtime.shutdown();
+        }
+        // 落盘断言：注释保留 + 两键就位 + 值正确。
+        let body = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(body.contains("# marker comment"), "{body}");
+        assert!(body.contains("max_image_dim = 1024"), "{body}");
+        assert!(body.contains("max_image_mb = 5"), "{body}");
+        // 重启后从落盘装载。
+        {
+            let (collector, rx) = Collector::new();
+            let runtime =
+                MobileRuntime::create_with(paths.clone(), collector.clone(), scripted_opts(vec![]))
+                    .unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let get: serde_json::Value =
+                serde_json::from_str(&runtime.get_image_processing()).unwrap();
+            assert_eq!(get["max_image_dim"], serde_json::json!(1024), "重启后仍生效");
+            assert_eq!(get["max_image_mb"], serde_json::json!(5));
+            runtime.shutdown();
+        }
+    }
+
+    /// resume 回填：带图 run 重启恢复（assemble_state restore 路径）后
+    /// history 的附件 data 已回填（下轮请求直接带图）。
+    #[test]
+    fn attachments_resume_refills_data_on_restart() {
+        let (paths, _dir) = temp_paths();
+        {
+            let provider = CapturingProvider::new(vec![text_response("第一轮。")]);
+            let _probe = provider.clone();
+            let opts = RuntimeOptions {
+                provider_factory: Some(Arc::new(move |_c, _a| {
+                    Ok(Box::new(provider.clone())
+                        as Box<dyn openslate_core::provider::ModelProvider>)
+                })),
+                ..Default::default()
+            };
+            let (collector, rx) = Collector::new();
+            let runtime =
+                MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let (png_path, _png_bytes) = write_tiny_png(_dir.path());
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "s.png"),
+            )
+            .unwrap();
+            let att_id = env["id"].as_str().unwrap().to_owned();
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png"}}]}}"#
+                ))
+                .unwrap();
+            collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+            runtime.shutdown();
+        }
+        // 重启：assemble_state 恢复最近 run，回填附件 data；第二轮请求
+        // （无新附件提交）仍带图。
+        {
+            let provider = CapturingProvider::new(vec![text_response("第二轮。")]);
+            let probe = provider.clone();
+            let opts = RuntimeOptions {
+                provider_factory: Some(Arc::new(move |_c, _a| {
+                    Ok(Box::new(provider.clone())
+                        as Box<dyn openslate_core::provider::ModelProvider>)
+                })),
+                ..Default::default()
+            };
+            let (collector, rx) = Collector::new();
+            let runtime =
+                MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            runtime.send(r#"{"type":"submit","text":"刚才那张图是什么颜色？"}"#).unwrap();
+            collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+            let reqs = probe.requests.lock().unwrap();
+            let user = reqs
+                .last()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|m| m.role == MessageRole::User && m.attachments.is_some())
+                .expect("恢复后的历史 user 消息带附件");
+            let att = &user.attachments.as_ref().unwrap()[0];
+            assert!(att.data.is_some(), "resume 回填后 data 在场（历史图随轮重发）");
+            runtime.shutdown();
+        }
+    }
+
+    /// 启动 GC：7 天前导入未发送的暂存附件被清（行 + 文件）。
+    #[test]
+    fn startup_gc_clears_stale_unbound_attachments() {
+        let (paths, _dir) = temp_paths();
+        paths.ensure_layout().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let stale_sha;
+        {
+            let (srt, store) = scratch_store(&paths);
+            srt.block_on(async {
+                store
+                    .insert_attachment(
+                        "att-stale",
+                        None,
+                        "deadbeef",
+                        "image/png",
+                        None,
+                        8,
+                        b"pngbytes",
+                        now_ms - 8 * 24 * 3600 * 1000,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .insert_attachment(
+                        "att-fresh",
+                        None,
+                        "cafef00d",
+                        "image/png",
+                        None,
+                        8,
+                        b"pngbytes",
+                        now_ms,
+                    )
+                    .await
+                    .unwrap();
+            });
+            stale_sha = "deadbeef".to_owned();
+        }
+
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
+
+        let (srt, store) = scratch_store(&paths);
+        let (stale, fresh) = srt.block_on(async {
+            (
+                store.get_attachment("att-stale").await.unwrap(),
+                store.get_attachment("att-fresh").await.unwrap(),
+            )
+        });
+        assert!(stale.is_none(), "8 天前暂存被 GC");
+        assert!(fresh.is_some(), "新暂存保留");
+        let file_gone = store
+            .files_dir()
+            .map(|d| !d.join(format!("{stale_sha}.png")).exists())
+            .unwrap_or(true);
+        assert!(file_gone, "对应文件已清扫");
+
+        runtime.shutdown();
+    }
+
+    /// transcript 持久化往返：完成一个带附件回合 → 行落库 → open_session
+    /// 从行重建（快照含 User 附件引用）；旧 run（无行）走投影回退不回归。
+    #[test]
+    fn transcript_entries_roundtrip_and_old_run_fallback() {
+        let (paths, _dir) = temp_paths();
+        let provider = CapturingProvider::new(vec![text_response("回答")]);
+        let opts = RuntimeOptions {
+            provider_factory: Some(Arc::new(move |_c, _a| {
+                Ok(Box::new(provider.clone()) as Box<dyn openslate_core::provider::ModelProvider>)
+            })),
+            ..Default::default()
+        };
+        let (collector, rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        let (png_path, _) = write_tiny_png(_dir.path());
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "s.png"),
+        )
+        .unwrap();
+        let att_id = env["id"].as_str().unwrap().to_owned();
+        runtime
+            .send(&format!(
+                r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png"}}]}}"#
+            ))
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+        let run_id = runtime.current_run_id().unwrap();
+
+        // 等同步任务落库（活跃期 300ms 周期）。
+        {
+            let (srt, store) = scratch_store(&paths);
+            let start = std::time::Instant::now();
+            loop {
+                let n = srt.block_on(async {
+                    store
+                        .list_transcript_entries(&run_id)
+                        .await
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                });
+                if n >= 2 {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "transcript_entries 未落库"
+                );
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+
+        // 新会话切走再 open_session 回来：transcript 从 entries 行重建
+        // （User 条目带附件引用——这是投影回退拿不到的字段一致性验证）。
+        runtime.send(r#"{"type":"new_session"}"#).unwrap();
+        collector.wait_for(&rx, "session_reset", Duration::from_secs(5));
+        runtime.open_session(run_id.clone()).unwrap();
+        // 快照序：create(1) → new_session 补发(2) → open_session(3)。
+        let events = collector.wait_for_count(&rx, "snapshot", 3, Duration::from_secs(10));
+        let snaps: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "snapshot")
+            .collect();
+        assert_eq!(snaps.len(), 3);
+        let snap = snaps[2];
+        // C2：!same_run 重开轮换 session_id（ChatScreen 会话揭示依赖它
+        // 变化；同一 run 重开则保持——另见专项测试）。
+        assert_ne!(
+            snap["session"]["session_id"], snaps[1]["session"]["session_id"],
+            "切换到另一 run 应轮换 session_id"
+        );
+        let transcript = snap["session"]["transcript"].as_array().unwrap();
+        let user_entry = transcript
+            .iter()
+            .find(|e| e["kind"] == "user")
+            .expect("User 条目在场");
+        assert!(
+            user_entry["attachments"][0]["id"].as_str() == Some(att_id.as_str()),
+            "entries 行重建的 User 条目带附件引用: {user_entry}"
+        );
+
+        // 旧 run（v5 前，无 entries 行）→ 投影回退不回归。
+        let old_run = "legacy-run-no-entries";
+        {
+            let (srt, store) = scratch_store(&paths);
+            srt.block_on(async {
+                store
+                    .insert_run(old_run, Some("旧会话"), "root", "completed", "{}", 1000)
+                    .await
+                    .unwrap();
+                store
+                    .insert_execution_node("legacy-persist", old_run, "root", None, None, "completed", "{}", 1000)
+                    .await
+                    .unwrap();
+                let user_msg = Message {
+                    attachments: None,
+                    role: MessageRole::User,
+                    content: "旧消息".into(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                };
+                store
+                    .insert_message(
+                        "legacy-msg-1",
+                        old_run,
+                        "legacy-persist",
+                        Some("root"),
+                        "user",
+                        &openslate_store_sqlite::codec::encode_content(
+                            &serde_json::to_string(&user_msg).unwrap(),
+                        ),
+                        None,
+                        1,
+                        1001,
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+        runtime.open_session(old_run.to_owned()).unwrap();
+        let events = collector.wait_for_count(&rx, "snapshot", 4, Duration::from_secs(10));
+        let snap = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "snapshot")
+            .unwrap();
+        let transcript = snap["session"]["transcript"].as_array().unwrap();
+        assert!(
+            transcript.iter().any(|e| e["kind"] == "user" && e["text"] == "旧消息"),
+            "无 entries 行的旧 run 走消息投影回退: {transcript:?}"
+        );
+
+        runtime.shutdown();
+    }
+
+    // ── 历史转写丢失修复（C1 前置冲刷 / C2 pop 回写 + 会话轮换 / C3 自愈）──
+
+    /// 等待 sync_loop 把 run 的 entries 行数写到 ≥ want（超时 panic；
+    /// scratch 连接独立于 runtime 私有池）。
+    fn wait_entry_count(paths: &MobilePaths, run_id: &str, want: usize) {
+        let (srt, store) = scratch_store(paths);
+        let start = std::time::Instant::now();
+        loop {
+            let n = srt.block_on(async {
+                store
+                    .list_transcript_entries(run_id)
+                    .await
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+            });
+            if n >= want {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "entries 未落库（有 {n}，期望 ≥ {want}）"
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    /// 种子一条消息行（content = Message JSON 压缩，与 recorder 同口径）。
+    async fn seed_message(
+        store: &openslate_store_sqlite::store::SqliteStore,
+        run: &str,
+        node: &str,
+        id: &str,
+        seq: i64,
+        msg: &Message,
+    ) {
+        let role = match msg.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+            MessageRole::System => "system",
+        };
+        store
+            .insert_message(
+                id,
+                run,
+                node,
+                Some("root"),
+                role,
+                &openslate_store_sqlite::codec::encode_content(
+                    &serde_json::to_string(msg).unwrap(),
+                ),
+                None,
+                seq,
+                1000 + seq,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// 悬挂形态的 assistant 消息（带未答 tool_calls）。
+    fn dangling_assistant(call_id: &str) -> Message {
+        Message {
+            attachments: None,
+            role: MessageRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: Some(vec![openslate_core::types::ToolCall {
+                id: openslate_core::types::ToolCallId(call_id.into()),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            }]),
+            reasoning_content: None,
+        }
+    }
+
+    /// T3（必做）：悬挂尾巴 pop 回写 DB——第一次 open 删行（messages 尾行
+    /// + 全部 entries）+ 投影重建；第二次 open 不再命中 pop 分支（G-1）、
+    /// 无新增 Meta 行。
+    #[test]
+    fn dangling_pop_persists_to_db_second_open_is_clean() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector.clone(), scripted_opts(vec![]))
+                .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        // 种一个尾部悬挂的 run：messages = [user, assistant(dangling)]，
+        // entries = [User, ToolCall(未折叠终值)]——正是会被反复 pop 的形状。
+        let seed_run = "dangling-run";
+        {
+            let (srt, store) = scratch_store(&paths);
+            srt.block_on(async {
+                store
+                    .insert_run(seed_run, Some("悬挂会话"), "root", "interrupted", "{}", 1000)
+                    .await
+                    .unwrap();
+                store
+                    .insert_execution_node(
+                        "dangling-node", seed_run, "root", None, None, "completed", "{}", 1000,
+                    )
+                    .await
+                    .unwrap();
+                seed_message(
+                    &store,
+                    seed_run,
+                    "dangling-node",
+                    "dangling-m1",
+                    1,
+                    &Message {
+                        attachments: None,
+                        role: MessageRole::User,
+                        content: "帮我查目录".into(),
+                        tool_call_id: None,
+                        name: None,
+                        tool_calls: None,
+                        reasoning_content: None,
+                    },
+                )
+                .await;
+                seed_message(
+                    &store, seed_run, "dangling-node", "dangling-m2", 2,
+                    &dangling_assistant("tc-dangling"),
+                )
+                .await;
+                store
+                    .insert_transcript_entry(
+                        "te-d0",
+                        seed_run,
+                        0,
+                        &serde_json::to_string(&EntryDto::User {
+                            text: "帮我查目录".into(),
+                            attachments: None,
+                        })
+                        .unwrap(),
+                        1200,
+                    )
+                    .await
+                    .unwrap();
+                let tc = EntryDto::ToolCall {
+                    name: "bash".into(),
+                    args: r#"{"command":"ls"}"#.into(),
+                    call_id: Some("tc-dangling".into()),
+                    status: openslate_protocol::ToolStatusDto::Running,
+                    detail: openslate_protocol::ToolEntryDetailDto {
+                        args: r#"{"command":"ls"}"#.into(),
+                        output: None,
+                    },
+                };
+                store
+                    .insert_transcript_entry(
+                        "te-d1",
+                        seed_run,
+                        1,
+                        &serde_json::to_string(&tc).unwrap(),
+                        1201,
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+
+        // 第一次 open：pop 发生 → DB 回写（messages 尾行删除、entries 全
+        // 删）→ 转写走投影重建 + 恰一条 DANGLING Meta。
+        runtime.open_session(seed_run.to_owned()).unwrap();
+        let events = collector.wait_for_count(&rx, "snapshot", 2, Duration::from_secs(10));
+        let snap = events.iter().rev().find(|e| e["type"] == "snapshot").unwrap();
+        let transcript = snap["session"]["transcript"].as_array().unwrap();
+        let metas: Vec<_> = transcript
+            .iter()
+            .filter(|e| e["kind"] == "meta")
+            .collect();
+        assert_eq!(metas.len(), 1, "恰一条 Meta: {transcript:?}");
+        assert_eq!(
+            metas[0]["text"].as_str().unwrap(),
+            crate::transcripts::DANGLING_TAIL_META
+        );
+
+        // 等 sync_loop 把重建转写全量写回（游标已失效 → 自举 0）。
+        wait_entry_count(&paths, seed_run, 2);
+
+        // G-1 + T3 断言：第二次 open 不再命中 pop——无新增 Meta、
+        // messages 尾行（悬挂 assistant）确已删除。
+        runtime.open_session(seed_run.to_owned()).unwrap();
+        let events = collector.wait_for_count(&rx, "snapshot", 3, Duration::from_secs(10));
+        let snap = events.iter().rev().find(|e| e["type"] == "snapshot").unwrap();
+        let transcript = snap["session"]["transcript"].as_array().unwrap();
+        assert_eq!(
+            transcript.iter().filter(|e| e["kind"] == "meta").count(),
+            1,
+            "第二次 open 无新增 Meta（DB 已删干净，不再 pop）: {transcript:?}"
+        );
+        {
+            let (srt, store) = scratch_store(&paths);
+            let (msgs, entries) = srt.block_on(async {
+                (
+                    store.list_messages_by_run(seed_run).await.unwrap().len(),
+                    store.list_transcript_entries(seed_run).await.unwrap().len(),
+                )
+            });
+            assert_eq!(msgs, 1, "被 pop 的悬挂 assistant 尾行已从 DB 删除");
+            assert_eq!(entries, 2, "重建转写已全量写回（User + Meta）");
+        }
+
+        runtime.shutdown();
+    }
+
+    /// T2（必做）：entries 截断自愈（C3）幂等——messages=5 行 / entries=2
+    /// 行的 run → open 转写 = 2 前缀 + HEAL Meta + 投影尾 3；再 open 结果
+    /// 一致（不重复 heal、不丢内容）。
+    #[test]
+    fn heal_truncated_entries_idempotent_on_reopen() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector.clone(), scripted_opts(vec![]))
+                .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        let plain = |role: MessageRole, text: &str| Message {
+            attachments: None,
+            role,
+            content: text.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        // 5 行消息（尾是 user → 无 pop 干扰），entries 只落前 2 条投影。
+        let messages = vec![
+            plain(MessageRole::User, "问1"),
+            plain(MessageRole::Assistant, "答1"),
+            plain(MessageRole::User, "问2"),
+            plain(MessageRole::Assistant, "答2"),
+            plain(MessageRole::User, "问3"),
+        ];
+        let seed_run = "truncated-run";
+        {
+            let (srt, store) = scratch_store(&paths);
+            srt.block_on(async {
+                store
+                    .insert_run(seed_run, Some("截断会话"), "root", "completed", "{}", 1000)
+                    .await
+                    .unwrap();
+                store
+                    .insert_execution_node(
+                        "trunc-node", seed_run, "root", None, None, "completed", "{}", 1000,
+                    )
+                    .await
+                    .unwrap();
+                for (i, msg) in messages.iter().enumerate() {
+                    seed_message(
+                        &store,
+                        seed_run,
+                        "trunc-node",
+                        &format!("trunc-m{i}"),
+                        i as i64 + 1,
+                        msg,
+                    )
+                    .await;
+                }
+                store
+                    .insert_transcript_entry(
+                        "te-t0",
+                        seed_run,
+                        0,
+                        &serde_json::to_string(&EntryDto::User {
+                            text: "问1".into(),
+                            attachments: None,
+                        })
+                        .unwrap(),
+                        1200,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .insert_transcript_entry(
+                        "te-t1",
+                        seed_run,
+                        1,
+                        &serde_json::to_string(&EntryDto::Assistant { text: "答1".into() })
+                            .unwrap(),
+                        1201,
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+
+        let assert_transcript = |snap: &serde_json::Value| {
+            let transcript = snap["session"]["transcript"].as_array().unwrap();
+            let texts: Vec<&str> = transcript
+                .iter()
+                .map(|e| e.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                .collect();
+            assert_eq!(
+                texts,
+                vec!["问1", "答1", crate::transcripts::HEAL_META, "问2", "答2", "问3"],
+                "2 前缀 + HEAL Meta + 投影尾 3: {transcript:?}"
+            );
+        };
+
+        // 第一次 open：heal 触发。
+        runtime.open_session(seed_run.to_owned()).unwrap();
+        let events = collector.wait_for_count(&rx, "snapshot", 2, Duration::from_secs(10));
+        let snap = events.iter().rev().find(|e| e["type"] == "snapshot").unwrap();
+        assert_transcript(snap);
+
+        // 等 sync_loop 把补齐尾部按接续 seq 写回（行数 2 → 6）。
+        wait_entry_count(&paths, seed_run, 6);
+
+        // 第二次 open：从 6 行重建 → 无缺尾 → 不再 heal，结果一致。
+        runtime.open_session(seed_run.to_owned()).unwrap();
+        let events = collector.wait_for_count(&rx, "snapshot", 3, Duration::from_secs(10));
+        let snap = events.iter().rev().find(|e| e["type"] == "snapshot").unwrap();
+        assert_transcript(snap);
+
+        runtime.shutdown();
+    }
+
+    /// 立即成功的测试工具（T1：模型点名的工具真实执行、Tool 消息落库）。
+    struct FastProbeTool;
+
+    #[async_trait]
+    impl openslate_core::tool::Tool for FastProbeTool {
+        fn name(&self) -> &str {
+            "fast_probe"
+        }
+        fn namespace(&self) -> Option<String> {
+            None
+        }
+        fn description(&self) -> &str {
+            "Returns immediately (test fixture)."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+        async fn execute(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                content: "ok".into(),
+                bytes: 2,
+                duration_ms: 1,
+                status: openslate_core::types::ToolOutputStatus::Success,
+                attachments: None,
+            })
+        }
+    }
+
+    /// 永不返回的工具（T4/T5：把回合钉在 running=true）。
+    struct HangingTool;
+
+    #[async_trait]
+    impl openslate_core::tool::Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hang_forever"
+        }
+        fn namespace(&self) -> Option<String> {
+            None
+        }
+        fn description(&self) -> &str {
+            "Never returns (test fixture; simulates a stuck tool)."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{},"additionalProperties":false})
+        }
+        async fn execute(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            std::future::pending().await
+        }
+    }
+
+    /// 点名工具的流脚本（无正文——工具调用回合的标准形状）。
+    fn tool_call_step(name: &str, call_id: &str) -> Vec<ModelStreamEvent> {
+        vec![ModelStreamEvent::Done(ModelResponse {
+            reasoning_content: None,
+            content: None,
+            tool_calls: vec![openslate_core::types::ToolCall {
+                id: openslate_core::types::ToolCallId(call_id.into()),
+                name: name.into(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: None,
+            finish_reason: Some("tool_calls".into()),
+        })]
+    }
+
+    /// T1 用 provider：首次调用回放脚本，之后的调用立刻吐流错误（回合
+    /// Err 收尾——折叠不运行，ToolCall 条目保持未定稿形态）。
+    #[derive(Clone)]
+    struct ToolThenErrorProvider {
+        scripts: Arc<Mutex<VecDeque<Vec<ModelStreamEvent>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenErrorProvider {
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> Result<ModelResponse, ProviderError> {
+            Err(ProviderError::ServerError(500))
+        }
+
+        async fn generate_stream(
+            &self,
+            _request: GenerateRequest,
+        ) -> tokio::sync::mpsc::Receiver<Result<ModelStreamEvent, ProviderError>> {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let script = self.scripts.lock().unwrap().pop_front();
+            tokio::spawn(async move {
+                match script {
+                    Some(events) => {
+                        for event in events {
+                            let _ = tx.send(Ok(event)).await;
+                        }
+                    }
+                    None => {
+                        let _ = tx
+                            .send(Err(ProviderError::ServerError(503)))
+                            .await;
+                    }
+                }
+            });
+            rx
+        }
+
+        fn provider_name(&self) -> &str {
+            "tool-then-error"
+        }
+    }
+
+    /// 审批缺省放开为 allow（恢复 gating 前的工具直通；host_call 测试同款）。
+    fn relax_approval(runtime: &MobileRuntime, collector: &Collector, rx: &std_mpsc::Receiver<()>) {
+        runtime
+            .send(r#"{"type":"set_approval_config","default_level":"allow","tool_levels":{},"server_levels":{}}"#)
+            .unwrap();
+        collector.wait_for(rx, "config_changed", Duration::from_secs(10));
+    }
+
+    /// T1（尽量做）：回合 Err 收尾（未折叠终值的 ToolCall 留在内存转写）
+    /// → NewSession 前置冲刷 → DB 含 as-is ToolCall + INCOMPLETE_TURN_
+    /// META；重开转写完整。
+    #[test]
+    fn interrupted_turn_new_session_flushes_snapshot_meta() {
+        let (paths, _dir) = temp_paths();
+        let provider = ToolThenErrorProvider {
+            scripts: Arc::new(Mutex::new(VecDeque::from(vec![tool_call_step(
+                "fast_probe",
+                "tc-t1",
+            )]))),
+        };
+        let opts = RuntimeOptions {
+            provider_factory: Some(Arc::new(move |_c, _a| {
+                Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>)
+            })),
+            extra_tools: vec![Box::new(FastProbeTool)],
+            ..Default::default()
+        };
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        relax_approval(&runtime, &collector, &rx);
+
+        // 步骤 1 工具执行成功（ToolCall 条目 live Done、output 未折叠），
+        // 步骤 2 模型流错误 → turn_error（Err 路径不折叠）。
+        runtime.send(r#"{"type":"submit","text":"跑探针"}"#).unwrap();
+        collector.wait_for(&rx, "turn_error", Duration::from_secs(20));
+        let run_id = runtime.current_run_id().expect("run 应已打开");
+
+        // NewSession：前置冲刷把推迟的 ToolCall 尾部 as-is 落库 + 中断
+        // 快照 Meta 行。
+        runtime.send(r#"{"type":"new_session"}"#).unwrap();
+        collector.wait_for(&rx, "session_reset", Duration::from_secs(5));
+
+        {
+            let (srt, store) = scratch_store(&paths);
+            let rows = srt
+                .block_on(async { store.list_transcript_entries(&run_id).await.unwrap() });
+            let jsons: Vec<&str> = rows.iter().map(|r| r.entry_json.as_str()).collect();
+            assert!(
+                jsons.iter().any(|j| j.contains(r#""kind":"tool_call""#) && j.contains(r#""output":null"#)),
+                "DB 应含 as-is ToolCall（未折叠终值）: {jsons:?}"
+            );
+            assert!(
+                jsons
+                    .iter()
+                    .any(|j| j.contains(crate::transcripts::INCOMPLETE_TURN_META)),
+                "DB 应含 INCOMPLETE_TURN_META 行: {jsons:?}"
+            );
+        }
+
+        // 重开：转写完整（用户消息在场——不再只剩截断前缀）。
+        runtime.open_session(run_id.clone()).unwrap();
+        let events = collector.wait_for_count(&rx, "snapshot", 3, Duration::from_secs(10));
+        let snap = events.iter().rev().find(|e| e["type"] == "snapshot").unwrap();
+        let transcript = snap["session"]["transcript"].as_array().unwrap();
+        assert!(
+            transcript.iter().any(|e| e["kind"] == "user" && e["text"] == "跑探针"),
+            "重开转写完整: {transcript:?}"
+        );
+
+        runtime.shutdown();
+    }
+
+    /// T4（尽量做）：NewSession 二次 busy 守卫——前置冲刷期间被注入的
+    /// submit 起了回合 → NewSession 被拒（Warn notice），转写未清、
+    /// session_id 未轮换。
+    struct SubmitInjectingFlusher;
+
+    impl openslate_session::state::TranscriptFlusher for SubmitInjectingFlusher {
+        fn flush(&self, state: Arc<AppState>) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                // 模拟冲刷窗口内的竞态 submit（挂死工具钉住 running=true）。
+                session_dispatch::dispatch(
+                    &state,
+                    crate::events::MOBILE_CONN_ID,
+                    ClientMsg::Submit {
+                        text: "抢跑提交".into(),
+                        attachments: None,
+                    },
+                )
+                .await;
+            })
+        }
+    }
+
+    #[test]
+    fn new_session_second_busy_guard_rejects_when_submit_lands_in_flush() {
+        let (paths, _dir) = temp_paths();
+        let provider = ToolThenErrorProvider {
+            scripts: Arc::new(Mutex::new(VecDeque::from(vec![tool_call_step(
+                "hang_forever",
+                "tc-t4",
+            )]))),
+        };
+        let opts = RuntimeOptions {
+            provider_factory: Some(Arc::new(move |_c, _a| {
+                Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>)
+            })),
+            extra_tools: vec![Box::new(HangingTool)],
+            ..Default::default()
+        };
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        relax_approval(&runtime, &collector, &rx);
+
+        // 预置转写标记 + 记录当前会话身份。
+        let sid_before = {
+            let mut inner = runtime.state.core.lock();
+            inner.transcript.push(EntryDto::Meta {
+                text: "t4-marker".into(),
+            });
+            inner.session_id.clone()
+        };
+
+        // 覆盖冲刷钩子为「注入 submit」的实现，再发 NewSession。
+        runtime
+            .state
+            .core
+            .set_transcript_flusher(Arc::new(SubmitInjectingFlusher));
+        runtime.send(r#"{"type":"new_session"}"#).unwrap();
+
+        // 二次守卫拒绝：Warn notice（回合进行中）；无 session_reset。
+        let events = collector.wait_for(&rx, "notice", Duration::from_secs(10));
+        let notice = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("回合进行中"))
+            .expect("二次 busy 守卫应定向 Warn notice");
+        assert_eq!(notice["level"].as_str().unwrap(), "warn");
+
+        // 转写未清（标记仍在 + 抢跑 user 条目）、session_id 未轮换。
+        {
+            let inner = runtime.state.core.lock();
+            assert!(
+                inner
+                    .transcript
+                    .iter()
+                    .any(|e| matches!(e, EntryDto::Meta { text } if text == "t4-marker")),
+                "转写未被清空"
+            );
+            assert_eq!(inner.session_id, sid_before, "被拒路径不轮换 session_id");
+        }
+
+        runtime.shutdown();
+    }
+
+    /// T5（尽量做）：回合中（工具挂死）shutdown → 关停冲刷把 ToolCall
+    /// 中断快照落库（entries 含尾部 + INCOMPLETE_TURN_META）。
+    #[test]
+    fn shutdown_flushes_transcript_tail_mid_turn() {
+        let (paths, _dir) = temp_paths();
+        let provider = ToolThenErrorProvider {
+            scripts: Arc::new(Mutex::new(VecDeque::from(vec![tool_call_step(
+                "hang_forever",
+                "tc-t5",
+            )]))),
+        };
+        let opts = RuntimeOptions {
+            provider_factory: Some(Arc::new(move |_c, _a| {
+                Ok(Box::new(provider.clone()) as Box<dyn ModelProvider>)
+            })),
+            extra_tools: vec![Box::new(HangingTool)],
+            ..Default::default()
+        };
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        relax_approval(&runtime, &collector, &rx);
+
+        // 回合进行中（工具挂死）：tool_start 事件 = ToolCall 条目已在
+        // 内存转写（推迟落库）。
+        runtime.send(r#"{"type":"submit","text":"挂住别动"}"#).unwrap();
+        collector.wait_for(&rx, "tool_start", Duration::from_secs(20));
+        let run_id = runtime.current_run_id().expect("run 应已打开");
+
+        runtime.shutdown();
+
+        // 关停冲刷已把 User + as-is ToolCall + 中断快照 Meta 落库。
+        let (srt, store) = scratch_store(&paths);
+        let rows = srt.block_on(async { store.list_transcript_entries(&run_id).await.unwrap() });
+        let jsons: Vec<&str> = rows.iter().map(|r| r.entry_json.as_str()).collect();
+        assert!(
+            jsons.iter().any(|j| j.contains(r#""kind":"user""#) && j.contains("挂住别动")),
+            "entries 应含 User 尾部: {jsons:?}"
+        );
+        assert!(
+            jsons
+                .iter()
+                .any(|j| j.contains(r#""kind":"tool_call""#) && j.contains(r#""output":null"#)),
+            "entries 应含 as-is ToolCall: {jsons:?}"
+        );
+        assert!(
+            jsons
+                .iter()
+                .any(|j| j.contains(crate::transcripts::INCOMPLETE_TURN_META)),
+            "entries 应含 INCOMPLETE_TURN_META: {jsons:?}"
+        );
+    }
+
     // ── 重启恢复 pop 兜底守卫（may_pop_dangling_tail）────────────────
 
     #[test]
     fn may_pop_dangling_tail_guard_semantics() {
         fn tail(ids: &[&str]) -> Message {
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -3066,6 +5317,7 @@ mod tests {
         }
         fn user() -> Message {
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "go".into(),
                 tool_call_id: None,
@@ -3128,6 +5380,7 @@ mod tests {
                 .await
                 .unwrap();
             let user_msg = Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "选个数据库".into(),
                 tool_call_id: None,
@@ -3136,6 +5389,7 @@ mod tests {
                 reasoning_content: None,
             };
             let assistant_msg = Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -3161,7 +5415,10 @@ mod tests {
                     &format!("{run_id}-persist"),
                     Some("root"),
                     "user",
-                    &serde_json::to_string(&user_msg).unwrap(),
+                    &openslate_store_sqlite::codec::encode_content(
+                        &serde_json::to_string(&user_msg).unwrap(),
+                    ),
+                    None,
                     1,
                     now_ms - 59_000,
                 )
@@ -3174,7 +5431,10 @@ mod tests {
                     &format!("{run_id}-persist"),
                     Some("root"),
                     "assistant",
-                    &serde_json::to_string(&assistant_msg).unwrap(),
+                    &openslate_store_sqlite::codec::encode_content(
+                        &serde_json::to_string(&assistant_msg).unwrap(),
+                    ),
+                    None,
                     2,
                     now_ms - 58_000,
                 )
@@ -3261,5 +5521,537 @@ mod tests {
             "无 pending 引用 → 尾部悬挂 assistant 照常 pop（经典语义）: {snap}"
         );
         runtime.shutdown();
+    }
+
+    // ── read_file 读图链路 + 附件缩略图 FFI（2026-10-21）─────────────
+
+    /// 端到端（core 侧链路，mobile 进程内验证）：builtin read_file 读图
+    /// → fs.rs 嗅探/归一化 → Image content block → core downgrade 收集
+    /// → ToolOutput.attachments → Tool Message 组装（runtime 同款）→
+    /// 持久化仅引用形状（data serde-skip）。
+    #[test]
+    fn read_file_image_flows_to_tool_message_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, png) = write_tiny_png(dir.path());
+        std::fs::write(dir.path().join("cam.png"), &png).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tools, _services) = openslate_core::mcp::connect_builtin_servers(
+                dir.path(),
+                &openslate_core::config::BuiltinToolsConfig::default(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let read = tools
+                .iter()
+                .find(|t| t.name() == "read_file")
+                .expect("read_file 注册");
+
+            let out = read
+                .execute(&serde_json::json!({"path": "cam.png"}))
+                .await
+                .unwrap();
+            assert_eq!(out.status, openslate_core::types::ToolOutputStatus::Success);
+            assert!(
+                out.content.contains("[image file: cam.png"),
+                "说明文本进 content：{}",
+                out.content
+            );
+            let atts = out.attachments.as_ref().expect("Image block → 附件收集");
+            assert_eq!(atts.len(), 1);
+            assert_eq!(atts[0].id, "tool-0");
+            assert_eq!(atts[0].mime, "image/png", "小 PNG passthrough");
+            assert_eq!(
+                atts[0].data.as_deref().unwrap(),
+                &png[..] as &[u8],
+                "字节 = 原图"
+            );
+
+            // runtime 同款 Tool Message 组装（runtime.rs 顺序/并行两路径）。
+            let msg = Message {
+                attachments: out.attachments,
+                role: MessageRole::Tool,
+                content: out.content,
+                tool_call_id: Some(openslate_core::types::ToolCallId::from("call-1")),
+                name: Some("read_file".into()),
+                tool_calls: None,
+                reasoning_content: None,
+            };
+            let value = serde_json::to_value(&msg).unwrap();
+            let att = &value["attachments"][0];
+            assert_eq!(att["id"].as_str(), Some("tool-0"), "{value}");
+            assert!(att.get("data").is_none(), "data serde-skip：{value}");
+        });
+    }
+
+    /// 缩略图 FFI 往返：import 一张 3000×2000 大图 → 归一化落库 →
+    /// get_attachment_thumbnail 出 ≤128 长边 JPEG（base64 可解、尺寸
+    /// 正确、mime 标 image/jpeg）；错误路径（未知 id / 视频附件）走
+    /// `{"ok":false,"error"}`。
+    #[test]
+    fn attachment_thumbnail_ffi_roundtrip() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector.clone(), scripted_opts(vec![]))
+                .unwrap();
+        let _ = collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        // 3000×2000 JPEG（归一化入口 → 落库 ≤2048）。
+        let big = dir_join_jpeg(_dir.path(), "big.jpg");
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(big.to_str().unwrap(), "image/jpeg", "big.jpg"),
+        )
+        .unwrap();
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(env["mime"].as_str().unwrap(), "image/jpeg");
+        let img_id = env["id"].as_str().unwrap().to_owned();
+
+        // 视频附件（缩略图不支持 → error）。
+        let mp4 = write_fake_mp4(_dir.path());
+        let venv: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(mp4.to_str().unwrap(), "video/mp4", "clip.mp4"),
+        )
+        .unwrap();
+        assert!(venv["ok"].as_bool().unwrap(), "{venv}");
+        let vid_id = venv["id"].as_str().unwrap().to_owned();
+
+        // 图像 → ok + 可解码 JPEG + 长边 128（只缩不放）。
+        let out: serde_json::Value =
+            serde_json::from_str(&runtime.get_attachment_thumbnail_json(&img_id, 128)).unwrap();
+        assert!(out["ok"].as_bool().unwrap(), "{out}");
+        assert_eq!(out["mime"].as_str().unwrap(), "image/jpeg");
+        let b64 = out["data"].as_str().unwrap();
+        let bytes = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("合法 base64")
+        };
+        let thumb = image::load_from_memory(&bytes).expect("JPEG 可解码");
+        assert_eq!(thumb.width().max(thumb.height()), 128);
+
+        // max_px<=0 → 256 兜底。
+        let out: serde_json::Value =
+            serde_json::from_str(&runtime.get_attachment_thumbnail_json(&img_id, 0)).unwrap();
+        assert!(out["ok"].as_bool().unwrap(), "{out}");
+        let bytes = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(out["data"].as_str().unwrap())
+                .unwrap()
+        };
+        let thumb = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(thumb.width().max(thumb.height()), 256);
+
+        // 错误路径：未知 id / 视频附件。
+        let miss: serde_json::Value = serde_json::from_str(
+            &runtime.get_attachment_thumbnail_json("att-nope", 128),
+        )
+        .unwrap();
+        assert!(!miss["ok"].as_bool().unwrap(), "{miss}");
+        assert!(miss["error"].as_str().unwrap().contains("不存在"), "{miss}");
+        let vid: serde_json::Value =
+            serde_json::from_str(&runtime.get_attachment_thumbnail_json(&vid_id, 128)).unwrap();
+        assert!(!vid["ok"].as_bool().unwrap(), "{vid}");
+        assert!(vid["error"].as_str().unwrap().contains("图像"), "{vid}");
+
+        runtime.shutdown();
+    }
+
+    /// 生成一张 3000×2000 的 JPEG 测试图（缩略图/归一化入口用）。
+    fn dir_join_jpeg(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let img = image::RgbImage::from_pixel(3000, 2000, image::Rgb([180, 40, 40]));
+        let mut buf = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 95);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, &buf).unwrap();
+        path
+    }
+
+    // ── 附件导入（import JSON 契约：无网络、无 tokens 键）────────────
+
+    /// 导入是纯本地操作：成功 JSON 恒无 `tokens` 键（发起任何 API 请求
+    /// 之前绝不把附件数据发到任何服务器——token 数由回合结束后响应侧
+    /// 回填，见 `attachment_tokens` 模块）；对比信息键（快速通道态）就位。
+    #[test]
+    fn import_json_never_estimates_tokens() {
+        let (paths, _dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
+        let (png, _) = write_tiny_png(_dir.path());
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(png.to_str().unwrap(), "image/png", "s.png"),
+        )
+        .unwrap();
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert!(env.get("tokens").is_none(), "导入侧绝不预估 token：{env}");
+        assert!(env["size_bytes"].as_u64().unwrap() > 0, "{env}");
+        // 对比信息（48×32 小 PNG → 快速通道）。
+        assert_eq!(env["processed"].as_str(), Some("passthrough"), "{env}");
+        assert_eq!(env["orig_width"].as_u64(), Some(48), "{env}");
+        assert_eq!(env["orig_height"].as_u64(), Some(32), "{env}");
+        assert_eq!(env["width"].as_u64(), Some(48), "{env}");
+        assert_eq!(env["height"].as_u64(), Some(32), "{env}");
+        assert_eq!(
+            env["orig_bytes"].as_u64(),
+            env["size_bytes"].as_u64(),
+            "passthrough 字节相等：{env}"
+        );
+        runtime.shutdown();
+    }
+
+    /// 成功 JSON 的对比信息三态：转码（超尺寸 JPEG → 缩放）与视频
+    /// passthrough（尺寸键省略）。
+    #[test]
+    fn import_json_reports_transcode_and_video_states() {
+        let (paths, _dir) = temp_paths();
+        let (collector, _rx) = Collector::new();
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector, scripted_opts(vec![])).unwrap();
+
+        // 3000×2000 JPEG → transcode：orig=3000×2000、处理后 2048×1365。
+        let img = image::RgbImage::from_pixel(3000, 2000, image::Rgb([30, 90, 200]));
+        let mut jpeg = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .unwrap();
+        let src = _dir.path().join("big.jpg");
+        std::fs::write(&src, &jpeg).unwrap();
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(src.to_str().unwrap(), "image/jpeg", "big.jpg"),
+        )
+        .unwrap();
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(env["processed"].as_str(), Some("transcode"), "{env}");
+        assert_eq!(env["orig_width"].as_u64(), Some(3000), "{env}");
+        assert_eq!(env["orig_height"].as_u64(), Some(2000), "{env}");
+        assert_eq!(env["width"].as_u64(), Some(2048), "{env}");
+        assert_eq!(env["height"].as_u64(), Some(1365), "{env}");
+        assert_eq!(env["orig_bytes"].as_u64(), Some(jpeg.len() as u64), "{env}");
+        assert!(env["size_bytes"].as_u64().unwrap() < jpeg.len() as u64, "{env}");
+
+        // MP4 → video_passthrough：尺寸四键全部省略。
+        let mp4 = write_fake_mp4(_dir.path());
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(mp4.to_str().unwrap(), "video/mp4", "clip.mp4"),
+        )
+        .unwrap();
+        assert!(env["ok"].as_bool().unwrap(), "{env}");
+        assert_eq!(env["processed"].as_str(), Some("video_passthrough"), "{env}");
+        for key in ["orig_width", "orig_height", "width", "height"] {
+            assert!(env.get(key).is_none(), "视频省略尺寸键 {key}：{env}");
+        }
+        assert_eq!(
+            env["orig_bytes"].as_u64(),
+            env["size_bytes"].as_u64(),
+            "视频 passthrough 字节相等：{env}"
+        );
+        runtime.shutdown();
+    }
+
+    // ── 附件 image tokens 响应侧回填（协议 v5）──────────────────────
+
+    /// 带实测 image tokens 的流脚本：Usage 事件（tap 闩值来源）与 Done
+    /// 的 ModelResponse.usage（meta_json 持久化来源）同值——真实 genai
+    /// 流路径两处一致。
+    fn image_usage_response(text: &str, image_tokens: u64) -> Vec<ModelStreamEvent> {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 5,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            image_tokens: Some(image_tokens),
+        };
+        vec![
+            ModelStreamEvent::Delta(text.to_owned()),
+            ModelStreamEvent::Usage(usage),
+            ModelStreamEvent::Done(ModelResponse {
+                content: Some(text.to_owned()),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: Some(usage),
+                finish_reason: Some("stop".into()),
+            }),
+        ]
+    }
+
+    /// 无分模态计数的流脚本（智谱口径：image_tokens None）。
+    fn no_image_usage_response(text: &str) -> Vec<ModelStreamEvent> {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 5,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+            image_tokens: None,
+        };
+        vec![
+            ModelStreamEvent::Delta(text.to_owned()),
+            ModelStreamEvent::Usage(usage),
+            ModelStreamEvent::Done(ModelResponse {
+                content: Some(text.to_owned()),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: Some(usage),
+                finish_reason: Some("stop".into()),
+            }),
+        ]
+    }
+
+    /// 轮询等待附件回填值落 map（sync_loop 消费 completed 队列 ≤1s）。
+    fn wait_token_backfill(
+        runtime: &MobileRuntime,
+        att_id: &str,
+        deadline: Duration,
+    ) -> Option<u64> {
+        let start = Instant::now();
+        loop {
+            if let Some(t) = runtime.attachment_tokens.get(att_id) {
+                return Some(t);
+            }
+            if start.elapsed() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    /// 从最近一条 snapshot 事件里取 User 条目的附件数组（按 att id 命中）。
+    fn snapshot_user_attachment<'a>(
+        collector: &Collector,
+        att_id: &str,
+    ) -> Option<serde_json::Value> {
+        let all = collector.events.lock().unwrap().clone();
+        let snapshot = all
+            .iter()
+            .rev()
+            .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("snapshot"))?;
+        snapshot
+            .pointer("/session/transcript")?
+            .as_array()?
+            .iter()
+            .filter_map(|e| {
+                let atts = e.get("attachments")?.as_array()?;
+                atts.iter()
+                    .find(|a| a.get("id").and_then(|i| i.as_str()) == Some(att_id))
+                    .cloned()
+            })
+            .next_back()
+    }
+
+    /// 单图回合：首次调用 image_tokens 经 tap 闩值、sync_loop 落
+    /// transcript，快照 User 附件携带 `tokens`；同回合第二条 Usage
+    /// （agentic 后续调用）忽略。
+    #[test]
+    fn single_image_turn_backfills_tokens_into_snapshot() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let mut script = image_usage_response("看到了", 728);
+        // 同回合第二次调用（历史图重发）：值更大但必须被忽略。
+        script.extend(image_usage_response("再确认", 9999));
+        let runtime =
+            MobileRuntime::create_with(paths.clone(), collector.clone(), scripted_opts(vec![script]))
+                .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        let (png_path, _bytes) = write_tiny_png(_dir.path());
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "s.png"),
+        )
+        .unwrap();
+        let att_id = env["id"].as_str().unwrap().to_owned();
+        runtime
+            .send(&format!(
+                r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png"}}]}}"#
+            ))
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+        // sync_loop 消费 completed（空闲周期 ≤1s）→ map + transcript 就位。
+        let t = wait_token_backfill(&runtime, &att_id, Duration::from_secs(5));
+        assert_eq!(t, Some(728), "首次调用值（9999 是后续调用，被忽略）");
+
+        // 重发 Hello → 新快照的 User 附件带 tokens。
+        runtime.send(r#"{"type":"hello","proto":5}"#).unwrap();
+        collector.wait_for_count(&rx, "snapshot", 2, Duration::from_secs(10));
+        let att = snapshot_user_attachment(&collector, &att_id)
+            .expect("快照 User 条目应带该附件");
+        assert_eq!(att["tokens"].as_u64(), Some(728), "{att}");
+        runtime.shutdown();
+    }
+
+    /// 多图不拆分：两图 Submit 不设标记，usage 有 image_tokens 也不回填。
+    #[test]
+    fn multi_image_submit_never_backfills_tokens() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![image_usage_response("两张都收到了", 500)]),
+        )
+        .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let (png_path, _) = write_tiny_png(_dir.path());
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(
+                    png_path.to_str().unwrap(),
+                    "image/png",
+                    &format!("s{i}.png"),
+                ),
+            )
+            .unwrap();
+            ids.push(env["id"].as_str().unwrap().to_owned());
+        }
+        let atts_json = ids
+            .iter()
+            .map(|id| format!(r#"{{"id":"{id}","mime":"image/png"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        runtime
+            .send(&format!(
+                r#"{{"type":"submit","text":"两张图","attachments":[{atts_json}]}}"#
+            ))
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+        // 覆盖一个 sync 周期后仍无回填。
+        std::thread::sleep(Duration::from_millis(1300));
+        for id in &ids {
+            assert_eq!(
+                runtime.attachment_tokens.get(id),
+                None,
+                "多图 usage 不分图，不回填（{id}）"
+            );
+        }
+        runtime.send(r#"{"type":"hello","proto":5}"#).unwrap();
+        collector.wait_for_count(&rx, "snapshot", 2, Duration::from_secs(10));
+        for id in &ids {
+            let att =
+                snapshot_user_attachment(&collector, id).expect("快照 User 条目应带该附件");
+            assert!(
+                att.get("tokens").is_none(),
+                "多图条目无 tokens 键：{att}"
+            );
+        }
+        runtime.shutdown();
+    }
+
+    /// 智谱口径：usage 不分模态（image_tokens None）→ 无回填，UI 回退
+    /// 文件大小。
+    #[test]
+    fn no_modality_usage_means_no_backfill() {
+        let (paths, _dir) = temp_paths();
+        let (collector, rx) = Collector::new();
+        let runtime = MobileRuntime::create_with(
+            paths.clone(),
+            collector.clone(),
+            scripted_opts(vec![no_image_usage_response("好的")]),
+        )
+        .unwrap();
+        collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+        let (png_path, _) = write_tiny_png(_dir.path());
+        let env: serde_json::Value = serde_json::from_str(
+            &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "s.png"),
+        )
+        .unwrap();
+        let att_id = env["id"].as_str().unwrap().to_owned();
+        runtime
+            .send(&format!(
+                r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png"}}]}}"#
+            ))
+            .unwrap();
+        collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(1300));
+        assert_eq!(runtime.attachment_tokens.get(&att_id), None);
+        runtime.shutdown();
+    }
+
+    /// 重启可见性：transcript_entries 行在回填前已落库（追加式不可变），
+    /// 重开经 messages.meta_json 重放同口径回填 → 首份快照即带 tokens。
+    #[test]
+    fn attachment_tokens_survive_restart_via_meta_replay() {
+        let (paths, _dir) = temp_paths();
+        {
+            let (collector, rx) = Collector::new();
+            let runtime = MobileRuntime::create_with(
+                paths.clone(),
+                collector.clone(),
+                scripted_opts(vec![image_usage_response("是截图", 728)]),
+            )
+            .unwrap();
+            collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let (png_path, _) = write_tiny_png(_dir.path());
+            let env: serde_json::Value = serde_json::from_str(
+                &runtime.import_attachment_json(png_path.to_str().unwrap(), "image/png", "s.png"),
+            )
+            .unwrap();
+            let att_id = env["id"].as_str().unwrap().to_owned();
+            runtime
+                .send(&format!(
+                    r#"{{"type":"submit","text":"看图","attachments":[{{"id":"{att_id}","mime":"image/png"}}]}}"#
+                ))
+                .unwrap();
+            collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+            // 等 sync_loop 把 User 条目落库 + 回填消费完（避免崩溃窗口
+            // 尾部与测试竞速）。
+            assert_eq!(
+                wait_token_backfill(&runtime, &att_id, Duration::from_secs(5)),
+                Some(728)
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            runtime.shutdown();
+        }
+        // 重启：首份 snapshot（rebuild_transcript → meta 重放）即带 tokens。
+        {
+            let (collector, rx) = Collector::new();
+            let runtime = MobileRuntime::create_with(
+                paths.clone(),
+                collector.clone(),
+                scripted_opts(vec![no_image_usage_response("继续")]),
+            )
+            .unwrap();
+            let events = collector.wait_for(&rx, "snapshot", Duration::from_secs(10));
+            let snapshot = events
+                .iter()
+                .rev()
+                .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("snapshot"))
+                .expect("snapshot");
+            let users_with_tokens: Vec<&serde_json::Value> = snapshot
+                .pointer("/session/transcript")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|e| {
+                            e.get("attachments")
+                                .and_then(|x| x.as_array())
+                                .is_some_and(|atts| {
+                                    atts.iter().any(|x| x.get("tokens").is_some())
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                users_with_tokens.len(),
+                1,
+                "重启后恰好一条 User 附件带 tokens：{snapshot}"
+            );
+            let att = &users_with_tokens[0]["attachments"][0];
+            assert_eq!(att["tokens"].as_u64(), Some(728), "{att}");
+            runtime.shutdown();
+        }
     }
 }

@@ -28,8 +28,9 @@ use anyhow::{Context, Result};
 use axum::routing::get;
 use axum::Router;
 use openslate_app::wiring::{apply_approval, build_app_context};
-use openslate_core::approval::ApprovalManager;
+use openslate_core::approval::{rules_from_config, ApprovalManager};
 use openslate_protocol::{ServerInfo, SkillInfoDto, PROTOCOL_VERSION};
+use openslate_store_sqlite::recorder::RunFinal;
 use hub::ConnectionHub;
 use openslate_session::approval::SessionApprovalBridge;
 use state::{AppState, ConfigPaths, CoreInner, ProviderFactory, SessionCore};
@@ -101,8 +102,14 @@ pub async fn build_state(opts: &ServeOptions) -> Result<Arc<AppState>> {
 
     // server = 交互式语义：审批策略按 interactive 推导，回调挂桥。
     apply_approval(&mut manager, &config, true, false);
-    let policy = manager.approval.policy().clone();
-    manager.approval = ApprovalManager::new(policy).with_callback(approval_bridge.clone());
+    // 规则引擎接线（tool-approval P1b）：初始规则 = rules_from_config
+    //（legacy 映射保旧行为；**不做** mobile 的 Auto opt-in——Auto = AI
+    // 审查语义是 mobile 装配专属，server 保持现状）。经 bridge 的共享
+    // cell 注入 manager（with_rules，P0-5 正道）：WS 客户端发
+    // SetApprovalConfig / always_* 应答的热更直达引擎。
+    approval_bridge.set_rules(rules_from_config(&config));
+    manager.approval = ApprovalManager::with_rules(approval_bridge.rules_handle())
+        .with_callback(approval_bridge.clone());
 
     let root_alias = agent_tree.get_root().model_alias.clone();
     let session_label = config
@@ -354,7 +361,7 @@ async fn graceful_shutdown_work(state: Arc<AppState>) {
 
     // 1. 审批全 deny（引擎解栈）+ 取消当前回合。
     state.approval.deny_all();
-    let (engine_task, session_run, stats_cost) = {
+    let (engine_task, session_run, final_cost, final_in, final_out) = {
         let mut inner = state.core.lock();
         if let Some(cancel) = &inner.cancel {
             cancel.cancel();
@@ -362,7 +369,12 @@ async fn graceful_shutdown_work(state: Arc<AppState>) {
         (
             inner.engine_task.take(),
             inner.session_run.take(),
+            // v5 L2：终态聚合快照（stats = 会话累计，含 title/compact
+            // 侧调用——与 session /new 关闭口径一致），经 RunFinal 落
+            // runs.input_tokens / output_tokens 聚合列。
             inner.stats.total_cost_usd,
+            inner.stats.total_input_tokens,
+            inner.stats.total_output_tokens,
         )
     };
     stdout_event!("turn cancelled, approvals denied");
@@ -374,7 +386,17 @@ async fn graceful_shutdown_work(state: Arc<AppState>) {
 
     // 3. 收尾 run 行落库。
     if let Some(run) = session_run {
-        if let Err(e) = run.recorder.finish("interrupted", None, stats_cost).await {
+        if let Err(e) = run
+            .recorder
+            .finish_with(RunFinal {
+                status: "interrupted".into(),
+                output_json: None,
+                cost_usd: final_cost,
+                input_tokens: final_in,
+                output_tokens: final_out,
+            })
+            .await
+        {
             tracing::warn!("failed to persist session run on shutdown: {e}");
         }
     }

@@ -15,6 +15,9 @@
 //!   `reload_mcp_servers()`）
 //! - `get/set_mcp_server_name()` → 聚合 server 键名读写（`{prefix}`
 //!   占位符的展开值；生效同样走 `reload_mcp_servers()`）
+//! - `set/get_experimental_video()` → 实验视频开关（落盘
+//!   `[attachments] experimental_video` + 内存即时生效，Submit 门控
+//!   下一轮即按新值放行/拒绝视频附件）
 //!
 //! 线程约定：所有方法立即返回（send 内部 spawn；shutdown 有限等待）；
 //! `callback.on_event` 从 Rust 泓线程调用——宿主实现必须线程安全、
@@ -233,6 +236,74 @@ impl OpenSlateRuntime {
     pub fn set_mcp_server_name(&self, name: String) -> String {
         openslate_mobile::alog!("ffi: set_mcp_server_name({name:?})");
         self.inner.set_mcp_server_name(name)
+    }
+
+    /// 实验视频开关（存储 v5 §3.5；设置页「实验性功能」，L4→L6 交接，
+    /// 签名与 L5 已约定）。写 openslate.toml
+    /// `[attachments] experimental_video`（保留文件其余内容）+ 同步更新
+    /// 运行中内存配置——Submit 附件门控下一轮即生效，无需重启。返回
+    /// `{"ok":true}` 或 `{"ok":false,"error":"…"}`（落盘失败时内存
+    /// 不变）。
+    pub fn set_experimental_video(&self, enabled: bool) -> String {
+        openslate_mobile::alog!("ffi: set_experimental_video({enabled})");
+        self.inner.set_experimental_video(enabled)
+    }
+
+    /// 读实验视频开关当前生效值（内存配置：装配期从落盘装载 + set 即时
+    /// 更新，与 Submit 门控消费的值同源）。
+    pub fn get_experimental_video(&self) -> bool {
+        openslate_mobile::alog!("ffi: get_experimental_video");
+        self.inner.get_experimental_video()
+    }
+
+    /// 图片处理双旋钮（设置页「图片最长边 / 处理后文件大小上限」）：
+    /// `max_dim` = 等比缩放目标边长（值域 512–6000），`max_mb` = 处理后
+    /// 大小上限 MB（值域 1–5；归一化迭代压缩 q85→70→55 → ×0.85 缩边的
+    /// 达标线）。值域外 → `{"ok":false,"error":"…"}`（core validation
+    /// 同源校验）。合法 → 写 openslate.toml `[attachments]` 两键（保留
+    /// 文件其余内容）+ 同步更新运行中内存配置——下一次 import_attachment
+    /// 即生效，无需重启。返回 `{"ok":true}` 或 `{"ok":false,"error":…}`
+    ///（落盘失败时内存不变）。
+    pub fn set_image_processing(&self, max_dim: i64, max_mb: i64) -> String {
+        openslate_mobile::alog!("ffi: set_image_processing(max_dim={max_dim}, max_mb={max_mb})");
+        self.inner.set_image_processing(max_dim, max_mb)
+    }
+
+    /// 读图片处理双旋钮当前生效值（内存配置：装配期从落盘装载 + set
+    /// 即时更新，与归一化消费的值同源）。返回
+    /// `{"max_image_dim":N,"max_image_mb":M}`。
+    pub fn get_image_processing(&self) -> String {
+        openslate_mobile::alog!("ffi: get_image_processing");
+        self.inner.get_image_processing()
+    }
+
+    /// 导入附件（PLAN §3.6；Kotlin 侧 cache 拷贝 + HEIC 预转码后调用，
+    /// 路径传递不走 base64）。magic-byte 嗅探 → sha256 → 图像归一化
+    ///（小图 JPEG/PNG header 快速通道 passthrough；其余按用户双旋钮
+    /// 迭代压缩：≤max_dim 等比缩 + q85→70→55 → ×0.85 缩边至 ≤max_mb，
+    /// 见 set_image_processing）→ files/ 落盘 → attachments 行（run_id
+    /// NULL 暂存）。返回含 orig/处理后对比信息的 JSON（见 mobile-ffi.md
+    /// 契约）或 `{"ok":false,"error":"…"}`。
+    pub fn import_attachment(
+        &self,
+        source_path: String,
+        declared_mime: String,
+        filename: String,
+    ) -> String {
+        openslate_mobile::alog!("ffi: import_attachment({source_path:?}, {declared_mime:?}, {filename:?})");
+        self.inner
+            .import_attachment_json(&source_path, &declared_mime, &filename)
+    }
+
+    /// 附件缩略图（des-2 Android lane 契约）。`id` = import_attachment
+    /// 返回的附件 id；原图经 sha256 从 files 读出，长边缩到 `max_px`
+    /// （只缩不放；`<=0` 按 256、上限 2048）后 JPEG q80 编码。返回
+    /// `{"ok":true,"data":"<base64>","mime":"image/jpeg"}` 或
+    /// `{"ok":false,"error":"…"}`（附件不存在 / 视频等非图像 / 文件
+    /// 缺失 / 解码失败均走 error）。阻塞（磁盘 + 解码），IO 线程调用。
+    pub fn get_attachment_thumbnail(&self, id: String, max_px: i32) -> String {
+        openslate_mobile::alog!("ffi: get_attachment_thumbnail(id={id:?}, max_px={max_px})");
+        self.inner.get_attachment_thumbnail_json(&id, max_px)
     }
 
     // ── 工具可见性（工具管理页）──────────────────────────────────────

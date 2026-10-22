@@ -363,6 +363,7 @@ async fn generate_summary(
         model_id: model_id.to_owned(),
         system_prompt: Some(SUMMARY_SYSTEM_PROMPT.to_owned()),
         messages: vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: format!(
                 "Summarize the following conversation for continuation:\n\n{}",
@@ -414,6 +415,7 @@ pub(crate) async fn generate_title(
         model_id: model_id.to_owned(),
         system_prompt: Some(TITLE_SYSTEM_PROMPT.to_owned()),
         messages: vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: trimmed_input,
             tool_call_id: None,
@@ -537,6 +539,7 @@ mod tests {
             output_tokens: 2,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            image_tokens: None,
         };
         assert_eq!(meta_line_for_test(&plain), "↑10 ↓2");
         let cached = Usage {
@@ -544,6 +547,7 @@ mod tests {
             output_tokens: 2,
             cached_input_tokens: Some(4),
             reasoning_tokens: None,
+            image_tokens: None,
         };
         assert_eq!(meta_line_for_test(&cached), "↑10 ↓2 ⎓4");
     }
@@ -643,6 +647,7 @@ mod tests {
             let agent_tree = AgentTree::from_configs(&agents.agents).expect("tree builds");
             let history: Vec<Message> = (0..9)
                 .map(|i| Message {
+                    attachments: None,
                     role: if i % 2 == 0 {
                         MessageRole::User
                     } else {

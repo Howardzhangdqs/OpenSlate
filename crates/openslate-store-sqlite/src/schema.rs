@@ -1,8 +1,9 @@
 //! OpenSlate SQLite 存储的 schema 定义与版本化迁移。
 //!
-//! 全部 9 张表：`runs`、`execution_nodes`、`steps`、`messages`、
+//! 全部 11 张表：`runs`、`execution_nodes`、`steps`、`messages`、
 //! `prompt_snapshots`、`audit_log`、`trace_events`、`pending_questions`
-//! （v3）、`credentials`（v4）。
+//! （v3）、`credentials`（v4）、`attachments`（v5）、`transcript_entries`
+//! （v5）。
 //!
 //! 迁移机制（见 [`crate::store::SqliteStore::run_migrations`]）：
 //! - 以 `PRAGMA user_version` 记录当前 schema 版本，目标版本为
@@ -11,7 +12,10 @@
 //!   崩溃后重跑不会出现半迁移状态；
 //! - v0 兼容存量库（无版本号的旧库）与全新库：DDL 全部 `IF NOT EXISTS`，
 //!   `ALTER TABLE` 前先经 `pragma_table_info` 检查列是否存在（不再依赖
-//!   错误文案字符串匹配）。
+//!   错误文案字符串匹配）；
+//! - **v4 → v5 为破坏性迁移**（用户拍板 2026-10-21，软件未发布开发期）：
+//!   `messages` 历史直接丢弃重建，不做数据保真复制；`runs` /
+//!   `credentials` / `pending_questions` 原样保留（API key、会话列表不丢）。
 
 use openslate_core::error::StoreError;
 use sqlx::AssertSqlSafe;
@@ -28,11 +32,22 @@ use sqlx::{query, query_scalar, SqliteConnection};
 ///   设计 r4/r5：request_id 主键 + tool_call_id 关联悬挂调用 + TTL 状态机）。
 /// - `4`：新增 `credentials` 表（ask_user secret 持久凭据库：name 主键 +
 ///   kind env|file + target + value；见 `DDL_CREDENTIALS` 的威胁模型注释）。
-pub const SCHEMA_VERSION: i64 = 4;
+/// - `5`：存储 v5（设计 PLAN-storage-v5-multimodal）——① `messages` 整表
+///   重建：`content_json TEXT` → `content_zst BLOB NOT NULL`（zstd-3，见
+///   `crate::codec`）+ 新增 `meta_json TEXT`（per-message 元数据旁路通道）；
+///   ② `runs` 加 `input_tokens`/`output_tokens` 聚合列；③ 新表
+///   `attachments`（content-addressed 附件元数据 + `files/` 文件布局）与
+///   `transcript_entries`（转写完整性行级持久化）；④ 删除非唯一索引
+///   `idx_messages_run_seq`（`idx_messages_run_seq_uq` 最左前缀完全覆盖，
+///   不重建）。**破坏性**（用户拍板）：`messages` 历史随 DROP 丢弃，
+///   存量脏数据（重复 seq）一并消失，新表 `UNIQUE(run_id, seq)` 必然可建。
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 基线建表 DDL（v0 → v1 执行；全新库直接建成最终形态）。
 ///
-/// 顺序有意义：被外键引用的表必须先建。
+/// 顺序有意义：被外键引用的表必须先建。v5 的 `attachments` /
+/// `transcript_entries` 只引用 `runs`，追加在基线集合尾部；全新库随后
+/// 仍会逐版本步进到 v5（步进 DDL 全部 `IF NOT EXISTS`，幂等）。
 pub fn ddl_statements() -> Vec<&'static str> {
     vec![
         DDL_RUNS,
@@ -42,20 +57,22 @@ pub fn ddl_statements() -> Vec<&'static str> {
         DDL_PROMPT_SNAPSHOTS,
         DDL_AUDIT_LOG,
         DDL_TRACE_EVENTS,
+        DDL_ATTACHMENTS,
+        DDL_TRANSCRIPT_ENTRIES,
     ]
 }
 
 /// 基线索引 DDL（v0 → v1 执行），全部 `IF NOT EXISTS`，天然幂等。
 ///
 /// 注意：不含 `idx_runs_cwd`（`cwd` 是死列，v2 中清理）；
-/// `idx_messages_run_seq_uq` 属于 v2 步进。
+/// `idx_messages_run_seq_uq` 属于 v2 步进；v5 起不再有非唯一的
+/// `idx_messages_run_seq`（uq 最左前缀覆盖，见 `IDX_MESSAGES_RUN_SEQ_UQ`）。
 pub fn index_statements() -> Vec<&'static str> {
     vec![
         IDX_RUNS_STATUS,
         IDX_RUNS_STARTED_AT,
         IDX_STEPS_RUN_ID,
         IDX_MESSAGES_EXECUTION_NODE_ID,
-        IDX_MESSAGES_RUN_SEQ,
         IDX_TRACE_EVENTS_RUN_ID,
         IDX_AUDIT_LOG_RUN_ID,
     ]
@@ -114,6 +131,14 @@ CREATE TABLE IF NOT EXISTS steps (
 );
 "#;
 
+/// v5 形态的 messages 表：压缩载荷 + per-message 元数据旁路列。
+///
+/// - `content_zst`：`serde_json::to_string(Message)` 的 zstd(level 3)
+///   压缩字节（见 [`crate::codec`]）。v4 及以前是 `content_json TEXT`，
+///   v4→v5 迁移**整表重建**（破坏性，历史丢弃），不存在双列并存形态。
+/// - `meta_json`：`Option<MessageMeta>` 的 serde JSON（assistant 消息的
+///   usage / finish_reason / latency / model id）。user/tool 行为 NULL，
+///   单列 NULL 语义干净（元数据不进 content envelope，读端零翻倍）。
 const DDL_MESSAGES: &str = r#"
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
@@ -121,7 +146,8 @@ CREATE TABLE IF NOT EXISTS messages (
     execution_node_id TEXT NOT NULL,
     agent_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('system','user','assistant','tool')),
-    content_json TEXT NOT NULL,
+    content_zst BLOB NOT NULL,
+    meta_json TEXT,
     seq INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     FOREIGN KEY(run_id) REFERENCES runs(id),
@@ -222,6 +248,50 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 "#;
 
+/// 附件元数据（v5；设计 §3.1）。字节进文件系统（content-addressed：
+/// `{db 父目录}/files/{sha256}.{ext}`，跨 run 按 sha 复用、天然去重），
+/// DB 只存引用。
+///
+/// - `run_id` 可空：用户在 composer 选图时 run 可能尚未创建；Submit 时
+///   由 mobile 层批量绑定（`bind_attachments`）。SQLite FK 对 NULL 父值
+///   放行。
+/// - `UNIQUE(run_id, sha256)`：run 内去重；跨 run 复用靠相同 sha256 指向
+///   同一文件。
+/// - ingest（mime 嗅探/归一化/写文件）在 openslate-mobile，store 只管
+///   行与文件生命周期（`insert_attachment` / `delete_run` GC / 启动暂存
+///   清扫）。
+const DDL_ATTACHMENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    run_id TEXT,
+    sha256 TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    filename TEXT,
+    size_bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(run_id, sha256),
+    FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+"#;
+
+/// 转写条目（v5；设计 §4）。一行一条 `EntryDto`（serde JSON 透传，store
+/// 不解析）；`entry_json` 不压缩（单条几百字节，压缩负收益）。
+///
+/// 与 `steps` 的语义边界：steps 是执行步骤；Approval/Delegate/StepBreak/
+/// Meta 不是执行步骤，复用即语义盗用。行级写入天然增量，"回合中途崩溃"
+/// 也不丢整回合 UI 条目（Approval 恰好多发生在回合中）。重建逻辑
+/// （mobile 层）优先读本表，空则回退 message 投影。
+const DDL_TRANSCRIPT_ENTRIES: &str = r#"
+CREATE TABLE IF NOT EXISTS transcript_entries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    entry_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+"#;
+
 // ---------------------------------------------------------------------------
 // v0 → v1：存量库补列用的 ALTER（先经 pragma_table_info 检查列存在）
 // ---------------------------------------------------------------------------
@@ -267,8 +337,10 @@ const IDX_MESSAGES_EXECUTION_NODE_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_messages_execution_node_id ON messages(execution_node_id)";
 
 /// 按 seq 加载一个 run 的完整会话（`list_messages_by_run` —— resume 路径）。
-const IDX_MESSAGES_RUN_SEQ: &str =
-    "CREATE INDEX IF NOT EXISTS idx_messages_run_seq ON messages(run_id, seq)";
+///
+/// v5 起此**非唯一**索引不再存在：`idx_messages_run_seq_uq` 最左前缀
+/// `(run_id, seq)` 完全覆盖其查询计划，v4→v5 随 `DROP TABLE messages`
+/// 一并消失且不重建。
 
 /// `messages(run_id, seq)` 唯一索引（v2 新增）。
 ///
@@ -276,7 +348,8 @@ const IDX_MESSAGES_RUN_SEQ: &str =
 /// 历史顺序不稳定（provider 会拒绝乱序的 `tool_calls`/tool 结果对）。
 /// 存量数据若已存在重复 `seq` 导致创建失败，迁移仅告警跳过（best-effort，
 /// 不阻断迁移）；重复数据本身依赖派生主键 `msg-{run_id}-{seq}` 的写入端
-/// 约定兜底。
+/// 约定兜底。v5 的破坏性迁移 DROP 整表后重建，新表从零开始，唯一索引
+/// 必然可建。
 const IDX_MESSAGES_RUN_SEQ_UQ: &str =
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_run_seq_uq ON messages(run_id, seq)";
 
@@ -294,12 +367,23 @@ const IDX_AUDIT_LOG_RUN_ID: &str =
 const IDX_PENDING_QUESTIONS_STATUS: &str =
     "CREATE INDEX IF NOT EXISTS idx_pending_questions_status ON pending_questions(status)";
 
+/// 附件按内容寻址定位（v5）：`delete_run` / 启动 GC 的孤儿文件判定做
+/// 行级 `SELECT 1 FROM attachments WHERE sha256 = ?`，走本索引。
+const IDX_ATTACHMENTS_SHA256: &str =
+    "CREATE INDEX IF NOT EXISTS idx_attachments_sha256 ON attachments(sha256)";
+
+/// 转写条目按 (run_id, seq) 唯一定序（v5）。UNIQUE：seq 由 mobile 层
+/// 的收口 helper 按 recorder 同款 AtomicI64 模式分配，行级顺序即转写
+/// 顺序。
+const IDX_TRANSCRIPT_RUN_SEQ: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_run_seq ON transcript_entries(run_id, seq)";
+
 // ---------------------------------------------------------------------------
 // 常量：测试校验用
 // ---------------------------------------------------------------------------
 
-/// 期望的表名（建表顺序）。含 v3 的 `pending_questions` 与 v4 的
-/// `credentials`。
+/// 期望的表名（建表顺序）。含 v3 的 `pending_questions`、v4 的
+/// `credentials`、v5 的 `attachments` 与 `transcript_entries`。
 pub const TABLE_NAMES: &[&str] = &[
     "runs",
     "execution_nodes",
@@ -310,19 +394,24 @@ pub const TABLE_NAMES: &[&str] = &[
     "trace_events",
     "pending_questions",
     "credentials",
+    "attachments",
+    "transcript_entries",
 ];
 
-/// 期望的索引名（测试校验用）。含 v2 的唯一索引与 v3 的问卷状态索引。
+/// 期望的索引名（测试校验用）。含 v2 的唯一索引、v3 的问卷状态索引、
+/// v5 的两个新索引；**不含** `idx_messages_run_seq`（v5 起随表重建消亡，
+/// uq 最左前缀覆盖）。
 pub const INDEX_NAMES: &[&str] = &[
     "idx_runs_status",
     "idx_runs_started_at",
     "idx_steps_run_id",
     "idx_messages_execution_node_id",
-    "idx_messages_run_seq",
     "idx_messages_run_seq_uq",
     "idx_trace_events_run_id",
     "idx_audit_log_run_id",
     "idx_pending_questions_status",
+    "idx_attachments_sha256",
+    "idx_transcript_run_seq",
 ];
 
 // ---------------------------------------------------------------------------
@@ -448,6 +537,81 @@ pub(crate) async fn migrate_v3_to_v4(conn: &mut SqliteConnection) -> Result<(), 
         .execute(&mut *conn)
         .await
         .map_err(merr)?;
+    Ok(())
+}
+
+/// v4 → v5：**破坏性**迁移（用户拍板 2026-10-21，见模块文档）。单事务内：
+///
+/// 1. `DROP TABLE IF EXISTS messages`（连带其全部索引，含非唯一的
+///    `idx_messages_run_seq`；旧消息历史丢弃，存量脏数据一并消失）；
+/// 2. 以最终 DDL 重建 `messages`（`content_zst BLOB NOT NULL` +
+///    `meta_json TEXT`；无任何表 FK 引用 messages，重建无级联风险，
+///    亦无需临时表 + RENAME）；
+/// 3. 建 messages 两个索引（uq + execution_node_id）；
+/// 4. `runs` 加 `input_tokens` / `output_tokens` 聚合列（column_exists
+///    守卫，幂等；存量 run 无 meta → 保持默认 0，不回填）；
+/// 5. `attachments` / `transcript_entries` 建表建索引（IF NOT EXISTS）。
+///
+/// `PRAGMA user_version = 5` 由 `run_migrations` 驱动器在本事务内写入；
+/// 步进事务提交后驱动器做一次 `wal_checkpoint(TRUNCATE)` 回收 WAL
+/// （迁移 O(1) DDL，无数据复制耗时风险）。
+pub(crate) async fn migrate_v4_to_v5(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
+
+    // 1. 破坏性 DROP（历史丢弃，用户已授权）
+    query("DROP TABLE IF EXISTS messages")
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+
+    // 2. 以最终 DDL 重建（IF NOT EXISTS：全新库路径若基线已建成同形态则跳过）
+    query(DDL_MESSAGES)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+
+    // 3. messages 索引
+    query(IDX_MESSAGES_RUN_SEQ_UQ)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_MESSAGES_EXECUTION_NODE_ID)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+
+    // 4. runs 聚合列（幂等守卫）
+    if !column_exists(conn, "runs", "input_tokens").await? {
+        query("ALTER TABLE runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0")
+            .execute(&mut *conn)
+            .await
+            .map_err(merr)?;
+    }
+    if !column_exists(conn, "runs", "output_tokens").await? {
+        query("ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0")
+            .execute(&mut *conn)
+            .await
+            .map_err(merr)?;
+    }
+
+    // 5. 新表 + 索引（IF NOT EXISTS，幂等）
+    query(DDL_ATTACHMENTS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_ATTACHMENTS_SHA256)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(DDL_TRANSCRIPT_ENTRIES)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_TRANSCRIPT_RUN_SEQ)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+
     Ok(())
 }
 

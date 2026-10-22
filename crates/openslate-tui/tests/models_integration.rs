@@ -78,6 +78,7 @@ async fn fixture_app() -> (App, Arc<MemLink>) {
             proto: 1,
             session_id: "models-test".into(),
             session_label: "models test".into(),
+            run_id: None,
             transcript: vec![],
             running: false,
             depth_cur: 0,

@@ -37,7 +37,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -66,6 +65,7 @@ import dev.openslate.mobile.R
 import dev.openslate.mobile.bridge.ConfigUi
 import dev.openslate.mobile.bridge.ModelUi
 import dev.openslate.mobile.bridge.RuntimeBridge
+import dev.openslate.mobile.bridge.TermuxDiagnostics
 
 /**
  * 输入框聚焦面板：点击聚焦输入框（进入编辑状态）时，从 composer 上方
@@ -80,8 +80,12 @@ import dev.openslate.mobile.bridge.RuntimeBridge
  * - 首行 Termux 状态区可点击：在面板内展开/收起 MCP 五灯子面板
  *   （McpLightsTracker → probeMcpLights 探测 + 共享映射 mcpLightRow
  *   渲染，与设置页 MCP 区同一口径：五项独立判定成败、失败时机与
- *   「打开 Termux」时机同源；展开瞬间 refresh，ON_RESUME 且展开时
- *   再检）。右缘 MCP / tools 计数保留原状、不参与点击。
+ *   「打开 Termux」时机同源；展开时走 gateRefresh 智能门控（无快照/
+ *   非全绿 → 全量重检含自动拉起 host，全绿 → 廉价探活比对），ON_RESUME
+ *   门控由 ChatScreen 全局观察承担——从 Termux 切回即触发重检，不要求
+ *   面板展开）。首行 Termux 文案/颜色本身也由五灯快照推导（与设置页
+ *   同口径，host 拉起期间显示「MCP host 启动中…」过渡态）。右缘
+ *   MCP / tools 计数保留原状、不参与点击。
  * - 未聚焦时 AnimatedVisibility 不参与组合，高度/间距零变化（硬性要求）。
  *
  * 生命周期：
@@ -93,9 +97,13 @@ import dev.openslate.mobile.bridge.RuntimeBridge
  *   聚焦先显示上次快照、后台静默刷新，避免每次聚焦闪加载态。
  *
  * 数据口径：
- * - Termux/MCP 活性：[ComposerMcpStatusTracker] 状态流（host 活性探测 +
- *   下游 server 连接数）。MCP 数 = **正常连接着的下游 server 数**——不是
- *   注册总数、不是工具总数；工具计数显示已移除（卡片精简）。
+ * - 首行 Termux 活性：[McpLightsTracker] 五灯快照（[McpLightsUiState]，
+ *   与设置页 MCP 区同一探测管线/同门控）经 [termuxLiveStatus] 推导——
+ *   host 探活通过即「Termux 运行中」，自动拉起期间显示「MCP host 启动
+ *   中…」过渡态，卡点按五灯终态分流。
+ * - MCP/tools 计数与 server 名单：[ComposerMcpStatusTracker] 状态流
+ *   （host 活性探测 + 下游 server 连接数 + Agent 工具计数）。MCP 数 =
+ *   **正常连接着的下游 server 数**——不是注册总数、不是工具总数。
  * - 常驻状态：未聚焦时输入框内部下方一行（模型名 · effort 档 · Termux/MCP
  *   状态）；聚焦展开后同源信息移交卡片首行，模型名/effort 档经
  *   sharedBounds 做「输入框 → 卡片」的位移动画（key composer.model /
@@ -136,8 +144,11 @@ internal fun ComposerFocusPanel(
 ) {
     val context = LocalContext.current
     // Termux/MCP 活性快照（tracker 持有状态流；未聚焦时输入框常驻状态行
-    // 也消费同源数据，见 ChatScreen）。
+    // 也消费同源数据，见 ChatScreen）。live 只供 MCP/tools 计数与 server
+    // 名单；首行 Termux 状态文案/颜色由五灯快照（lights，与设置页 MCP 区
+    // 同一口径）推导，见 termuxLiveStatus。
     val live by ComposerMcpStatusTracker.state.collectAsState()
+    val lights by McpLightsTracker.state.collectAsState()
     // 聚焦展开刷新一次：上次快照立即上屏（无空白窗），探测结果异步回灌。
     LaunchedEffect(visible) {
         if (visible) ComposerMcpStatusTracker.refresh(context)
@@ -169,7 +180,7 @@ internal fun ComposerFocusPanel(
                         // 探测结果回灌（计数/名单变化）时高度过渡平滑化。
                         .animateContentSize(),
                 ) {
-                    val (termuxText, termuxColor) = termuxLiveStatus(live)
+                    val (termuxText, termuxColor) = termuxLiveStatus(lights)
                     // ── 首行：Termux 连接状态（排首位）+ 右缘 MCP 连接数 ──
                     // MCP 数 = 正常连接着的下游 server 数（host 活着才有值；
                     // 死亡/未知显示 —）。工具计数已删（卡片精简）。
@@ -271,27 +282,17 @@ internal fun ComposerFocusPanel(
                     // 折叠语言对齐 ToolNameTemplateSection（expandVertically +
                     // 200ms 淡入淡出）。数据 = McpLightsTracker（与设置页 MCP
                     // 区同一探测管线 probeMcpLights、同一五灯映射 mcpLightRow
-                    // ——五项独立判定成败）；展开瞬间 refresh 一次，从 Termux
-                    // 切回（ON_RESUME）时若面板展开再 refresh——手动打开
-                    // Termux 唤醒后返回即见重检结果，无需收起重开。不再触发
+                    // ——五项独立判定成败）；展开时走 gateRefresh（无快照/非
+                    // 全绿→全量重检含自动拉起 host、全绿→廉价 hostAlive 比对，
+                    // 与设置页同款门控）；ON_RESUME 门控已上移 ChatScreen 全局
+                    // 观察（从 Termux 切回即触发，不再要求面板展开）。不再触发
                     // TermuxStallTracker（onTermuxConnectionRestored 回归停滞
                     // 面板专属语义）。五行全显（checked→终态、当前步骤→进行
-                    // 中、其余→待检测），高度有界，小屏与 IME 共存无需滚动。
-                    val lights by McpLightsTracker.state.collectAsState()
+                    // 中、其余→待检测；hostAlive 拉起窗口显示「MCP host 启动
+                    // 中…」过渡态），高度有界，小屏与 IME 共存无需滚动。
                     val mcpActions = remember(context) { standardMcpLightActions(context) }
                     LaunchedEffect(termuxExpanded) {
-                        if (termuxExpanded) McpLightsTracker.refresh(context)
-                    }
-                    @Suppress("DEPRECATION") // 非 deprecated 替代在 lifecycle-runtime-compose（非本项目依赖），与设置页 McpSection 同款用法
-                    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
-                    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
-                        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
-                            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && termuxExpanded) {
-                                McpLightsTracker.refresh(context)
-                            }
-                        }
-                        lifecycleOwner.lifecycle.addObserver(obs)
-                        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+                        if (termuxExpanded) McpLightsTracker.gateRefresh(context)
                     }
                     AnimatedVisibility(
                         visible = termuxExpanded,
@@ -303,7 +304,7 @@ internal fun ComposerFocusPanel(
                                 for (key in MCP_LIGHT_KEYS) {
                                     mcpLightRow(
                                         key = key,
-                                        result = lights ?: McpLightsResult(),
+                                        result = lights.result ?: McpLightsResult(),
                                         displayDetails = true,
                                         actions = mcpActions,
                                     )?.let { add(it) }
@@ -391,14 +392,54 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> =
 internal fun resolvedCurrentModel(modelAlias: String, config: ConfigUi): ModelUi? =
     config.models.firstOrNull { it.entry == RuntimeBridge.modelEntryOf(modelAlias, config) }
 
-/** Termux/MCP 活性 → 首行文案 + 语义色（面板首行与输入框状态点共用）。
- *  优先级：探测中 > 已连接 > 未连接 > 未探测。 */
+/** 首行 Termux 状态文案 + 语义色（面板首行与输入框状态点共用）：由五灯
+ *  快照（[McpLightsTracker] → [McpLightsUiState]）推导——与设置页 MCP 区
+ *  同一口径。自上而下取首个命中：host 探活通过即「Termux 运行中」；host
+ *  自动拉起期间（restartingHost）显示「MCP host 启动中…」过渡态而非把
+ *  host 未起误报成 Termux 未运行；host 探活未过的具体卡点（未安装/无
+ *  权限/通道未放行/host 未装）按五灯终态如实分流；部分完成无结论时按
+ *  probing 显示「检测中…/未检测」。 */
 @Composable
-internal fun termuxLiveStatus(s: McpLiveSnapshot): Pair<String, Color> = when {
-    s.probing -> "检测中…" to MaterialTheme.colorScheme.outline
-    s.hostAlive == true -> "Termux 运行中" to MaterialTheme.colorScheme.secondary
-    s.hostAlive == false -> "Termux 未连接" to MaterialTheme.colorScheme.error
-    else -> "未检测" to MaterialTheme.colorScheme.outline
+internal fun termuxLiveStatus(lights: McpLightsUiState): Pair<String, Color> {
+    val res = lights.result
+    return when {
+        res == null -> if (lights.probing) {
+            "检测中…" to MaterialTheme.colorScheme.outline
+        } else {
+            "未检测" to MaterialTheme.colorScheme.outline
+        }
+        "hostAlive" in res.checked && res.hostAlive ->
+            "Termux 运行中" to MaterialTheme.colorScheme.secondary
+        res.restartingHost ->
+            "MCP host 启动中…" to MaterialTheme.colorScheme.secondary
+        "termuxInstalled" in res.checked && !res.installed ->
+            "Termux 未安装" to MaterialTheme.colorScheme.error
+        "termuxPerm" in res.checked && !res.perm ->
+            "Termux 权限未授予" to MaterialTheme.colorScheme.error
+        "termuxAllowed" in res.checked && !res.allowed ->
+            // NoResponse = Termux 本体没起来；其余（PolicyRejected 等）=
+            // 通道配置问题，文案分流不误导。
+            if (res.channel is TermuxDiagnostics.ChannelResult.NoResponse) {
+                "Termux 未运行" to MaterialTheme.colorScheme.error
+            } else {
+                "Termux 通道未放行" to MaterialTheme.colorScheme.error
+            }
+        "hostInstalled" in res.checked && !res.hostInstalled ->
+            "MCP host 未安装" to MaterialTheme.colorScheme.error
+        "hostAlive" in res.checked && !res.hostAlive ->
+            // restartedHost=true = 本轮已尝试拉起仍无应答 → 如实未运行；
+            // 否则拉起尚未发生（如用户操作在途的门控轮），按启动中显示。
+            if (res.restartedHost) {
+                "MCP host 未运行" to MaterialTheme.colorScheme.error
+            } else {
+                "MCP host 启动中…" to MaterialTheme.colorScheme.secondary
+            }
+        else -> if (lights.probing) {
+            "检测中…" to MaterialTheme.colorScheme.outline
+        } else {
+            "未检测" to MaterialTheme.colorScheme.outline
+        }
+    }
 }
 
 /** 输入框内常驻状态（未聚焦显示；聚焦后同源信息在面板卡片展开）。
@@ -418,12 +459,15 @@ internal data class ComposerInlineStatus(
     val termuxColor: Color,
 )
 
-/** 常驻状态组装（ChatScreen 组合期调用；与面板卡片同源同判定）。 */
+/** 常驻状态组装（ChatScreen 组合期调用；与面板卡片同源同判定）。
+ *  Termux 状态文案/颜色由五灯快照（lights，与设置页 MCP 区同口径）经
+ *  [termuxLiveStatus] 推导；live 保留供 MCP/tools 计数。 */
 @Composable
 internal fun composerInlineStatus(
     modelAlias: String,
     config: ConfigUi,
     live: McpLiveSnapshot,
+    lights: McpLightsUiState,
 ): ComposerInlineStatus {
     val model = resolvedCurrentModel(modelAlias, config)
     val effortLabel = model?.let { m ->
@@ -434,7 +478,7 @@ internal fun composerInlineStatus(
                 ?: "默认"
         }
     }
-    val (termuxText, termuxColor) = termuxLiveStatus(live)
+    val (termuxText, termuxColor) = termuxLiveStatus(lights)
     val modelDisplay = when {
         config.models.isEmpty() -> "未配置模型"
         modelAlias.isEmpty() -> "未设置"

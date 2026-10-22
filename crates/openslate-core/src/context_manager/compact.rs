@@ -86,6 +86,7 @@ where
     });
 
     let summary_msg = Message {
+        attachments: None,
         role: MessageRole::System,
         content: format!("{}{}{}", SUMMARY_PREFIX, summary, SUMMARY_SUFFIX),
         tool_call_id: None,
@@ -168,6 +169,7 @@ mod tests {
             .flat_map(|i| {
                 vec![
                     Message {
+                        attachments: None,
                         role: MessageRole::User,
                         content: format!("user msg {}", i),
                         tool_call_id: None,
@@ -176,6 +178,7 @@ mod tests {
                         reasoning_content: None,
                     },
                     Message {
+                        attachments: None,
                         role: MessageRole::Assistant,
                         content: format!("assistant msg {}", i),
                         tool_call_id: None,
@@ -259,6 +262,7 @@ mod tests {
     #[test]
     fn needs_compact_returns_true_near_byte_limit() {
         let msgs = vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: "a".repeat(900),
             tool_call_id: None,
@@ -302,6 +306,7 @@ mod tests {
     async fn compact_respects_byte_limit() {
         let mut msgs: Vec<Message> = (0..20)
             .map(|i| Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: format!("message {} with some padding text here", i),
                 tool_call_id: None,
@@ -359,6 +364,7 @@ mod tests {
         let big = "x".repeat(300);
         let mut msgs = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "old one".to_owned(),
                 tool_call_id: None,
@@ -367,6 +373,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "old two".to_owned(),
                 tool_call_id: None,
@@ -375,6 +382,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: big,
                 tool_call_id: None,
@@ -383,6 +391,7 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "newest message".to_owned(),
                 tool_call_id: None,

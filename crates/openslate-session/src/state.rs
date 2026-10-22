@@ -20,14 +20,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use openslate_core::agent_tree::AgentTree;
+use openslate_core::approval::ApprovalRules;
 use openslate_core::config::{AgentsConfig, LimitsConfig, OpenSlateConfig};
 use openslate_core::provider::ModelProvider;
 use openslate_core::run_manager::RunManager;
 use openslate_core::types::{Message, RunId};
 use openslate_protocol::{
-    AgentNodeDto, ApprovalSummaryDto, ConfigViewDto, EntryDto, LimitsDto, PendingApprovalDto,
-    ProviderDto, SessionStatsDto, SkillInfoDto, SnapshotDto, ToolEntryDetailDto, ToolStatusDto,
-    PROTOCOL_VERSION,
+    AgentNodeDto, ApprovalConfigViewDto, ApprovalSummaryDto, ConfigViewDto, EntryDto, LimitsDto,
+    PendingApprovalDto, ProviderDto, SessionStatsDto, SkillInfoDto, SnapshotDto, ToolEntryDetailDto,
+    ToolStatusDto, PROTOCOL_VERSION,
 };
 use openslate_store_sqlite::recorder::RunRecorder;
 use openslate_store_sqlite::store::SqliteStore;
@@ -74,6 +75,19 @@ pub struct ConfigPaths {
     pub global: Option<PathBuf>,
     /// 本地叠加配置。
     pub local: Option<PathBuf>,
+}
+
+/// 转写前置冲刷钩子（历史转写丢失修复 C1）：`NewSession` 清空内存转写
+/// 之前，宿主把未落库的尾部条目**强制**落库——回合未干净收尾（模型流
+/// 挂死后取消）时，sync_loop 推迟的 ToolCall 尾部只有此刻还有机会写库，
+/// 清了就随内存蒸发（DB 截断 → 重开只剩前缀）。
+///
+/// server / cli / tui 不注册（`None` = 无前置冲刷，行为不变）。实现自取
+/// 状态快照（mobile 侧锁序唯一方向：SyncState cursors → core），失败
+/// 只记录不传播（best-effort：冲刷失败不应挡住新建会话）。
+pub trait TranscriptFlusher: Send + Sync {
+    /// 强制冲刷当前 run 的转写尾部。future 完成即冲刷已尽最大努力。
+    fn flush(&self, state: Arc<AppState>) -> futures::future::BoxFuture<'static, ()>;
 }
 
 /// 会话当前打开的持久化 run（lazy，首个 submit 建立，/new 关闭）。
@@ -138,6 +152,11 @@ pub struct SessionCore {
     /// notice）。锁方向遵守模块头不变量：core 锁内只做非阻塞短临界
     /// 区操作（clone Arc），handler 本身由宿主在 core 锁外调用。
     questions: Mutex<Option<Arc<dyn QuestionHandler>>>,
+    /// 转写前置冲刷钩子（C1；注入点仿 questions：避免破坏各装配点的
+    /// 结构体字面量）。`None` = 未注册（server/cli/tui，行为不变）；
+    /// mobile 注册 SyncState 委托（见 mobile transcripts.rs）。锁内只
+    /// clone Arc，flush 本身由调用方在 core 锁外 await。
+    transcripts: Mutex<Option<Arc<dyn TranscriptFlusher>>>,
 }
 
 impl SessionCore {
@@ -145,6 +164,7 @@ impl SessionCore {
         Self {
             inner: Mutex::new(inner),
             questions: Mutex::new(None),
+            transcripts: Mutex::new(None),
         }
     }
 
@@ -167,6 +187,23 @@ impl SessionCore {
     fn lock_questions(
         m: &Mutex<Option<Arc<dyn QuestionHandler>>>,
     ) -> std::sync::MutexGuard<'_, Option<Arc<dyn QuestionHandler>>> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 注入转写前置冲刷钩子（C1；mobile 装配层在构造 AppState 之后
+    /// 调用，与 sync_loop 共享同一 SyncState 游标表）。
+    pub fn set_transcript_flusher(&self, flusher: Arc<dyn TranscriptFlusher>) {
+        *Self::lock_flusher(&self.transcripts) = Some(flusher);
+    }
+
+    /// 当前冲刷钩子快照（`None` = 未注册，NewSession 跳过前置冲刷）。
+    pub fn transcript_flusher(&self) -> Option<Arc<dyn TranscriptFlusher>> {
+        Self::lock_flusher(&self.transcripts).clone()
+    }
+
+    fn lock_flusher(
+        m: &Mutex<Option<Arc<dyn TranscriptFlusher>>>,
+    ) -> std::sync::MutexGuard<'_, Option<Arc<dyn TranscriptFlusher>>> {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -197,7 +234,12 @@ pub fn effective_limits(config: &OpenSlateConfig) -> LimitsConfig {
 }
 
 /// ConfigViewDto：纯函数，从 CoreInner 投影。
-pub fn build_config_view(inner: &CoreInner) -> ConfigViewDto {
+///
+/// `approval_rules`：审批生效规则快照（bridge 的 rules cell，legacy
+/// 映射后的**生效值**，非 toml 原文——oracle P1：UI 显示的必须是生效
+/// 规则）。调用方在取 core 锁**之前**快照（锁序红线：先 bridge 后
+/// core；rules cell 为叶子锁、非阻塞短临界区）。
+pub fn build_config_view(inner: &CoreInner, approval_rules: &ApprovalRules) -> ConfigViewDto {
     let providers = inner
         .config
         .providers
@@ -237,11 +279,28 @@ pub fn build_config_view(inner: &CoreInner) -> ConfigViewDto {
         active_config: inner.paths.active.display().to_string(),
         global_config: inner.paths.global.as_ref().map(|p| p.display().to_string()),
         local_config: inner.paths.local.as_ref().map(|p| p.display().to_string()),
+        // tool-approval P1b：审批生效规则视图（legacy 映射后的生效值）。
+        approval: Some(ApprovalConfigViewDto {
+            default_level: approval_rules.default_level.as_str().to_owned(),
+            tool_levels: approval_rules
+                .tools
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                .collect(),
+            server_levels: approval_rules
+                .servers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                .collect(),
+        }),
     }
 }
 
 /// SnapshotDto：纯函数投影 + 审批桥的队首待审。
 pub fn build_snapshot(inner: &CoreInner, approval: &SessionApprovalBridge) -> SnapshotDto {
+    // 规则快照先取（bridge 侧叶子锁、非阻塞短临界区——模块头允许
+    // core → bridge 的该方向；与 front_pending 同级），再投影视图。
+    let approval_rules = approval.rules_snapshot();
     let pending_approval = approval
         .front_pending()
         .map(|(id, summary)| PendingApprovalDto {
@@ -252,6 +311,9 @@ pub fn build_snapshot(inner: &CoreInner, approval: &SessionApprovalBridge) -> Sn
         proto: PROTOCOL_VERSION,
         session_id: inner.session_id.clone(),
         session_label: inner.session_label.clone(),
+        // 当前 run 键随快照下发：Kotlin 转写镜像（落盘/恢复仲裁）以事件流
+        // 内嵌的 run_id 对齐泵协程 FIFO，替换直读 FFI 的旁路竞态源。
+        run_id: inner.session_run.as_ref().map(|r| r.run_id.0.clone()),
         transcript: inner.transcript.clone(),
         running: inner.busy(),
         depth_cur: inner.depth_cur,
@@ -263,7 +325,7 @@ pub fn build_snapshot(inner: &CoreInner, approval: &SessionApprovalBridge) -> Sn
         // server 投影恒空；mobile 装配侧（emit_snapshot）按持久层
         // 回填后再下发——重启恢复回放走这条通路。
         pending_questions: Vec::new(),
-        config: build_config_view(inner),
+        config: build_config_view(inner, &approval_rules),
         session_stats: inner.stats,
     }
 }
@@ -648,6 +710,7 @@ model = "m"
 
     fn tool_msg(call_id: &str, name: &str, content: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(ToolCallId(call_id.into())),

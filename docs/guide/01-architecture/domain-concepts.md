@@ -19,7 +19,7 @@
 | MCP | `core/src/mcp.rs` | 工具供给协议（外部 + 内置） |
 | PTC | `openslate-ptc` + core 的 `run_code` | QuickJS 沙箱内程序化工具调用 |
 | Skill | `core/src/skills.rs:31` `Skill` | SKILL.md 渐进披露 |
-| Approval | `core/src/approval.rs:81` `ApprovalManager` | 工具执行闸门 |
+| Approval | `core/src/approval.rs`（`ToolApprovalLevel`/`ApprovalRules`/`ApprovalManager`） | 工具执行闸门（三级规则引擎） |
 | Session | `openslate-session/src/state.rs:93` `CoreInner` | 跨回合共享状态 |
 
 ---
@@ -174,23 +174,26 @@ impl StepKind {
 - `Skill`（:31）= name/description/body/path；`skill_name_warnings`（:130）校验名字规范性。
 - 约定格式：agentskills.io 的 SKILL.md。
 
-## Approval（审批闸门）
+## Approval（审批闸门 / 规则引擎）
 
-`core/src/approval.rs`：
+`core/src/approval.rs`（tool-approval 重构后的规则引擎语义；线格式与审批卡交互见 protocol / mobile 章）：
 
-- `ApprovalPolicy`（:17）= `Auto`（默认）/ `Manual` / `AutoExcept(Vec<String>)`（忽略大小写精确匹配）。
-- `RiskLevel`（:26）= Low / Medium / High；`assess_risk`（:131）按工具名子串启发式分级（高险指示词：bash/shell/exec/write/delete/curl/sql…；低险：read/list/grep/find/info…；未知默认 Medium；`run_code` 硬编码 High）。
-- `ApprovalManager::check`（:231）是**聚合闸门**，在每次工具执行前被咨询：policy 不需要 → Approved；需要且有 callback → `callback.decide()`；需要但无 callback → Approved（非交互透传，CLI 层负责避免到达此分支）。
-- **每个**工具调用都过它——含 `call_agent` 与 `run_code`，无绕过路径（模块头注释钉死）。
-- 审批 watchdog（runner.rs:138-145）：连续 Denied 按工具名计数，触发后中止 run。
-- 决策审计走 tracing（target `openslate_approval`），**不写 store**。
+- **三级等级** `ToolApprovalLevel`（:75）= `Manual`（每次必问，trigger=Manual）/ `Allow`（从不问，**默认值**）/ `Auto`（自动判断：启发式 `RiskLevel::Low`（纯只读）直接放行，Medium/High 进审批链，trigger=AutoRisk——mobile 装配的 AI 审查装饰器只滤 AutoRisk 请求，Manual 直通人工，P0-2）。
+- **规则集** `ApprovalRules`（:121）= `{default_level, tools: BTreeMap<工具名,等级>, servers: BTreeMap<server 作用域,等级>}`；评估序 **`tools[工具名]` > `servers[server]` > `default_level`**（`level_for` :146；精确未命中做 ASCII 大小写不敏感回退，兼容 legacy AutoExcept 语义）。`servers` 键 = 审批作用域标识（聚合形态 = 下游 slug、host 内置裸名 = host 前缀），由 `mcp::server_slug_of`（mcp.rs:217，权威反解）产出。
+- **`ApprovalManager::check(name, server, args, agent_id)`**（:506）是**聚合闸门**，每次工具执行前被咨询（runner.rs `ToolExecutor::execute` 顶部唯一闸口：registry namespace 经 `server_slug_of` 反解注入 server 作用域）：等级评估 → 不需要 → Approved；需要且有 callback → `callback.decide()`（同步阻塞）；需要但无 callback → Approved（非交互直通，CLI `NonInteractiveGate` 依赖该语义）。**每个**工具调用都过它——含 `call_agent` 与 `run_code`，无绕过路径（模块头注释钉死）。
+- **热更新**：规则存 `Arc<RwLock<ApprovalRules>>`（Clone 共享同一 cell），`set_rules` / 外部 `rules_handle()` 改写对**进行中回合**的下一次 check 即生效（P0-5 红线：装配侧必须 `ApprovalManager::with_rules(bridge.rules_handle())` 注入共享 cell——重建 manager 会拿到游离 cell，热更永远到不了引擎且无编译错误）。
+- **legacy 映射（P0-4，钉死勿改）**：`ApprovalPolicy::Auto` → default=Allow；`Manual` → default=Manual；`AutoExcept(list)` → default=Allow + `tools[每项]=Manual`。`rules_from_config`（:218）是 `[approval]` 段 → 生效规则的**单一推导函数**（legacy 铺底 → `default_level` 覆盖 → `tool_levels`/`server_levels` 逐键合并；段缺省 = 纯 Allow 基线——mobile 的 Auto 默认是装配层显式 opt-in，不在这里做）。
+- `ApprovalTrigger`（:248）= Manual / AutoRisk（本次询问由谁触发）；`ApprovalRequest`（:266）携带 `server: Option<String>` / `trigger` / `note`（AI 审查理由——core 恒 None，mobile 审查装饰器回填）。
+- `RiskLevel`（:52）= Low / Medium / High；`assess_risk`（:398）按工具名子串启发式（高险：bash/shell/exec/write/delete/curl/sql…；低险：read/list/grep/find/info…；未知 Medium；`run_code` 硬编码 High——**一次审批盖住整个脚本**，沙箱内桥接调用不过闸门，Claude-Code 命令粒度惯例；会话级放行 `run_code` 亦盖全脚本）。Auto 等级下启发式是 AI 审查的**预过滤**（Low 不进审查直接放行，省一次 LLM 调用）。
+- 审批 watchdog（runner.rs）：连续 Denied 按工具名计数中止 run——**只有 deny 计数**（无「一直禁止」），放行类 choice 一律不触发。
+- 决策审计走 tracing（target `openslate_approval`），**不写 store**（AI 审查 safe 静默放行同样只进日志、不进转写；人工审批才进转写条目）。
 
 ## Session（会话）
 
 `openslate-session/src/state.rs:93` `CoreInner`（由 `SessionCore` 的 std Mutex 包着）：
 
 - 内容：`session_id`/`session_label`/`history: Vec<Message>`（真相源）/`transcript: Vec<EntryDto>`（展示镜像）/`running`/`compacting`/深度与工具计数/`model_alias`/`cancel`/`config`/`agent_tree`/`skills`/`store`/`session_run`/`manager: Option<RunManager>`（在家/引擎持有两态槽位）/`engine_task`/`paths`/`stats`/`stream`（流式缓冲）/`tool_timers`/`pending_step_meta`。
-- 生命周期：进程内一条（server 单会话；mobile 一条）；`NewSession` 清空 history/transcript、换 session_id、关旧 run 行、stats 归零。
+- 生命周期：进程内一条（server 单会话；mobile 一条）；`NewSession` 清空 history/transcript、换 session_id、关旧 run 行、stats 归零，并调 `approval.clear_session_scopes()` 清空会话作用域审批集合（`SessionApprovalBridge` 的 `allowed_tools`/`allowed_servers` 双集合——「当前会话」语义；持久化规则不随会话重置）。
 - server 与 mobile 两侧同语义——这正是 session crate 抽取的目的。
 - 锁与顺序不变量见 [../02-core/openslate-session.md](../02-core/openslate-session.md)。
 

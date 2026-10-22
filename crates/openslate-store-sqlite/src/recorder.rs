@@ -10,7 +10,7 @@
 //! - [`RunRecorder::begin`] inserts the run row (`status = "running"`) and a
 //!   root execution node upfront — the run exists in the store before any
 //!   LLM call, and every terminal path (completed / interrupted / failed)
-//!   updates it via [`RunRecorder::finish`].
+//!   updates it via [`RunRecorder::finish`] / [`RunRecorder::finish_with`].
 //! - [`RunRecorder::resume`] adopts an existing run (continuing `seq` from
 //!   `max_message_seq`), used by `run --resume <id>` and REPL `/resume`.
 //! - [`RunRecorder::load_messages`] reads a run's conversation back in `seq`
@@ -18,14 +18,46 @@
 //!   `tool_calls` pairing). A trailing assistant message with unanswered
 //!   `tool_calls` (crash between the assistant turn and its tool results) is
 //!   dropped — providers reject dangling `tool_calls`.
+//!
+//! 存储可靠性（v5 设计 §5）：消息持久化失败不再"warn 后丢弃"——
+//! [`Self::write_message_with_meta`] 先退避重试（100/250/500ms × 3），
+//! 穷尽后推入**进程内挂起队列**并 `tracing::error`；每次 append / finish
+//! 前先冲刷队列。边界：队列仅内存（进程崩溃仍丢——彻底解决需要 WAL 外
+//! journal，超出本期），UI 侧经 [`Self::pending_persisted_writes`] 感知。
+//!
+//! per-message 元数据（v5 设计 §2）：assistant 消息的 usage /
+//! finish_reason / latency / model_id 经 `meta_json` 旁路列落库（不进
+//! `Message` 本体——provider 回放路径零泄漏）。core `MessageSink` trait
+//! 的 `append_with_meta` 扩展与下方 [`RunRecorder`] 的 override 均已
+//! 接线（L2）：runtime 捕获点构造 [`MessageMeta`] 随消息交付，本 impl
+//! 转写入 `meta_json` 列。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Mutex;
 
 use openslate_core::error::StoreError;
 use openslate_core::runtime::MessageSink;
-use openslate_core::types::{Message, MessageRole, RunId};
+use openslate_core::types::{Message, MessageMeta, MessageRole, RunId};
 
 use crate::store::SqliteStore;
+
+/// append 失败的退避间隔（ms）：初始尝试 + 以下 3 次重试（设计 §5）。
+const APPEND_RETRY_BACKOFF_MS: [u64; 3] = [100, 250, 500];
+
+/// run 终态聚合（v5 设计 §2）。[`RunRecorder::finish_with`] 的入参形状；
+/// `input_tokens` / `output_tokens` 为 run 级累加（无 usage 采集时传 0）。
+#[derive(Debug, Clone)]
+pub struct RunFinal {
+    /// 小写词汇（"completed" / "interrupted" / "cancelled" / "failed"）。
+    pub status: String,
+    /// 可选 output 载荷；`None` 保持库中已有值。
+    pub output_json: Option<String>,
+    /// run 累计模型开销（USD）；未配置定价传 `0.0`。
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
 
 /// Per-step persistence sink + run lifecycle recorder (see module docs).
 pub struct RunRecorder {
@@ -47,6 +79,9 @@ pub struct RunRecorder {
     /// 时才由首次 [`write_message`](Self::write_message) 激活为 running。
     /// `begin()` 创建即已 running，初始为 true。
     activated: AtomicBool,
+    /// 挂起队列（设计 §5）：重试穷尽后的 `(Message, Option<MessageMeta>)`
+    /// 兜底，下一次 append / finish 前冲刷。仅进程内——崩溃仍丢。
+    pending: Mutex<VecDeque<(Message, Option<MessageMeta>)>>,
 }
 
 fn now_ms() -> i64 {
@@ -104,6 +139,7 @@ impl RunRecorder {
             agent_id: root_agent_id.to_owned(),
             last_seq: AtomicI64::new(0),
             activated: AtomicBool::new(true),
+            pending: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -151,6 +187,7 @@ impl RunRecorder {
             agent_id: run.root_agent_id,
             last_seq: AtomicI64::new(last_seq),
             activated: AtomicBool::new(false),
+            pending: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -159,13 +196,67 @@ impl RunRecorder {
         &self.run_id
     }
 
-    /// Persist one message with the next `seq`. Fallible twin of the
-    /// [`MessageSink::append`] impl — callers that want to surface errors
-    /// (e.g. writing the initial user message) use this directly.
+    /// Persist one message (with optional per-message metadata) with the next
+    /// `seq`, applying the v5 reliability policy (设计 §5):
+    ///
+    /// 1. 先冲刷挂起队列（前序失败的消息优先补写，保持顺序）；
+    /// 2. 单次尝试失败 → 退避重试（100/250/500ms × 3）；
+    /// 3. 穷尽 → `(Message, meta)` 推入进程内挂起队列 + `tracing::error`，
+    ///    同时把最后的错误返回给调用方（sink 侧吞掉；fallible 调用方
+    ///    可上浮——入队保证稍后仍会补写，不会丢）。
+    ///
+    /// meta 语义：`Some(&MessageMeta)` 仅 assistant 消息（usage /
+    /// finish_reason / latency / model_id → `meta_json` 列）；ask_user /
+    /// 初始 user 消息等无 meta 写入点传 `None`。
     ///
     /// resume 过的 recorder 在首次写入时把 run 置回 `running`
-    /// （一次性，`AtomicBool` 去重，避免每条消息都发 UPDATE）。
+    /// （一次性，`AtomicBool` 去重）。
+    pub async fn write_message_with_meta(
+        &self,
+        message: &Message,
+        meta: Option<&MessageMeta>,
+    ) -> Result<(), StoreError> {
+        self.flush_pending().await;
+        match self.persist_with_retry(message, meta).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Ok(mut queue) = self.pending.lock() {
+                    queue.push_back((message.clone(), meta.cloned()));
+                }
+                tracing::error!(
+                    target: "openslate_store",
+                    "run {}: message persist failed after {} retries, queued for later flush \
+                     (pending={}): {}",
+                    self.run_id.0,
+                    APPEND_RETRY_BACKOFF_MS.len(),
+                    self.pending_persisted_writes(),
+                    e
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Persist one message without metadata — delegates to
+    /// [`Self::write_message_with_meta`] with `meta = None`（兼容全部既有
+    /// 调用方：CLI 初始 user 消息、ask_user 补写等）。
     pub async fn write_message(&self, message: &Message) -> Result<(), StoreError> {
+        self.write_message_with_meta(message, None).await
+    }
+
+    /// 挂起队列长度（UI 上报通道：>0 时 mobile 层发"存储写入失败，历史
+    /// 可能不完整"横幅，设计 §5）。
+    pub fn pending_persisted_writes(&self) -> usize {
+        self.pending.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// 单次持久化尝试：serde → zstd 压缩 → insert。seq 每次尝试重新分配
+    /// （失败尝试烧掉的 seq 留下空洞，无害——单调唯一即可）。
+    async fn persist_once(
+        &self,
+        message: &Message,
+        meta: Option<&MessageMeta>,
+    ) -> Result<(), StoreError> {
         if !self.activated.swap(true, Ordering::SeqCst) {
             self.store
                 .activate_run(&self.run_id.0)
@@ -174,6 +265,14 @@ impl RunRecorder {
         let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let content_json = serde_json::to_string(message)
             .map_err(|e| StoreError::WriteError(format!("message encode failed: {e}")))?;
+        let content_zst = crate::codec::encode_content(&content_json);
+        let meta_json = match meta {
+            Some(m) => Some(
+                serde_json::to_string(m)
+                    .map_err(|e| StoreError::WriteError(format!("message meta encode failed: {e}")))?,
+            ),
+            None => None,
+        };
         let id = format!("msg-{}-{seq}", self.run_id.0);
         self.store
             .insert_message(
@@ -182,50 +281,142 @@ impl RunRecorder {
                 &self.execution_node_id,
                 Some(&self.agent_id),
                 role_str(&message.role),
-                &content_json,
+                &content_zst,
+                meta_json.as_deref(),
                 seq,
                 now_ms(),
             )
             .await
     }
 
-    /// Record the run's terminal state (status / optional output payload /
-    /// finish timestamp / accumulated cost in USD) —— 四项在**单事务**内
-    /// 落库，避免"已 completed 但成本缺失"的半状态。`status` uses the
-    /// store's lowercase vocabulary ("completed", "interrupted",
-    /// "cancelled", "failed"). `cost_usd` is the run's model spend (P2-3);
-    /// pass `0.0` when no pricing is configured. `output_json` 为 `None`
-    /// 时保持原值。
+    /// 初始尝试 + 3 次退避重试；每次失败 warn（含下一次间隔）。
+    async fn persist_with_retry(
+        &self,
+        message: &Message,
+        meta: Option<&MessageMeta>,
+    ) -> Result<(), StoreError> {
+        let mut attempt = 0usize;
+        loop {
+            match self.persist_once(message, meta).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let Some(&delay) = APPEND_RETRY_BACKOFF_MS.get(attempt) else {
+                        return Err(e);
+                    };
+                    attempt += 1;
+                    tracing::warn!(
+                        target: "openslate_store",
+                        "run {}: message persist attempt failed ({}), retrying in {delay}ms",
+                        self.run_id.0,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+
+    /// 冲刷挂起队列：逐条（队首优先，保持顺序）重试补写；某条再次穷尽
+    /// 则保留队列原样并停止（当前消息走自己的重试路径）。锁只在取队首
+    /// / 弹出时短暂持有，绝不跨 await。
+    async fn flush_pending(&self) {
+        loop {
+            let front = match self.pending.lock() {
+                Ok(queue) => match queue.front() {
+                    Some((message, meta)) => Some((message.clone(), meta.clone())),
+                    None => None,
+                },
+                Err(_) => return, // 锁中毒：放弃本次冲刷（下次再试）
+            };
+            let Some((message, meta)) = front else {
+                return;
+            };
+            match self.persist_with_retry(&message, meta.as_ref()).await {
+                Ok(()) => {
+                    let _ = self
+                        .pending
+                        .lock()
+                        .map(|mut queue| queue.pop_front());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "openslate_store",
+                        "run {}: pending message flush failed again, kept queued: {}",
+                        self.run_id.0,
+                        e
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Record the run's terminal state（v5 形态）：`RunFinal` 全字段
+    /// （status / output / finished_at / cost / token 聚合）在**单事务**
+    /// 内落库；写入前先冲刷挂起队列。见 [`RunFinal`]。
+    pub async fn finish_with(&self, final_state: RunFinal) -> Result<(), StoreError> {
+        self.flush_pending().await;
+        self.store
+            .finish_run(
+                &self.run_id.0,
+                &final_state.status,
+                final_state.output_json.as_deref(),
+                now_ms(),
+                final_state.cost_usd,
+                final_state.input_tokens,
+                final_state.output_tokens,
+            )
+            .await
+    }
+
+    /// Record the run's terminal state（旧签名兼容包装）：委托
+    /// [`Self::finish_with`]，token 聚合记 0（存量调用方——run_manager /
+    /// session / mobile——编译不动；迁移到 `RunFinal` 归 L2/L4）。
+    ///
+    /// status / output / finished_at / cost 四项仍单事务落库；
+    /// `output_json` 为 `None` 时保持原值。
     pub async fn finish(
         &self,
         status: &str,
         output_json: Option<&str>,
         cost_usd: f64,
     ) -> Result<(), StoreError> {
-        self.store
-            .finish_run(&self.run_id.0, status, output_json, now_ms(), cost_usd)
-            .await
+        self.finish_with(RunFinal {
+            status: status.to_owned(),
+            output_json: output_json.map(str::to_owned),
+            cost_usd,
+            input_tokens: 0,
+            output_tokens: 0,
+        })
+        .await
     }
 
     /// Load a run's persisted conversation in `seq` order, decoded back into
     /// core [`Message`]s. A trailing assistant message whose `tool_calls`
     /// have no tool results yet (crash mid-step) is dropped: providers
     /// reject dangling `tool_calls`, and the model simply re-decides.
+    ///
+    /// 丢弃动作显性化（设计 §5）：`tracing::warn` 携带 run_id 与被丢弃
+    /// 消息的 id（`msg-{run}-{seq}` 定位）。
     pub async fn load_messages(
         store: &SqliteStore,
         run_id: &str,
     ) -> Result<Vec<Message>, StoreError> {
-        let mut messages = Self::load_messages_keep_dangling(store, run_id).await?;
+        let records = store.list_messages_by_run(run_id).await?;
+        let trailing_id = records.last().map(|r| r.id.clone());
+        let mut messages = Self::decode_records(records)?;
+
         if matches!(
             messages.last(),
             Some(m) if m.role == MessageRole::Assistant
                 && m.tool_calls.as_ref().is_some_and(|tcs| !tcs.is_empty())
         ) {
             messages.pop();
-            tracing::info!(
+            tracing::warn!(
                 target: "openslate_store",
-                "run {run_id}: dropped trailing assistant message with unanswered \
-                 tool_calls (crash mid-step); the model will re-decide"
+                "run {run_id}: dropped trailing assistant message '{}' with unanswered \
+                 tool_calls (crash mid-step); the model will re-decide",
+                trailing_id.as_deref().unwrap_or("<unknown>")
             );
         }
         Ok(messages)
@@ -244,32 +435,41 @@ impl RunRecorder {
         run_id: &str,
     ) -> Result<Vec<Message>, StoreError> {
         let records = store.list_messages_by_run(run_id).await?;
-        let mut messages = Vec::with_capacity(records.len());
-        for record in records {
-            let message: Message = serde_json::from_str(&record.content_json).map_err(|e| {
-                StoreError::QueryError(format!(
-                    "run '{}' message '{}' failed to decode: {e}",
-                    record.run_id, record.id
-                ))
-            })?;
-            messages.push(message);
-        }
-        Ok(messages)
+        Self::decode_records(records)
+    }
+
+    /// 压缩记录 → core Message（解压在 query 侧完成，这里只做 JSON
+    /// 反序列化；失败报带消息 id 的错误）。
+    fn decode_records(
+        records: Vec<crate::query::MessageRecord>,
+    ) -> Result<Vec<Message>, StoreError> {
+        records
+            .into_iter()
+            .map(|record| {
+                serde_json::from_str(&record.content_json).map_err(|e| {
+                    StoreError::QueryError(format!(
+                        "run '{}' message '{}' failed to decode: {e}",
+                        record.run_id, record.id
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
 #[async_trait::async_trait]
 impl MessageSink for RunRecorder {
     async fn append(&self, message: &Message) {
-        // Persistence must never kill the run: warn and continue.
-        if let Err(e) = self.write_message(message).await {
-            tracing::warn!(
-                target: "openslate_store",
-                "failed to persist message for run {}: {}",
-                self.run_id.0,
-                e
-            );
-        }
+        // Persistence must never kill the run. write_message_with_meta 已做
+        // 重试 + 入队 + error 记录；这里仅吞掉返回值。
+        let _ = self.write_message_with_meta(message, None).await;
+    }
+
+    /// v5 §2 旁路通道接线（L2）：assistant 消息的采集元数据经
+    /// `meta_json` 列落库。吞错风格与 [`Self::append`] 一致——
+    /// 持久化失败绝不向 runtime 传播（重试/入队已在底层处理）。
+    async fn append_with_meta(&self, message: &Message, meta: &MessageMeta) {
+        let _ = self.write_message_with_meta(message, Some(meta)).await;
     }
 }
 
@@ -286,6 +486,7 @@ mod tests {
 
     fn user_msg(content: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::User,
             content: content.to_owned(),
             reasoning_content: None,
@@ -297,6 +498,7 @@ mod tests {
 
     fn assistant_with_tool_calls() -> Message {
         Message {
+        attachments: None,
         reasoning_content: None,
             role: MessageRole::Assistant,
             content: String::new(),
@@ -312,6 +514,7 @@ mod tests {
 
     fn tool_result() -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: "file_a\nfile_b".into(),
             tool_call_id: Some(ToolCallId("tc-1".into())),
@@ -400,6 +603,7 @@ mod tests {
             assistant_with_tool_calls(),
             tool_result(),
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "done".into(),
                 tool_call_id: None,
@@ -650,7 +854,163 @@ mod tests {
             .await
             .expect("clear runs");
 
-        // FK violation inside the sink → warn, not panic/abort.
+        // FK violation inside the sink → 重试穷尽 → 入队 + error 日志；
+        // sink 永不向 runtime 传播（不 panic / 不 abort）。
         rec.append(&user_msg("ghost")).await;
+        assert_eq!(
+            rec.pending_persisted_writes(),
+            1,
+            "重试穷尽后消息应进入挂起队列"
+        );
+    }
+
+    /// v5 §5 全链路：FK 失败 → 重试穷尽入队；库恢复后下一次 append 先
+    /// 冲刷队列（顺序保持），两条消息都落盘。
+    #[tokio::test]
+    async fn sink_failure_queues_then_flushes_on_next_append() {
+        let store = setup().await;
+        let rec = RunRecorder::begin(
+            store.clone(),
+            RunId("r-flush".into()),
+            "root",
+            None,
+            "{}",
+        )
+        .await
+        .expect("begin");
+
+        // 掏空 run 行（FK 必然失败）
+        sqlx::query("DELETE FROM messages")
+            .execute(store.pool())
+            .await
+            .expect("clear messages");
+        sqlx::query("DELETE FROM execution_nodes")
+            .execute(store.pool())
+            .await
+            .expect("clear nodes");
+        sqlx::query("DELETE FROM runs")
+            .execute(store.pool())
+            .await
+            .expect("clear runs");
+
+        rec.append(&user_msg("lost-then-queued")).await;
+        assert_eq!(rec.pending_persisted_writes(), 1);
+
+        // 库恢复（run + persist 节点重建）
+        store
+            .insert_run("r-flush", None, "root", "running", "{}", now_ms_like())
+            .await
+            .expect("recreate run");
+        store
+            .insert_execution_node(
+                "r-flush-persist",
+                "r-flush",
+                "root",
+                None,
+                None,
+                "running",
+                "{}",
+                now_ms_like(),
+            )
+            .await
+            .expect("recreate node");
+
+        // 下一次 append：先冲刷队列，再写当前消息
+        rec.append(&user_msg("fresh")).await;
+        assert_eq!(rec.pending_persisted_writes(), 0, "队列应被冲刷");
+
+        let loaded = RunRecorder::load_messages_keep_dangling(&store, "r-flush")
+            .await
+            .expect("load");
+        assert_eq!(loaded.len(), 2, "排队消息 + 新消息都落盘");
+        assert_eq!(loaded[0].content, "lost-then-queued", "队列消息先落（顺序保持）");
+        assert_eq!(loaded[1].content, "fresh");
+    }
+
+    fn now_ms_like() -> i64 {
+        42
+    }
+
+    /// meta 通道写读往返：write_message_with_meta 的 meta 进 meta_json，
+    /// Message 本体不混入 usage（provider 回放零泄漏）。
+    #[tokio::test]
+    async fn write_read_roundtrip_with_meta() {
+        let store = setup().await;
+        let rec = RunRecorder::begin(store.clone(), RunId("r-meta".into()), "root", None, "{}")
+            .await
+            .expect("begin");
+
+        let meta = MessageMeta {
+            model_id: Some("glm-4.7-flash".into()),
+            usage: Some(openslate_core::types::Usage {
+                input_tokens: 101,
+                output_tokens: 202,
+                cached_input_tokens: None,
+                reasoning_tokens: None,
+                image_tokens: None,
+            }),
+            finish_reason: Some("tool_calls".into()),
+            latency_ms: Some(3_500),
+        };
+        rec.write_message(&user_msg("hi")).await.expect("no meta");
+        rec.write_message_with_meta(&assistant_with_tool_calls(), Some(&meta))
+            .await
+            .expect("with meta");
+
+        let records = store.list_messages_by_run("r-meta").await.expect("read");
+        assert_eq!(records.len(), 2);
+        assert!(records[0].meta_json.is_none(), "user 行无 meta");
+        let stored: MessageMeta =
+            serde_json::from_str(records[1].meta_json.as_deref().expect("assistant 行有 meta"))
+                .expect("meta 反序列化");
+        assert_eq!(stored.model_id.as_deref(), Some("glm-4.7-flash"));
+        assert_eq!(stored.usage.expect("usage").input_tokens, 101);
+        assert_eq!(stored.usage.expect("usage").output_tokens, 202);
+        assert_eq!(stored.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(stored.latency_ms, Some(3_500));
+
+        // Message 本体（content）不含 meta 字段——provider 回放路径零泄漏
+        let messages = RunRecorder::load_messages_keep_dangling(&store, "r-meta")
+            .await
+            .expect("load");
+        let raw = serde_json::to_value(&messages[1]).expect("serialize");
+        assert!(
+            raw.get("usage").is_none() && raw.get("finish_reason").is_none(),
+            "Message wire 形状不携带 meta"
+        );
+    }
+
+    /// RunFinal 两签名：finish_with 落 token 聚合；旧 finish 委托 tokens=0。
+    #[tokio::test]
+    async fn finish_with_runfinal_and_legacy_delegation() {
+        let store = setup().await;
+        let rec = RunRecorder::begin(store.clone(), RunId("r-final".into()), "root", None, "{}")
+            .await
+            .expect("begin");
+        rec.finish_with(RunFinal {
+            status: "completed".into(),
+            output_json: Some(r#"{"out":1}"#.into()),
+            cost_usd: 0.25,
+            input_tokens: 1111,
+            output_tokens: 2222,
+        })
+        .await
+        .expect("finish_with");
+
+        let run = store.get_run("r-final").await.expect("get").expect("row");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.input_tokens, 1111);
+        assert_eq!(run.output_tokens, 2222);
+        assert!((run.cost_usd - 0.25).abs() < 1e-12);
+
+        // 旧签名委托：tokens 记 0（存量 run 语义）
+        let rec2 = RunRecorder::begin(store.clone(), RunId("r-legacy".into()), "root", None, "{}")
+            .await
+            .expect("begin 2");
+        rec2.finish("interrupted", None, 0.0).await.expect("legacy finish");
+        let run2 = store.get_run("r-legacy").await.expect("get").expect("row");
+        assert_eq!(run2.status, "interrupted");
+        assert_eq!(run2.input_tokens, 0, "旧签名委托 tokens=0");
+        assert_eq!(run2.output_tokens, 0);
     }
 }

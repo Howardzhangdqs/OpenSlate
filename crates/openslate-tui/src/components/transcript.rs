@@ -1881,11 +1881,22 @@ impl TranscriptComponent {
 /// Assistant messages with `tool_calls` emit ToolCall entries in the
 /// Running state — the following Tool-role message folds each one to its
 /// final status ([`fold_tool_outcome`]).
+///
+/// storage-v5 L6: a non-empty persisted `reasoning_content` maps to a
+/// Reasoning entry BEFORE the tool calls / answer text — aligned with the
+/// mobile projection (`openslate_protocol::project_from_messages`) so a
+/// rebuilt transcript keeps the chain-of-thought blocks the merge path
+/// preserves. Empty-string reasoning emits nothing.
 fn entry_from_message(msg: &Message) -> Vec<TranscriptEntry> {
     let mut out = Vec::new();
     match msg.role {
         MessageRole::User => out.push(TranscriptEntry::User(msg.content.clone())),
         MessageRole::Assistant => {
+            // 思维链随消息持久化——rebuild 路径还原为 Reasoning 条目
+            // （对齐 mobile 投影；空串不产生条目）。
+            if let Some(rc) = msg.reasoning_content.as_ref().filter(|r| !r.is_empty()) {
+                out.push(TranscriptEntry::Reasoning(rc.clone()));
+            }
             if let Some(tool_calls) = &msg.tool_calls {
                 for tc in tool_calls {
                     let args_text = tc.arguments.to_string();
@@ -3485,6 +3496,7 @@ mod tests {
 
     fn msg(role: MessageRole, content: &str) -> Message {
         Message {
+            attachments: None,
             role,
             content: content.to_owned(),
             tool_call_id: None,
@@ -3496,6 +3508,7 @@ mod tests {
 
     fn assistant_with_call(id: &str, name: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -3511,6 +3524,7 @@ mod tests {
 
     fn tool_result(id: &str, name: &str, content: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.to_owned(),
             tool_call_id: Some(ToolCallId(id.to_owned())),
@@ -3572,6 +3586,28 @@ mod tests {
             ]
         );
         assert!(t.streaming_text().is_empty());
+    }
+
+    /// storage-v5 L6: a persisted non-empty `reasoning_content` maps to a
+    /// Reasoning entry (before the answer text), matching the mobile
+    /// projection; empty-string reasoning emits nothing.
+    #[test]
+    fn rebuild_restores_reasoning_content_entries() {
+        let mut t = TranscriptComponent::new();
+        let mut thinks = msg(MessageRole::Assistant, "answer");
+        thinks.reasoning_content = Some("thinking hard".into());
+        let mut blank = msg(MessageRole::Assistant, "no CoC");
+        blank.reasoning_content = Some(String::new());
+        t.rebuild(&[msg(MessageRole::User, "go"), thinks, blank]);
+        assert_eq!(
+            t.entries(),
+            &[
+                TranscriptEntry::User("go".into()),
+                TranscriptEntry::Reasoning("thinking hard".into()),
+                TranscriptEntry::Assistant("answer".into()),
+                TranscriptEntry::Assistant("no CoC".into()),
+            ]
+        );
     }
 
     #[test]
@@ -3665,6 +3701,7 @@ mod tests {
             t.rebuild(&[
                 assistant_with_call("t", "x"),
                 Message {
+                    attachments: None,
                     role: MessageRole::Tool,
                     content: content.to_owned(),
                     tool_call_id: Some(ToolCallId("t".into())),
@@ -5480,6 +5517,7 @@ mod tests {
             output_tokens: 10,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            image_tokens: None,
         };
         // FirstToken observed → the ttft segment after the counts;
         // rate = output / total elapsed.
@@ -5544,6 +5582,7 @@ mod tests {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(600)),
@@ -5616,6 +5655,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_millis(500)),
             None,
@@ -5773,6 +5813,7 @@ mod tests {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(800)),
@@ -5808,6 +5849,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_millis(500)),
             None,
@@ -5842,6 +5884,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             None,
             None,
@@ -5855,6 +5898,7 @@ mod tests {
                 output_tokens: 7,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             None,
             None,
@@ -5894,6 +5938,7 @@ mod tests {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             None,
             None,
@@ -5909,6 +5954,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             None,
             None,
@@ -5948,6 +5994,7 @@ mod tests {
                 output_tokens: 9,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             None,
             None,
@@ -6047,6 +6094,7 @@ mod tests {
                 output_tokens: 96,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.6)),
             None,
@@ -6080,6 +6128,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: Some(80),
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs(1)),
             Some(Duration::from_millis(500)),
@@ -6106,6 +6155,7 @@ mod tests {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             None,
@@ -6132,6 +6182,7 @@ mod tests {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(700)),
@@ -6682,6 +6733,7 @@ mod tests {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(2.0)),
             Some(Duration::from_millis(800)),
@@ -6700,6 +6752,7 @@ mod tests {
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             Some(Duration::from_secs_f64(1.0)),
             None,
@@ -6708,6 +6761,7 @@ mod tests {
         let messages = vec![
             msg(MessageRole::User, "go"),
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "checking".into(),
                 tool_call_id: None,

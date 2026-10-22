@@ -2,8 +2,9 @@
 
 > 面向接手本项目的 AI agent。五个**进程内** MCP server（rmcp `ServerHandler`），
 > 取代 legacy 的 `openslate-core::tool` 内置工具。全部是库代码：不写 stdout/stderr，
-> 理论上也可以走 stdio 对外提供而协议保持干净。crate 只依赖
-> futures/rmcp/serde/thiserror/tokio，**不依赖 openslate-core**（避免环）。
+> 理论上也可以走 stdio 对外提供而协议保持干净。crate 依赖
+> futures/rmcp/serde/thiserror/tokio + image/base64（read_file 读图归一化与编码，
+> 2026-10），**不依赖 openslate-core**（避免环）。
 > 消费方有两个：core 侧 `connect_builtin_servers`（桌面/App 装配）与
 > **openslate-mcp-host**（Termux 聚合宿主，host 的唯一 workspace 依赖——见
 > `01-architecture/crate-layers.md` 规则5 白名单）。
@@ -14,7 +15,7 @@
 
 | 模块 | server 类型 | 工具 | 沙箱 | 行数 |
 |------|------------|------|------|------|
-| `src/fs.rs` | `FsServer::new(root)` | `read_file` / `write_file` | workspace root | 716 |
+| `src/fs.rs` | `FsServer::new(root)` | `read_file` / `write_file` | workspace root | ~900 |
 | `src/shell.rs` | `ShellServer::new(root)` | `shell` | cwd = workspace root | 590 |
 | `src/bash.rs` | `BashServer::new(root, bash_path)` | `bash` | cwd = workspace root | 214 |
 | `src/edit/mod.rs` + `edit/editor.rs` | `EditServer::new(root)` | `edit_file` | workspace-relative，文件必须已存在 | 440 + 875 |
@@ -76,10 +77,39 @@ tool-level error result（镜像 legacy `ToolError::SecurityError/ExecutionError
 
 ### 2.2 工具行为
 
-- `read_file`（L181-201）：`path` trim 空 → invalid_params；沙箱解析失败 → error result
-  （文本如 "Path is outside workspace"）；读失败 → `Failed to read '{path}': {e}`。
+- `read_file`（2026-10 起支持读图，见 §2.3）：`path` trim 空 → invalid_params；沙箱解析失败
+  → error result（文本如 "Path is outside workspace"）；读失败 → `Failed to read '{path}': {e}`。
+  非 UTF-8 的视频/未知二进制 → error result 带结构化提示（mime + 字节数，视频明确"不支持直接
+  读取"）。
 - `write_file`（L204-236）：父目录 `create_dir_all`（legacy 行为）；成功文案
   `Successfully wrote {N} bytes to '{path}'`。
+
+### 2.3 `read_file` 读图（2026-10-21）
+
+字节读替代 `read_to_string`，按 magic-byte 嗅探分流（不信任扩展名）：
+
+- **图像白名单**（JPEG `FF D8 FF` / PNG `89PNG` / WebP `RIFF…WEBP` / GIF `GIF87a|89a`）：
+  归一化后以 `[text 说明, image block]` 双块 success 返回——
+  - 归一化在本 crate 执行（mcp-host 与 CLI in-process 共用同一实现；2026-10-21 与 mobile
+    同款提速）：**小图 JPEG/PNG 快速通道**——header-only 读尺寸（不碰像素），长边 ≤2048 且
+    ≤5MB → **字节原样 passthrough**（零解码零编码零重采样；JPEG 本就在出口白名单内；EXIF
+    方向不处理，字节原样保留交给 provider，与全解码路径行为一致；header 失败回落全解码报
+    准确错误）；**其余**（超尺寸/超体积 JPEG/PNG、WebP、GIF）缩到长边 ≤2048（只缩不放，
+    **CatmullRom**——纯 Rust 无 SIMD 下比 Lanczos3 快数倍，2048 降采样画质对视觉模型够用）
+    + JPEG q85 重编码（动图取首帧）；分段耗时打 stderr（本 crate 零日志依赖，stdio
+    transport 下 stderr 是安全诊断通道），格式与 mobile 统一 `attachment timing: …`；
+  - 出口硬校验：≤5MB、像素 ≤6000²（常量 `MAX_IMAGE_DIM/MAX_NORMALIZED_IMAGE_BYTES/
+    MAX_IMAGE_PIXELS/JPEG_QUALITY`，与 mobile `attachments::normalize_image` 对齐——本 crate
+    不能依赖 openslate-mobile，精简复刻一份）；
+  - 归一化放 host 侧的动机：相机原图（10MB+）先缩再编码，避免 5MB 级 base64 走
+    JSON-RPC（mobile 链路 read_file 经 mcp-host HTTP）；
+  - text 块形如 `[image file: {filename}, {mime}, {size} bytes (normalized from {N} bytes) —
+    the image itself is attached below…]`——模型看得到元信息，图片本体由 core 侧
+    `downgrade_content_blocks` 解成 `ToolOutput.attachments` 随 Tool Message 走
+    （见 `02-core/openslate-core.md`）。
+- **视频**（mp4/mkv/mov 魔数）：error result，文案含 mime 与字节数——本期不支持视频读取。
+- **其余非 UTF-8**：error result（`binary or non-UTF-8 file (N bytes)`）。UTF-8 文本行为与
+  legacy 完全一致（`String::from_utf8` 校验替代了 `read_to_string` 的隐式校验）。
 
 ## 3. shell.rs：限额与安全（bash.rs 共享）
 

@@ -22,7 +22,10 @@
 //! 本 crate 无任何 Android 依赖，可在 desktop 上完整测试。
 
 pub mod alog;
+pub mod approval_review;
 pub mod askuser;
+pub mod attachment_tokens;
+pub mod attachments;
 pub mod bootstrap;
 pub mod events;
 pub mod exec;
@@ -32,6 +35,7 @@ pub mod provider;
 pub mod registry;
 pub mod runtime;
 pub mod secrets;
+pub mod transcripts;
 
 pub use bootstrap::MobilePaths;
 pub use events::{EventCallback, EventSink, MOBILE_CONN_ID};

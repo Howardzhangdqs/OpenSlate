@@ -31,8 +31,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - [probeMcpLights]：设置页 refresh() 原始探测序的提炼（顺序 / 短路 /
  *   语义逐字保持），渐进 emit 供两处消费方做过程显示；
  * - [McpLightsResult] / [mcpLightRow]：探测结果 → [StatusCheckRow] 的
- *   一灯一行映射（语义源唯一，设置页与子面板共用）；
- * - [McpLightsTracker]：子面板数据源（CAS 单飞探测，快照持有）。
+ *   一灯一行映射（语义源唯一，设置页与子面板共用；含 restartingHost
+ *   拉起窗口的「MCP host 启动中…」过渡态分支）；
+ * - [McpLightsTracker]：子面板数据源（CAS 单飞探测，[McpLightsUiState]
+ *   快照 + probing 持有；[McpLightsTracker.gateRefresh] 提供与设置页
+ *   同款的 ON_RESUME/展开智能门控）。
  *
  * 与旧 detectTermuxStatus 四行阶梯的本质区别：这里五项独立判定成败、
  * 终态失败如实落 Failed（配置类通道问题不再映射成永不失败的
@@ -50,8 +53,13 @@ internal val MCP_LIGHT_KEYS = listOf(
  * 一轮五灯探测的结果快照：五项独立布尔 + RUN_COMMAND 通道精确诊断 +
  * 本轮已完成的 key 集合（渐进渲染：未含 = 未检测/检测中）。
  *
- * @param restartedHost 探测时是否已尝试自动拉起 host（hostAlive 行的
- *   失败摘要分支用：已尝试 →「稍候自动重检」，未尝试 →「到设置页重启」）。
+ * @param restartedHost 探测时是否已尝试自动拉起 host（终态标记：hostAlive 行的
+ *   失败摘要分支用——已尝试 →「稍候自动重检」，未尝试 →「到设置页重启」）。
+ * @param restartingHost 「host 自动拉起进行中」过渡态（步骤 ⑦ 调 restartHost
+ *   前置 true、收尾 emit / 最终返回归位 false）：拉起窗口内 hostAlive 仍为
+ *   false，消费方据此把 hostAlive 行 / 首行状态显示为「MCP host 启动中…」
+ *   而非误报未运行——与终态标记 restartedHost 语义区分（一个说「正在拉」，
+ *   一个说「拉过了」）。
  */
 internal data class McpLightsResult(
     val installed: Boolean = false,
@@ -63,6 +71,7 @@ internal data class McpLightsResult(
     val hostAlive: Boolean = false,
     val checked: Set<String> = emptySet(),
     val restartedHost: Boolean = false,
+    val restartingHost: Boolean = false,
 )
 
 /**
@@ -78,9 +87,11 @@ internal data class McpLightsResult(
  *    （前台拉起可能让部分 ROM 补全授权）；
  * ⑤ 通道放行才查 host 安装 → emit；
  * ⑥ 收并行探活结果 → emit；
- * ⑦ 放行 && host 已装 && 未运行 && [autoRestartHost] → restartHost +
- *    复探回写 → emit；
- * ⑧ 终态：checked 补齐五键 → 返回。
+ * ⑦ 放行 && host 已装 && 未运行 && [autoRestartHost] → **先 emit
+ *    restartingHost=true 过渡态**（拉起窗口内消费方显示「MCP host 启动中…」
+ *    而非误报未运行）→ restartHost + 复探回写 → emit（restartingHost
+ *    归位 false）；
+ * ⑧ 终态：checked 补齐五键 → 返回（restartingHost 恒 false）。
  *
  * @param autoRestartHost 步骤 ⑦ 的门控（设置页传 !busy：用户操作在途时
  *   不自动拉起；子面板 tracker 传 true）。
@@ -167,12 +178,18 @@ internal suspend fun probeMcpLights(
             if (allowed && inst && !alive && autoRestartHost) {
                 log("服务未运行，自动拉起（停止旧进程 → nohup 后台启动）…")
                 restarted = true
+                // 拉起是秒级长窗口（停旧进程 + nohup 启动 + 复探）：先行
+                // emit 过渡态 restartingHost=true，消费方把 hostAlive 行 /
+                // 首行状态显示为「MCP host 启动中…」；收尾 emit 与最终
+                // 返回一律归位 false。
+                st = st.copy(restartingHost = true)
+                onStage(st)
                 runCatching { McpHostManager.restartHost(appCtx) { log(it) } }
                     .onSuccess {
                         val (a2, d2) = McpHostManager.hostAliveDetail(appCtx)
                         alive = a2
                         coroutineContext.ensureActive()
-                        st = st.copy(hostAlive = alive)
+                        st = st.copy(hostAlive = alive, restartingHost = false)
                         onStage(st)
                         log(
                             if (a2) "服务已自动恢复（$d2），无需重装"
@@ -181,6 +198,9 @@ internal suspend fun probeMcpLights(
                     }
                     .onFailure {
                         log("自动拉起失败：${it.message?.take(160)}——可点「自动化操作（重新安装）」修复")
+                        coroutineContext.ensureActive()
+                        st = st.copy(restartingHost = false)
+                        onStage(st)
                     }
             }
         }
@@ -194,45 +214,111 @@ internal suspend fun probeMcpLights(
         onStage(st)
     }
     coroutineContext.ensureActive() // 取消轮不落地：消费方不落终态/快照
-    // ── ⑧ 终态：checked 补齐五键（短路路径未检测的项一次性补齐语义）──
-    return st.copy(hostAlive = alive, restartedHost = restarted, checked = MCP_LIGHT_KEYS.toSet())
+    // ── ⑧ 终态：checked 补齐五键（短路路径未检测的项一次性补齐语义）；
+    // restartingHost 恒归位 false（过渡态只在拉起窗口内存在）──
+    return st.copy(
+        hostAlive = alive,
+        restartedHost = restarted,
+        restartingHost = false,
+        checked = MCP_LIGHT_KEYS.toSet(),
+    )
 }
+
+/**
+ * 子面板五灯 UI 状态：探测在途标记 + 最新结果快照。探测期间 result
+ * 保留上轮结论（onStage 渐进回灌，过程不闪烁），probing 供首行状态
+ * 显示「检测中…」与 gateRefresh 在途判定共用。
+ */
+internal data class McpLightsUiState(
+    /** 最新探测结果；null = 尚未探测过（按 checked 空集渲染渐进行）。 */
+    val result: McpLightsResult? = null,
+    /** 探测在途（refresh CAS 抢到后置 true，finally 归 false）。 */
+    val probing: Boolean = false,
+)
 
 /**
  * 子面板五灯数据源：单例 tracker，CAS 单飞探测（照 TermuxStallTracker
  * 范式——在途探测中重复 refresh 直接忽略），快照保留上轮结论（onStage
- * 渐进回灌，过程不闪烁）。autoRestartHost 恒 true：子面板探测与设置页
- * 同语义——host 已装未运行时顺手自动拉起，ON_RESUME/再展开重检即见恢复。
- * 探测明细进 logcat（OpenSlateDiag），不进任何 UI 日志面板。
+ * 渐进回灌，过程不闪烁；probing 单列于 [McpLightsUiState]）。autoRestartHost
+ * 恒 true：子面板探测与设置页同语义——host 已装未运行时顺手自动拉起，
+ * 重检即见恢复。探测明细进 logcat（OpenSlateDiag），不进任何 UI 日志面板。
  */
 internal object McpLightsTracker {
 
     /** 单线程 IO：探测串行化，RUN_COMMAND 往返不与在途探测交错。 */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
 
-    private val _state = MutableStateFlow<McpLightsResult?>(null)
+    private val _state = MutableStateFlow(McpLightsUiState())
 
-    /** 最新快照；null = 尚未探测过（子面板展开即触发首轮，期间按
-     *  checked 空集渲染「正在检测…/待检测」渐进行）。 */
-    val state: StateFlow<McpLightsResult?> = _state.asStateFlow()
+    /** 最新 UI 状态；result=null = 尚未探测过（子面板展开即触发首轮，
+     *  期间按 checked 空集渲染「正在检测…/待检测」渐进行）。 */
+    val state: StateFlow<McpLightsUiState> = _state.asStateFlow()
 
     private val probing = AtomicBoolean(false)
 
-    /** 触发一次探测（fire-and-forget）：在途探测中调用为无操作。 */
+    /** 触发一次探测（fire-and-forget）：在途探测中调用为无操作。抢到
+     *  CAS 后置 probing=true（result 保留旧值不闪烁），onStage 渐进写
+     *  .result，finally 置 probing=false。 */
     fun refresh(context: Context) {
         val appCtx = context.applicationContext
         if (!probing.compareAndSet(false, true)) return
+        _state.value = _state.value.copy(probing = true)
         scope.launch {
             try {
-                _state.value = probeMcpLights(
-                    appCtx,
-                    autoRestartHost = true,
-                    log = { android.util.Log.i("OpenSlateDiag", it) },
-                    onStage = { st -> _state.value = st },
+                _state.value = _state.value.copy(
+                    result = probeMcpLights(
+                        appCtx,
+                        autoRestartHost = true,
+                        log = { android.util.Log.i("OpenSlateDiag", it) },
+                        onStage = { st -> _state.value = _state.value.copy(result = st) },
+                    ),
                 )
             } finally {
                 probing.set(false)
+                _state.value = _state.value.copy(probing = false)
             }
+        }
+    }
+
+    /**
+     * 进页 / ON_RESUME / 子面板展开的智能门控（语义照抄设置页
+     * McpSection 的 gateRefresh，适配到 tracker）：
+     * - 无快照（result=null，冷启动首轮）→ 全量探测；
+     * - 探测在途 → 门控不叠加（在途轮的结果本来就更新）；
+     * - 快照非全绿（checked 未齐或五布尔任一 false）→ 直接全量重检：
+     *   典型场景是用户按指引打开 Termux 后返回——Termux 刚复活时 host
+     *   端口必然仍无应答（host 还没人重启），廉价比对看不见「Termux
+     *   已活」这个变化，全量重检的步骤 ⑦ 会顺带把 host 自动拉起；
+     * - 全绿快照 → 只做廉价变化探测（本机回环 HTTP ~ms 级，不碰
+     *   Termux 通道），与快照 hostAlive 比对：一致 → 无动作；翻转 →
+     *   全量重检（launch 内复查 probing 防竞态）。
+     */
+    fun gateRefresh(context: Context) {
+        val snap = _state.value.result ?: run { refresh(context); return }
+        if (probing.get()) return
+        val snapGreen = MCP_LIGHT_KEYS.all { it in snap.checked } &&
+            snap.installed && snap.perm && snap.allowed && snap.hostInstalled && snap.hostAlive
+        if (!snapGreen) {
+            android.util.Log.i(
+                "OpenSlateDiag",
+                "McpLightsTracker：上次检测有未通过项（如刚从 Termux 返回），自动全量重检…",
+            )
+            refresh(context)
+            return
+        }
+        scope.launch {
+            // 复查 probing：廉价探测期间可能已有全量轮/手动 refresh 启动，
+            // 其结果本来就更新，本次翻转判定作废不叠加。
+            if (probing.get()) return@launch
+            val (alive, _) = McpHostManager.hostAliveDetail(context.applicationContext)
+            if (probing.get()) return@launch
+            if (alive == snap.hostAlive) return@launch
+            android.util.Log.i(
+                "OpenSlateDiag",
+                "McpLightsTracker：服务状态变化（" +
+                    "${if (snap.hostAlive) "运行中 → 未应答" else "未运行 → 已应答"}），自动重检…",
+            )
+            refresh(context)
         }
     }
 }
@@ -327,6 +413,13 @@ internal fun mcpLightRow(
         } else {
             StatusCheckRow(StatusCheckState.Pending, lightPendingTitle(key))
         }
+    }
+    // hostAlive 拉起过渡态（步骤 ⑦ restartHost 前的先行 emit：探活仍未过
+    // 且 restartingHost=true）→ InProgress「MCP host 启动中…」，不误报
+    // 未运行；displayDetails true/false 两态都走此分支——设置页与子面板
+    // 同享该过渡态。放在正常 ok/state 判定之前。
+    if (key == "hostAlive" && !result.hostAlive && result.restartingHost) {
+        return StatusCheckRow(StatusCheckState.InProgress, "MCP host 启动中…")
     }
     val ok = when (key) {
         "termuxInstalled" -> result.installed

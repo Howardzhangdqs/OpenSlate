@@ -251,6 +251,7 @@ impl Tool for HostTool {
             Ok(value) => {
                 let content = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
                 Ok(ToolOutput {
+                    attachments: None,
                     bytes: content.len(),
                     content,
                     duration_ms,
@@ -258,6 +259,7 @@ impl Tool for HostTool {
                 })
             }
             Err(message) => Ok(ToolOutput {
+                attachments: None,
                 bytes: message.len(),
                 content: message,
                 duration_ms,

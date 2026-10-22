@@ -1804,6 +1804,7 @@ impl App {
         self.cancel_sent = false;
 
         let user_message = Message {
+            attachments: None,
             role: MessageRole::User,
             content: prompt.clone(),
             tool_call_id: None,
@@ -1814,7 +1815,10 @@ impl App {
         self.history.push(user_message);
         self.transcript.push_user(&prompt);
 
-        self.link.send(ClientMsg::Submit { text: prompt });
+        self.link.send(ClientMsg::Submit {
+            text: prompt,
+            attachments: None, // v4：TUI 无附件输入（多模态是 mobile 场景）
+        });
         // Optimistic in-flight state; the broadcasts (RequestStart
         // first) take over from here. If the server is mid-turn from
         // ANOTHER client, its directed notice corrects us (the pushed
@@ -3100,6 +3104,7 @@ max_output_bytes = 10_000
             active_config: "/fixture/openslate.toml".into(),
             global_config: None,
             local_config: None,
+            approval: None,
         }
     }
 
@@ -3111,6 +3116,7 @@ max_output_bytes = 10_000
             proto: 1,
             session_id: "test-session".into(),
             session_label: "tui test".into(),
+            run_id: None,
             transcript: vec![],
             running: false,
             depth_cur: 0,

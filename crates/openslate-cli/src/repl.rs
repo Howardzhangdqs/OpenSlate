@@ -14,7 +14,7 @@ use openslate_core::context_manager::CompactResult;
 use openslate_core::run_manager::RunManager;
 use openslate_core::runtime::{CancellationToken, MessageSink};
 use openslate_core::types::{Message, MessageRole, RunId, RunStatus, Usage};
-use openslate_store_sqlite::recorder::RunRecorder;
+use openslate_store_sqlite::recorder::{RunFinal, RunRecorder};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::collections::HashSet;
@@ -62,6 +62,7 @@ async fn generate_summary(
         model_id: model_id.to_owned(),
         system_prompt: Some(SUMMARY_SYSTEM_PROMPT.to_owned()),
         messages: vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: format!(
                 "Summarize the following conversation for continuation:\n\n{}",
@@ -197,6 +198,11 @@ pub(crate) struct SessionStats {
     /// calls bill the SESSION but not the persisted run row, whose finish
     /// gets `run_cost_usd()` = total − compact.
     compact_cost_usd: f64,
+    /// The compact-summary token subsets (v5 L2, `compact_cost_usd` 的
+    /// token 同型口径)：摘要调用计会话不计 run 行，finish 落
+    /// runs.input_tokens / output_tokens 时用 `run_*_tokens()` 差额。
+    compact_input_tokens: u64,
+    compact_output_tokens: u64,
 }
 
 /// The REPL session's backing persisted run (Phase 3).
@@ -221,6 +227,8 @@ impl SessionStats {
             started_at: Instant::now(),
             total_cost_usd: 0.0,
             compact_cost_usd: 0.0,
+            compact_input_tokens: 0,
+            compact_output_tokens: 0,
         }
     }
 
@@ -229,6 +237,17 @@ impl SessionStats {
     /// session only.
     fn run_cost_usd(&self) -> f64 {
         self.total_cost_usd - self.compact_cost_usd
+    }
+
+    /// Token totals attributable to the persisted run row (v5 L2): the
+    /// token twin of [`Self::run_cost_usd`] — everything except compact
+    /// summary calls. Persisted as `runs.input_tokens` / `output_tokens`.
+    fn run_input_tokens(&self) -> u64 {
+        self.total_input_tokens - self.compact_input_tokens
+    }
+
+    fn run_output_tokens(&self) -> u64 {
+        self.total_output_tokens - self.compact_output_tokens
     }
 }
 
@@ -489,10 +508,17 @@ impl ReplSession {
         // Clean exit (EOF / /exit): the session run completes. Error paths
         // above return early WITHOUT this update, deliberately leaving the
         // run at `running` — a crashed session stays resumable via /resume.
+        // v5 L2：token 聚合（run-only 口径，同 run_cost_usd）落 runs 列。
         if let Some(ref run) = self.session_run {
             if let Err(e) = run
                 .recorder
-                .finish("completed", None, self.stats.run_cost_usd())
+                .finish_with(RunFinal {
+                    status: "completed".into(),
+                    output_json: None,
+                    cost_usd: self.stats.run_cost_usd(),
+                    input_tokens: self.stats.run_input_tokens(),
+                    output_tokens: self.stats.run_output_tokens(),
+                })
                 .await
             {
                 tracing::warn!("Failed to persist session completion: {}", e);
@@ -567,17 +593,26 @@ impl ReplSession {
             }
             SlashCommand::New => {
                 self.history.clear();
-                // Snapshot the run-only cost BEFORE resetting stats — the
-                // backing run below is closed with this value, and reading
-                // it after the reset would always persist 0.0.
+                // Snapshot the run-only aggregates BEFORE resetting stats —
+                // the backing run below is closed with these values, and
+                // reading them after the reset would always persist 0.
+                // v5 L2：token 同步快照（与 cost 同一时刻、同一口径）。
                 let closed_run_cost = self.stats.run_cost_usd();
+                let closed_run_in = self.stats.run_input_tokens();
+                let closed_run_out = self.stats.run_output_tokens();
                 self.stats = SessionStats::new();
                 // Close the backing run (its transcript stays resumable);
                 // the next turn opens a fresh one.
                 if let Some(run) = self.session_run.take() {
                     if let Err(e) = run
                         .recorder
-                        .finish("completed", None, closed_run_cost)
+                        .finish_with(RunFinal {
+                            status: "completed".into(),
+                            output_json: None,
+                            cost_usd: closed_run_cost,
+                            input_tokens: closed_run_in,
+                            output_tokens: closed_run_out,
+                        })
                         .await
                     {
                         tracing::warn!("Failed to persist previous session run: {}", e);
@@ -908,10 +943,13 @@ impl ReplSession {
     /// cost — the cost priced with the fast model's CostSpec via the same
     /// helper the runtime uses. It lands in `total_cost_usd` (/status) and
     /// in `compact_cost_usd`, keeping the persisted run row's cost
-    /// (`run_cost_usd()`) turn-only.
+    /// (`run_cost_usd()`) turn-only. v5 L2：token 同型落
+    /// `compact_*_tokens`，run 行聚合列（`run_*_tokens()`）同样 turn-only。
     fn credit_compact_usage(&mut self, usage: &Usage, pricing: openslate_core::runtime::CostSpec) {
         self.stats.total_input_tokens += usage.input_tokens as u64;
         self.stats.total_output_tokens += usage.output_tokens as u64;
+        self.stats.compact_input_tokens += usage.input_tokens as u64;
+        self.stats.compact_output_tokens += usage.output_tokens as u64;
         let cost = pricing.cost_of(usage);
         self.stats.total_cost_usd += cost;
         self.stats.compact_cost_usd += cost;
@@ -919,6 +957,7 @@ impl ReplSession {
 
     async fn handle_normal_input(&mut self, input: &str) -> Result<DispatchResult> {
         let user_message = Message {
+            attachments: None,
             role: MessageRole::User,
             content: input.to_owned(),
             tool_call_id: None,
@@ -1177,7 +1216,13 @@ impl ReplSession {
                 if let Some(run) = self.session_run.take() {
                     if let Err(e) = run
                         .recorder
-                        .finish("interrupted", None, self.stats.run_cost_usd())
+                        .finish_with(RunFinal {
+                            status: "interrupted".into(),
+                            output_json: None,
+                            cost_usd: self.stats.run_cost_usd(),
+                            input_tokens: self.stats.run_input_tokens(),
+                            output_tokens: self.stats.run_output_tokens(),
+                        })
                         .await
                     {
                         tracing::warn!("Failed to persist previous session run: {}", e);
@@ -1805,6 +1850,7 @@ max_tool_calls = 20
         let mut session = make_session();
 
         session.history.push(Message {
+            attachments: None,
             role: MessageRole::User,
             content: "test".to_owned(),
             tool_call_id: None,
@@ -1825,6 +1871,7 @@ max_tool_calls = 20
         let mut session = make_session();
 
         session.history.push(Message {
+            attachments: None,
             role: MessageRole::User,
             content: "test".to_owned(),
             tool_call_id: None,
@@ -2250,6 +2297,7 @@ max_tool_calls = 20
 
     fn assistant_tool_call_msg() -> Message {
         Message {
+        attachments: None,
         reasoning_content: None,
             role: MessageRole::Assistant,
             content: String::new(),
@@ -2265,6 +2313,7 @@ max_tool_calls = 20
 
     fn tool_result_msg() -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: "a.txt".into(),
             tool_call_id: Some(ToolCallId("tc-1".into())),
@@ -2289,6 +2338,7 @@ max_tool_calls = 20
         .expect("begin");
         for m in [
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "list files".into(),
                 tool_call_id: None,
@@ -2332,6 +2382,7 @@ max_tool_calls = 20
         assert_eq!(run.run_id.0, "seeded-run");
         run.recorder
             .write_message(&Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "next turn".into(),
                 tool_call_id: None,
@@ -2357,6 +2408,7 @@ max_tool_calls = 20
         .await
         .expect("begin");
         rec.write_message(&Message {
+            attachments: None,
             role: MessageRole::User,
             content: "boom".into(),
             tool_call_id: None,
@@ -2391,6 +2443,7 @@ max_tool_calls = 20
         .await
         .expect("begin");
         rec.write_message(&Message {
+            attachments: None,
             role: MessageRole::User,
             content: "old".into(),
             tool_call_id: None,
@@ -2433,6 +2486,7 @@ max_tool_calls = 20
         .await
         .expect("begin");
         rec.write_message(&Message {
+            attachments: None,
             role: MessageRole::User,
             content: "spent".into(),
             tool_call_id: None,
@@ -2585,6 +2639,7 @@ max_tool_calls = 20
     fn seed_history(session: &mut ReplSession) {
         for i in 0..3 {
             session.history.push(Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: format!("user {}", i),
                 tool_call_id: None,
@@ -2593,6 +2648,7 @@ max_tool_calls = 20
                 reasoning_content: None,
             });
             session.history.push(Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: format!("assistant {}", i),
                 tool_call_id: None,
@@ -2729,6 +2785,7 @@ max_tool_calls = 20
                     output_tokens: 5,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2761,6 +2818,7 @@ max_tool_calls = 20
                     output_tokens: 500,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2827,6 +2885,7 @@ max_tool_calls = 20
                     output_tokens: 0,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             }),
@@ -2877,7 +2936,7 @@ max_tool_calls = 20
 
     // ── Interactive approval callback (Phase 1) ──────────────────────────
 
-    use openslate_core::approval::RiskLevel;
+    use openslate_core::approval::{ApprovalTrigger, RiskLevel};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn approval_req(tool: &str, agent: &str, risk: RiskLevel) -> ApprovalRequest {
@@ -2886,6 +2945,9 @@ max_tool_calls = 20
             arguments: serde_json::json!({"cmd": "ls"}),
             agent_id: agent.to_owned(),
             risk_level: risk,
+            server: None,
+            trigger: ApprovalTrigger::Manual,
+            note: None,
         }
     }
 
@@ -3091,14 +3153,15 @@ max_tool_calls = 20
     #[test]
     fn repl_session_without_approval_section_derives_shell_run_code_default() {
         // temp_project's config has no [approval] section → the locked REPL
-        // default auto_except(["shell", "run_code"]) applies.
+        // default auto_except(["shell", "run_code"]) applies. approval_policy()
+        // 经 rules 引擎重建（BTreeMap 有序化工具列表——legacy 匹配是 any()
+        // 无序语义，等价），期望侧排序后比较。
         let session = make_session();
+        let mut expected = vec!["shell".to_owned(), "run_code".to_owned()];
+        expected.sort();
         assert_eq!(
             session.approval_policy(),
-            openslate_core::approval::ApprovalPolicy::AutoExcept(vec![
-                "shell".to_owned(),
-                "run_code".to_owned()
-            ])
+            openslate_core::approval::ApprovalPolicy::AutoExcept(expected)
         );
     }
 }

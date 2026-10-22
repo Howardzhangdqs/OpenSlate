@@ -69,11 +69,21 @@
 - 审批应答：`approval_choice_to_msg`（L363）/ `approval_choice_label`（L374）。
 - server URL 归一化：`normalize_server_url`（L392，容忍 ws:// / http:// / host:port 拼写）。
 
+### 3.3 transcript rebuild 的 reasoning 映射（存储 v5 L6 修复）
+
+`components/transcript.rs` 的 `entry_from_message`（rebuild 路径）：assistant 消息携带
+非空 `reasoning_content` 时，在 ToolCall / Assistant 条目**之前**补一条
+`TranscriptEntry::Reasoning`（空串不产生条目）——与 mobile 侧共享投影
+（`openslate_protocol::project_from_messages`）语义对齐。修复前 rebuild 丢弃持久化的
+思维链（merge 路径保留、rebuild 路径丢失的不一致）；测试
+`rebuild_restores_reasoning_content_entries`。TUI 的 `TranscriptEntry` 是自己的枚举，
+与 protocol `EntryDto` 的完全统一仍是 follow-up（设计 §4 记档）。
+
 ## 4. openslate-protocol（server/tui 共享协议，也是 mobile FFI 的载荷）
 
 `crates/openslate-protocol/src/lib.rs`：
 
-- `PROTOCOL_VERSION = 1`；`ClientMsg` / `ServerMsg` 枚举——**写操作与 hello 走
+- `PROTOCOL_VERSION`（现 v4，见 02-core/openslate-protocol.md §1）；`ClientMsg` / `ServerMsg` 枚举——**写操作与 hello 走
   ClientMsg；snapshot/事件流/审批请求走 ServerMsg**。
 - 全套 DTO：`SnapshotDto` / `EntryDto` / `ConfigViewDto`…；
 - `SERVER_INFO_FILE`（server.json 文件名常量，**单一真相源**，server 写 / tui 读两端共用）；

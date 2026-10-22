@@ -21,20 +21,24 @@ Kotlin (UniFFI callback)◄──EventSink(单队列+泵线程)──┐
 MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ──► LLM
 ```
 
-## 2. 模块一览（10 个模块 + lib.rs）
+## 2. 模块一览（11 个模块 + lib.rs）
 
 | 模块 | 行数 | 关键导出 | 职责 |
 |------|------|---------|------|
-| `src/runtime.rs` | 1514 | `MobileRuntime`、`RuntimeOptions` | FFI 边界的组合根；create/send/shutdown/会话管理/registry 查询全部入口 |
+| `src/runtime.rs` | 3371 | `MobileRuntime`、`RuntimeOptions` | FFI 边界的组合根；create/send/shutdown/会话管理/registry 查询全部入口 |
 | `src/bootstrap.rs` | 396 | `MobilePaths` | 宿主注入的 4 个路径；首启目录脚手架 + 默认配置；DB 路径归位 |
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
 | `src/hostcall.rs` | 447 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`call_with_id`（自定义超时，ask_user 先例）；`HostTool::with_timeout`（超时覆盖 builder——termux 壳用，见 exec.rs）；`fail_all` 对 ask_user 豁免（持久化恢复） |
 | `src/mcp_recovery.rs` | — | `RecoveringMcpTool`、`RecoveryCtx`、`MCP_RECOVER_HOST_TOOL`、`is_mcp_connection_failure` | MCP host 死亡自愈：外部 MCP 工具的恢复装饰器（连接失败签名 → 单飞恢复 host call `mcp.recover_host` → 注册表同名重发一次）；`RecoveryCtx` = 单飞闩 + 完成代数 + 冷却窗口（10s）+ 注册表弱引用；重试预算 = 1（task-local 重入标记）；包装点两处（create_with 装配期 `wrap_mcp_tools` / reload_mcp scratch 迁移期），见 call-chains.md §3.1.2 |
 | `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`AskUserExemptApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、Manual 审批豁免（见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
+| `src/approval_review.rs` | 502 | `AiReviewApproval`、`DEFAULT_REVIEW_TIMEOUT` | 审批 AI 审查装饰器（mobile-only，tool-approval）：AutoRisk 请求先付一次小额 LLM 审查——safe 静默放行 / risky 弹人（note 带审查理由）/ 失败超时 fail-safe 弹人；verdict 缓存（(tool, args hash)→结论，容量 128）；审查模型 = `[capabilities].review` 未绑定继承会话模型；P0 红线全落实（见 [call-chains.md](call-chains.md) §3.3 与 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1） |
 | `src/secrets.rs` | — | `PersistentSecretVault`、`env_source`、`mask_with_known_values` | ask_user secret 子系统：会话内存 + store v4 `credentials` 持久镜像两级凭据库、env 注入源、file 写入（0600）、脱敏值源（见 [04-tools/ask-user.md §8](../04-tools/ask-user.md)） |
 | `src/exec.rs` | 940 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1）；termux HostTool 壳专用超时 `TERMUX_HOST_CALL_TIMEOUT` = **900s**（停滞期间 Kotlin 侧等待连接 + 重发续跑，见 android-app.md / call-chains.md §3.1.1；配套 Kotlin `HARD_WAIT_TIMEOUT_MS` = 880s） |
 | `src/provider.rs` | 88 | `mobile_provider_factory`、`MobileSecrets` | provider 工厂：内存 key 注入 + env 兜底 |
-| `src/registry.rs` | 541 | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新） |
+| `src/attachments.rs` | ~1400 | `import_attachment`、`sniff_mime`、`normalize_image`（header 快速通道 + 迭代压缩）、`gate_submit_attachments`、`AttachmentDataProxy`、`refill_message_attachment_data` | 附件 ingest（多模态输入，存储 v5 §3）：magic-byte 嗅探 → sha256 content-addressing → 图像归一化（小图 JPEG/PNG header-only 零转码 passthrough；其余按用户双旋钮**迭代压缩达标** q85→70→55 → ×0.85 缩边，地板 1024）→ 视频 passthrough → 落盘；Submit 门控矩阵；请求路径字节装载代理（见 §12）。**导入纯本地零网络**（token 数由响应侧回填，见 §12.5）；全程分段耗时日志 |
+| `src/transcripts.rs` | ~640 | `SyncState`（`persist_range`/`flush_now`/`invalidate`）、`sync_loop`、`rebuild_transcript`、`heal_truncated_tail`、`DANGLING_TAIL_META`/`INCOMPLETE_TURN_META`/`HEAL_META` | transcript 持久化（存储 v5 §4 + 历史转写丢失修复 C1/C3）：SyncState 收口的增量同步 + 三个高危时刻的强制冲刷 + 两级重建（entries 优先 / 消息投影回退 / 截断自愈）+ 存储健康横幅（见 §13）；sync_loop 兼附件 tokens 回填消费点（见 §12.5） |
+| `src/attachment_tokens.rs` | ~330 | `AttachmentTokenBackfill`、`overlay_tokens_from_messages` | 附件 image tokens **响应侧回填**（协议 v5）：EventSink tap 闩首次调用值 → sync_loop 落 transcript → 重开经 messages.meta_json 重放（见 §12.5） |
+| `src/registry.rs` | 541+ | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新）；`supports_video`（models.dev modalities 直读——Submit 门控的 video 维） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
 
 `src/lib.rs`（45 行）re-export 关键类型，另有一个 crate 级函数：
@@ -57,6 +61,7 @@ pub fn set_mcp_host_token(token: &str) {
 | `provider_factory` | `Option<ProviderFactory>` | `None` | None = mobile secret factory（`mobile_provider_factory`）；测试注入 ScriptedProvider |
 | `extra_tools` | `Vec<Box<dyn Tool>>` | 空 | 额外 host 工具；装配时总会追加内置 `mobile.ping` |
 | `host_call_timeout` | `Duration` | `HOST_CALL_TIMEOUT`（120s） | host call 等宿主应答的上限 |
+| `approval_review_timeout` | `Duration` | `DEFAULT_REVIEW_TIMEOUT`（20s） | 审批 AI 审查等待上限（tool-approval；测试接缝——超时路径单测注 200ms 级别） |
 | `run_retention` | `i64` | **100** | 启动保留策略：装配期只保留最近 N 个 run，其余连同子表数据删除（防历史库无限膨胀；0 = 清空，生产不建议） |
 
 ### 3.2 `MobileRuntime` 结构与装配链（runtime.rs:61-174）
@@ -88,7 +93,7 @@ pub fn set_mcp_host_token(token: &str) {
   - 其余消息：从 `Mutex<Option<Runtime>>` 借 `handle()` clone 后 `spawn`（不移动 runtime 本体），`session_dispatch::dispatch(&state, MOBILE_CONN_ID, msg).await`。
 - **`set_api_key(provider, value)`**（runtime.rs:228-230）：`MobileSecrets.set`（内存 map）。
 - **`set_exec_backends(backends_csv)`**（runtime.rs）：`ExecSelection::parse_csv().normalized()` → 存 `ExecSelectionCell` → 重算 MCP bash 接管（统一谓词）→ `register_bash_tools` 热重注册（MCP 已接管的名字让位，见 §7.1）。
-- **`list_tools_json()`**（runtime.rs:253-275）：全部已注册工具，按 name 排序的 JSON 数组；`input_schema` 原样透传（无 schema 恒为 `{}`，键恒存在）。
+- **`list_tools_json()`**（runtime.rs:792-820）：全部已注册工具，按 name 排序的 JSON 数组；`input_schema` 原样透传（无 schema 恒为 `{}`，键恒存在）；每项含 `server` = 审批作用域标识（tool-approval：聚合形态 = 下游 slug 如 `"github"`，host 内置裸名 = host 前缀，非 MCP 为 JSON null——反解走 core 权威实现 `mcp::server_slug_of`，namespace 取 registry `Tool::namespace()`）。Android 设置页「工具权限」tab 按它分组。
 - **`get_agent_tool_visibility_json()`**（runtime.rs:280-287）：读 root agent frontmatter 的 `{"tools":[…],"hidden_tools":[…]}`（含 glob，保持落盘顺序）。
 - **`set_agent_tool_visibility_json(tools, hidden)`**（runtime.rs:295-355）：①定位 root md（frontmatter `id:` 优先，`<id>.md` 文件名兜底，`find_agent_markdown` runtime.rs:942-970）→ ②外科手术式改写 frontmatter（`openslate_core::config::persist::set_agent_tool_lists`，其余字段与正文逐字节保留）→ ③重装 agent 树 + 热替换（manager 在家就换；回合进行中改 `inner.agent_tree`，引擎回收时自动对齐）。重装失败不回滚磁盘。下一回合即按新可见性过滤，无需重启。
 - **`resolve_host_call(id, ok, payload) -> bool`**（runtime.rs:359-361）：转发 `HostCallRouter::resolve`；false = 无此在途调用。
@@ -103,7 +108,7 @@ pub fn set_mcp_host_token(token: &str) {
 - **会话域**（runtime.rs:566-752）：
   - `list_sessions_json(offset)`：每页 **50** 条；title 直接读 run 行 title 列（新 run 建立时已写 prompt 摘要，旧 run 由 open_session 治愈），无 N+1；
   - `delete_session(run_id) -> bool`：**当前活动会话拒绝删**（recorder 还在写，删了 FK 断裂）；成功后 best-effort `wal_checkpoint`；false 还涵盖 store 不可用 / run 不存在 / DB 错误；
-  - `open_session(run_id)`：busy 守卫（回合进行中拒绝并 Notice Warn）→ 加载 messages → **存量标题治愈**（title 为 None/"mobile session" 时取首条 user 消息前 40 字符补写回库，runtime.rs:682-702）→ `RunRecorder::resume` → **切换前收束旧 run 为 "interrupted"**（同 run 重开不收束）→ 替换 inner 的 history/transcript/session_run/stats → `emit_snapshot()`；
+  - `open_session(run_id)`：busy 守卫（回合进行中拒绝并 Notice Warn）→ 【C1】**切换前强制冲刷**当前 run 转写尾部（`SyncState::flush_now(force=true)`，含回合中推迟的 ToolCall 中断快照 + `INCOMPLETE_TURN_META` 收尾行；busy 守卫已保证无并发 submit）→ 加载 messages → 尾部悬挂 assistant（带未答 tool_calls）pop 时【C2】**回写 DB**：`delete_messages_from_seq(run, max_seq)` 删尾行 + `delete_transcript_entries_for_run` 全删条目 + `SyncState::invalidate(run)`（游标自举 0 → sync_loop 全量重写重建转写；删干净后第二次 open 不再命中 pop）→ **存量标题治愈**（title 为 None/"mobile session" 时取首条 user 消息前 40 字符补写回库）→ `RunRecorder::resume` → **切换前收束旧 run 为 "interrupted"**（同 run 重开不收束）→ 【C2】**会话身份轮换**（!same_run：`clear_session_scopes()`（core 锁外，锁序先 bridge 后 core）+ swap 块内 `session_id = new_session_id()`——session_id 变化驱动 ChatScreen 会话揭示、A 会话 approve_all 不泄漏到 B；同 run 重开不轮换）→ 替换 inner 的 history/transcript/session_run/stats → `emit_snapshot()`；
   - `current_run_id()`：`Option<String>`（Kotlin transcript 本地持久化的键）。
 
 ### 3.4 `shutdown()`（runtime.rs:370-411）
@@ -113,6 +118,7 @@ pub fn set_mcp_host_token(token: &str) {
 1. `host_router.fail_all("runtime shutting down")` —— 在途 host call 全部立刻失败；
 2. `state.approval.deny_all()` —— 审批全拒；
 3. `sink.close_all()` —— 丢 sender，泵线程 drain 完余量后退出（已入队事件仍送达）；
+3.5 【C1】**关停冲刷**：`handle.block_on(sync.flush_now(&state, force=true))`——把当前 run 转写尾部（含回合中推迟的 ToolCall 中断快照 + `INCOMPLETE_TURN_META`）强制落库；必须在 `rt.take()` 之前同步完成（此后无 runtime 可执行异步）；
 4. **run 终态先于 runtime 收束落库**（runtime.rs:383-402）：`session_run.take()` 后 `handle.block_on(run.recorder.finish("interrupted", None, cost))`（先放 core 锁再 block_on——不能持锁等异步）；不做这步该 run 永远停留 running，只能等下次启动清扫；
 5. `rt.take()` → `rt.shutdown_timeout(Duration::from_secs(5))` —— 有限等待 **~5s**，残余任务随 runtime drop 强制终止。
 
@@ -127,12 +133,16 @@ Kotlin 侧对应 `AgentService.onDestroy` 的 2.5s 上限（见 call-chains.md �
 server `build_state` 的 mobile 变体（origin / 显式路径 / 注入 factory）：
 
 - `build_app_context_with(config_flag, extra_tools)`（openslate-app wiring）解构出 config/agents/store/agent_tree/manager/skills/mcp_connections；
-- `apply_approval(&mut manager, &config, true, false)` + 装上 `SessionApprovalBridge`（事件回推审批）；
+- **审批装配（tool-approval，runtime.rs:1398-1429）**：
+  1. `apply_approval(&mut manager, &config, true, false)` 装上 legacy 语义基线（wiring 通用链）；
+  2. 建桥 `SessionApprovalBridge::new(sink)` → **初始规则 = `rules_from_config(&config)` + mobile 专属 opt-in**：`config.approval.is_none()`（`[approval]` 段缺省）时 `default_level = Auto`（设计 v3 用户拍板：自动判断 = 启发式预过滤 + AI 审查；显式配置（legacy 或新键）按映射保持原行为）→ `bridge.set_rules(initial_rules)`；
+  3. `ApprovalManager::with_rules(approval_bridge.rules_handle())` **挂桥的共享 cell**（P0-5：`apply_approval` 的重建形状必须被此步覆盖——游离副本会让 always_*/set_approval_config 热更永远到不了引擎且无编译错误；防回归单测 `approval_rules_cell_shared_between_bridge_and_engine` 钉死桥/引擎/manager 三方同一 cell）；
+  4. callback 链 = `AskUserExemptApproval(AiReviewApproval(bridge))`——ask_user 豁免最外层；`AiReviewApproval::new(bridge, sink, provider_factory, registry, Handle::current()).with_timeout(review_timeout)`，SessionCore 构造完后 `review_approval.wire(&core)` 后注（core 字段 `Mutex<Option<Arc<SessionCore>>>` 防循环依赖，AskUserContext.wire 同款先例）；
 - 初始会话模型：`[capabilities] main` 代号优先（不可解析时回退 root agent 别名）（runtime.rs:790-798）；session_label 默认 `"OpenSlate Mobile"`；
 - **启动清扫**（runtime.rs:806-839，必须在恢复最近 run 之前）：
   - `mark_running_runs_interrupted(now_ms)`：上次进程被杀留下的 running run 统一标 interrupted（get_last_resumable_run 只排除 failed，interrupted 仍可续聊，先清扫不影响重启续聊）；
   - `prune_runs_keep_last(run_retention)`：只留最近 N 个 run；删了东西才 `wal_checkpoint`；
-- **重启续聊**（runtime.rs:841-885）：`get_last_resumable_run()` → `RunRecorder::load_messages`（空消息/失败均退化为 fresh session）→ `RunRecorder::resume` → 恢复 history / transcript / cost；
+- **重启续聊**（runtime.rs:841-885）：`get_last_resumable_run()` → `RunRecorder::load_messages`（空消息/失败均退化为 fresh session）→ `RunRecorder::resume` → 恢复 history / transcript / cost。重启恢复的悬挂尾巴 pop（may_pop_dangling_tail 守卫通过后）同样走 C2 回写（删尾消息行 + 全删 entries 行；此刻 SyncState 尚未构造、游标表为空，无需失效——sync_loop 首周期自会从 DB 行数自举）；
 - 组 `CoreInner{…, session_id: uuid simple}` → `AppState{core, sink, approval, auth_token: None, provider_factory, origin: "mobile", _mcp: mcp_connections}`。
 
 辅助：`messages_to_transcript()`（runtime.rs:991-1062）把持久化消息投影回 transcript（User / Assistant / Reasoning（思维链随消息持久化，恢复为折叠 Reasoning 条目）/ ToolCall（args 截 40 字符、output 并入时截 2000 字符））。
@@ -267,8 +277,10 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 ## 10. 测试
 
 - 集成测试 `crates/openslate-mobile/tests/runtime_flow.rs`（desktop 可跑，无 Android 依赖）：`mobile_runtime_closed_loop_streaming`（scripted provider 流式回包闭环）、`mobile_runtime_host_call_roundtrip`（信封往返 + resolve）、`mobile_runtime_hello_version_check`（版本不匹配报错）、`mobile_runtime_shutdown_rejects_send`、`mobile_runtime_tool_visibility_roundtrip`。harness：`ScriptedProvider`（脚本化 `ModelStreamEvent` 流）+ `Collector`（事件采集 + `wait_for_count` 按类型计数等待）。
+- 审批集成测试 `crates/openslate-mobile/tests/approval_flow.rs`（tool-approval P1b 出口标准，六路径）：Manual 直问 / Auto+Low 跳过审查 / 审查 safe 静默放行 / risky 弹人（note 下发）/ 审查失败 fail-safe 弹人 / 超时 fail-safe 弹人 + 作用域语义（approve_all / session_mcp 会话放行、always_* 持久化热更、rules cell 共享防回归）。审查模型走 ScriptedProvider 注入。
 - 单元测试在各模块 `#[cfg(test)] mod tests`：runtime 生命周期 / 安全守卫（触达私有状态；DB 校验经独立 scratch 连接）、hostcall 四条路径（roundtrip/error/timeout/fail_all）、exec（注册矩阵 / 热切换 / native 执行 / 截断 / 脱敏 / MCP 接管判定与让位）、bootstrap（幂等 / realign 四场景）、provider（set/get 往返）。
 - 降级阶梯（runtime tests，手写 std::net MCP HTTP 挡板同 app wiring 集成测试模式）：`set_exec_backends` 热切换不误杀 MCP bash 工具、HostTool 在场 reload 升级接管（不撞名回滚）、reload 全败兜底在场、reload 真冲突回滚装回让位工具、termux-only 命名矩阵（仅 termux_bash 在场、`bash` 不注册；默认 / 自定义 builtin 模板，证明不硬编码）、builtin 模板 setter（校验 + 落盘 + 空串删键）。
+- 附件 tokens 响应侧回填（attachment_tokens/runtime tests）：状态机（首次调用闩值 + agentic 后续调用忽略 / 首次调用 None 即不分模态 → 无回填且后续 Some 不追认 / TurnError 也收尾已闩实值 / 未标记回合忽略 / clear_pending / map first-write-wins / transcript 只填未填条目）；集成（scripted provider 流 Usage 事件 + Done.usage 同值，真实 genai 流路径形态）：单图回合 → map + 快照 User 附件带 `tokens`、同回合第二条 Usage 忽略；多图提交恒无回填（覆盖一个 sync 周期 + 快照无 tokens 键）；不分模态 usage（智谱口径）→ 无回填；重启可见性（transcript_entries 追加式不可变 → 重开首份快照经 meta_json 重放即带 tokens）；import JSON 恒无 `tokens` 键（导入零网络契约）。
 - 跑法：`cargo test -p openslate-mobile`。
 
 ## 11. 接手检查清单
@@ -277,3 +289,86 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 2. 新增 host tool → Rust 侧注册 `HostTool`（或进 extra_tools），Kotlin 侧 `RuntimeBridge.handleHostCall` 补分发。
 3. 改事件协议（新 ServerMsg 变体）→ `events.rs` 无需动（透传 JSON），但 Kotlin `handleEvent` 要补分支。
 4. 改 bash 后端命名 → 同步 `DEFAULT_ROOT_AGENT_MD` 白名单与 `ALL_BASH_NAMES` 清理表 + Kotlin `handleHostCall` 的工具名匹配。
+
+## 12. 附件（多模态输入，存储 v5 §3/§6/§7；L4）
+
+端到端链路：Kotlin `PickVisualMedia` → 拷 cache（HEIC 在 Kotlin 预转码 JPEG）→ FFI `import_attachment(path, mime, name)`（**纯本地零网络**，返回 `{ok,id,mime,filename,size_bytes,orig_bytes,processed,orig_width?,orig_height?,width?,height?}`，对比信息见 §12.1 契约）→ id 入 composer → Submit 拼 `"attachments":[{id,mime,filename}]` → 门控 → session 构进 user 消息（引用形状）→ `AttachmentDataProxy` 请求时装载字节 → L3 convert 产 Binary part（image_url/video_url）。**ByteArray/base64 不出现在任何边界**；发起 API 请求之前附件数据绝不上行任何服务器（导入侧无任何 token 预估，见 §12.5）。
+
+### 12.1 ingest（attachments.rs）
+
+- **嗅探表**（不信任 declared_mime，仅记偏差）：jpeg `FF D8 FF` / png 8 字节 / gif87a|89a / webp `RIFF…WEBP` / mkv EBML `1A 45 DF A3` / mp4+mov `ftyp`（brand `qt  ` → mov，heic 家族 brand → 拒绝，其余 mp4）。
+- **图像归一化**（2026-10-21 两轮演进：提速快速通道 → 用户可配置迭代压缩）：入口防呆 = **固定 50MB 源文件常量**（`MAX_SOURCE_IMAGE_BYTES`，非用户旋钮——归一化总能压到达标，入口只挡病态大文件；`max_image_mb` 语义已迁移为处理后上限）；
+  - **快速通道（零解码零编码零重采样）**：JPEG/PNG 先 **header-only 读尺寸**（`header_dimensions` → `image::ImageReader::into_dimensions`，只解析 SOF/IHDR 不碰像素），长边 ≤ 用户 `max_image_dim` 且字节 ≤ 用户 `max_image_mb` → **字节原样 passthrough**。JPEG 本就在 wire 白名单内无需转码——相机截图/压缩图直接省掉全处理流程（12MP 照片在 P10 lite 级 SoC 上数秒 → 毫秒级 header 解析）。**EXIF 方向不处理**：passthrough 保留原字节，方向解释交给 provider（全解码路径同样不处理 EXIF，行为一致）。header 解析失败（畸形/截断）→ 回落全解码路径给准确错误；
+  - **迭代压缩达标**（transcode 路径，**用户双旋钮**：`max_image_dim` 等比缩放目标 + `max_image_mb` 处理后大小上限，FFI `set_image_processing` 热更）：① 等比缩到 ≤ 用户 dim（只缩不放，**`CatmullRom`** 快档——纯 Rust 无 SIMD 下比 Lanczos3 快数倍，画质对视觉模型够用）；② JPEG **q85** 编码 ≤ 用户 mb → 完成；③ 超限 → 质量 **q85→70→55** 逐档重编码；仍超且还能缩（target ×0.85 后仍会真正变小、地板 1024 之上）→ **缩边重试**（每轮从原图重采样，不累积二次缩放）；④ **地板**：dim ≤1024 / 缩无可缩 且 q55 仍超（病态小图高噪点）→ 取最后结果 + `tracing::warn`，**不再失败**。动图取首帧；
+  - 出口硬校验（provider 安全公共分母，两条路径都执行）：像素 ≤6000²、字节 ≤5MB——validation 已限用户旋钮 dim ≤6000 / mb ≤5，断言是 wire 侧最后防线（达标路径恒 ≤ user_cap ≤5MB）。出口 mime 恒 `image/jpeg|png`——归一化器即 wire 白名单执行者；
+  - **分段耗时日志**（真机慢了 logcat 直接可诊，格式统一 `attachment timing:` 前缀）：快速通道打 `fast_path=…_passthrough`；迭代路径逐档 `attempt=N q=Q WxH → NB >|≤ cap`、缩边 `target X → Y`、地板 `floor q=…`、终值 `q=Q attempts=N`；`import_attachment` 打 `read/normalize/sha256/write/total`；FFI `import_attachment_json` 入口/出口各一条总耗时。样例：`attachment timing: attempt=2 q=70 1550x1200 → 1980000B ≤ cap 2097152B`。
+- **视频 passthrough 不转码**；落盘 ≤`max_video_mb`，发送另受 `max_inline_video_mb`。
+- **落盘**：sha256 over 最终字节 → `files/{sha256}.{ext}`（store `insert_attachment`，幂等覆盖同名字节）+ 行（run_id NULL 暂存）；`MobileRuntime::import_attachment_json` 为 FFI 后端（block_on，IO 线程）。
+- **import JSON 对比信息契约**（2026-10-21，chip 点击展开展示）：成功对象
+  `{"ok":true,"id","mime","filename","size_bytes","orig_bytes","processed","orig_width","orig_height","width","height"}`。
+  `processed` = `"passthrough"`（小图 JPEG/PNG 零转码，orig 尺寸=处理后、orig_bytes=size_bytes）|
+  `"transcode"`（缩放/重编码，orig_* 为 header 尺寸/源字节数，width/height 为缩放后）|
+  `"video_passthrough"`（视频不转码，尺寸四键**省略**——嗅探层不解析容器头，不做重解析；
+  orig_bytes=size_bytes）。尺寸四键图像恒在（orig 来自 header-only 读取）。UI 据
+  `processed` 生成「为什么这样处理」文案；`tokens` 键恒缺省（响应侧回填，见 §12.5）。
+- **导入零网络**（2026-10-21 方向调整）：导入是纯本地操作，**绝不发起任何网络请求**——附件字节只在真正发起模型请求时随请求上行。曾有的智谱 tokenizer 预估（fix-8）已整体移除（`estimate_attachment_tokens`/`is_zhipu_endpoint`/`tokenizer_client`/`tokenizer_mock` 与 import JSON 的 `tokens` 键、mobile 对 reqwest/webpki-roots 的依赖增量）。附件 chip 的 token 数改由**回合结束后响应侧回填**（见 §12.5）：真实模型响应顺带携带才显示，否则回退文件大小。
+
+### 12.2 Submit 门控（runtime.rs `gate_submit_attachments`，§3.3/§3.4/§6.4）
+
+`send()` 的 spawn 内、dispatch 前执行；矩阵（纯函数 `attachments::gate_submit_attachments` 可单测）：
+
+| 条件 | 结果 |
+|---|---|
+| 图+视频混发 | 拒「图像与视频请分开发送」（单点常量，实测可放开） |
+| 图 > 50 张 | 拒（`MAX_IMAGES_PER_SUBMIT` 常量；convert 层同值兜底） |
+| 总字节 > `max_inline_total_mb` | 拒并列出实际总量（fail fast 不裁剪） |
+| 含图且 registry caps 无 image 模态 | 拒「当前模型不支持图像输入…」 |
+| 含视频且 caps 无 video 模态 | 拒（无论开关） |
+| 含视频且 `experimental_video=false` | 拒「当前版本视频输入为实验性功能，请在设置中开启」 |
+| 单视频 > `max_inline_video_mb` | 拒并列出文件与实际大小 |
+| caps 未知（手填模型无元数据） | 放行，provider 错误原样透出 |
+| 空文本 + 附件 | 拒「请为附件输入文字说明」（session 对空文本静默丢弃，必须 fail fast） |
+| 附件 id 不存在/已过期 | 拒「附件不存在或已过期」 |
+
+- caps 数据源：image = registry 三源合并 `lookup_local().supports_vision`；video = `RegistryStore::supports_video`（models.dev 条目 `modalities.input` 直读——`ModelMeta` 无 video 维，L3 冻结面）。均 `None`=未知放行。
+- 同 sha256 重复导入去重（first-wins）——省 token 且避免 bind 撞 `UNIQUE(run_id, sha256)`。
+- 拒绝全部走 **Notice（Error 级）**，文案 = 设计文档措辞。
+
+### 12.3 绑定与字节装载
+
+- **绑定**：门控通过 → dispatch（session 把引用构进 user 消息 + transcript 条目）→ 引擎 spawn 后 `bind_landed_attachments`（`bind_attachments(ids, run_id)`；以「history 尾部是刚落地的带附件 user 消息」为落地判定——busy 拒绝/回滚不绑，暂存行留给下次或 7 天 GC）。
+- **装载**：provider 工厂统一包 `AttachmentDataProxy`（`create_with` 装配期，含测试注入的 factory）——GenerateRequest 进 provider 前为 data=None 的引用从 files 读字节，单点执行 `max_inline_total_mb` 封顶；多步回合每步请求、迟到答案续跑、resume 续聊全走这一处。**超封顶就地丢弃**（2026-10-21）：data=Some 的附件（含 read_file 工具附件——工具读图链路把字节装在 Tool Message 上）累计超总封顶时置 None + warn（R5：模型丢图不丢文本），而非仅计入预算。
+- **resume 回填**：`open_session` 与重启恢复（assemble_state）加载消息后 `refill_message_attachment_data`（总字节封顶同配置；超限 warn 跳过——模型丢图不丢文本，R5）。工具附件 id `tool-{n}` 不落 attachments 表，resume 后不回填（跳过 + warn，同语义）。
+- **缩略图**（2026-10-21）：`attachment_thumbnail_base64(store, id, max_px)`——id → files 原图 → 长边缩到 max_px（只缩不放，`<=0` 按 256、上限 2048）→ JPEG q80 → base64；FFI `getAttachmentThumbnail` 后端（des-2 Android lane）。仅图像（视频/未命中/解码失败 → Err）。
+
+### 12.4 启动 GC
+
+`assemble_state` 启动清扫块末尾调 `store.gc_stale_unbound_attachments(now_ms)`：删 7 天前导入未发送的暂存行 + 对应文件清扫（失败仅告警）。
+
+### 12.5 附件 image tokens 响应侧回填（协议 v5，2026-10-21）
+
+方向（用户拍板）：① 发起 API 请求之前**绝不**把附件数据发到任何服务器（导入零预估，见 §12.1）；② 只有**真实模型响应**顺带携带的 image token 信息才显示——OpenAI 系 chat usage 的 `prompt_tokens_details.image_tokens`（vendor 补丁 #3 归一化为 genai `Usage::image_input_tokens` → core `Usage::image_tokens`，见 03-models/model-genai.md）。**智谱 chat usage 不分模态、天然无此字段 → 永远回退文件大小显示，符合预期。**
+
+- **数据源口径**：本回合**第一次**模型调用的 `usage.image_tokens`。agentic 循环里历史图每轮全量重发、每次都计入 usage——只有首次调用才是"这张图的首次完整成本"，后续调用的值一律忽略（闩锁语义）。
+- **单图限定**：仅当本回合 Submit 的 user 消息**恰好带 1 张图片附件**时回填；多图 usage 不分图拆分，回填哪个都是错 → 全部不填（UI 回退文件大小）。视频同理。
+- **回合收尾**：TurnOk 与 TurnError 都收尾（首次调用已完成即测量真实，回合后续失败不否定该值）；首次调用即 None（不分模态）→ 本回合无回填，后续调用冒出的值也不追认。
+- **流转**（`attachment_tokens.rs`，避开引擎线程持 core 锁的窗口）：`EventSink` tap（广播线程，新增 `set_tap`）收 `Usage` 闩值 / `TurnOk`·`TurnError` 收尾推 completed 队列（tap 里**绝不锁 core**——引擎广播 TurnOk 时持有 core 锁，锁了就死锁）；`transcripts.rs::sync_loop` 每周期（活跃 300ms / 空闲 1s）在持锁快照段消费队列、原地更新 live transcript 的 `EntryDto::User.attachments[].tokens` → 之后所有快照（`build_snapshot` 从 inner.transcript 构造）自然携带。Submit 标记在 runtime `send` 的 spawn 内设置（dispatch 前；busy/回滚未落地则清除）。
+- **持久化 / 重启可见性**：`transcript_entries` 追加式不可变（回填晚于 User 条目落库，无 UPDATE API）——重开会话时 `rebuild_transcript` 经 `overlay_tokens_from_messages` 从 `messages.meta_json`（每条 assistant 消息的 `MessageMeta.usage.image_tokens`）**按同口径重放**（单图 user 消息 → 其后第一条 assistant 消息配对），重启后 tokens 照常读回。live 会话与重放路径共用 `AttachmentTokenBackfill::apply_to_transcript`。
+- **协议形状**：`AttachmentDto.tokens: Option<u64>`（serde default + None 跳键，v5；仅 `EntryDto::User` 出现，`ClientMsg::Submit` 方向忽略）。Kotlin 契约：有值显示 token 数，缺键回退文件大小。
+
+## 13. transcript 持久化与存储健康（存储 v5 §4/§5；L4；历史转写丢失修复 C1/C2/C3）
+
+- **同步任务**（`transcripts.rs::sync_loop`，create_with spawn，300ms 活跃 / 1s 空闲）：对比内存 transcript 与已落库游标，新条目按 `seq`（= 下标）写 `transcript_entries`；兼**附件 tokens 回填消费点**（§12.5，每周期 drain completed 队列更新 User 条目）。**写库段收口在 `SyncState`**（C1 重构）：cursors 表 + `persist_range(force)`（原内联写库段原样提取），**唯一写者**、转写只在尾部追加 ⇒ 游标恒等于该 run 已落库行数——run 切换时从 DB 行数自举；pop 重建（C2）后经 `invalidate(run)` 清游标 → 自举 0 → 全量重写（幂等）。锁序唯一方向：**cursors（tokio Mutex，可跨 await）→ core（std Mutex，短临界区快照）**，不得反向嵌套。**回合进行中推迟 ToolCall 条目**（回合结束折叠后才是终值）；`insert_transcript_entry` 为 INSERT OR IGNORE（自举读失败按 0 重插 = 幂等补写，不再是致命告警死循环）。seq 分配与 recorder 的 AtomicI64 模式同构（自举例程）。
+- **强制冲刷（C1，防新增丢失）**：三个「内存转写即将蒸发」的时刻都走 `SyncState::flush_now(force=true)`（与 sync_loop 共享同一游标表）——① **NewSession**（session.rs 经 `TranscriptFlusher` 钩子前置冲刷，锁段开头另设二次 busy 守卫挡 flush 窗口内的竞态 submit）；② **open_session 切换**（busy 守卫后、swap 前冲刷旧 run）；③ **shutdown**（`rt.take()` 之前 block_on 同步完成）。冲刷若写了未折叠终值的 ToolCall 条目（`detail.output.is_none()` = 回合未完成快照）→ 直接向 DB 追加 `EntryDto::Meta{text:"回合未完成，以下为中断时的快照"}`（`INCOMPLETE_TURN_META`，区别于 `DANGLING_TAIL_META`），不碰内存转写。
+- **两级重建**（`rebuild_transcript`，open_session + 重启恢复共用）：优先 `list_transcript_entries`（v5 真相源，Approval/Meta/StepBreak 等投影拿不到的条目都在）；空（v5 前 run）→ `messages_to_transcript` 消息投影回退（L6 换 protocol 共享投影 `project_from_messages`）。
+- **截断自愈（C3，修已损坏 run）**：重建时总是算消息投影对照；entries 行的 durable 前缀（User/Assistant/ToolCall 计数）短于投影且逐条对得上（User↔User / Assistant↔Assistant；ToolCall call_id 精确优先、任一侧缺失按名字——配对语义同 `fold_tool_outcomes` 双分支；种类错位/数量不齐立即 bail 宁缺勿错）→ 补 `EntryDto::Meta{text:"检测到未同步的转写尾部，已从消息记录恢复"}`（`HEAL_META`）+ 投影尾部。**不重写表**：重开后游标按行数自举 → 补齐尾部按接续 seq 写回（幂等自愈）。
+- **悬挂尾部 Meta（§5）+ pop 回写（C2）**：`open_session` / 重启恢复 pop 悬挂 assistant（带未答 tool_calls 的尾消息）时**回写 DB**——`delete_messages_from_seq(run, max_seq)` 删尾行 + `delete_transcript_entries_for_run` 全删条目行 + `invalidate` 清游标，重建走消息投影（完整、无悬挂条目）；删干净后第二次 open 不再命中 pop 分支（修「反复重开 ⚡Meta 行累积、悬挂消息夹进历史中间」）。pop 后若转写非空仍追加 `DANGLING_TAIL_META` Meta 行——恢复后的 UI 不再"无声少一截"。
+- **存储健康（§5）**：同循环检查 `recorder.pending_persisted_writes() > 0` → Notice Warn「存储写入失败，历史可能不完整」（per pending 期一次）。
+- **token 聚合**：`list_sessions_json` 每项含 `input_tokens`/`output_tokens`（v5 runs 聚合列）。
+- **会话身份轮换（C2）**：open_session 切到**不同** run 时 `clear_session_scopes()`（core 锁外）+ `session_id = new_session_id()`（session.rs pub 导出）——session_id 变化驱动 ChatScreen 会话揭示，A 会话的 approve_all 白名单不再泄漏到 B；同 run 重开不轮换。
+
+## 14. 测试补充（L4；历史转写丢失修复测试面）
+
+`attachments.rs` 单测：嗅探表（含 heic 拒绝）/ 归一化（缩放重编码 + PNG passthrough 逐字节）/ 门控矩阵（混发、50 张、25MB、20MB、开关两态、caps 三态）/ sha256 去重 / ingest 往返（真实文件库：PNG passthrough、MP4 passthrough、declared 说谎按嗅探、未知格式与超限拒绝）/ 回填封顶（超限跳过、缺行不失败）。
+`runtime.rs` 集成（CapturingProvider 捕获 GenerateRequest）：import→submit e2e（data 装载字节一致 + bind + 持久化引用 + transcript 行带引用）；门控 notice 矩阵（纯文本模型拒图且引擎零调用 / 混发 / 实验关 / 空文本 / 未知 id；多模态+开关开 mp4 放行）；重启 resume 回填（第二轮请求仍带图）；启动 GC（8 天前暂存清、新暂存留）；transcript 往返（entries 行重建 + 旧 run 投影回退不回归 + !same_run 重开轮换 session_id）。
+历史转写丢失修复（C1/C2/C3）：`transcripts.rs` walk 单测（call_id 配对 / 名字兜底 / 错位与数量不齐 bail / 装饰跳过 / 无缺尾 no-op + 三条 Meta 文案 pin）；`runtime.rs` 集成——悬挂 pop 回写（第一次 open 删行 + 投影重建 + 恰一条 DANGLING Meta；第二次 open 无 pop 无新增 Meta、messages 尾行已删）、截断自愈幂等（messages=5/entries=2 → 2 前缀 + HEAL Meta + 投影尾 3，再 open 一致）、中断回合冲刷（tool 执行后模型流错误 → NewSession → DB 含 as-is ToolCall + INCOMPLETE_TURN_META，重开转写完整）、NewSession 二次 busy 守卫（冲刷钩子注入 submit → 拒绝、转写未清、session_id 未轮换）、shutdown 中冲刷（挂死工具回合中关停 → entries 含 User + as-is ToolCall + INCOMPLETE Meta）；store `delete_messages_from_seq` / `delete_transcript_entries_for_run` 边界（空集/越界/计数/幂等/不误伤他 run）与 `insert_transcript_entry` OR IGNORE 语义（重复 seq 静默让位首写行）。

@@ -8,6 +8,13 @@ description = "UniFFI FFI surface of the OpenSlate mobile runtime (Android/Kotli
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "openslate_mobile"
+# doctest 关闭（L6 验证时定位）：本 crate 的 lib 名与依赖
+# `openslate-mobile` 的 lib 目标同名（uniffi 脚手架要求），rustdoc
+# --test 会收到两条同名 `--extern openslate_mobile`（自身 lib 的
+# deps/ 软链 + 依赖的哈希 rlib）→ E0464 multiple candidates，
+# 挂载即编译失败（与文件内容无关，HEAD 即复现）。本 crate 无
+# runnable doctest（模块文档均为 //!，无代码围栏示例），关闭零损失。
+doctest = false
 
 [dependencies]
 openslate-mobile = { path = "../openslate-mobile" }

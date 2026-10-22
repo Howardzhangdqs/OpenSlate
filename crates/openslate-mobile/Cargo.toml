@@ -16,6 +16,8 @@ openslate-store-sqlite = { path = "../openslate-store-sqlite" }
 openslate-mcp-builtin = { path = "../openslate-mcp-builtin" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# TranscriptFlusher 实现的 BoxFuture 类型名（历史转写丢失修复 C1）。
+futures = { workspace = true }
 # bootstrap 的 [database] path 原地改写（保持其余注释/格式零扰动）。
 toml_edit = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
@@ -28,7 +30,18 @@ genai = { path = "../../vendor/genai" }
 # 模型元数据注册表本地存储压缩（数据源页面 / registry 模块）。
 zstd = "0.13"
 serde = { workspace = true }
+# 附件 content-addressing 哈希（attachments 模块，存储 v5 §3）。
+sha2 = "0.10"
+# 附件图像归一化（解码 / 缩放 / JPEG q85 重编码；纯 Rust codec，
+# Android 交叉编译无 C 依赖——default-features=false 只带所需四格式）。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+# 缩略图出口 base64（attachment_thumbnail_base64 → FFI JSON）。
+base64 = "0.22"
+
+[target.'cfg(target_os = "android")'.dependencies]
 
 [dev-dependencies]
 tempfile = { workspace = true }
 openslate-model-genai = { path = "../openslate-model-genai" }
+# 集成测试：附件 ingest / registry 种子数据压缩 / 异步断言。
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

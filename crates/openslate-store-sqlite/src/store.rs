@@ -26,6 +26,9 @@ use crate::schema;
 #[derive(Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    /// 文件库的 DB 路径（`files_dir()` 的派生源 + 权限收紧目标）。
+    /// 内存库（`new_in_memory`）为 `None` → 附件文件写入不可用。
+    db_path: Option<String>,
 }
 
 /// PRAGMA 关键设置的快照（用于验证）。
@@ -110,7 +113,10 @@ impl SqliteStore {
             .connect_with(in_memory_connect_options())
             .await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: None,
+        })
     }
 
     /// 创建一个连接到文件数据库的存储。
@@ -130,7 +136,25 @@ impl SqliteStore {
         // 在任何 run 数据落进去之前收紧权限。
         restrict_db_file_permissions(path);
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            db_path: Some(path.to_owned()),
+        })
+    }
+
+    /// 附件文件的根目录：`{db 文件父目录}/files`（v5 设计 §3.1）。
+    ///
+    /// content-addressed 布局（`files/{sha256}.{ext}`），**不按 run_id 分
+    /// 目录**——相同 sha256 跨 run 复用同一文件。内存库返回 `None`
+    /// （附件写入随之不可用，`insert_attachment` 返回明确错误）。三个
+    /// 前端的 db 都落在各自 data 目录，派生零管线成本。
+    pub fn files_dir(&self) -> Option<std::path::PathBuf> {
+        self.db_path.as_ref().map(|p| {
+            std::path::Path::new(p)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("files")
+        })
     }
 
     /// 读取当前 `PRAGMA user_version`。
@@ -147,6 +171,7 @@ impl SqliteStore {
     /// 提交 —— 崩溃后重跑只会从上次已提交的版本继续，不会出现半迁移。
     pub async fn run_migrations(&self) -> Result<(), StoreError> {
         let mut version = self.user_version().await?;
+        let start_version = version;
         if version > schema::SCHEMA_VERSION {
             return Err(StoreError::MigrationError(format!(
                 "数据库 schema 版本 {version} 高于本程序支持的版本 {}，请先升级程序",
@@ -166,6 +191,7 @@ impl SqliteStore {
                 1 => schema::migrate_v1_to_v2(&mut tx).await?,
                 2 => schema::migrate_v2_to_v3(&mut tx).await?,
                 3 => schema::migrate_v3_to_v4(&mut tx).await?,
+                4 => schema::migrate_v4_to_v5(&mut tx).await?,
                 v => {
                     return Err(StoreError::MigrationError(format!(
                         "未知的 schema 版本步进起点: v{v}"
@@ -187,6 +213,17 @@ impl SqliteStore {
                 .await
                 .map_err(|e| StoreError::MigrationError(e.to_string()))?;
             version += 1;
+        }
+
+        // v4→v5 步进（破坏性 DROP TABLE）事务提交后回收 WAL（设计 §8.2
+        // 步骤 7）。best-effort：迁移已提交，checkpoint 失败仅告警。
+        if start_version < 5 && version >= 5 {
+            if let Err(e) = self.wal_checkpoint().await {
+                tracing::warn!(
+                    target: "openslate_store",
+                    "post-v5-migration wal_checkpoint(TRUNCATE) failed (non-fatal): {e}"
+                );
+            }
         }
         Ok(())
     }
@@ -468,8 +505,8 @@ mod tests {
         .expect("合法 status 应通过");
 
         query(
-            "INSERT INTO messages (id, run_id, execution_node_id, role, content_json, created_at) \
-             VALUES ('bad-role', 'ok-run', 'enode-x', 'narrator', '{}', 1)",
+            "INSERT INTO messages (id, run_id, execution_node_id, role, content_zst, created_at) \
+             VALUES ('bad-role', 'ok-run', 'enode-x', 'narrator', x'00', 1)",
         )
         .execute(store.pool())
         .await
@@ -495,16 +532,16 @@ mod tests {
         .expect("insert node");
 
         query(
-            "INSERT INTO messages (id, run_id, execution_node_id, role, content_json, seq, created_at) \
-             VALUES ('uq-m1', 'uq-run', 'uq-enode', 'user', '{}', 1, 1)",
+            "INSERT INTO messages (id, run_id, execution_node_id, role, content_zst, seq, created_at) \
+             VALUES ('uq-m1', 'uq-run', 'uq-enode', 'user', x'00', 1, 1)",
         )
         .execute(store.pool())
         .await
         .expect("first message");
 
         let dup = query(
-            "INSERT INTO messages (id, run_id, execution_node_id, role, content_json, seq, created_at) \
-             VALUES ('uq-m2', 'uq-run', 'uq-enode', 'user', '{}', 1, 2)",
+            "INSERT INTO messages (id, run_id, execution_node_id, role, content_zst, seq, created_at) \
+             VALUES ('uq-m2', 'uq-run', 'uq-enode', 'user', x'00', 1, 2)",
         )
         .execute(store.pool())
         .await;
@@ -519,6 +556,25 @@ mod tests {
 
         let store = SqliteStore::new(path_str).await;
         assert!(store.is_ok(), "file-based store should create successfully");
+    }
+
+    /// files_dir 派生：文件库 = `{db 父目录}/files`；内存库 = None。
+    #[tokio::test]
+    async fn test_files_dir_derivation() {
+        let mem = SqliteStore::new_in_memory().await.expect("mem store");
+        assert!(mem.files_dir().is_none(), "内存库无 files_dir");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nested").join("test.db");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let store = SqliteStore::new(path.to_str().expect("utf-8"))
+            .await
+            .expect("file store");
+        assert_eq!(
+            store.files_dir(),
+            Some(dir.path().join("nested").join("files")),
+            "files_dir = db 父目录/files"
+        );
     }
 
     /// 路径含 `?` / `#` 时也必须能正常打开（URL 拼接时代的回归测试）。
@@ -811,19 +867,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_migrates_head_era_v0_db_to_v2() {
+    async fn test_migrates_head_era_v0_db_to_latest() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("legacy_head.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
         build_head_era_v0_db(path_str).await;
 
         let store = SqliteStore::new(path_str).await.expect("open store");
-        store.run_migrations().await.expect("migrate to v2");
+        store.run_migrations().await.expect("migrate to latest");
 
         // user_version 正确
         assert_eq!(store.user_version().await.expect("version"), schema::SCHEMA_VERSION);
 
-        // title 列存在且数据完好
+        // title 列存在且数据完好（runs 行原样保留——v5 破坏性迁移只丢 messages）
         let run = store.get_run("legacy-run").await.expect("get").expect("run");
         assert_eq!(run.title.as_deref(), Some("旧标题"));
         assert_eq!(run.status, "completed");
@@ -846,7 +902,7 @@ mod tests {
         .expect("index check");
         assert!(idx.is_none(), "idx_runs_cwd 应被删除");
 
-        // 唯一索引存在
+        // 唯一索引存在（v5 重建 messages 后必然可建）
         let uq: Option<String> = query_scalar(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_run_seq_uq'",
         )
@@ -855,10 +911,11 @@ mod tests {
         .expect("uq check");
         assert!(uq.is_some(), "唯一索引应已创建");
 
-        // 存量消息完好
+        // v5 破坏性迁移：存量 messages 历史被丢弃（含旧 content_json 形态）
         assert_eq!(
             store.count_messages_by_run("legacy-run").await.expect("cnt"),
-            2
+            0,
+            "v5 破坏性迁移应清空 messages 历史"
         );
 
         // 重复迁移幂等
@@ -947,9 +1004,11 @@ mod tests {
         assert_eq!(run.cost_usd, 0.0);
     }
 
-    /// 存量数据存在重复 seq 时，唯一索引创建失败仅告警跳过，迁移不阻断。
+    /// 存量数据存在重复 seq 时，v1→v2 唯一索引创建失败仅告警跳过；随后
+    /// v4→v5 破坏性迁移 DROP 整表重建，最终唯一索引必然就位（重复数据
+    /// 随旧表消失）。
     #[tokio::test]
-    async fn test_v2_unique_index_skipped_on_duplicate_seq() {
+    async fn test_dup_seq_legacy_db_migrates_through_destructive_v5() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("legacy_dup_seq.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
@@ -979,7 +1038,7 @@ mod tests {
                 .execute(&pool)
                 .await
                 .expect("node");
-            // 两条消息同 seq —— 唯一索引必然创建失败
+            // 两条消息同 seq —— v2 步进的唯一索引创建必然失败（仅告警）
             for id in ["dup-m1", "dup-m2"] {
                 query("INSERT INTO messages VALUES (?, 'dup-run', 'dup-enode', 'user', '\"x\"', 7, 1)")
                     .bind(id)
@@ -994,7 +1053,7 @@ mod tests {
         store
             .run_migrations()
             .await
-            .expect("重复 seq 只能导致索引跳过，不能阻断迁移");
+            .expect("重复 seq 不能阻断迁移（v2 告警跳过 + v5 破坏性重建）");
 
         assert_eq!(store.user_version().await.expect("version"), schema::SCHEMA_VERSION);
         let uq: Option<String> = query_scalar(
@@ -1003,7 +1062,211 @@ mod tests {
         .fetch_optional(store.pool())
         .await
         .expect("uq check");
-        assert!(uq.is_none(), "重复数据下唯一索引应被跳过");
+        assert!(
+            uq.is_some(),
+            "v5 DROP+重建后唯一索引必然可建（新表从零开始）"
+        );
+        assert_eq!(
+            store.count_messages_by_run("dup-run").await.expect("cnt"),
+            0,
+            "重复 seq 的存量消息随破坏性迁移丢弃"
+        );
+    }
+
+    /// v4 库（含大文本消息）→ v5 破坏性迁移的完整断言：messages 清空且
+    /// 新 schema 就位、runs/credentials 原样保留、索引集合正确、幂等重跑。
+    #[tokio::test]
+    async fn test_v4_db_migrates_destructively_to_v5() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("v4_to_v5.sqlite");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(path_str)
+                        .create_if_missing(true),
+                )
+                .await
+                .expect("open v4 db");
+
+            // v4 形态的完整表集（真实 v4 库 9 张表；messages 为 content_json 形态）
+            for ddl in [
+                "CREATE TABLE runs (id TEXT PRIMARY KEY, title TEXT, root_agent_id TEXT NOT NULL, \
+                 status TEXT NOT NULL, input_json TEXT NOT NULL, output_json TEXT, \
+                 started_at INTEGER NOT NULL, finished_at INTEGER, cost_usd REAL NOT NULL DEFAULT 0)",
+                "CREATE TABLE execution_nodes (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, \
+                 agent_id TEXT NOT NULL, parent_execution_id TEXT, parent_call_id TEXT, \
+                 status TEXT NOT NULL, input_json TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER)",
+                "CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, execution_node_id TEXT NOT NULL, \
+                 agent_id TEXT NOT NULL, kind TEXT NOT NULL, data_json TEXT NOT NULL, \
+                 seq INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL, finished_at INTEGER)",
+                "CREATE TABLE messages (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, \
+                 execution_node_id TEXT NOT NULL, agent_id TEXT, \
+                 role TEXT NOT NULL, content_json TEXT NOT NULL, \
+                 seq INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+                "CREATE TABLE prompt_snapshots (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, \
+                 execution_node_id TEXT NOT NULL, agent_id TEXT NOT NULL, profile_name TEXT NOT NULL, \
+                 source_kind TEXT NOT NULL, source_path TEXT, content_hash TEXT NOT NULL, \
+                 rendered_prompt TEXT NOT NULL, created_at INTEGER NOT NULL)",
+                "CREATE TABLE audit_log (id TEXT PRIMARY KEY, run_id TEXT, agent_id TEXT, \
+                 event_type TEXT NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL)",
+                "CREATE TABLE trace_events (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, \
+                 execution_node_id TEXT, step_id TEXT, agent_id TEXT, event_name TEXT NOT NULL, \
+                 event_kind TEXT NOT NULL, ts_ns INTEGER NOT NULL, dur_ns INTEGER, \
+                 track TEXT NOT NULL, args_json TEXT)",
+                "CREATE TABLE pending_questions (request_id TEXT PRIMARY KEY, tool_call_id TEXT NOT NULL, \
+                 questions_json TEXT NOT NULL, status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, \
+                 created_at INTEGER NOT NULL)",
+                "CREATE TABLE credentials (name TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+                 target TEXT NOT NULL, value TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+            ] {
+                query(ddl).execute(&pool).await.expect("v4 ddl");
+            }
+            query("CREATE UNIQUE INDEX idx_messages_run_seq_uq ON messages(run_id, seq)")
+                .execute(&pool)
+                .await
+                .expect("v4 uq index");
+            query("CREATE INDEX idx_messages_run_seq ON messages(run_id, seq)")
+                .execute(&pool)
+                .await
+                .expect("v4 non-unique index");
+
+            query("INSERT INTO runs (id, title, root_agent_id, status, input_json, started_at, cost_usd) \
+                   VALUES ('v4-run', '旧会话', 'root', 'completed', '{}', 1000, 0.5)")
+                .execute(&pool)
+                .await
+                .expect("v4 run");
+            query("INSERT INTO execution_nodes VALUES ('v4-enode', 'v4-run', 'root', NULL, NULL, 'completed', '{}', 1100, 1200)")
+                .execute(&pool)
+                .await
+                .expect("v4 node");
+            // 大文本消息（reasoning 膨胀形态）+ 常规消息
+            query("INSERT INTO messages (id, run_id, execution_node_id, role, content_json, seq, created_at) \
+                   VALUES ('v4-big', 'v4-run', 'v4-enode', 'assistant', ?, 1, 1200)")
+                .bind("r".repeat(200_000))
+                .execute(&pool)
+                .await
+                .expect("v4 big message");
+            query("INSERT INTO messages (id, run_id, execution_node_id, role, content_json, seq, created_at) \
+                   VALUES ('v4-small', 'v4-run', 'v4-enode', 'user', '\"hi\"', 2, 1300)")
+                .execute(&pool)
+                .await
+                .expect("v4 small message");
+            query("INSERT INTO credentials VALUES ('API_KEY', 'env', 'API_KEY', 'secret-v4', 1, 2)")
+                .execute(&pool)
+                .await
+                .expect("v4 credential");
+            query("PRAGMA user_version = 4")
+                .execute(&pool)
+                .await
+                .expect("stamp v4");
+            pool.close().await;
+        }
+
+        let store = SqliteStore::new(path_str).await.expect("open store");
+        store.run_migrations().await.expect("v4 → v5");
+
+        // 版本
+        assert_eq!(store.user_version().await.expect("version"), 5);
+
+        // messages：清空 + 新 schema 就位（content_zst / meta_json 有、
+        // content_json 无）
+        assert_eq!(
+            store.count_messages_by_run("v4-run").await.expect("cnt"),
+            0,
+            "破坏性迁移：messages 历史清空"
+        );
+        let msg_columns: Vec<String> =
+            query_scalar("SELECT name FROM pragma_table_info('messages') ORDER BY name")
+                .fetch_all(store.pool())
+                .await
+                .expect("columns");
+        assert!(msg_columns.iter().any(|c| c == "content_zst"), "got: {msg_columns:?}");
+        assert!(msg_columns.iter().any(|c| c == "meta_json"), "got: {msg_columns:?}");
+        assert!(
+            !msg_columns.iter().any(|c| c == "content_json"),
+            "旧列不应残留, got: {msg_columns:?}"
+        );
+
+        // runs 原样保留 + 聚合列就位（默认 0）
+        let run = store.get_run("v4-run").await.expect("get").expect("run kept");
+        assert_eq!(run.title.as_deref(), Some("旧会话"));
+        assert_eq!(run.status, "completed");
+        assert!((run.cost_usd - 0.5).abs() < 1e-12);
+        let run_columns: Vec<String> =
+            query_scalar("SELECT name FROM pragma_table_info('runs') ORDER BY name")
+                .fetch_all(store.pool())
+                .await
+                .expect("runs columns");
+        assert!(run_columns.iter().any(|c| c == "input_tokens"), "got: {run_columns:?}");
+        assert!(run_columns.iter().any(|c| c == "output_tokens"), "got: {run_columns:?}");
+        assert_eq!(run.input_tokens, 0, "存量 run 无 meta → 聚合列保持 0");
+        assert_eq!(run.output_tokens, 0);
+
+        // credentials 原样保留
+        assert_eq!(
+            store.get_credential_value("API_KEY").await.expect("get"),
+            Some("secret-v4".to_owned()),
+            "API key 不随迁移丢失"
+        );
+
+        // 索引变化断言（v5 delta）：idx_messages_run_seq 随表 DROP 消亡、
+        // uq / execution_node_id 重建就位、两个新索引就位。
+        // （完整索引集合的相等断言由全新库的 test_all_indexes_created /
+        // test_migrations_triple_run 覆盖；本手工 v4 库未建齐 v1~v3 时代
+        // 的索引，不做全量比对。）
+        let index: Option<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_run_seq'",
+        )
+        .fetch_optional(store.pool())
+        .await
+        .expect("check");
+        assert!(index.is_none(), "非唯一 idx_messages_run_seq 应随 DROP TABLE 消亡");
+        for expected in [
+            "idx_messages_run_seq_uq",
+            "idx_messages_execution_node_id",
+            "idx_attachments_sha256",
+            "idx_transcript_run_seq",
+        ] {
+            let found: Option<String> = query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='{expected}'"
+            )))
+            .fetch_optional(store.pool())
+            .await
+            .expect("check index");
+            assert!(found.is_some(), "v5 后 {expected} 应存在");
+        }
+
+        // attachments / transcript_entries 表就位
+        let mut tables: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("tables");
+        tables.sort();
+        let mut expected_tables: Vec<&str> = schema::TABLE_NAMES.to_vec();
+        expected_tables.sort();
+        assert_eq!(tables, expected_tables);
+
+        // 新表可用：transcript_entries 写入 + 唯一索引生效
+        store
+            .insert_transcript_entry("te-1", "v4-run", 1, r#"{"kind":"user"}"#, 2000)
+            .await
+            .expect("transcript insert on migrated db");
+        let dup = query(
+            "INSERT INTO transcript_entries (id, run_id, seq, entry_json, created_at) \
+             VALUES ('te-2', 'v4-run', 1, '{}', 2001)",
+        )
+        .execute(store.pool())
+        .await;
+        assert!(dup.is_err(), "idx_transcript_run_seq 应拒绝重复 (run_id, seq)");
+
+        // 幂等重跑不炸
+        store.run_migrations().await.expect("idempotent rerun");
     }
 
     /// 高于支持版本的库必须拒绝迁移。

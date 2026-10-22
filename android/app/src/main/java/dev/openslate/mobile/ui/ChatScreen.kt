@@ -1,13 +1,18 @@
 package dev.openslate.mobile.ui
 
+import android.net.Uri
 import android.os.Build
 import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.expandVertically
@@ -55,11 +60,20 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.outlined.AddPhotoAlternate
+import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material.icons.outlined.Build
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.FactCheck
+import androidx.compose.material.icons.outlined.Gavel
+import androidx.compose.material.icons.outlined.GppMaybe
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
@@ -73,6 +87,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -121,6 +137,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import dev.openslate.mobile.bridge.McpRecoverPhase
 import dev.openslate.mobile.bridge.McpRecoverStep
+import dev.openslate.mobile.bridge.AttachmentRefUi
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
@@ -146,16 +163,21 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import dev.openslate.mobile.R
+import dev.openslate.mobile.bridge.PendingApprovalUi
 import dev.openslate.mobile.bridge.PendingQuestionUi
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.UiEntry
+import dev.openslate.mobile.bridge.approvalDecisionLabel
 import dev.openslate.mobile.bridge.RuntimeBridge.ASK_USER_TOOL
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 /**
- * Phase 1 聊天主界面：transcript 流 + 输入框 + 审批横幅。
+ * 聊天主界面：transcript 流 + 输入框 + 工具调用审批卡（底部横幅位）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -164,6 +186,8 @@ fun ChatScreen(
     onOpenSettings: () -> Unit,
     onOpenAskUser: () -> Unit = {},
     onOpenReviewAskUser: () -> Unit = {},
+    /** 查看器对比块「跳转设置」：跳设置页并直落「工具 > 内置工具」（处理图片分区）。 */
+    onOpenImageProcessingSettings: () -> Unit = {},
 ) {
     val state by RuntimeBridge.state.collectAsState()
     val listState = rememberLazyListState()
@@ -178,17 +202,45 @@ fun ChatScreen(
         focusManager.clearFocus()
     }
     val context = LocalContext.current
+    // 错误/提示 snackbar 通道（多模态输入契约）：① RuntimeBridge Error/Warn
+    // 级 notice（附件门控拒绝等）→ 自动展示；② composer 侧校验失败/导入
+    // 失败经 onMessage 上抛。附件提交被拒时 composer 草稿与 chips 原地保留
+    // （submit 终态信号见 RuntimeBridge.submitResolution），snackbar 只管
+    // 展示原因。
+    val snackbarHostState = remember { SnackbarHostState() }
+    val snackbarScope = rememberCoroutineScope()
+    val showMessage: (String) -> Unit = { msg ->
+        snackbarScope.launch { snackbarHostState.showSnackbar(msg) }
+    }
+    val lastNotice by RuntimeBridge.lastNotice.collectAsState()
+    var seenNoticeSeq by remember { mutableStateOf(0L) }
+    LaunchedEffect(lastNotice) {
+        val n = lastNotice ?: return@LaunchedEffect
+        if (n.seq > seenNoticeSeq) {
+            seenNoticeSeq = n.seq
+            if (n.level == "error" || n.level == "warn") snackbarHostState.showSnackbar(n.text)
+        }
+    }
     // 输入框聚焦面板：显示 = 输入框持有焦点（编辑状态）。未聚焦时面板
     // 不参与组合，底部布局零变化。Termux/MCP 活性走 tracker 状态流
     // （聚焦展开时面板内部 refresh），未聚焦时喂输入框内常驻状态行。
     var composerFocused by remember { mutableStateOf(false) }
     val live by ComposerMcpStatusTracker.state.collectAsState()
-    val inlineStatus = composerInlineStatus(state.modelAlias, state.config, live)
-    // MCP 活性常新鲜（不依赖聚焦）：初次组合刷一次 + 回前台（ON_RESUME）
-    // 刷一次。tracker 自带单飞去重（重复触发安全），探活为本机回环 HTTP
-    // 成本低，故不设轮询定时器；面板聚焦时另有 refresh（ComposerFocusPanel）。
-    // ChatScreen 无 config_changed / MCP reload 回调处理点，按约定不新增链路。
-    LaunchedEffect(Unit) { ComposerMcpStatusTracker.refresh(context) }
+    val lightsState by McpLightsTracker.state.collectAsState()
+    val inlineStatus = composerInlineStatus(state.modelAlias, state.config, live, lightsState)
+    // 双 tracker 分工（与 composer 聚焦面板同口径）：MCP/tools 计数与
+    // server 名单走 ComposerMcpStatusTracker（廉价 HTTP 探活 + tools/list）；
+    // 首行 Termux 活性走五灯 McpLightsTracker（probeMcpLights 完整管线）。
+    // 两者常新鲜（不依赖聚焦）：初次组合刷一次 + 回前台（ON_RESUME）刷
+    // 一次——lights 侧经 gateRefresh 智能门控（无快照/非全绿→全量重检含
+    // 自动拉起 host、全绿→廉价 hostAlive 比对，与设置页同款）；tracker
+    // 自带单飞去重（重复触发安全），探活为本机回环 HTTP 成本低，故不设
+    // 轮询定时器；面板聚焦时另有 refresh（ComposerFocusPanel）。ChatScreen
+    // 无 config_changed / MCP reload 回调处理点，按约定不新增链路。
+    LaunchedEffect(Unit) {
+        ComposerMcpStatusTracker.refresh(context)
+        McpLightsTracker.gateRefresh(context)
+    }
     // Termux stall 激活期间周期重探连接（约 2.5s；tracker CAS 单飞防抖，
     // 在途探测的 refresh 为无操作）——stall 解除（termuxStallSince 变
     // null）即停。重探与面板可见性解耦：Ready 收起面板后重探仍继续到
@@ -216,6 +268,11 @@ fun ChatScreen(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 ComposerMcpStatusTracker.refresh(context)
+                // 五灯侧同款 ON_RESUME 门控（与设置页 McpSection 一致）：
+                // 非全绿快照（如刚从 Termux 切回）→ 全量重检 + 自动拉起
+                // host；全绿 → 廉价 hostAlive 比对，翻转才重检。composer
+                // 聚焦面板首行/子面板与输入框常驻状态行同享该快照。
+                McpLightsTracker.gateRefresh(context)
                 // stall 在途时回前台立即重探：用户从 Termux 切回的最快
                 // 路径确认恢复并续跑（gateRefresh 同款 ON_RESUME 门控）。
                 if (RuntimeBridge.state.value.termuxStallSince != null) {
@@ -258,6 +315,12 @@ fun ChatScreen(
             .firstOrNull { it.name == d.name && it.fullArgs == d.fullArgs }
             ?: d
     }
+    // 附件全屏查看器：消息气泡缩略图 / composer 草稿卡点击打开（视频卡无动作）。
+    var attachmentViewer by remember { mutableStateOf<AttachmentViewerSource?>(null) }
+    // 「编辑」请求（用户消息长按菜单 → 文本回填 composer 输入框）：seq 单调
+    // 递增驱动 Composer 侧 LaunchedEffect，同一文本重复编辑也能再触发。
+    var editSeq by remember { mutableStateOf(0L) }
+    var editText by remember { mutableStateOf("") }
 
     // ── 智能贴底跟随 ────────────────────────────────────────────────────
     // 「跟随」是用户意图闩（followBottom），几何「贴底」（listAtBottom）只
@@ -423,10 +486,11 @@ fun ChatScreen(
             }
         },
         bottomBar = {
-            if (state.pendingApproval != null) {
-                ApprovalBanner(
-                    pending = state.pendingApproval!!,
-                    onAnswer = { id, choice -> RuntimeBridge.answerApproval(id, choice) },
+            state.pendingApproval?.let { pending ->
+                ApprovalCard(
+                    pending = pending,
+                    glass = glass,
+                    rootCoords = { rootCoords },
                 )
             }
         },
@@ -505,6 +569,15 @@ fun ChatScreen(
                                     pendingQuestion = state.pendingQuestion,
                                     onOpenAskUser = onOpenAskUser,
                                     onOpenReview = onOpenReviewAskUser,
+                                    // 用户消息长按「编辑」→ 文本回填 composer（seq
+                                    // 触发，同文本重复编辑也生效）。
+                                    onEditMessage = { t -> editText = t; editSeq += 1 },
+                                    // 气泡内图片缩略图点击 → 全屏查看器（视频卡无动作）。
+                                    onOpenAttachment = { ref ->
+                                        if (!ref.isVideo) {
+                                            attachmentViewer = AttachmentViewerSource.Stored(ref.id, ref.filename)
+                                        }
+                                    },
                                 )
                                 is RenderItem.ToolGroup -> ToolGroupCard(
                                     item.parts,
@@ -637,21 +710,48 @@ fun ChatScreen(
                         rootCoords = { rootCoords },
                         hazeState = hazeState,
                     )
+                    // 错误/提示 snackbar：压在聚焦面板与输入区之间（出现时
+                    // 把底部组顶起，自动消失后回落；空状态零占位）。
+                    SnackbarHost(
+                        hostState = snackbarHostState,
+                        modifier = Modifier.padding(horizontal = 10.dp),
+                    )
                     Composer(
                         glass = glass,
                         rootCoords = { rootCoords },
                         running = state.running,
                         onInputFocusChange = { composerFocused = it },
-                        onSend = { text ->
-                            RuntimeBridge.submit(text)
-                            // 发送后退出编辑状态：清焦点 → 聚焦面板收起（键盘随之收起）。
-                            focusManager.clearFocus()
+                        // 发送（纯文本/带附件同路）：附件提交是异步门控（拒绝
+                        // 经 Error notice 返回），composer 等终态信号
+                        // （submitResolution）再清草稿；这里只透传送达结果。
+                        // 发送成功退出编辑状态：清焦点 → 聚焦面板收起。
+                        onSend = { text, refs ->
+                            val delivered = RuntimeBridge.submit(text, refs)
+                            if (delivered) focusManager.clearFocus()
+                            delivered
                         },
                         onCancel = { RuntimeBridge.cancel() },
+                        hazeState = hazeState,
+                        onMessage = showMessage,
                         // 常驻状态行：仅未聚焦时显示（聚焦后同源信息移交面板卡片）。
                         showInlineStatus = !composerFocused,
                         inlineStatus = inlineStatus,
                         sharedTransitionScope = this@SharedTransitionLayout,
+                        // 「编辑」请求：seq 变化 → 输入框回填 + 聚焦（见 Composer）。
+                        editRequestSeq = editSeq,
+                        editRequestText = editText,
+                        // 草稿图片卡点击 → 全屏查看器（原 URI 解码；带处理
+                        // 对比数据时信息区展示「原图 vs 处理后」）。
+                        onOpenDraft = { att ->
+                            att.previewUri?.let { uri ->
+                                attachmentViewer = AttachmentViewerSource.Draft(
+                                    uri = uri,
+                                    filename = att.filename,
+                                    sizeBytes = att.sizeBytes,
+                                    processed = att.processedInfo,
+                                )
+                            }
+                        },
                     )
                 }
             }
@@ -659,6 +759,20 @@ fun ChatScreen(
             // 工具详情弹窗（Dialog 自身是独立 window，不参与列表布局）。
             detailLive?.let { tc ->
                 ToolDetailDialog(tc, onDismiss = { detailTool = null })
+            }
+
+            // 附件全屏查看器（气泡缩略图 / composer 草稿卡点击；Dialog 独立 window）。
+            // 对比块「跳转设置」：先摘 viewer 状态（同帧关 Dialog）再导航，
+            // 设置页右滑推入与 Dialog 消失同帧进行，无闪屏。
+            attachmentViewer?.let { src ->
+                AttachmentViewerDialog(
+                    source = src,
+                    onDismiss = { attachmentViewer = null },
+                    onOpenProcessingSettings = {
+                        attachmentViewer = null
+                        onOpenImageProcessingSettings()
+                    },
+                )
             }
         }
     }
@@ -682,7 +796,7 @@ private sealed class RenderItem {
  */
 private fun entrySig(e: UiEntry?): String = when (e) {
     null -> ""
-    is UiEntry.User -> "u:${e.text.length}"
+    is UiEntry.User -> "u:${e.text.length}:${e.attachments.size}"
     is UiEntry.Assistant -> "a:${e.text.length}"
     is UiEntry.Reasoning -> "r:${e.text.length}"
     is UiEntry.Meta -> "m:${e.text.length}"
@@ -740,9 +854,20 @@ private fun EntryRow(
     pendingQuestion: PendingQuestionUi? = null,
     onOpenAskUser: () -> Unit = {},
     onOpenReview: () -> Unit = {},
+    /** 用户消息长按菜单「编辑」→ 文本回填 composer。 */
+    onEditMessage: (String) -> Unit = {},
+    /** 气泡内图片缩略图点击 → 全屏查看器。 */
+    onOpenAttachment: (AttachmentRefUi) -> Unit = {},
 ) {
     when (entry) {
-        is UiEntry.User -> Bubble(entry.text, mine = true)
+        is UiEntry.User -> Bubble(
+            entry.text,
+            mine = true,
+            attachments = entry.attachments,
+            hazeState = hazeState,
+            onEdit = onEditMessage,
+            onOpenAttachment = onOpenAttachment,
+        )
         is UiEntry.Assistant -> MarkdownBubble(entry.text, hazeState, onTapWhileFocused)
         is UiEntry.Reasoning -> ReasoningBlock(entry.text, entry.meta, entry.startTs, activeLast)
         is UiEntry.Meta -> Text(
@@ -767,13 +892,78 @@ private fun EntryRow(
             style = MaterialTheme.typography.labelMedium,
             modifier = Modifier.padding(horizontal = 8.dp),
         )
-        is UiEntry.Approval -> Text(
-            "⚑ ${entry.toolName} → ${entry.decision}",
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.padding(horizontal = 8.dp),
-        )
+        is UiEntry.Approval -> ApprovalTranscriptRow(entry)
         UiEntry.StepBreak -> Spacer(Modifier.widthIn(min = 4.dp))
     }
+}
+
+/** 允许类决定（转写行绿/红分色判定；未知值走 Gavel 中性兜底）。 */
+private val APPROVAL_ALLOW_DECISIONS =
+    setOf("approved", "approve-all", "always-tool", "session-mcp", "always-mcp")
+
+/**
+ * 审批转写行：Material 图标（按决定分色：允许族绿 / 拒绝红 / 未知中性）
+ * + 工具名（等宽内嵌）+ 决定文案（[approvalDecisionLabel]，未知值兜底
+ * 显示原始串）。
+ */
+@Composable
+private fun ApprovalTranscriptRow(entry: UiEntry.Approval) {
+    val allowed = entry.decision in APPROVAL_ALLOW_DECISIONS
+    val icon = when {
+        entry.decision == "denied" -> Icons.Outlined.Block
+        allowed -> Icons.Outlined.FactCheck
+        else -> Icons.Outlined.Gavel
+    }
+    val tint = when {
+        entry.decision == "denied" -> MaterialTheme.colorScheme.error
+        allowed -> successGreen()
+        else -> MaterialTheme.colorScheme.outline
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(horizontal = 8.dp),
+    ) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(13.dp), tint = tint)
+        Spacer(Modifier.width(8.dp))
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(fontFamily = MonoFont)) { append(entry.toolName) }
+                append(" · ")
+                append(approvalDecisionLabel(entry.decision))
+            },
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.outline,
+        )
+    }
+}
+
+/** bash 类工具注册名（与 Rust 侧注册一一绑定，后端判定即工具名）：Termux 内执行。 */
+private const val TERMUX_BASH_TOOL = "termux_bash"
+
+/** bash 类工具注册名：App 进程内 native sh（/system/bin/sh + Toybox）。 */
+private const val NATIVE_BASH_TOOL = "bash"
+
+/** bash 类工具判定：命令形态渲染仅覆盖这两个名字，其他工具完全保持现状。 */
+private fun isBashLikeTool(name: String): Boolean =
+    name == TERMUX_BASH_TOOL || name == NATIVE_BASH_TOOL
+
+/**
+ * 解析 bash 类工具 fullArgs 的 command 字段（参数形状 `{"command": "..."}`，
+ * bash 另有可选 timeout_ms）。命中返回 (命令文本, 其余参数 pretty JSON)——
+ * 其余参数为空串表示无额外参数；fullArgs 空 / 非 JSON / 缺 command 键返回
+ * null（调用方回退原始 argsPreview / fullArgs 展示，信息不丢）。
+ */
+private fun parseBashCommand(fullArgs: String): Pair<String, String>? = try {
+    val obj = JSONObject(fullArgs)
+    val cmd = obj.optString("command")
+    if (cmd.isBlank()) {
+        null
+    } else {
+        obj.remove("command")
+        cmd to if (obj.length() > 0) obj.toString(2) else ""
+    }
+} catch (_: Exception) {
+    null
 }
 
 /**
@@ -833,7 +1023,13 @@ private fun ToolGroupCard(parts: List<UiEntry>, onOpenTool: (UiEntry.ToolCall) -
     }
 }
 
-/** 单个工具条目：状态图标 + 名称 + 参数摘要，点击弹出详情弹窗（完整命令 + 输出）。 */
+/**
+ * 单个工具条目：状态图标 + 名称 + 参数摘要，点击弹出详情弹窗（完整命令 + 输出）。
+ * bash 类工具（termux_bash / bash）的摘要槽改显实际命令（解析 fullArgs 的
+ * command 字段）：MonoFont 等宽单行截断 + 前缀区分执行环境（termux_bash 挂
+ * Termux 品牌 logo、bash 挂 `$` 提示符——命令文本语义，非图标）；解析失败
+ * 回退原 argsPreview。其他工具完全保持现状。
+ */
 @Composable
 private fun ToolChipRow(
     tc: UiEntry.ToolCall,
@@ -859,6 +1055,12 @@ private fun ToolChipRow(
         ok -> successGreenContainer()
         failed -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
         else -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
+    }
+    // bash 类命令预览：解析 fullArgs 的 command 字段（remember 缓存，避免
+    // 重组重复 parse）。null = 非 bash 类或解析失败/空 fullArgs，回退原
+    // argsPreview 展示。
+    val bashCmd = remember(tc.name, tc.fullArgs) {
+        if (isBashLikeTool(tc.name)) parseBashCommand(tc.fullArgs) else null
     }
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -894,14 +1096,39 @@ private fun ToolChipRow(
             color = statusTint,
         )
         Spacer(Modifier.widthIn(min = 6.dp))
-        Text(
-            tc.argsPreview,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.outline,
-            maxLines = 1,
-            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
+        if (bashCmd != null) {
+            // 前缀区分执行环境：Termux 侧挂品牌 logo（固定配色不走 tint，见
+            // ic_termux.xml 头注释）；native 侧用 `$` 提示符（等宽命令文本
+            // 语义的一部分，非图标组件）。
+            if (tc.name == TERMUX_BASH_TOOL) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_termux),
+                    contentDescription = null,
+                    modifier = Modifier.size(13.dp),
+                    tint = Color.Unspecified,
+                )
+                Spacer(Modifier.width(4.dp))
+            }
+            // 实际命令替代原始 JSON 预览：MonoFont 等宽（标识类短文本约定），
+            // 单行截断省略。
+            Text(
+                if (tc.name == NATIVE_BASH_TOOL) "\$ " + bashCmd.first else bashCmd.first,
+                style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFont),
+                color = MaterialTheme.colorScheme.outline,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            Text(
+                tc.argsPreview,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        }
     }
 }
 
@@ -943,6 +1170,11 @@ private fun parseToolOut(raw: String): ToolOutParts {
  * 替代原就地展开视图（maxLines=16 硬限制 + 不可滚动，长输出看不全）。
  * 执行中的工具打开时显示等待文案，完成输出经 ChatScreen 的实时回查刷新。
  *
+ * bash 类工具（termux_bash / bash）命令区分层展示：顶部具体命令（去 JSON
+ * wrapper、系统等宽、可多行、前缀与工具条同语言）+「调用参数」区（command
+ * 外其余参数 pretty JSON，无则省略）；解析失败整块回退原始 JSON 展示，
+ * 「复制命令」随解析结果切换纯命令 / 原始 fullArgs。输出区与懒加载逻辑不动。
+ *
  * 懒加载全量输出：条目携带 callId 且非 running / 非 ask_user 时，经 FFI
  * 从 Rust 内存 history 拉取 max_output_bytes 上限内的完整版本，与条目
  * 自带输出（host 工具的 Kotlin 缓存 / 事件 preview / 恢复快照）**取更
@@ -979,6 +1211,11 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     val parts = remember(shownOut) { parseToolOut(shownOut.orEmpty()) }
     var tab by remember(shownOut) { mutableStateOf(0) }
     val running = tc.status == "running"
+    // bash 类分层展示的解析（remember 缓存，避免重组重复 parse）：null =
+    // 非 bash 类或解析失败/空 fullArgs，命令区整块回退原始 JSON 展示。
+    val bashCmd = remember(tc.name, tc.fullArgs) {
+        if (isBashLikeTool(tc.name)) parseBashCommand(tc.fullArgs) else null
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1057,13 +1294,57 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                             )
                         }
                     }
-                    Text(
-                        "命令",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                    SelectionContainer {
-                        Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
+                    if (bashCmd == null) {
+                        // 非 bash 类 / 解析失败：维持原「命令」区原始 JSON 展示。
+                        Text(
+                            "命令",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        SelectionContainer {
+                            Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
+                        }
+                    } else {
+                        // bash 类：顶部具体命令（去 JSON wrapper，系统等宽、可
+                        // 多行），前缀与工具条同语言——termux_bash 挂品牌 logo
+                        // （固定配色不走 tint）、bash 挂 `$` 提示符（文本语义，
+                        // 非图标）。不设「命令」标签：前缀标记本身即语义。
+                        Row(verticalAlignment = Alignment.Top) {
+                            if (tc.name == TERMUX_BASH_TOOL) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_termux),
+                                    contentDescription = null,
+                                    modifier = Modifier
+                                        .padding(top = 2.dp)
+                                        .size(13.dp),
+                                    tint = Color.Unspecified,
+                                )
+                                Spacer(Modifier.width(6.dp))
+                            }
+                            SelectionContainer {
+                                Text(
+                                    if (tc.name == NATIVE_BASH_TOOL) {
+                                        "\$ " + bashCmd.first
+                                    } else {
+                                        bashCmd.first
+                                    },
+                                    style = mono,
+                                )
+                            }
+                        }
+                        // 调用参数区：command 外其余参数（如 timeout_ms）pretty
+                        // JSON；无其余参数整区省略（命令已全量显示，信息不丢）。
+                        if (bashCmd.second.isNotBlank()) {
+                            Spacer(Modifier.height(12.dp))
+                            Text(
+                                "调用参数",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            SelectionContainer {
+                                Text(bashCmd.second, style = mono)
+                            }
+                        }
                     }
                     Spacer(Modifier.height(12.dp))
                     // 输出区头：标签 + stdout/stderr 切换 + 字符数提示。
@@ -1144,9 +1425,13 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
+                    // bash 类解析成功时复制纯命令文本（不带 JSON wrapper、不含
+                    // `$` 提示符装饰）；失败回退复制原始 fullArgs。
                     SoftButton(
-                        onClick = { clipboard.setText(AnnotatedString(tc.fullArgs)) },
-                        enabled = tc.fullArgs.isNotBlank(),
+                        onClick = {
+                            clipboard.setText(AnnotatedString(bashCmd?.first ?: tc.fullArgs))
+                        },
+                        enabled = bashCmd?.first?.isNotBlank() == true || tc.fullArgs.isNotBlank(),
                     ) {
                         Icon(
                             Icons.Filled.ContentCopy,
@@ -1459,8 +1744,20 @@ private fun SourceCodeDialog(text: String, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun Bubble(text: String, mine: Boolean) {
+private fun Bubble(
+    text: String,
+    mine: Boolean,
+    attachments: List<AttachmentRefUi> = emptyList(),
+    hazeState: HazeState,
+    /** 长按菜单「编辑」：文本回填 composer 输入框。 */
+    onEdit: (String) -> Unit = {},
+    /** 图片缩略图点击 → 全屏查看器。 */
+    onOpenAttachment: (AttachmentRefUi) -> Unit = {},
+) {
     val clipboard = LocalClipboardManager.current
+    val haptics = LocalHapticFeedback.current
+    // 上下文菜单触点锚点（null = 菜单关闭）——与模型消息 MarkdownBubble 同款。
+    var menuAnchor by remember { mutableStateOf<Offset?>(null) }
     Surface(
         shape = RoundedCornerShape(
             topStart = 16.dp,
@@ -1472,14 +1769,73 @@ private fun Bubble(text: String, mine: Boolean) {
         else MaterialTheme.colorScheme.surfaceVariant,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 4.dp),
-        onClick = { clipboard.setText(AnnotatedString(text)) },
+            .padding(horizontal = 4.dp)
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    // 2026-10 改版：点击不再复制（tap 空消费维持既有事件边界，
+                    // 与 MarkdownBubble 同理由）；长按弹「复制/编辑」菜单。
+                    onTap = {},
+                    onLongPress = { offset ->
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        menuAnchor = offset
+                    },
+                )
+            },
     ) {
-        Text(
-            text,
+        Column(
+            // 附件随行（v4 多模态）：chips 在文本上方只读渲染（纵向预览小
+            // 卡片——预览图经 getAttachmentThumbnail FFI 反射获取，未就绪/
+            // 失败回退 Material 图标占位，LruCache 按附件 id 防滚动重复解码）；
+            // 图片卡点击 → 全屏查看器。
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        ) {
+            if (attachments.isNotEmpty()) {
+                AttachmentRefChipsRow(
+                    refs = attachments,
+                    onOpen = onOpenAttachment,
+                )
+                if (text.isNotBlank()) Spacer(Modifier.height(8.dp))
+            }
+            if (text.isNotBlank()) {
+                Text(
+                    text,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+        // 触点锚定的零尺寸 Box：GlassDropdownMenu 的 Popup 以父布局锚定
+        // （模型消息长按菜单同款交互/视觉）。
+        menuAnchor?.let { anchor ->
+            Box(
+                Modifier
+                    .offset { IntOffset(anchor.x.roundToInt(), anchor.y.roundToInt()) }
+                    .size(0.dp),
+            ) {
+                GlassDropdownMenu(
+                    expanded = true,
+                    onDismissRequest = { menuAnchor = null },
+                    hazeState = hazeState,
+                    items = listOf(
+                        GlassDropdownItem(
+                            value = "copy",
+                            label = "复制",
+                            leadingIcon = Icons.Filled.ContentCopy,
+                        ),
+                        GlassDropdownItem(
+                            value = "edit",
+                            label = "编辑",
+                            leadingIcon = Icons.Filled.Edit,
+                        ),
+                    ),
+                    onSelect = { opt ->
+                        when (opt.value) {
+                            "copy" -> clipboard.setText(AnnotatedString(text))
+                            "edit" -> onEdit(text)
+                        }
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -1606,18 +1962,122 @@ private fun Composer(
     rootCoords: () -> LayoutCoordinates?,
     running: Boolean,
     onInputFocusChange: (Boolean) -> Unit = {},
-    onSend: (String) -> Unit,
+    /** 发送（refs 空 = 纯文本，非空 = 带附件）；返回是否送达 runtime。 */
+    onSend: (String, List<dev.openslate.mobile.bridge.AttachmentRefUi>) -> Boolean,
     onCancel: () -> Unit,
     showInlineStatus: Boolean,
     inlineStatus: ComposerInlineStatus,
     sharedTransitionScope: SharedTransitionScope,
+    hazeState: HazeState,
+    onMessage: (String) -> Unit,
+    /** 「编辑」请求序号（>0 递增触发）：变化即把 editRequestText 回填输入框。 */
+    editRequestSeq: Long = 0L,
+    editRequestText: String = "",
+    /** 草稿图片卡点击 → 全屏查看器（附件卡为 Ready 图片时携带）。 */
+    onOpenDraft: (ComposerAttachment.Ready) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var input by remember { mutableStateOf("") }
+    // ── 附件草稿（多模态输入）────────────────────────────────────
+    // chips 两态（导入中/就绪）见 ComposerAttachment；清空时机由提交终态
+    // 信号（submitResolution）决定：accepted（request_start）才清，门控
+    // 拒绝（Error notice）时草稿与 chips 原地保留供修正重发。
+    var attachments by remember { mutableStateOf<List<ComposerAttachment>>(emptyList()) }
+    var awaitingResolution by remember { mutableStateOf(false) }
+    // 附件选择：图片多选（本期视频入口整体隐藏——设置开关不暴露、附件按钮
+    // 恒直开系统图片选择器；Rust 侧 experimental_video 配置与门控不动）。
+    var inputFocused by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    // 提交终态观察（seq 门防初始组合误触发）。
+    val resolution by RuntimeBridge.submitResolution.collectAsState()
+    var seenResolution by remember { mutableStateOf(0L) }
+    LaunchedEffect(resolution) {
+        if (resolution.seq > seenResolution) {
+            seenResolution = resolution.seq
+            if (awaitingResolution) {
+                awaitingResolution = false
+                if (resolution.accepted) {
+                    // 引擎已接受：本地草稿使命完成（回显由 bridge 侧补写）。
+                    // 只清已发送的部分——文本与就绪 chips；导入仍在途的
+                    // chip 保留（不属本次提交）。
+                    input = ""
+                    attachments = attachments.filterIsInstance<ComposerAttachment.Importing>()
+                }
+                // rejected：保留草稿与 chips（原因经 ChatScreen snackbar）。
+            }
+        }
+    }
+    // 系统照片选择器（Photo Picker，Activity Result API 兼容 API 26+）。
+    // 图片 = 多选（上限对齐发送侧 50 张门控）。选回**批量占位先行**（2026-10
+    // 用户反馈：原逐个处理到才加 chip，多选时一张张冒出来视觉上像只选了
+    // 一张）——预检通过后整批 Importing chips 一次 addAll（全部转圈），再
+    // 单个协程串行走导入管线（拷贝 / HEIC 转码 / importAttachment，FFI
+    // block_on 一次一个），轮到谁谁原位转就绪 / 失败摘除，先完成先出图。
+    fun importUris(uris: List<Uri>) {
+        scope.launch {
+            // 数量预检（UI 侧提前拦；服务端门控仍是兜底）：chips 已有数量
+            // （Ready 图片 + 全部导入中——导入中类型未知，保守按图计）+
+            // 本批新增合并计算。
+            val existing = attachments.count { it !is ComposerAttachment.Ready || !it.isVideo }
+            if (existing + uris.size > MAX_SUBMIT_IMAGES) {
+                onMessage("单次最多发送 $MAX_SUBMIT_IMAGES 张图片")
+                return@launch
+            }
+            // 批量类型混合预检：图+视频混批整批不导入（与发送侧混发规则
+            // 一致；图片路径 ImageOnly / 视频单选，防御性保留）。
+            val types = uris.map { uri ->
+                runCatching { context.contentResolver.getType(uri) }.getOrNull().orEmpty()
+            }
+            if (types.any { it.startsWith("video/") } && types.any { !it.startsWith("video/") }) {
+                onMessage("图像与视频请分开发送")
+                return@launch
+            }
+            // 批量占位：key/名称/URI 一次配齐 → 整批 addAll（名称一次 IO
+            // 串行查完，失败序号名兜底——chip 标签其实只显大小/导入中，名字
+            // 主要供移除钮 contentDescription 与导入管线声明文件名）。
+            val isVideoFlags = types.map { it.startsWith("video/") }
+            val names = attachmentDisplayNames(context, uris, isVideoFlags)
+            val batch = List(uris.size) { idx ->
+                ComposerAttachment.Importing(
+                    // 尾缀 idx 防同批连发 nanoTime 撞车（粒度粗的机型）。
+                    key = "local-${System.nanoTime()}-$idx",
+                    displayName = names[idx],
+                    // URI 留在 chip 状态供预览位解码（AttachmentThumbnails）。
+                    previewUri = uris[idx],
+                )
+            }
+            attachments = attachments + batch
+            for ((idx, uri) in uris.withIndex()) {
+                val chip = batch[idx]
+                when (val r = importComposerAttachment(context, uri, chip.displayName)) {
+                    is AttachmentImportResult.Ok ->
+                        attachments = attachments.map { if (it.key == chip.key) r.ready else it }
+                    is AttachmentImportResult.Failed -> {
+                        attachments = attachments.filterNot { it.key == chip.key }
+                        onMessage(r.message)
+                    }
+                }
+            }
+        }
+    }
+    val pickImages = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_SUBMIT_IMAGES),
+    ) { uris ->
+        if (uris.isNotEmpty()) importUris(uris)
+    }
     // 常驻状态行「整块点按 = 聚焦展开」：行本身不拦输入区可点性，
     // 点击经 FocusRequester 直打输入框（焦点 → 面板展开 + IME 弹出，
     // 与直接点输入框同一路径）。
     val inputFocusRequester = remember { FocusRequester() }
+    // 「编辑」请求：用户消息长按菜单 → 文本回填输入框并聚焦（本轮只做
+    // 回填，不删历史/不重放；seq 单调递增，同文本重复编辑也再触发）。
+    LaunchedEffect(editRequestSeq) {
+        if (editRequestSeq > 0L) {
+            input = editRequestText
+            inputFocusRequester.requestFocus()
+        }
+    }
     // 输入区字号/行盒/上下 padding 一律保持原单条输入条的原始值
     //（bodyLarge 16sp/24sp 行盒 + 10dp 上下边距）→ 输入列单独就把条高
     // 锚在原单条高度（20dp + 24sp，任意 fontScale 精确成立）；右侧状态
@@ -1626,6 +2086,48 @@ private fun Composer(
     // 未聚焦单行横向溢出标记（onTextLayout 布局相位回填）：驱动文字
     // 末尾 DstIn 渐隐遮罩。
     var inputOverflow by remember { mutableStateOf(false) }
+    // 发送动作（send 按钮点击；纯文本与带附件两路）：
+    // - 纯文本（无就绪附件）：维持既有语义——非空即发、送达才清空输入。
+    // - 带附件：契约预检（文本必填非空白 / 纯图 XOR 纯视频 / 图 ≤50 张），
+    //   通过后携附件引用提交；**不立即清空**——等待 submitResolution 终态，
+    //   accepted（request_start）才清；门控拒绝时草稿与 chips 原地保留，
+    //   错误原因经 ChatScreen snackbar（Error notice 自动展示）。
+    // - 校验失败经 onMessage（snackbar）提示，不发送。
+    fun composerSend() {
+        if (running) {
+            onCancel()
+            return
+        }
+        if (awaitingResolution) return
+        val text = input.trim()
+        val ready = attachments.filterIsInstance<ComposerAttachment.Ready>()
+        if (ready.isEmpty()) {
+            if (text.isNotEmpty()) {
+                if (onSend(text, emptyList())) input = "" else onMessage("发送失败，请稍后重试")
+            }
+            return
+        }
+        if (text.isEmpty()) {
+            onMessage("请为附件输入文字说明")
+            return
+        }
+        val videos = ready.count { it.isVideo }
+        val images = ready.size - videos
+        if (images > 0 && videos > 0) {
+            onMessage("图像与视频请分开发送")
+            return
+        }
+        if (images > MAX_SUBMIT_IMAGES) {
+            onMessage("单次最多发送 $MAX_SUBMIT_IMAGES 张图片")
+            return
+        }
+        val refs = ready.map { dev.openslate.mobile.bridge.AttachmentRefUi(it.id, it.mime, it.filename) }
+        if (!onSend(text, refs)) {
+            onMessage("发送失败，请稍后重试")
+            return
+        }
+        awaitingResolution = true
+    }
     // 底部条透明：去掉 tonalElevation 带来的色调底色，仅保留布局占位。
     Surface(color = androidx.compose.ui.graphics.Color.Transparent, modifier = modifier) {
         Row(
@@ -1647,87 +2149,141 @@ private fun Composer(
                 ),
                 border = true,
             ) {
-                // 未聚焦左右布局：输入区在左（weight 占剩余宽，原字号单行
-                // + 末尾渐隐），右侧上下两行状态块贴右缘（wrap 内容）。聚焦
-                // 后状态块横向收出、输入区扩至全宽恢复多行。
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    BasicTextField(
-                        value = input,
-                        onValueChange = { input = it },
-                        textStyle = MaterialTheme.typography.bodyLarge.copy(
-                            color = MaterialTheme.colorScheme.onSurface,
-                        ),
-                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                        maxLines = if (showInlineStatus) 1 else 5,
-                        onTextLayout = { result ->
-                            if (showInlineStatus) inputOverflow = result.hasVisualOverflow
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .focusRequester(inputFocusRequester)
-                            .onFocusChanged { onInputFocusChange(it.isFocused) }
-                            .padding(horizontal = 14.dp, vertical = 10.dp)
-                            // 溢出末尾渐隐需独立离屏层：DstIn 只与自身内容
-                            // 运算，否则会透掉玻璃底（同模型名遮罩）。蒙层在
-                            // padding 之内 → 渐变恰好收在文字区右缘，淡出
-                            // 完成后才轮到状态块内容。
-                            .then(
-                                if (showInlineStatus && inputOverflow) {
-                                    Modifier
-                                        .graphicsLayer {
-                                            compositingStrategy = CompositingStrategy.Offscreen
-                                        }
-                                        .drawWithContent {
-                                            drawContent()
-                                            drawRect(
-                                                brush = Brush.horizontalGradient(
-                                                    0f to Color.Black,
-                                                    0.75f to Color.Black,
-                                                    1f to Color.Black.copy(alpha = 0f),
-                                                ),
-                                                blendMode = BlendMode.DstIn,
-                                            )
-                                        }
-                                } else {
-                                    Modifier
-                                },
-                            ),
-                        decorationBox = { inner ->
-                            Box {
-                                if (input.isEmpty()) {
-                                    Text(
-                                        "发消息…",
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        color = MaterialTheme.colorScheme.outline,
-                                        maxLines = 1,
-                                    )
-                                }
-                                inner()
-                            }
-                        },
+                Column(
+                    // chips 增删 / 导入完成时高度平滑过渡（草稿条出现/消失）。
+                    modifier = Modifier.animateContentSize(),
+                ) {
+                    ComposerAttachmentChipsRow(
+                        items = attachments,
+                        onRemove = { key -> attachments = attachments.filterNot { it.key == key } },
+                        // 草稿图片卡点击 → 全屏查看器（原 URI 解码大图）。
+                        onOpen = onOpenDraft,
+                        modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 10.dp),
                     )
-                    AnimatedVisibility(
-                        visible = showInlineStatus,
-                        // 状态块水平收放（贴右缘）：聚焦时向右收出，未聚焦
-                        // 反向从右缘展开；与面板 320ms 过渡同一时钟家族，
-                        // 输入区随 weight 逐帧让位/扩宽，无字号跳变。
-                        enter = fadeIn() + expandHorizontally(
-                            expandFrom = Alignment.End,
-                            animationSpec = tween(320, easing = FastOutSlowInEasing),
-                        ),
-                        exit = fadeOut() + shrinkHorizontally(
-                            shrinkTowards = Alignment.End,
-                            animationSpec = tween(320, easing = FastOutSlowInEasing),
-                        ),
-                    ) {
-                        ComposerInlineStatusRow(
-                            status = inlineStatus,
-                            sharedTransitionScope = sharedTransitionScope,
-                            animatedVisibilityScope = this,
-                            onFocusInput = { inputFocusRequester.requestFocus() },
+                    // 未聚焦左右布局：附件按钮 + 输入区在左（weight 占剩余宽，
+                    // 原字号单行 + 末尾渐隐），右侧上下两行状态块贴右缘（wrap 内容）。
+                    // 聚焦后状态块横向收出、输入区扩至全宽恢复多行。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        // 附件按钮（输入区图标排首位的操作位）：**同心嵌在胶囊
+                        // 左圆头内**（2026-10 用户反馈「按钮与胶囊之间有缝、
+                        // 对不齐」）——胶囊 r=20dp，40dp 触达圆同心（start 0，
+                        // 圆心恰在左端圆弧圆心 x=20dp 处，触达圆与圆弧重合）；
+                        // 可见圆底 38dp 内缩 1dp（r=19，半径一致性：与 r=20
+                        // 圆头留发丝玻璃环），深浅主题下衔接处无脏缝。触达
+                        // 40dp 满足热区下限；文本起始 padding 8dp 让出按钮区
+                        // （光标起点 48dp 不被遮挡）。恒直开系统图片多选选择
+                        // 器（ImageOnly 系统层过滤；本期视频入口整体隐藏）。
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .clickable {
+                                    pickImages.launch(
+                                        PickVisualMediaRequest(
+                                            ActivityResultContracts.PickVisualMedia.ImageOnly,
+                                        ),
+                                    )
+                                },
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f),
+                                    ),
+                            ) {
+                                Icon(
+                                    Icons.Outlined.AddPhotoAlternate,
+                                    contentDescription = "添加图片附件",
+                                    tint = MaterialTheme.colorScheme.outline,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                            }
+                        }
+                        BasicTextField(
+                            value = input,
+                            onValueChange = { input = it },
+                            textStyle = MaterialTheme.typography.bodyLarge.copy(
+                                color = MaterialTheme.colorScheme.onSurface,
+                            ),
+                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                            maxLines = if (showInlineStatus) 1 else 5,
+                            onTextLayout = { result ->
+                                if (showInlineStatus) inputOverflow = result.hasVisualOverflow
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .focusRequester(inputFocusRequester)
+                                .onFocusChanged {
+                                    inputFocused = it.isFocused
+                                    onInputFocusChange(it.isFocused)
+                                }
+                                .padding(start = 8.dp, end = 14.dp, top = 10.dp, bottom = 10.dp)
+                                // 溢出末尾渐隐需独立离屏层：DstIn 只与自身内容
+                                // 运算，否则会透掉玻璃底（同模型名遮罩）。蒙层在
+                                // padding 之内 → 渐变恰好收在文字区右缘，淡出
+                                // 完成后才轮到状态块内容。
+                                .then(
+                                    if (showInlineStatus && inputOverflow) {
+                                        Modifier
+                                            .graphicsLayer {
+                                                compositingStrategy = CompositingStrategy.Offscreen
+                                            }
+                                            .drawWithContent {
+                                                drawContent()
+                                                drawRect(
+                                                    brush = Brush.horizontalGradient(
+                                                        0f to Color.Black,
+                                                        0.75f to Color.Black,
+                                                        1f to Color.Black.copy(alpha = 0f),
+                                                    ),
+                                                    blendMode = BlendMode.DstIn,
+                                                )
+                                            }
+                                    } else {
+                                        Modifier
+                                    },
+                                ),
+                            decorationBox = { inner ->
+                                Box {
+                                    if (input.isEmpty()) {
+                                        Text(
+                                            "发消息…",
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = MaterialTheme.colorScheme.outline,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                    inner()
+                                }
+                            },
                         )
+                        AnimatedVisibility(
+                            visible = showInlineStatus,
+                            // 状态块水平收放（贴右缘）：聚焦时向右收出，未聚焦
+                            // 反向从右缘展开；与面板 320ms 过渡同一时钟家族，
+                            // 输入区随 weight 逐帧让位/扩宽，无字号跳变。
+                            enter = fadeIn() + expandHorizontally(
+                                expandFrom = Alignment.End,
+                                animationSpec = tween(320, easing = FastOutSlowInEasing),
+                            ),
+                            exit = fadeOut() + shrinkHorizontally(
+                                shrinkTowards = Alignment.End,
+                                animationSpec = tween(320, easing = FastOutSlowInEasing),
+                            ),
+                        ) {
+                            ComposerInlineStatusRow(
+                                status = inlineStatus,
+                                sharedTransitionScope = sharedTransitionScope,
+                                animatedVisibilityScope = this,
+                                onFocusInput = { inputFocusRequester.requestFocus() },
+                            )
+                        }
                     }
-                }
+                } // Column（chips 条 + 输入行）
             }
             Spacer(Modifier.width(6.dp))
             Box(
@@ -1737,25 +2293,22 @@ private fun Composer(
                     .shadow(elevation = 2.dp, shape = RoundedCornerShape(50), clip = false)
                     .clip(RoundedCornerShape(50))
                     .background(MaterialTheme.colorScheme.primary)
-                    .clickable {
-                        if (running) onCancel() else {
-                            val text = input.trim()
-                            if (text.isNotEmpty()) {
-                                onSend(text)
-                                input = ""
-                            }
-                        }
-                    },
+                    .clickable { composerSend() },
             ) {
-                if (running) {
-                    Icon(
+                when {
+                    running -> Icon(
                         Icons.Filled.Stop,
                         contentDescription = "取消",
                         tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(18.dp),
                     )
-                } else {
-                    Icon(
+                    // 附件提交等待引擎接受（异步门控）：转圈而非可再发。
+                    awaitingResolution -> CircularProgressIndicator(
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    else -> Icon(
                         Icons.AutoMirrored.Filled.Send,
                         contentDescription = "发送",
                         tint = MaterialTheme.colorScheme.onPrimary,
@@ -1767,6 +2320,9 @@ private fun Composer(
     }
 }
 
+/** 带附件单次提交的图片数上限（Submit 门控常量，设计 §3.3；客户端预检，
+ *  Rust 侧 gate 为最终权威）。 */
+private const val MAX_SUBMIT_IMAGES = 50
 /**
  * 常驻状态行模型名三态降级阶段：FULL（Provider/modelId 全串）→ SHORT
  * （仅 modelId）→ FADE（短版 + 末尾渐隐）。只进不退——一次定型 + 随
@@ -1934,28 +2490,292 @@ private fun ComposerInlineStatusRow(
     }
 }
 
+// ── 工具调用审批卡 ──────────────────────────────────────────────────
+
+/** 风险等级 → (中文标签, 图标, 语义色)；未知值兜底显示原始串 + 中性盾形图标。 */
 @Composable
-private fun ApprovalBanner(
-    pending: dev.openslate.mobile.bridge.PendingApprovalUi,
-    onAnswer: (Long, String) -> Unit,
+private fun approvalRiskVisual(level: String): Triple<String, androidx.compose.ui.graphics.vector.ImageVector, Color> =
+    when (level) {
+        "low" -> Triple("低风险", Icons.Outlined.CheckCircle, successGreen())
+        "medium" -> Triple("中风险", Icons.Outlined.Warning, warningAmber())
+        "high" -> Triple("高风险", Icons.Outlined.GppMaybe, MaterialTheme.colorScheme.error)
+        else -> Triple(level, Icons.Outlined.GppMaybe, MaterialTheme.colorScheme.outline)
+    }
+
+/**
+ * 工具调用审批卡（Scaffold 底部横幅位）：待批调用的完整上下文与五项决定。
+ * 视觉对齐 ask_user 家族 / TermuxStallBanner（磨砂玻璃面板 + 16dp 圆角 +
+ * 细边框 + 轻阴影），入场动画克制（220ms 底部展开淡入，仅播一次）。
+ *
+ * 内容分级：头部（图标 + 标题 + 风险 chip）→ 工具名（等宽）→ MCP 归属行
+ * （server 存在时）→ 参数预览（等宽小字，3 行截断、可展开）→ 触发原因
+ * （manual = 权限等级说明；auto_risk = AI 审查 + 理由）→ 决定按钮。
+ * 允许类做主强调（primary 两枚 + secondary 两枚 MCP），「拒绝」做次强调
+ * （底部静音文字行）——不与允许并列争抢。
+ *
+ * 「拒绝」必须发送 deny：纯 UI 关闭会让 Rust 侧审批等待永久挂起（turn 卡死）。
+ * 首答即锁按钮：Rust 侧首答赢、重复发送无害，但 UI 反馈要干脆。
+ */
+@Composable
+private fun ApprovalCard(
+    pending: PendingApprovalUi,
+    glass: Glass,
+    rootCoords: () -> LayoutCoordinates?,
 ) {
-    Surface(tonalElevation = 6.dp) {
-        Column(Modifier.fillMaxWidth().padding(12.dp)) {
-            Text(
-                "审批请求：${pending.toolName}（${pending.riskLevel}）",
-                style = MaterialTheme.typography.titleSmall,
-            )
-            if (pending.reason.isNotEmpty()) {
-                Text(
-                    pending.reason,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SoftButton(onClick = { onAnswer(pending.id, "approve_all") }) { Text("全部允许") }
-                SoftButton(onClick = { onAnswer(pending.id, "approve") }) { Text("允许") }
-                SoftButton(onClick = { onAnswer(pending.id, "deny") }) { Text("拒绝") }
+    // 入场（首次组合播一次；id 换新 = 新请求重播）。出场随 pendingApproval
+    // 清空直接离场，不做过场（克制）。
+    val enterState = remember(pending.id) {
+        MutableTransitionState(false).apply { targetState = true }
+    }
+    var answered by remember(pending.id) { mutableStateOf(false) }
+    var argsExpanded by remember(pending.id) { mutableStateOf(false) }
+    // 收起态参数是否被截断（onTextLayout 回填）：没截断就不显示展开开关。
+    var argsTruncated by remember(pending.id) { mutableStateOf(false) }
+    AnimatedVisibility(
+        visibleState = enterState,
+        enter = fadeIn(tween(220, easing = FastOutSlowInEasing)) +
+            expandVertically(
+                expandFrom = Alignment.Bottom,
+                animationSpec = tween(220, easing = FastOutSlowInEasing),
+            ),
+        exit = fadeOut(tween(180)) + shrinkVertically(tween(180)),
+    ) {
+        Box(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+            GlassPanel(
+                glass = glass,
+                rootCoords = rootCoords,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .shadow(elevation = 2.dp, shape = RoundedCornerShape(16.dp), clip = false),
+                shape = RoundedCornerShape(16.dp),
+                tint = MaterialTheme.colorScheme.surfaceVariant.copy(
+                    alpha = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0.6f else 0.92f,
+                ),
+                border = true,
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    // 头部行：面板身份 + 风险 chip（语义色 pill）。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Outlined.Gavel,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text("工具调用确认", style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.weight(1f))
+                        val (label, icon, tint) = approvalRiskVisual(pending.riskLevel)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(tint.copy(alpha = 0.12f))
+                                .border(0.5.dp, tint.copy(alpha = 0.4f), RoundedCornerShape(50))
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                        ) {
+                            Icon(
+                                icon,
+                                contentDescription = null,
+                                modifier = Modifier.size(12.dp),
+                                tint = tint,
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = tint,
+                            )
+                        }
+                    }
+                    // 工具名（注册全名，等宽；标识类短文本用 MonoFont 子集）。
+                    Text(
+                        pending.toolName,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontFamily = MonoFont,
+                    )
+                    // MCP 归属行（server 存在时；host 内置也带 host 前缀键）。
+                    pending.server?.let { server ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_mcp),
+                                contentDescription = null,
+                                modifier = Modifier.size(12.dp),
+                                tint = MaterialTheme.colorScheme.secondary,
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "MCP · $server",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline,
+                            )
+                        }
+                    }
+                    // 参数预览：等宽小字（任意 JSON 需全字形 → 系统 Monospace，
+                    // 不换 MonoFont 子集），收起 3 行截断、点击展开（上限 12 行）。
+                    if (pending.arguments.isNotBlank()) {
+                        Text(
+                            pending.arguments,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = if (argsExpanded) 12 else 3,
+                            overflow = TextOverflow.Ellipsis,
+                            softWrap = true,
+                            onTextLayout = { result ->
+                                if (!argsExpanded) argsTruncated = result.hasVisualOverflow
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                                .clickable { argsExpanded = !argsExpanded }
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        )
+                        // 展开开关：仅在确实被截断（或已展开）时出现。
+                        if (argsTruncated || argsExpanded) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { argsExpanded = !argsExpanded }
+                                    .padding(horizontal = 2.dp, vertical = 2.dp),
+                            ) {
+                                Icon(
+                                    if (argsExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                    contentDescription = if (argsExpanded) "收起参数" else "展开参数",
+                                    modifier = Modifier.size(13.dp),
+                                    tint = MaterialTheme.colorScheme.outline,
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    if (argsExpanded) "收起参数" else "展开参数",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.outline,
+                                )
+                            }
+                        }
+                    }
+                    // 触发原因行：manual = 权限等级说明；auto_risk = AI 审查
+                    // 结论 + 理由（note 可空，缺省按 manual 渲染）。
+                    val autoRisk = pending.trigger == "auto_risk"
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            if (autoRisk) Icons.Outlined.Psychology else Icons.Outlined.Tune,
+                            contentDescription = null,
+                            modifier = Modifier.size(13.dp),
+                            tint = MaterialTheme.colorScheme.outline,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (autoRisk) "AI 审查判定高风险" else "权限等级：全部手动",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
+                    if (autoRisk && !pending.note.isNullOrBlank()) {
+                        Text(
+                            pending.note,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline,
+                            modifier = Modifier.padding(start = 19.dp),
+                        )
+                    }
+                    // ── 决定区 ──
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            SoftButton(
+                                onClick = {
+                                    answered = true
+                                    RuntimeBridge.approveForSession(pending.id)
+                                },
+                                enabled = !answered,
+                                modifier = Modifier.weight(1f),
+                            ) { Text("本会话允许") }
+                            SoftButton(
+                                onClick = {
+                                    answered = true
+                                    RuntimeBridge.approveAlways(pending.id)
+                                },
+                                enabled = !answered,
+                                modifier = Modifier.weight(1f),
+                            ) { Text("一直允许") }
+                        }
+                        pending.server?.let { server ->
+                            Text(
+                                "针对 $server 服务器的全部工具",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                SoftButton(
+                                    onClick = {
+                                        answered = true
+                                        RuntimeBridge.approveMcpForSession(pending.id)
+                                    },
+                                    enabled = !answered,
+                                    tint = MaterialTheme.colorScheme.secondary,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text(
+                                        "本会话允许 $server 工具",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                SoftButton(
+                                    onClick = {
+                                        answered = true
+                                        RuntimeBridge.approveMcpAlways(pending.id)
+                                    },
+                                    enabled = !answered,
+                                    tint = MaterialTheme.colorScheme.secondary,
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Text(
+                                        "一直允许 $server 工具",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                        // 拒绝：次强调（静音文字行，居中），不与允许并列争抢；
+                        // 必须真正发送 deny（挂起语义见组件 KDoc）。
+                        Row(
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(enabled = !answered) {
+                                    answered = true
+                                    RuntimeBridge.deny(pending.id)
+                                }
+                                .padding(vertical = 4.dp),
+                        ) {
+                            Icon(
+                                Icons.Outlined.Block,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                                tint = MaterialTheme.colorScheme.error.copy(alpha = 0.75f),
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "拒绝执行",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.error.copy(alpha = 0.75f),
+                            )
+                        }
+                    }
+                }
             }
         }
     }

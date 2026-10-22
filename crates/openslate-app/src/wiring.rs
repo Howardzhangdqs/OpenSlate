@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::approval::{
-    ApprovalCallback, ApprovalDecision, ApprovalManager, ApprovalPolicy, ApprovalRequest, RiskLevel,
+    ApprovalCallback, ApprovalDecision, ApprovalManager, ApprovalPolicy, ApprovalRequest,
+    RiskLevel,
 };
 use openslate_core::config::merge::merge_configs;
 use openslate_core::config::validation::validate_config;
@@ -783,6 +784,7 @@ pub async fn build_app_context_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openslate_core::approval::ApprovalTrigger;
 
     /// Create a temp dir with valid config + agents for testing.
     fn temp_project() -> tempfile::TempDir {
@@ -1254,6 +1256,9 @@ path = "{}"
             arguments: serde_json::json!({"code": "async () => 1"}),
             agent_id: "root".to_owned(),
             risk_level: RiskLevel::High,
+            server: None,
+            trigger: ApprovalTrigger::Manual,
+            note: None,
         };
         match NonInteractiveGate.decide(&req) {
             ApprovalDecision::Denied(reason) => {
@@ -1271,6 +1276,9 @@ path = "{}"
                 arguments: serde_json::json!({}),
                 agent_id: "root".to_owned(),
                 risk_level: risk,
+                server: None,
+                trigger: ApprovalTrigger::Manual,
+                note: None,
             };
             assert_eq!(NonInteractiveGate.decide(&req), ApprovalDecision::Approved);
         }
@@ -1319,7 +1327,7 @@ model = "m1"
             apply_approval(&mut manager, &cfg, false, true),
             ApprovalPolicy::Auto
         );
-        assert_eq!(manager.approval.policy(), &ApprovalPolicy::Auto);
+        assert_eq!(manager.approval.policy(), ApprovalPolicy::Auto);
 
         // No section + non-interactive → Auto (no gate, no callback).
         let mut manager = build_manager(base);

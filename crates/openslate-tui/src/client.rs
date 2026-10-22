@@ -147,7 +147,7 @@ pub fn entries_from_dto(dtos: Vec<EntryDto>) -> Vec<TranscriptEntry> {
 
 fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
     match dto {
-        EntryDto::User { text } => TranscriptEntry::User(text),
+        EntryDto::User { text, .. } => TranscriptEntry::User(text), // v4：附件引用 TUI 不渲染
         EntryDto::Assistant { text } => TranscriptEntry::Assistant(text),
         EntryDto::Reasoning { text } => TranscriptEntry::Reasoning(text),
         EntryDto::ToolCall {
@@ -244,6 +244,7 @@ pub fn config_from_view(view: &ConfigViewDto) -> openslate_core::config::OpenSla
         approval: None,
         tui: Default::default(),
         ask_user: Default::default(),
+        attachments: Default::default(),
     }
 }
 
@@ -311,6 +312,7 @@ pub fn view_from_config(config: &openslate_core::config::OpenSlateConfig) -> Con
         active_config: "/fixture/openslate.toml".into(),
         global_config: None,
         local_config: None,
+        approval: None,
     }
 }
 
@@ -324,6 +326,7 @@ pub fn snapshot_from_config(
         proto: 1,
         session_id: "test-session".into(),
         session_label: "test".into(),
+        run_id: None,
         transcript: vec![],
         running: false,
         depth_cur: 0,
@@ -723,6 +726,7 @@ mod tests {
             total_cost_usd: 0.002,
             model: "test-model".into(),
             messages: vec![Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "hi".into(),
                 tool_call_id: None,
@@ -777,7 +781,8 @@ mod tests {
                 name: "t".into(),
                 bytes: 9,
                 truncated: true,
-                preview: None
+                preview: None,
+                call_id: None
             }),
             vec![TuiEvent::ToolEnd {
                 name: "t".into(),
@@ -792,6 +797,7 @@ mod tests {
                     output_tokens: 2,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }
             })
             .len(),
@@ -1009,6 +1015,7 @@ mod tests {
             active_config: "/x.toml".into(),
             global_config: None,
             local_config: None,
+            approval: None,
         };
         let config = config_from_view(&view);
         assert_eq!(config.providers.len(), 1);

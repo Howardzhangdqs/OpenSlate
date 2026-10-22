@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         model_id: model.clone(),
         system_prompt: Some("You are a helpful assistant.".into()),
         messages: vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: "用一句话介绍你自己".into(),
             tool_call_id: None,

@@ -139,6 +139,7 @@ fn text_response(text: &str) -> Vec<ModelStreamEvent> {
             output_tokens: 4,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            image_tokens: None,
         }),
         ModelStreamEvent::Done(ModelResponse {
             content: Some(text.to_owned()),
@@ -221,6 +222,14 @@ fn mobile_runtime_host_call_roundtrip() {
     };
 
     let runtime = MobileRuntime::create_with(paths, collector.clone(), opts).unwrap();
+    // 工具审批自 P1b 起 [approval] 缺省 opt-in Auto：mobile.ping（启发式
+    // Medium）会进审查链弹人。本测试聚焦 host call 通路，先把审批缺省
+    // 放开为 allow（恢复本 harness 原有 gating 行为）。
+    runtime
+        .send(r#"{"type":"set_approval_config","default_level":"allow","tool_levels":{},"server_levels":{}}"#)
+        .unwrap();
+    collector.wait_for(&rx, "config_changed", Duration::from_secs(10));
+
     runtime
         .send(r#"{"type":"submit","text":"ping 一下宿主"}"#)
         .unwrap();
@@ -348,6 +357,12 @@ fn mobile_runtime_tool_visibility_roundtrip() {
         assert!(
             t["input_schema"].is_object(),
             "input_schema 应为对象（可空 schema 输出 {{}}）: {t}"
+        );
+        // server 键恒存在（tool-approval P1b：审批作用域；非 MCP 工具
+        // 为 JSON null——本 harness 全部为 host/native 工具）。
+        assert!(
+            t.get("server").is_some() && t["server"].is_null(),
+            "server 恒存在、非 MCP 为 null: {t}"
         );
     }
     // 至少一个工具的参数 schema 非空（mobile.ping 恒注册且带完整 schema）。

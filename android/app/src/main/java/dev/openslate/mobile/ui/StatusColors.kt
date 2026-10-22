@@ -19,3 +19,11 @@ fun successGreen(): Color =
 @Composable
 fun successGreenContainer(): Color =
     if (LocalDarkTheme.current) Color(0xFF1F3A29) else Color(0xFFDDF3DE)
+
+/**
+ * 警示琥珀（中风险）：与 successGreen 同族处理，深浅各一套（浅色深棕、
+ * 深色亮琥珀，保证双主题对比度）。工具审批风险分级用。
+ */
+@Composable
+fun warningAmber(): Color =
+    if (LocalDarkTheme.current) Color(0xFFF0C24F) else Color(0xFF8A5A00)

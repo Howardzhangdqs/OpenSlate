@@ -167,6 +167,7 @@ impl DanglingClosure {
 /// `tool_call_id` / `name` 对应原调用）。
 fn synthetic_tool_message(tool_call_id: &str, name: &str, content: &str) -> Message {
     Message {
+        attachments: None,
         role: MessageRole::Tool,
         content: content.to_owned(),
         tool_call_id: Some(ToolCallId(tool_call_id.to_owned())),
@@ -308,6 +309,7 @@ mod tests {
 
     fn user(text: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::User,
             content: text.into(),
             tool_call_id: None,
@@ -319,6 +321,7 @@ mod tests {
 
     fn tool_result(id: &str, name: &str, content: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(ToolCallId(id.into())),
@@ -331,6 +334,7 @@ mod tests {
     /// assistant 消息声明一组工具调用（content 置空，与 runtime 循环一致）。
     fn assistant_with_calls(calls: &[(&str, &str)]) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -513,6 +517,7 @@ mod tests {
 
         // ToolOutput 包装：content 替换 + 内部提示追加 + bytes 重算。
         let output = crate::types::ToolOutput {
+            attachments: None,
             bytes: 100,
             content: "leak sk-123456".to_owned(),
             duration_ms: 1,
@@ -534,6 +539,7 @@ mod tests {
 
         // 无替换 → 原样返回（不追加提示，避免噪音）。
         let clean = crate::types::ToolOutput {
+            attachments: None,
             bytes: 5,
             content: "nothing secret".to_owned(),
             duration_ms: 1,

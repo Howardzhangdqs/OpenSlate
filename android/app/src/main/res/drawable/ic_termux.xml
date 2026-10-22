@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Termux 品牌标识（自绘 vector）：黑色圆角方底 + 白色 >_ 两字符。颜色
+     固定（黑底白字）不走 Icon tint 上色，Termux logo 本体即此双色，与
+     ic_mcp 的白色基底 + tint 方案不同。用户指定的品牌表示，是 AGENTS.md
+     「一律 Material 图标」规范的用户例外（先例见 ic_mcp.xml 头注释）；
+     `>_` 为 Termux 官方标识图形的自绘转写，VectorDrawable 无 text 元素、
+     不依赖系统字体，> 与 _ 均以 path 描边绘制。仅 bash 类工具调用的
+     Termux 侧前缀使用（ChatScreen 的 ToolChipRow 与 ToolDetailDialog），
+     13dp 对齐 ic_mcp 小图标语言。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 圆角方底（黑） -->
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M6,1 L18,1 A5,5 0 0 1 23,6 L23,18 A5,5 0 0 1 18,23 L6,23 A5,5 0 0 1 1,18 L1,6 A5,5 0 0 1 6,1 Z" />
+    <!-- > 字符（白色描边） -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M5.4,7.8 L10.9,12 L5.4,16.2" />
+    <!-- _ 字符（白色描边，坐落右下、低于 > 收笔，复刻官方标识的错位关系） -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:pathData="M14.2,17.6 L18.6,17.6" />
+</vector>

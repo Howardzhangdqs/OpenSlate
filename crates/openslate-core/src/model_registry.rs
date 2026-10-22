@@ -97,14 +97,18 @@ pub fn norm_id(s: &str) -> String {
 }
 
 /// 匹配候选：原始 id、去 provider 前缀（最后一个 `/` 后）、去 `@...`
-/// 变体后缀、去尾部日期快照（`-20251222` / `-251222`）。全部归一化后
-/// 比对。
+/// 变体后缀、去尾部方括号上下文变体（`glm-5.3-flash[1m]` →
+/// `glm-5.3-flash`，见 [`strip_trailing_bracket_suffix`]）、去尾部日期
+/// 快照（`-20251222` / `-251222`）。全部归一化后比对。
 pub fn id_candidates(model_id: &str) -> Vec<String> {
     let mut out = vec![norm_id(model_id)];
     let base = model_id.split('@').next().unwrap_or(model_id);
     let tail = base.rsplit('/').next().unwrap_or(base);
+    // 方括号剥离在日期快照剥离之前——`-20251222[1m]` 这类叠加后缀应
+    // 两段都剥掉。
+    let no_bracket = strip_trailing_bracket_suffix(tail);
     let trimmed = {
-        let mut t = tail;
+        let mut t = no_bracket;
         if let Some(pos) = t.rfind('-') {
             let seg = &t[pos + 1..];
             let digits = seg.chars().all(|c| c.is_ascii_digit());
@@ -115,13 +119,26 @@ pub fn id_candidates(model_id: &str) -> Vec<String> {
         }
         t
     };
-    for part in [model_id, base, tail, trimmed] {
+    for part in [model_id, base, tail, no_bracket, trimmed] {
         let n = norm_id(part);
         if !out.contains(&n) {
             out.push(n);
         }
     }
     out
+}
+
+/// 剥离尾部方括号上下文变体后缀：`glm-5.3-flash[1m]` / `[1M]` /
+/// `[long]` → `glm-5.3-flash`。方括号内容不限（同一基座的不同上下文
+/// 窗口/时长变体共用基座元数据）；只剥**最后一个尾部** `[...]` 段，
+/// 开头 / 中途的方括号不是变体语义，不动。无尾部方括号时原样返回。
+fn strip_trailing_bracket_suffix(s: &str) -> &str {
+    if let Some(rest) = s.strip_suffix(']') {
+        if let Some(open) = rest.rfind('[') {
+            return &s[..open];
+        }
+    }
+    s
 }
 
 // ── 归一化元数据与合并 ───────────────────────────────────────────
@@ -136,6 +153,12 @@ pub struct ModelMeta {
     pub supports_reasoning: Option<bool>,
     pub supports_tool_call: Option<bool>,
     /// USD / 百万 token（LiteLLM per-token × 1e6）。
+    ///
+    /// 数据源缺失 → `None`（**非免费**）：绝不落 0 冒充免费。zhipuai
+    /// 官方条目（如 glm-5.3-flash）models.dev / LiteLLM / CloudPrice 均
+    /// 无计价，合并后保持 `None`；"未配置 → 成本记 0"的既有约定在
+    /// runtime `CostSpec::cost_of`（`is_configured()` 为 false 供 UI
+    /// 标注未配置），registry 层只负责把"未配置"如实传下去。
     pub input_price_per_mtok: Option<f64>,
     pub output_price_per_mtok: Option<f64>,
     /// 命中的源（调试/展示）。
@@ -433,6 +456,70 @@ mod tests {
         assert!(c.contains(&norm_id("zhipu/glm-4.7")));
         let d = id_candidates("claude-sonnet-4-5-20250929");
         assert!(d.contains(&norm_id("claude-sonnet-4-5")));
+    }
+
+    /// 尾部方括号上下文变体后缀归一化（GLM-5.3-Flash `[1m]` 场景，
+    /// 2026-10）：`基座[变体]` 命中基座条目。表驱动覆盖：常见大小写、
+    /// 其他方括号内容、无后缀不受影响、中途方括号不剥、与 provider
+    /// 前缀 / 日期快照规则的叠加。
+    #[test]
+    fn bracket_variant_suffix_stripped_in_candidates() {
+        // [1m] / [1M] / 其他内容 → 基座候选。
+        for raw in ["glm-5.3-flash[1m]", "glm-5.3-flash[1M]", "glm-5.3-flash[long]"] {
+            let c = id_candidates(raw);
+            assert!(
+                c.contains(&norm_id("glm-5.3-flash")),
+                "{raw} must yield base candidate glm-5.3-flash; got {c:?}"
+            );
+        }
+        // 无后缀：不受影响——候选集不变（只有基座自身，无新增条目）。
+        assert_eq!(
+            id_candidates("glm-5.3-flash"),
+            vec![norm_id("glm-5.3-flash")],
+            "no bracket suffix → single candidate, rule is a no-op"
+        );
+        // 中途 / 开头的方括号不是尾部变体语义，不剥。
+        assert!(!id_candidates("glm[base]-5.3").contains(&norm_id("glm-5.3")));
+        assert!(!id_candidates("[x]glm-5.3").contains(&norm_id("glm-5.3")));
+        // 与 provider 前缀 + @ 变体叠加。
+        let c = id_candidates("zhipuai/glm-5.3-flash[1m]@exp");
+        assert!(c.contains(&norm_id("glm-5.3-flash")));
+        // 与尾部日期快照叠加：先剥方括号再剥日期，两段都剥掉。
+        let d = id_candidates("glm-5.3-flash-20251222[1m]");
+        assert!(d.contains(&norm_id("glm-5.3-flash")));
+        // 未闭合 / 空方括号不剥（原样保留）。
+        assert!(!id_candidates("glm-5.3-flash[1m").contains(&norm_id("glm-5.3")));
+    }
+
+    /// 端到端：`glm-5.3-flash[1m]` 经 [`lookup_in_map`] 命中 models.dev
+    /// 风格的 `glm-5.3-flash` 条目（含 video modality → registry 合并后
+    /// caps 自动就位）。zhipuai 条目多源均无计价 → 价格保持 `None`
+    /// （**数据源缺失非免费**：不能落成 0 冒充免费）。成本记 0 的既有
+    /// 约定在 runtime `CostSpec::cost_of`（"未配置 → 成本记 0"，且
+    /// `is_configured()` 为 false 供 UI 标注），registry 层只负责把
+    /// "未配置"如实传下去。
+    #[test]
+    fn bracket_variant_lookup_hits_base_entry_and_missing_cost_stays_none() {
+        let v = json!({
+            "zhipuai/glm-5.3-flash": {
+                "id": "zhipuai/glm-5.3-flash",
+                "name": "GLM-5.3-Flash",
+                "reasoning": true,
+                "tool_call": true,
+                "modalities": {"input": ["text", "image", "video"], "output": ["text"]},
+                "limit": {"context": 131072, "output": 32768}
+            }
+        });
+        let map = parse_source_map(SourceFormat::ModelsDev, &v).unwrap();
+        let m = lookup_in_map(SourceFormat::ModelsDev, "models.dev", &map, "glm-5.3-flash[1m]")
+            .expect("[1m] variant must hit the base entry");
+        assert_eq!(m.context_tokens, Some(131072));
+        assert_eq!(m.supports_vision, Some(true));
+        // models.dev 不携带计价（extract 恒 None）；LiteLLM / CloudPrice
+        // 亦无 zhipuai 官方条目 → 合并后计价保持 None，不落 0。
+        let merged = merge_metas(vec![m]);
+        assert_eq!(merged.input_price_per_mtok, None);
+        assert_eq!(merged.output_price_per_mtok, None);
     }
 
     #[test]

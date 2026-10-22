@@ -161,12 +161,14 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// 在单事务内写入 run 的终态：status、可选 output、finished_at 与
-    /// 累计成本（`RunRecorder::finish` 使用）。
+    /// 在单事务内写入 run 的终态：status、可选 output、finished_at、
+    /// 累计成本与 token 聚合（`RunRecorder::finish_with` 使用）。
     ///
     /// 合并为单事务的原因：status 与 cost 分两条语句提交时，中间崩溃
     /// 会留下"已 completed 但成本缺失"的半状态。`output_json` 为 `None`
     /// 时保持原值（与 [`Self::update_run_status`] 语义一致）。
+    /// `input_tokens` / `output_tokens` 为 run 级聚合（v5；存量 run 无
+    /// meta → 调用方传 0，不回填）。
     pub(crate) async fn finish_run(
         &self,
         id: &str,
@@ -174,6 +176,8 @@ impl SqliteStore {
         output_json: Option<&str>,
         finished_at: i64,
         cost_usd: f64,
+        input_tokens: u64,
+        output_tokens: u64,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool().begin().await.map_err(werr)?;
 
@@ -196,12 +200,16 @@ impl SqliteStore {
                 .map_err(werr)?;
         }
 
-        query("UPDATE runs SET cost_usd = ? WHERE id = ?")
-            .bind(cost_usd)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(werr)?;
+        query(
+            "UPDATE runs SET cost_usd = ?, input_tokens = ?, output_tokens = ? WHERE id = ?",
+        )
+        .bind(cost_usd)
+        .bind(input_tokens as i64)
+        .bind(output_tokens as i64)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(werr)?;
 
         tx.commit().await.map_err(werr)?;
         Ok(())
@@ -210,12 +218,25 @@ impl SqliteStore {
     /// 删除一个 run 及其全部子表数据，单事务内按依赖顺序显式删除。
     ///
     /// 删除顺序：messages → steps → prompt_snapshots → trace_events →
-    /// audit_log → execution_nodes → runs（先删引用方再删被引用方）。
-    /// 不依赖 `ON DELETE CASCADE` —— 存量库的外键定义无法追加删除动作。
+    /// audit_log → attachments → transcript_entries → execution_nodes →
+    /// runs（先删引用方再删被引用方）。不依赖 `ON DELETE CASCADE` ——
+    /// 存量库的外键定义无法追加删除动作。
+    ///
+    /// 事务提交后对受影响附件做**孤儿文件清扫**：逐 sha256 行级
+    /// `SELECT 1 FROM attachments WHERE sha256 = ?`，无行引用则删除
+    /// `files/{sha256}.*`（跨 run 复用的文件仅在最后一个引用消失时删除）。
     ///
     /// 返回 runs 表的删除行数（`0` 表示 run 不存在；子表此时也不会有
     /// 残留——即使有，也会一并清掉）。
     pub async fn delete_run(&self, run_id: &str) -> Result<u64, StoreError> {
+        // GC 判定需要在删除前收集该 run 附件的 sha256（删后就无从得知）
+        let affected_sha256s: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT sha256 FROM attachments WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| StoreError::QueryError(e.to_string()))?;
+
         // 字面量语句数组（而非 format! 拼表名）：可静态审计，天然满足
         // sqlx 的 SqlSafeStr 约束。
         const CHILD_DELETES: &[&str] = &[
@@ -224,6 +245,8 @@ impl SqliteStore {
             "DELETE FROM prompt_snapshots WHERE run_id = ?",
             "DELETE FROM trace_events WHERE run_id = ?",
             "DELETE FROM audit_log WHERE run_id = ?",
+            "DELETE FROM attachments WHERE run_id = ?",
+            "DELETE FROM transcript_entries WHERE run_id = ?",
             "DELETE FROM execution_nodes WHERE run_id = ?",
         ];
 
@@ -237,6 +260,79 @@ impl SqliteStore {
             .await
             .map_err(werr)?;
         tx.commit().await.map_err(werr)?;
+
+        // 事务外文件清扫（DB 行已是权威状态）
+        self.sweep_orphan_files(&affected_sha256s).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 孤儿文件清扫：对给定 sha256 集合逐一判定是否仍被任何 attachments
+    /// 行引用（行级 `SELECT 1`，非全表 diff）；无引用则删除
+    /// `files/{sha256}.{ext}` 文件（ext 未知，按 `{sha256}.` 前缀匹配）。
+    ///
+    /// 内存库无 files_dir → 无文件可扫，直接 Ok。
+    async fn sweep_orphan_files(&self, sha256s: &[String]) -> Result<(), StoreError> {
+        if sha256s.is_empty() {
+            return Ok(());
+        }
+        let Some(files_dir) = self.files_dir() else {
+            return Ok(());
+        };
+        for sha in sha256s {
+            let still_referenced: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM attachments WHERE sha256 = ? LIMIT 1")
+                    .bind(sha)
+                    .fetch_optional(self.pool())
+                    .await
+                    .map_err(|e| StoreError::QueryError(e.to_string()))?;
+            if still_referenced.is_some() {
+                continue;
+            }
+            let prefix = format!("{sha}.");
+            let Ok(entries) = std::fs::read_dir(&files_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(&prefix) {
+                    if let Err(e) = std::fs::remove_file(entry.path()) {
+                        tracing::warn!(
+                            target: "openslate_store",
+                            "failed to remove orphan attachment file {}: {e}",
+                            entry.path().display()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 启动暂存清扫（GC）：删除 `run_id IS NULL AND created_at < now-7d`
+    /// 的 attachments 行（用户在 composer 选了图但从未发送的暂存），并对
+    /// 其 sha256 做文件清扫。返回删除行数。
+    ///
+    /// 绑定行（已属于某个 run）不受影响；7 天内的暂存保留（用户可能
+    /// 还在编辑草稿）。
+    pub async fn gc_stale_unbound_attachments(&self, now_ms: i64) -> Result<u64, StoreError> {
+        const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+        let cutoff = now_ms - SEVEN_DAYS_MS;
+
+        let affected_sha256s: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT sha256 FROM attachments WHERE run_id IS NULL AND created_at < ?",
+        )
+        .bind(cutoff)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| StoreError::QueryError(e.to_string()))?;
+
+        let result = query("DELETE FROM attachments WHERE run_id IS NULL AND created_at < ?")
+            .bind(cutoff)
+            .execute(self.pool())
+            .await
+            .map_err(werr)?;
+
+        self.sweep_orphan_files(&affected_sha256s).await?;
         Ok(result.rows_affected())
     }
 
@@ -363,13 +459,18 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// 插入一条消息。
+    /// 插入一条消息（v5：载荷为压缩字节 + 可选 meta 旁路 JSON）。
+    ///
+    /// - `content_zst`：`serde_json::to_string(Message)` 经
+    ///   [`crate::codec::encode_content`] 压缩的字节（zstd-3）。
+    /// - `meta_json`：`Option<MessageMeta>` 的 serde JSON（assistant 行的
+    ///   usage/finish_reason/latency/model_id）；user/tool 行传 `None`。
     ///
     /// `seq` 是 per-run 单调递增序号（由调用方分配）。会话顺序对
     /// resume 是关键语义 —— provider 会拒绝 `tool_calls` 与 tool 结果
     /// 分离的乱序历史 —— 因此读取端一律按 `seq` 排序，绝不单独按
     /// `created_at`。同一 run 内 `seq` 由唯一索引
-    /// `idx_messages_run_seq_uq` 保证不重复（见 schema v2）。
+    /// `idx_messages_run_seq_uq` 保证不重复（v5 重建后必然存在）。
     pub async fn insert_message(
         &self,
         id: &str,
@@ -377,27 +478,193 @@ impl SqliteStore {
         execution_node_id: &str,
         agent_id: Option<&str>,
         role: &str,
-        content_json: &str,
+        content_zst: &[u8],
+        meta_json: Option<&str>,
         seq: i64,
         created_at: i64,
     ) -> Result<(), StoreError> {
         query(
             "INSERT INTO messages \
-             (id, run_id, execution_node_id, agent_id, role, content_json, seq, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, run_id, execution_node_id, agent_id, role, content_zst, meta_json, seq, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(run_id)
         .bind(execution_node_id)
         .bind(agent_id)
         .bind(role)
-        .bind(content_json)
+        .bind(content_zst)
+        .bind(meta_json)
         .bind(seq)
         .bind(created_at)
         .execute(self.pool())
         .await
         .map_err(werr)?;
         Ok(())
+    }
+
+    // ── 附件（v5；字节 content-addressed 落 files/，DB 存引用）────────
+
+    /// mime → 文件扩展名映射（设计 §3.1 wire 白名单：图像 jpg/png、
+    /// 视频 mp4/mkv/mov + ingest 可解的 webp/gif）。
+    fn mime_extension(mime: &str) -> Option<&'static str> {
+        match mime {
+            "image/jpeg" => Some("jpg"),
+            "image/png" => Some("png"),
+            "image/webp" => Some("webp"),
+            "image/gif" => Some("gif"),
+            "video/mp4" => Some("mp4"),
+            "video/x-matroska" => Some("mkv"),
+            "video/quicktime" => Some("mov"),
+            _ => None,
+        }
+    }
+
+    /// 写入一个附件：字节落 `files/{sha256}.{ext}`（content-addressed，
+    /// 幂等覆盖同名文件），行进 `attachments` 表。
+    ///
+    /// - `run_id` 可为 `None`（composer 暂存，Submit 时
+    ///   [`Self::bind_attachments`] 绑定）；
+    /// - `sha256` / `size_bytes` 由调用方（mobile ingest 层）计算并保证
+    ///   与 `data` 一致，store 信任不复算；
+    /// - 内存库（无 files_dir）或未映射 mime → 明确报错（fail fast，
+    ///   不静默降级）。
+    pub async fn insert_attachment(
+        &self,
+        id: &str,
+        run_id: Option<&str>,
+        sha256: &str,
+        mime: &str,
+        filename: Option<&str>,
+        size_bytes: i64,
+        data: &[u8],
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let files_dir = self.files_dir().ok_or_else(|| {
+            StoreError::WriteError(
+                "attachment writes require a file-backed store; in-memory store has no files_dir"
+                    .to_owned(),
+            )
+        })?;
+        let ext = Self::mime_extension(mime).ok_or_else(|| {
+            StoreError::WriteError(format!(
+                "unsupported attachment mime '{mime}' (no file extension mapping)"
+            ))
+        })?;
+
+        std::fs::create_dir_all(&files_dir)
+            .map_err(|e| StoreError::WriteError(format!("create files_dir failed: {e}")))?;
+        let path = files_dir.join(format!("{sha256}.{ext}"));
+        std::fs::write(&path, data).map_err(|e| {
+            StoreError::WriteError(format!(
+                "write attachment file {} failed: {e}",
+                path.display()
+            ))
+        })?;
+
+        query(
+            "INSERT INTO attachments (id, run_id, sha256, mime, filename, size_bytes, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(run_id)
+        .bind(sha256)
+        .bind(mime)
+        .bind(filename)
+        .bind(size_bytes)
+        .bind(created_at)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(())
+    }
+
+    /// 批量把暂存附件（`run_id IS NULL`）绑定到 run（Submit 门控时
+    /// mobile 层调用）。返回实际更新的行数（不存在的 id 静默跳过）。
+    pub async fn bind_attachments(
+        &self,
+        ids: &[&str],
+        run_id: &str,
+    ) -> Result<u64, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // 占位符来自 ids.len()（内部整数），无注入风险；AssertSqlSafe 仅为
+        // 通过 sqlx 的动态 SQL 审计。
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("UPDATE attachments SET run_id = ? WHERE id IN ({placeholders})");
+        let mut q = query(sqlx::AssertSqlSafe(sql)).bind(run_id);
+        for id in ids {
+            q = q.bind(*id);
+        }
+        let result = q.execute(self.pool()).await.map_err(werr)?;
+        Ok(result.rows_affected())
+    }
+
+    // ── 转写条目（v5；entry_json 透传，store 不解析）──────────────────
+
+    /// 插入一条转写条目。`seq` 由 mobile 层收口 helper 按 recorder 同款
+    /// AtomicI64 模式分配（run 内唯一，`idx_transcript_run_seq` 兜底）。
+    ///
+    /// C1 起 `INSERT OR IGNORE`：同 run 同 seq 冲突静默让位首写行（同
+    /// run 同 seq 的内容确定性地来自同一转写下标——自举读失败按 0 重插
+    /// 的场景由「致命告警死循环」降级为幂等补写；调用方按 attempted 推
+    /// 进游标是安全的）。
+    pub async fn insert_transcript_entry(
+        &self,
+        id: &str,
+        run_id: &str,
+        seq: i64,
+        entry_json: &str,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        query(
+            "INSERT OR IGNORE INTO transcript_entries (id, run_id, seq, entry_json, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(run_id)
+        .bind(seq)
+        .bind(entry_json)
+        .bind(created_at)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(())
+    }
+
+    /// 删除该 run `seq >= from_seq` 的尾部消息行（悬挂尾巴 pop 回写，
+    /// 历史转写丢失修复 C2）：open_session / 重启恢复 pop 悬挂 assistant
+    /// 后同步删行，修「只改内存不回写 → 反复重开反复 pop」。返回删除
+    /// 行数（0 = 无匹配 / run 无消息）。
+    pub async fn delete_messages_from_seq(
+        &self,
+        run_id: &str,
+        from_seq: i64,
+    ) -> Result<u64, StoreError> {
+        let result = query("DELETE FROM messages WHERE run_id = ? AND seq >= ?")
+            .bind(run_id)
+            .bind(from_seq)
+            .execute(self.pool())
+            .await
+            .map_err(werr)?;
+        Ok(result.rows_affected())
+    }
+
+    /// 删除该 run 的全部转写条目行（悬挂 pop 重建清场，C2）：pop 后转写
+    /// 走消息投影重建，entries 全删 + 调用方失效 SyncState 游标 →
+    /// sync_loop 从 0 全量重写（幂等；悬挂是罕见路径，一次全量重写可
+    /// 接受）。返回删除行数（0 = 本就无行）。
+    pub async fn delete_transcript_entries_for_run(&self, run_id: &str) -> Result<u64, StoreError> {
+        let result = query("DELETE FROM transcript_entries WHERE run_id = ?")
+            .bind(run_id)
+            .execute(self.pool())
+            .await
+            .map_err(werr)?;
+        Ok(result.rows_affected())
     }
 
     /// 插入一个 prompt 快照。
@@ -608,6 +875,16 @@ mod tests {
         store
     }
 
+    /// 文件库（附件/文件布局/GC 测试用）。
+    async fn setup_file_store(dir: &tempfile::TempDir) -> SqliteStore {
+        let path = dir.path().join("test.sqlite");
+        let store = SqliteStore::new(path.to_str().expect("utf-8 path"))
+            .await
+            .expect("file store");
+        store.run_migrations().await.expect("migrations");
+        store
+    }
+
     async fn seed_run(store: &SqliteStore) {
         store
             .insert_run("run-1", Some("test run"), "agent-root", "running", "{}", 1000)
@@ -811,6 +1088,7 @@ mod tests {
         let store = setup_store().await;
         seed_execution_node(&store).await;
 
+        let meta = r#"{"model_id":"glm-4.7","usage":{"input_tokens":10,"output_tokens":20}}"#;
         store
             .insert_message(
                 "msg-1",
@@ -818,24 +1096,42 @@ mod tests {
                 "enode-1",
                 Some("agent-root"),
                 "user",
-                r#"{"text":"hello"}"#,
+                &crate::codec::encode_content(r#"{"text":"hello"}"#),
+                None,
                 1,
                 1300,
             )
             .await
-            .expect("insert message");
-
-        let (role, content, seq): (String, String, i64) =
-            sqlx::query_as::<_, (String, String, i64)>(
-                "SELECT role, content_json, seq FROM messages WHERE id = 'msg-1'",
+            .expect("insert message (no meta)");
+        store
+            .insert_message(
+                "msg-2",
+                "run-1",
+                "enode-1",
+                Some("agent-root"),
+                "assistant",
+                &crate::codec::encode_content(r#"{"text":"world"}"#),
+                Some(meta),
+                2,
+                1301,
             )
-            .fetch_one(store.pool())
             .await
-            .expect("query message");
+            .expect("insert message (with meta)");
 
-        assert_eq!(role, "user");
-        assert_eq!(content, r#"{"text":"hello"}"#);
-        assert_eq!(seq, 1);
+        let msgs = store.list_messages_by_run("run-1").await.expect("read back");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content_json, r#"{"text":"hello"}"#);
+        assert_eq!(msgs[0].seq, 1);
+        assert!(msgs[0].meta_json.is_none(), "无 meta 的行为 NULL");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content_json, r#"{"text":"world"}"#);
+        assert_eq!(
+            msgs[1].meta_json.as_deref(),
+            Some(meta),
+            "meta_json 透传零损"
+        );
+        assert_eq!(msgs[1].seq, 2);
     }
 
     #[tokio::test]
@@ -939,8 +1235,9 @@ mod tests {
         assert_eq!(ts_ns, 1_000_000_000);
     }
 
+    /// 大文本消息：压缩落盘 + 解压零损往返 + 高冗余文本实际变小。
     #[tokio::test]
-    async fn test_large_content_insert() {
+    async fn test_large_content_compresses_and_roundtrips() {
         let store = setup_store().await;
         seed_execution_node(&store).await;
 
@@ -953,21 +1250,28 @@ mod tests {
                 "enode-1",
                 None,
                 "assistant",
-                &large_content,
+                &crate::codec::encode_content(&large_content),
+                None,
                 1,
                 1600,
             )
             .await
             .expect("large insert should succeed");
 
-        let len: i64 = query_scalar::<_, i64>(
-            "SELECT LENGTH(content_json) FROM messages WHERE id = 'msg-big'",
+        let blob_len: i64 = query_scalar::<_, i64>(
+            "SELECT LENGTH(content_zst) FROM messages WHERE id = 'msg-big'",
         )
         .fetch_one(store.pool())
         .await
-        .expect("query length");
+        .expect("query blob length");
+        assert!(
+            blob_len < 200_000,
+            "1MB 高冗余文本压缩后应远小于原大, got {blob_len}"
+        );
 
-        assert_eq!(len, 1_048_576);
+        let loaded = store.list_messages_by_run("run-1").await.expect("read");
+        assert_eq!(loaded[0].content_json.len(), 1_048_576, "解压零损");
+        assert_eq!(loaded[0].content_json, large_content);
     }
 
     // -----------------------------------------------------------------------
@@ -1013,7 +1317,8 @@ mod tests {
                 &format!("{run_id}-enode"),
                 Some("root"),
                 "user",
-                "\"hi\"",
+                &crate::codec::encode_content("\"hi\""),
+                None,
                 1,
                 started_at + 3,
             )
@@ -1069,6 +1374,22 @@ mod tests {
         seed_full_run(&store, "victim", 1000).await;
         seed_full_run(&store, "survivor", 2000).await;
 
+        // v5 新子表也要随 run 删除（行级塞数据，不涉文件）
+        sqlx::query(
+            "INSERT INTO attachments (id, run_id, sha256, mime, filename, size_bytes, created_at) \
+             VALUES ('victim-att', 'victim', 'sha-v', 'image/png', NULL, 1, 1500)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("victim attachment");
+        sqlx::query(
+            "INSERT INTO transcript_entries (id, run_id, seq, entry_json, created_at) \
+             VALUES ('victim-te', 'victim', 1, '{}', 1500)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("victim transcript entry");
+
         let deleted = store.delete_run("victim").await.expect("delete");
         assert_eq!(deleted, 1, "runs 表删除 1 行");
 
@@ -1079,6 +1400,8 @@ mod tests {
             "prompt_snapshots",
             "trace_events",
             "audit_log",
+            "attachments",
+            "transcript_entries",
             "execution_nodes",
         ] {
             let count: i64 = query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
@@ -1387,5 +1710,374 @@ mod tests {
             .upsert_credential("x", "weird", "x", "v", 1)
             .await;
         assert!(result.is_err(), "CHECK 约束应拒绝未知 kind");
+    }
+
+    // -----------------------------------------------------------------------
+    // 附件 / 转写条目 / 文件 GC（v5）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_attachment_crud_file_layout_and_bind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-1", None, "root", "running", "{}", 1000)
+            .await
+            .expect("seed run");
+
+        // 暂存（未绑定）附件：run_id NULL + 文件落 files/{sha}.png
+        store
+            .insert_attachment(
+                "att-1",
+                None,
+                "sha-abc",
+                "image/png",
+                Some("photo.png"),
+                4,
+                &[1, 2, 3, 4],
+                2000,
+            )
+            .await
+            .expect("insert unbound attachment");
+        let files_dir = store.files_dir().expect("files_dir");
+        let file = files_dir.join("sha-abc.png");
+        assert_eq!(
+            std::fs::read(&file).expect("file written"),
+            vec![1, 2, 3, 4],
+            "字节按 sha256 寻址落盘"
+        );
+
+        // 绑定到 run（Submit 路径）
+        let bound = store
+            .bind_attachments(&["att-1", "ghost-id"], "run-1")
+            .await
+            .expect("bind");
+        assert_eq!(bound, 1, "仅存在的 id 被更新");
+        let att = store.get_attachment("att-1").await.expect("get").expect("row");
+        assert_eq!(att.run_id.as_deref(), Some("run-1"));
+        assert_eq!(att.mime, "image/png");
+        assert_eq!(att.size_bytes, 4);
+        assert_eq!(att.filename.as_deref(), Some("photo.png"));
+
+        // run 视图只列已绑定的
+        store
+            .insert_attachment(
+                "att-2",
+                None,
+                "sha-def",
+                "video/mp4",
+                None,
+                2,
+                &[9, 9],
+                2100,
+            )
+            .await
+            .expect("second attachment");
+        let listed = store.list_run_attachments("run-1").await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "att-1");
+
+        // 同 sha 重复绑定同 run → UNIQUE(run_id, sha256) 拒绝
+        let dup = store
+            .insert_attachment("att-3", Some("run-1"), "sha-abc", "image/png", None, 4, &[1, 2, 3, 4], 2200)
+            .await;
+        assert!(dup.is_err(), "UNIQUE(run_id, sha256) 应拒绝 run 内重复");
+    }
+
+    #[tokio::test]
+    async fn test_attachment_in_memory_store_rejected() {
+        let store = setup_store().await;
+        let err = store
+            .insert_attachment("att-x", None, "sha", "image/png", None, 1, &[1], 1)
+            .await
+            .expect_err("内存库必须明确拒绝");
+        assert!(
+            err.to_string().contains("files_dir"),
+            "错误应说明 files_dir 缺失, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attachment_unsupported_mime_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        let err = store
+            .insert_attachment("att-x", None, "sha", "application/pdf", None, 1, &[1], 1)
+            .await
+            .expect_err("未映射 mime 必须拒绝");
+        assert!(
+            err.to_string().contains("application/pdf"),
+            "错误应指出 mime, got: {err}"
+        );
+    }
+
+    /// 跨 run 共享同一 sha256 的文件：删一个 run 文件保留（另一 run 仍
+    /// 引用），删最后一个引用 run 才删文件。
+    #[tokio::test]
+    async fn test_delete_run_gc_shared_sha_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-a", None, "root", "completed", "{}", 1000)
+            .await
+            .expect("run a");
+        store
+            .insert_run("run-b", None, "root", "completed", "{}", 2000)
+            .await
+            .expect("run b");
+
+        let data = vec![7u8; 16];
+        store
+            .insert_attachment("att-a", Some("run-a"), "sha-shared", "image/jpeg", None, 16, &data, 1500)
+            .await
+            .expect("att a");
+        store
+            .insert_attachment("att-b", Some("run-b"), "sha-shared", "image/jpeg", None, 16, &data, 2500)
+            .await
+            .expect("att b");
+        let file = store.files_dir().expect("dir").join("sha-shared.jpg");
+        assert!(file.exists());
+
+        store.delete_run("run-a").await.expect("delete run a");
+        assert!(
+            file.exists(),
+            "run-b 仍引用 → 文件必须保留（跨 run 复用）"
+        );
+
+        store.delete_run("run-b").await.expect("delete run b");
+        assert!(
+            !file.exists(),
+            "最后一个引用消失 → 孤儿文件被清扫"
+        );
+    }
+
+    /// 启动暂存清扫：>7 天的未绑定附件行+文件删除；7 天内暂存与已绑定
+    /// 行不受影响。
+    #[tokio::test]
+    async fn test_gc_stale_unbound_attachments() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = setup_file_store(&dir).await;
+        store
+            .insert_run("run-1", None, "root", "completed", "{}", 1000)
+            .await
+            .expect("run");
+
+        let now = 100 * 24 * 60 * 60 * 1000i64; // 任意"现在"
+        let eight_days_ago = now - 8 * 24 * 60 * 60 * 1000;
+        let one_day_ago = now - 1 * 24 * 60 * 60 * 1000;
+
+        // 旧暂存（应被清）
+        store
+            .insert_attachment("att-old", None, "sha-old", "image/png", None, 1, &[1], eight_days_ago)
+            .await
+            .expect("old stale");
+        // 新暂存（应保留）
+        store
+            .insert_attachment("att-new", None, "sha-new", "image/png", None, 1, &[2], one_day_ago)
+            .await
+            .expect("recent stale");
+        // 旧的已绑定行（应保留）
+        store
+            .insert_attachment("att-bound", Some("run-1"), "sha-bound", "image/png", None, 1, &[3], eight_days_ago)
+            .await
+            .expect("old bound");
+
+        let deleted = store
+            .gc_stale_unbound_attachments(now)
+            .await
+            .expect("gc");
+        assert_eq!(deleted, 1, "只删 >7d 的未绑定行");
+
+        let files = store.files_dir().expect("dir");
+        assert!(!files.join("sha-old.png").exists(), "过期暂存文件被清扫");
+        assert!(files.join("sha-new.png").exists(), "近期暂存保留");
+        assert!(files.join("sha-bound.png").exists(), "已绑定文件保留");
+        assert!(
+            store.get_attachment("att-bound").await.expect("q").is_some(),
+            "绑定行保留"
+        );
+        assert!(
+            store.get_attachment("att-old").await.expect("q").is_none(),
+            "过期暂存行已删"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcript_entry_insert_and_unique_seq() {
+        let store = setup_store().await;
+        store
+            .insert_run("run-1", None, "root", "running", "{}", 1000)
+            .await
+            .expect("run");
+
+        store
+            .insert_transcript_entry("te-1", "run-1", 1, r#"{"kind":"user"}"#, 2000)
+            .await
+            .expect("insert 1");
+        store
+            .insert_transcript_entry("te-2", "run-1", 2, r#"{"kind":"meta"}"#, 2100)
+            .await
+            .expect("insert 2");
+
+        // C1 起 INSERT OR IGNORE：同 run 同 seq 冲突静默让位首写行（原
+        // 「唯一索引报错」语义退役——游标按 0 自举的重插场景从致命告警
+        // 死循环降级为幂等补写）。
+        store
+            .insert_transcript_entry("te-3", "run-1", 1, r#"{"kind":"other"}"#, 2200)
+            .await
+            .expect("duplicate seq ignored (OR IGNORE)");
+        let rows = store.list_transcript_entries("run-1").await.expect("rows");
+        assert_eq!(rows.len(), 2, "重复 seq 不新增行");
+        assert_eq!(
+            rows[0].entry_json, r#"{"kind":"user"}"#,
+            "首写行内容胜出（IGNORE 让位）"
+        );
+
+        // 不同 run 同 seq 合法（唯一索引按 run 分域）
+        store
+            .insert_run("run-2", None, "root", "running", "{}", 3000)
+            .await
+            .expect("run 2");
+        store
+            .insert_transcript_entry("te-4", "run-2", 1, "{}", 3100)
+            .await
+            .expect("cross-run same seq ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // 悬挂 pop 回写删除 API（C2；空集 / 越界 / 返回计数）
+    // -----------------------------------------------------------------------
+
+    /// C2：`delete_messages_from_seq` 的边界语义。
+    #[tokio::test]
+    async fn test_delete_messages_from_seq_boundaries() {
+        let store = setup_store().await;
+        seed_execution_node(&store).await;
+        for (id, seq) in [("m-1", 1), ("m-2", 2), ("m-3", 3)] {
+            store
+                .insert_message(
+                    id,
+                    "run-1",
+                    "enode-1",
+                    Some("agent-root"),
+                    "user",
+                    &crate::codec::encode_content(r#""x""#),
+                    None,
+                    seq,
+                    1300 + seq,
+                )
+                .await
+                .expect("seed message");
+        }
+
+        // 越界（高于最大 seq）→ 0 行。
+        assert_eq!(
+            store.delete_messages_from_seq("run-1", 99).await.expect("del"),
+            0,
+            "无匹配返回 0"
+        );
+        // 不存在的 run → 0 行（不报错）。
+        assert_eq!(
+            store
+                .delete_messages_from_seq("no-run", 0)
+                .await
+                .expect("del"),
+            0
+        );
+        // 尾部删除：seq >= 3 → 恰 1 行。
+        assert_eq!(
+            store.delete_messages_from_seq("run-1", 3).await.expect("del"),
+            1
+        );
+        // 中点删除：seq >= 2 → 剩下的尾部 1 行。
+        assert_eq!(
+            store.delete_messages_from_seq("run-1", 2).await.expect("del"),
+            1
+        );
+        // 前缀全删：seq >= 0 → 最后 1 行。
+        assert_eq!(
+            store.delete_messages_from_seq("run-1", 0).await.expect("del"),
+            1
+        );
+        // 空集：再删 → 0。
+        assert_eq!(
+            store.delete_messages_from_seq("run-1", 0).await.expect("del"),
+            0
+        );
+        assert_eq!(store.max_message_seq("run-1").await.expect("max"), 0);
+    }
+
+    /// C2：`delete_transcript_entries_for_run` 的边界语义（空 run / 不存在
+    /// 的 run / 全删计数 / 不误伤其它 run）。
+    #[tokio::test]
+    async fn test_delete_transcript_entries_for_run_boundaries() {
+        let store = setup_store().await;
+        store
+            .insert_run("run-1", None, "root", "running", "{}", 1000)
+            .await
+            .expect("run 1");
+        store
+            .insert_run("run-2", None, "root", "running", "{}", 2000)
+            .await
+            .expect("run 2");
+
+        // 空集 / 不存在的 run → 0 行。
+        assert_eq!(
+            store
+                .delete_transcript_entries_for_run("run-1")
+                .await
+                .expect("del"),
+            0
+        );
+        assert_eq!(
+            store
+                .delete_transcript_entries_for_run("no-run")
+                .await
+                .expect("del"),
+            0
+        );
+
+        for seq in 0..3 {
+            store
+                .insert_transcript_entry(
+                    &format!("te-a{seq}"),
+                    "run-1",
+                    seq,
+                    r#"{"kind":"user"}"#,
+                    3000 + seq,
+                )
+                .await
+                .expect("seed run-1");
+        }
+        store
+            .insert_transcript_entry("te-b0", "run-2", 0, r#"{"kind":"meta"}"#, 4000)
+            .await
+            .expect("seed run-2");
+
+        // 全删：返回该 run 全部行数，不误伤其它 run。
+        assert_eq!(
+            store
+                .delete_transcript_entries_for_run("run-1")
+                .await
+                .expect("del"),
+            3
+        );
+        assert_eq!(
+            store.list_transcript_entries("run-1").await.expect("q").len(),
+            0
+        );
+        assert_eq!(
+            store.list_transcript_entries("run-2").await.expect("q").len(),
+            1,
+            "其它 run 不受影响"
+        );
+        // 幂等：再删 → 0。
+        assert_eq!(
+            store
+                .delete_transcript_entries_for_run("run-1")
+                .await
+                .expect("del"),
+            0
+        );
     }
 }

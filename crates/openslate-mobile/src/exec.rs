@@ -296,6 +296,7 @@ impl Tool for NativeShellTool {
         let started = std::time::Instant::now();
         let error_out = |msg: String| {
             Ok(ToolOutput {
+                attachments: None,
                 bytes: msg.len(),
                 content: msg,
                 duration_ms: started.elapsed().as_millis() as u64,
@@ -400,6 +401,7 @@ impl Tool for NativeShellTool {
         let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
         let output = truncate_output(&format_output(exit_code, &stdout_buf, &stderr_buf));
         Ok(ToolOutput {
+            attachments: None,
             bytes: output.len(),
             content: output,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -564,15 +566,32 @@ mod tests {
     #[tokio::test]
     async fn hot_swap_between_selections() {
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = std::sync::mpsc::channel::<String>();
-        struct Cb(std::sync::mpsc::Sender<String>);
+        // 回调自动应答 host call：termux 工具壳的等待超时是 900s 级
+        // （TERMUX_HOST_CALL_TIMEOUT，等人语义），不应答会把本测试拖到
+        // 15 分钟——测试里直接 resolve(false) 让调用毫秒级返回。回调
+        // 需要 router 而 router 构造又需要 sink（回调）→ OnceLock 后注。
+        struct Cb(std::sync::OnceLock<std::sync::Arc<crate::hostcall::HostCallRouter>>);
         impl crate::events::EventCallback for Cb {
-            fn on_event(&self, _e: String) {}
+            fn on_event(&self, e: String) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&e) {
+                    if v["type"] == "host_call_requested" {
+                        if let Some(router) = self.0.get() {
+                            router.resolve(
+                                v["id"].as_u64().unwrap_or(0),
+                                false,
+                                "test auto-resolve".into(),
+                            );
+                        }
+                    }
+                }
+            }
         }
+        let cb = std::sync::Arc::new(Cb(std::sync::OnceLock::new()));
         let router = crate::hostcall::HostCallRouter::new(
-            crate::events::EventSink::new(std::sync::Arc::new(Cb(tx))),
+            crate::events::EventSink::new(cb.clone()),
             Duration::from_secs(2),
         );
+        let _ = cb.0.set(router.clone());
         let reg = ToolRegistry::new();
         let sel = ExecSelection {
             native: true,
@@ -885,6 +904,7 @@ mod tests {
             }
             async fn execute(&self, _args: &Value) -> Result<ToolOutput, ToolError> {
                 Ok(ToolOutput {
+                    attachments: None,
                     bytes: 0,
                     content: String::new(),
                     duration_ms: 0,

@@ -216,6 +216,7 @@ impl openslate_core::tool::Tool for HugeOutputTool {
         let content = "z".repeat(10_000);
         let bytes = content.len();
         Ok(ToolOutput {
+            attachments: None,
             content,
             bytes,
             duration_ms: 0,
@@ -261,6 +262,7 @@ async fn integration_simple_single_turn() {
             output_tokens: 5,
             cached_input_tokens: None,
             reasoning_tokens: None,
+            image_tokens: None,
         }),
         finish_reason: Some("stop".into()),
     }]);
@@ -310,6 +312,7 @@ async fn integration_run_with_real_tool() {
                 output_tokens: 20,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("tool_calls".into()),
         },
@@ -323,6 +326,7 @@ async fn integration_run_with_real_tool() {
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
@@ -684,6 +688,7 @@ async fn integration_delegates_root_to_child() {
                 output_tokens: 5,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("tool_calls".into()),
         },
@@ -697,6 +702,7 @@ async fn integration_delegates_root_to_child() {
                 output_tokens: 3,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },
@@ -710,6 +716,7 @@ async fn integration_delegates_root_to_child() {
                 output_tokens: 8,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         },

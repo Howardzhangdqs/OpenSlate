@@ -50,6 +50,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -58,6 +61,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -94,13 +98,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import dev.openslate.mobile.bridge.LogExporter
+import dev.openslate.mobile.bridge.ApprovalRulesUi
 import dev.openslate.mobile.bridge.ConfigUi
 import dev.openslate.mobile.bridge.McpHostManager
 import dev.openslate.mobile.bridge.ModelUi
+import dev.openslate.mobile.bridge.ToolInfoUi
+import dev.openslate.mobile.bridge.approvalLevelLabel
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -131,6 +139,12 @@ fun SettingsScreen(
     onThemeModeChange: (ThemeMode) -> Unit = {},
     accent: String = ThemePrefs.DEFAULT_ACCENT,
     onAccentChange: (String) -> Unit = {},
+    /**
+     * 深链初始工具二级 tab（查看器对比块「跳转设置」→ 3 =「内置工具」处理
+     * 图片分区）：≥0 时主 tab 直定「工具」、二级 tab 定该值（rememberSaveable
+     * 初值，本回栈条目首组合生效；普通入口默认 -1 走首 tab，不越权记忆）。
+     */
+    initialToolTab: Int = -1,
 ) {
     val state by RuntimeBridge.state.collectAsState()
     val config = state.config
@@ -138,6 +152,8 @@ fun SettingsScreen(
     // Haze 内容源：会话页功能模型弹层（GlassDropdownMenu）对本页内容做局部
     // 真实模糊；挂在下方承载各域内容的内容列上（即弹层背后可见区域）。
     val hazeState = rememberHazeState()
+    // 页内轻提示（设置写入失败等；ChatScreen snackbar 同语言——设置页自持）。
+    val snackbarHostState = remember { SnackbarHostState() }
 
     var editProvider by remember { mutableStateOf<ProviderUi?>(null) }
     var editProviderIsNew by remember { mutableStateOf(false) }
@@ -147,16 +163,20 @@ fun SettingsScreen(
     var editModelLock by remember { mutableStateOf<String?>(null) }
     /** Provider 的模型管理弹窗（null = 关闭）。 */
     var modelsProvider by remember { mutableStateOf<ProviderUi?>(null) }
-    var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
-    // 工具域二级 Tab 选中态。「命令行」Tab 已删（bash 后端选择并入
-    // 「内置工具」），值域 0..2。saveable 显式换新 key（toolTabV2）：
-    // 旧 key 的存量值是四 Tab 时代索引，语义已变且与新写入无法区分——
-    // 曾用读侧映射折算（旧 3→2、旧 1/2→1），但它会连新点击一起劫持
-    // （点「内置工具」写 2 被折回 1，Tab 永远点不亮，真机实测 bug）；
-    // 换 key 一次性丢弃旧值，落点重置 MCP（0），无映射表。
+    // 深链落点（initialToolTab ≥ 0，查看器「跳转设置」）：主 tab 直定「工具」
+    // （索引 2）+ 二级 tab 定目标值；普通入口 -1 → 首组合取 0（本回栈条目
+    // 首次组合生效，进程恢复仍以存量 saveable 为准）。
+    var tab by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(if (initialToolTab >= 0) 2 else 0)
+    }
+    // 工具域二级 Tab 选中态。值域 0..3（「工具权限」插入后：0=MCP、
+    // 1=工具管理、2=工具权限、3=内置工具）。saveable 显式换新 key
+    // （toolTabV3）：旧 key 的存量值是三 Tab 时代索引（2=内置工具），插入
+    // 新 Tab 后语义错位——沿用 toolTabV2 换 key 的先例，一次性丢弃旧值，
+    // 落点重置 MCP（0），无映射表。
     var toolTab by androidx.compose.runtime.saveable.rememberSaveable(
-        key = "toolTabV2",
-    ) { mutableStateOf(0) }
+        key = "toolTabV3",
+    ) { mutableStateOf(if (initialToolTab >= 0) initialToolTab.coerceIn(0, 3) else 0) }
     var modelTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
 
     // API key 存在性批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，
@@ -189,6 +209,7 @@ fun SettingsScreen(
                 },
             )
         },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { padding ->
         Column(
             Modifier
@@ -221,14 +242,14 @@ fun SettingsScreen(
             }
 
             // ── 工具域二级 Tab：吸顶固定（在滚动容器外），紧贴主 Tab ──
-            // 原「命令行」Tab 已删，bash 后端选择（ExecBackendSection）并入
-            // 「内置工具」Tab。
+            // 「工具权限」为审批规则编辑（ApprovalPermissionsSection）。
             if (tab == 2) {
                 androidx.compose.material3.TabRow(selectedTabIndex = toolTab) {
                     for ((label, idx) in listOf(
                         "MCP" to 0,
                         "工具管理" to 1,
-                        "内置工具" to 2,
+                        "工具权限" to 2,
+                        "内置工具" to 3,
                     )) {
                         androidx.compose.material3.Tab(
                             selected = toolTab == idx,
@@ -312,6 +333,24 @@ fun SettingsScreen(
                             )
                             CapabilityModelRow("title", "会话标题生成", config, hazeState)
                         }
+                        // ── 会话域：审批审查模型（capability=review）──────
+                        // 「自动判断」审批等级的 AI 审查器；未绑定 → 继承会话
+                        // 模型（与 compact 同款运行时语义，不生成显式写入）。
+                        Section(title = "审批审查模型") {
+                            Text(
+                                "工具权限为「自动判断」时，工具调用先由这个模型审查风险，" +
+                                    "只有判定高风险才向你确认；未绑定时跟随会话模型。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline,
+                            )
+                            CapabilityModelRow(
+                                "review",
+                                "审批风险审查",
+                                config,
+                                hazeState,
+                                unsetLabel = "跟随会话模型",
+                            )
+                        }
                     }
                     2 -> {
                         // ── Provider 域：Provider CRUD + API key ─────────
@@ -392,19 +431,21 @@ fun SettingsScreen(
                         }
                     }
                     2 -> {
-                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 工具管理 / 内置工具 ──
-                        // 原「命令行」Tab 已删：ExecBackendSection（native bash
-                        // 开关；termux 恒在）迁入「内置工具」Tab 置顶——先定
-                        // 哪些内置 bash 工具存在（注册层），再看内置工具行为设置。
+                        // ── 工具域（二级 Tab 在上方吸顶）：MCP / 工具管理 /
+                        // 工具权限 / 内置工具 ──
                         when (toolTab) {
                             0 -> {
                                 McpSection()
                                 LogSection()
                             }
                             1 -> ToolManagementSection()
+                            2 -> ApprovalPermissionsSection(config, hazeState)
                             else -> {
                                 ExecBackendSection()
-                                BuiltinToolBehaviorSection()
+                                BuiltinToolBehaviorSection(hazeState)
+                                // 「附件输入」分区（实验视频开关）已随视频入口
+                                // 整体隐藏（本期不做视频）；处理图片保留。
+                                ImageProcessingSection(snackbarHostState)
                             }
                         }
                     }
@@ -973,7 +1014,15 @@ private fun Section(
  * （悬空代号 / 条目已删）显示「未设置」——重选条目即自愈。
  */
 @Composable
-private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, hazeState: HazeState) {
+private fun CapabilityModelRow(
+    cap: String,
+    title: String,
+    config: ConfigUi,
+    hazeState: HazeState,
+    // 未绑定（capabilities 无此键）时的显示文案：「未设置」为缺省；
+    // review 等继承型功能传「跟随会话模型」。
+    unsetLabel: String = "未设置",
+) {
     var expanded by remember { mutableStateOf(false) }
     val stored = config.capabilities[cap]
     val fallback = if (cap == "main") "main" else "fast"
@@ -1024,7 +1073,7 @@ private fun CapabilityModelRow(cap: String, title: String, config: ConfigUi, haz
                     // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
                     text = when {
                         items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
-                        bound == null -> AnnotatedString("未设置")
+                        bound == null -> AnnotatedString(unsetLabel)
                         else -> buildAnnotatedString {
                             withStyle(SpanStyle(fontFamily = MonoFont)) {
                                 append(RuntimeBridge.modelAliasDisplay(bound, config))
@@ -1921,7 +1970,7 @@ private fun ExecBackendSection() {
  * 本地 SharedPreferences 仅为 UI 显示源，两端不漂移。
  */
 @Composable
-private fun BuiltinToolBehaviorSection() {
+private fun BuiltinToolBehaviorSection(hazeState: HazeState) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     // prefs 读取预取到 IO 线程（组合期同步读盘会卡帧）；null = 加载中。
     var timeoutSec by remember { mutableStateOf<Long?>(null) }
@@ -1942,24 +1991,25 @@ private fun BuiltinToolBehaviorSection() {
         if (timeoutSec == null) {
             Text("加载中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
         } else {
-            DropdownChoice(
-                options = listOf(
-                    "-1" to "永不超时",
-                    "300" to "5 分钟",
-                    "600" to "10 分钟",
-                    "1800" to "30 分钟",
-                    "3600" to "60 分钟",
-                ),
-                selected = timeoutSec.toString(),
-                onSelect = { v ->
-                    val sec = v.toLong()
+            // 默认等待时长：经典设置行（标签居左、值控件贴行右缘、玻璃弹层
+            // 右对齐）——与 ApprovalDefaultLevelRow 完全同构，弹层语言与
+            // 模型选择器一致；写入链路不变（IO 协程 setAskUserTimeoutSecAndPersist）。
+            // 本地捕获：delegated 属性无法 smart cast，else 分支内显式取值。
+            val currentSec = timeoutSec ?: return@Section
+            AskUserTimeoutRow(
+                selectedSec = currentSec,
+                hazeState = hazeState,
+                onSelect = { sec ->
                     timeoutSec = sec
                     scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                         RuntimeBridge.setAskUserTimeoutSecAndPersist(sec)
                     }
                 },
-                fieldLabel = "默认等待时长",
-                supportingText = "超过该时长未作答，Agent 将按「用户可能不在」自行判断继续；单次提问可由 Agent 覆盖。",
+            )
+            Text(
+                "超过该时长未作答，Agent 将按「用户可能不在」自行判断继续；单次提问可由 Agent 覆盖。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
             )
         }
     }
@@ -2010,6 +2060,684 @@ private fun BuiltinToolBehaviorSection() {
     }
 }
 
+// （「附件输入」分区 / 实验视频输入开关已删——2026-10 本期不做视频：设置
+// 不暴露、聊天页附件按钮恒图片多选；Rust 侧 experimental_video 配置与
+// experimentalVideoEnabled/setExperimentalVideoEnabled 网关保留不删，存量
+// openslate.toml 配置照常生效。）
+
+/**
+ * 最长边离散格点：512 起步进 256（格点顶 5888），端点补 6000——512..6000
+ * 两端不同余（差 5488 非整除 256），滑块 23 个均匀位、值映射仅末段非等距。
+ */
+private val IMAGE_DIM_STEPS: List<Long> = buildList {
+    var v = 512L
+    while (v <= 5888L) {
+        add(v)
+        v += 256
+    }
+    add(6000L)
+}
+
+/** Rust 侧存量值可能不在格点上（如手改配置的 3000），就近映射到滑块位。 */
+private fun nearestDimIndex(v: Long): Int {
+    var best = 0
+    var bestDist = Long.MAX_VALUE
+    IMAGE_DIM_STEPS.forEachIndexed { i, step ->
+        val d = kotlin.math.abs(step - v)
+        if (d < bestDist) {
+            bestDist = d
+            best = i
+        }
+    }
+    return best
+}
+
+/**
+ * 图片处理限制（设置页「处理图片」分区；fix-12 FFI `get/setImageProcessing`
+ * 直调——binding 已生成）。
+ *
+ * 两旋钮改 **Material 3 Slider**（2026-10 用户反馈，替换 ApprovalLevelPicker
+ * 分段下拉）：图片最长边（512~6000，步进 256 离散格点，顶格 6000）与处理
+ * 后大小上限（整数 1~5 MB 五档——FFI 契约 i64 不做半步）。读取 = 进分区
+ * LaunchedEffect IO 回显；写入 = **拖动结束（onValueChangeFinished）才落
+ * FFI**（拖动途中零调用防风暴），乐观更新 + 失败 snackbar 成对回滚到拖动
+ * 前值。生效语义 = 下一次导入生效（已有附件不重处理，intro 注明）。
+ */
+@Composable
+private fun ImageProcessingSection(
+    snackbar: SnackbarHostState,
+) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    // null = 加载中；unavailable = runtime 未就绪/读取异常 → 整区块占位。
+    var maxDim by remember { mutableStateOf<Long?>(null) }
+    var maxMb by remember { mutableStateOf<Long?>(null) }
+    var unavailable by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        val cur = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            RuntimeBridge.imageProcessing()
+        }
+        if (cur == null) unavailable = true
+        else {
+            maxDim = cur.maxDim
+            maxMb = cur.maxMb
+        }
+    }
+    // 拖动态滑块位置（Float）：remember 键 = 已提交值——回显加载与写失败
+    // 回滚都经提交值变化自动复位滑块；拖动途中只改本态，onValueChangeFinished
+    // 才经 save() 乐观提交（失败回滚 = 拖动前已提交值）。
+    var dimPos by remember(maxDim) {
+        mutableFloatStateOf(maxDim?.let { nearestDimIndex(it).toFloat() } ?: 6f)
+    }
+    var mbPos by remember(maxMb) { mutableFloatStateOf((maxMb ?: 5L) - 1f) }
+    // 选择即保存（乐观）：先改 UI 再 IO 写 FFI；失败成对回滚 + snackbar
+    //（error 文案直通——含运行时未就绪与非法值报错）。
+    fun save(nextDim: Long?, nextMb: Long?) {
+        val prevDim = maxDim ?: return
+        val prevMb = maxMb ?: return
+        val dim = nextDim ?: prevDim
+        val mb = nextMb ?: prevMb
+        if (nextDim != null) maxDim = nextDim
+        if (nextMb != null) maxMb = nextMb
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val r = RuntimeBridge.setImageProcessing(dim, mb)
+            if (r is RuntimeBridge.ImageProcessingWriteUi.Failed) {
+                maxDim = prevDim
+                maxMb = prevMb
+                scope.launch { snackbar.showSnackbar(r.message) }
+            }
+        }
+    }
+    Section(title = "处理图片") {
+        if (unavailable) {
+            Text(
+                "需更新应用：当前安装包不含图片处理设置。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        } else {
+            Text(
+                "导入图片的等比缩放与体积上限；改动对下一次导入生效，已有附件不重处理。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            ImageProcessingSliderRow(
+                label = "图片最长边",
+                subtitle = "等比缩放目标；越大越清晰、消耗 token 越多",
+                loaded = maxDim != null,
+                valueText = maxDim?.let {
+                    val i = dimPos.roundToInt().coerceIn(0, IMAGE_DIM_STEPS.lastIndex)
+                    "${IMAGE_DIM_STEPS[i]} px"
+                } ?: "…",
+                position = dimPos,
+                range = 0f..IMAGE_DIM_STEPS.lastIndex.toFloat(),
+                steps = IMAGE_DIM_STEPS.size - 2,
+                onPosition = { dimPos = it },
+                onCommit = {
+                    val v = IMAGE_DIM_STEPS[dimPos.roundToInt().coerceIn(0, IMAGE_DIM_STEPS.lastIndex)]
+                    if (v != maxDim) save(v, null)
+                },
+            )
+            ImageProcessingSliderRow(
+                label = "处理后大小上限",
+                subtitle = "压不到会自动降质量/继续缩小",
+                loaded = maxMb != null,
+                valueText = maxMb?.let { "${mbPos.roundToInt().coerceIn(1, 5)} MB" } ?: "…",
+                position = mbPos,
+                range = 1f..5f,
+                steps = 3,
+                onPosition = { mbPos = it },
+                onCommit = {
+                    val v = mbPos.roundToInt().coerceIn(1, 5).toLong()
+                    if (v != maxMb) save(null, v)
+                },
+            )
+            Text(
+                "压缩仅在超出限制时进行；已符合的图片原样发送。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+    }
+}
+
+/**
+ * 处理限制滑杆行（M3 [Slider] 主题色默认，工程首个 Slider 用法）：标签居
+ * 左、当前档位实时值贴行右缘（labelMedium，已加载 primary / 否则 outline
+ * 「…」），滑杆通栏，副标题随下。enabled = 已加载（回显前不可动）。
+ */
+@Composable
+private fun ImageProcessingSliderRow(
+    label: String,
+    subtitle: String,
+    loaded: Boolean,
+    valueText: String,
+    position: Float,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onPosition: (Float) -> Unit,
+    onCommit: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                valueText,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (loaded) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.outline,
+            )
+        }
+        Slider(
+            value = position,
+            onValueChange = onPosition,
+            onValueChangeFinished = onCommit,
+            valueRange = range,
+            steps = steps,
+            enabled = loaded,
+        )
+        Text(
+            subtitle,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+    }
+}
+
+/**
+ * ask_user 默认等待时长行：与 [ApprovalDefaultLevelRow] 完全同构的经典
+ * 设置行（标签居左、值控件贴行右缘、[GlassDropdownMenu] alignEnd 右对齐、
+ * 内容自适应宽、选中 Check）。五档选项；时长无「继承」语义，值控件恒用
+ * 显式态（primary 主强调）。写入经 [RuntimeBridge.setAskUserTimeoutSecAndPersist]
+ * （本地 prefs + 协议推引擎，调用方 IO 协程）。
+ */
+@Composable
+private fun AskUserTimeoutRow(
+    selectedSec: Long,
+    hazeState: HazeState,
+    onSelect: (Long) -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 6.dp),
+    ) {
+        Text(
+            "默认等待时长",
+            style = MaterialTheme.typography.titleSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        ApprovalLevelPicker(
+            options = listOf(
+                "-1" to "永不超时",
+                "300" to "5 分钟",
+                "600" to "10 分钟",
+                "1800" to "30 分钟",
+                "3600" to "60 分钟",
+            ),
+            selected = selectedSec.toString(),
+            explicit = true,
+            hazeState = hazeState,
+            onSelect = { v -> onSelect(v.toLong()) },
+        )
+    }
+}
+
+// ── 工具权限（审批规则可视编辑，工具域二级 Tab）─────────────────────
+
+/** 显式等级选项（除「跟随上级/默认」外的三态；值域与 Rust ApprovalRules 对齐）。 */
+private val APPROVAL_LEVEL_OPTIONS = listOf(
+    "auto" to "自动判断",
+    "allow" to "全部允许",
+    "manual" to "全部手动",
+)
+
+/** MCP 组头显示名（同 ToolManagementSection 反查法）：配置内 server 用显示
+ *  名；反查 miss 且组内全为裸名（不含 __）→ host 内置前缀组（聚合 host
+ *  本身的工具）；其余（server 已删但注册表工具还在）→ slug +「（未配置）」；
+ *  反查表未就绪 → slug 原样。 */
+private fun approvalGroupDisplayName(
+    slug: String,
+    tools: List<ToolInfoUi>,
+    serverNames: Map<String, String>?,
+): String {
+    val names = serverNames ?: return slug
+    if (slug in names) return names[slug] ?: slug
+    if (tools.all { !it.name.contains("__") }) return "Termux 服务内置"
+    return "$slug（未配置）"
+}
+
+/**
+ * 工具权限域：审批规则（默认等级 / MCP 组级 / 单工具）的可视编辑。
+ *
+ * - 数据 = config 视图的 approval（config_changed 回证后的生效规则）+
+ *   listTools()（server 字段缺失回退 mcpServerSlugOf 推导）；
+ * - 等级弹层统一走 [GlassDropdownMenu] 磨砂玻璃（与模型选择器同语言）：
+ *   本 Tab 与 CapabilityModelRow 渲染在同一 hazeSource 内容列，模糊源
+ *   直接复用 SettingsScreen 顶层 [hazeState]；
+ * - 分组：MCP 组（组头 = server 显示名，反查 serversSlugMap 同
+ *   ToolManagementSection）提供组级等级（server_levels，四态，首项
+ *   「跟随默认」= 从 map 删除该键）；Termux host 生态（host 内置裸名 +
+ *   termux_bash + native bash）合为一组且**跟随 host 连接状态**——
+ *   在线才渲染（ComposerMcpStatusTracker 共享管线，hostAlive == false
+ *   整组隐藏；探测中/未探测按上次快照保守显示，不闪空）；非 MCP 工具
+ *   （mobile.ping 等）归「内置 / 宿主工具」组（无组级选择，只能跟随
+ *   默认或单独设置）；
+ * - 工具行四态：首项「跟随上级（<上级当前等级>）」= 从 tool_levels 删除
+ *   该键；显式设置以 primary 文字 + 淡色底区分继承态（outline 无底）；
+ *   生效等级 = 单工具显式 ?? 组级 ?? 默认；
+ * - 任意改动即 setApprovalConfig 全量发送（对齐设置页即时保存模式），
+ *   本地乐观更新；config_changed 回证后 config.approval 换新实例，显示
+ *   源随之重置为权威值（内容一致则无感）。
+ */
+@Composable
+private fun ApprovalPermissionsSection(config: ConfigUi, hazeState: HazeState) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // ── Termux/MCP host 连接状态（「Termux 服务内置」组的显示门控）────
+    // 共享探测管线 ComposerMcpStatusTracker（object 单例，CAS 单飞，无新
+    // 探测代码）：进 Tab 刷新一次；Tab 可见期间 ON_RESUME（如从 Termux
+    // 切回）再刷。resumedOnce 跳过挂观察者时的合成 ON_RESUME（防与进页
+    // 首刷重复，ToolManagementSection 同款）。hostAlive == false 才隐藏
+    // 整组；true / 未探测（null，冷启动首进）都渲染——探测在途时快照
+    // 保留上次终态（tracker CAS 写法），不闪空。
+    val mcpLive by ComposerMcpStatusTracker.state.collectAsState()
+    LaunchedEffect(Unit) { ComposerMcpStatusTracker.refresh(context) }
+    var resumedOnce by remember { mutableStateOf(false) }
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                if (resumedOnce) ComposerMcpStatusTracker.refresh(context)
+                resumedOnce = true
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+    // 工具清单（FFI，进页异步读）；null = 加载中。
+    var tools by remember { mutableStateOf<List<ToolInfoUi>?>(null) }
+    // slug → server 显示名反查表（null = 仍在读，期间组头显示 slug）。
+    var serverNames by remember { mutableStateOf<Map<String, String>?>(null) }
+    LaunchedEffect(Unit) {
+        tools = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { RuntimeBridge.listTools() }.getOrNull()
+        }
+        serverNames = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                McpHostManager.serversSlugMap(McpHostManager.loadServers(context))
+                    .associate { it.second to it.first.name }
+            }.getOrDefault(emptyMap())
+        }
+    }
+
+    Section(title = "工具权限") {
+        val rules = config.approval
+        if (rules == null) {
+            Text(
+                "运行时未就绪，审批规则尚未加载；稍后回到本页会自动刷新。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            return@Section
+        }
+        // 本地乐观规则：改动即刻生效显示；remember(rules) 保证 config_changed
+        // 回证（config.approval 换新实例）后重置为权威值。
+        var local by remember(rules) { mutableStateOf(rules) }
+        fun push(next: ApprovalRulesUi) {
+            local = next
+            RuntimeBridge.setApprovalConfig(next.defaultLevel, next.toolLevels, next.serverLevels)
+        }
+        Text(
+            "控制工具调用是否需要向你确认，改动立即保存并生效。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+        // 默认权限等级：经典设置行（标签居左、值控件贴右缘、玻璃弹层右对齐）。
+        ApprovalDefaultLevelRow(
+            selected = local.defaultLevel,
+            hazeState = hazeState,
+            onSelect = { push(local.copy(defaultLevel = it)) },
+        )
+        Text(
+            "未单独设置的工具按此等级执行。自动判断 = 先经 AI 审查，仅高风险才询问；" +
+                "全部允许 = 一律直接执行；全部手动 = 每次调用都先询问。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.outline,
+        )
+        val loadedTools = tools
+        when {
+            loadedTools == null -> Text(
+                "加载工具清单中…",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            loadedTools.isEmpty() -> Text(
+                "暂无可用工具：运行时未注册任何工具。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            else -> {
+                // 按 server 分组（server 字段有则用，缺失回退 mcpServerSlugOf
+                // 推导）。Termux host 生态三源合流为一组（组头沿用「Termux
+                // 服务内置」口径）：host 内置裸名工具（read_file/write_file/
+                // …，server = host 前缀）、termux_bash（MCP 接管 / HostTool
+                // 兜底同名注册）与 native bash（server=null，恒名 bash，按
+                // 名字并入）——该组跟随 host 连接状态：hostAlive == false 才
+                // 整组隐藏（显示层语义，权限引擎的等级照旧生效，写入链路
+                // 不动）；其余非 Termux 工具（mobile.ping 等）仍归
+                // 「内置 / 宿主工具」组，行为不变。
+                val hostPrefix = RuntimeBridge.MCP_SERVER_NAMES.firstOrNull() ?: "termux"
+                val termuxHostVisible = mcpLive.hostAlive != false
+                val mcpGroups = linkedMapOf<String, MutableList<ToolInfoUi>>()
+                val hostTools = mutableListOf<ToolInfoUi>()
+                for (t in loadedTools) {
+                    val slug = t.server
+                        ?: RuntimeBridge.mcpServerSlugOf(t.name, RuntimeBridge.MCP_SERVER_NAMES)
+                    when {
+                        // native bash 与 termux_bash 兜底形态（server=null）：
+                        // 恒归 Termux host 组，不进「内置 / 宿主工具」。
+                        slug == null && (t.name == "bash" || t.name == "termux_bash") ->
+                            mcpGroups.getOrPut(hostPrefix) { mutableListOf() }.add(t)
+                        slug != null -> mcpGroups.getOrPut(slug) { mutableListOf() }.add(t)
+                        else -> hostTools.add(t)
+                    }
+                }
+                for ((slug, groupTools) in mcpGroups) {
+                    // 连接门控只作用于 Termux host 组；其余 MCP 组不受此
+                    // 门控（注册表残留的显示语义保持不变）。
+                    if (slug == hostPrefix && !termuxHostVisible) continue
+                    val groupLevel = local.serverLevels[slug]
+                    ApprovalGroupCard(
+                        title = approvalGroupDisplayName(slug, groupTools, serverNames),
+                        toolCount = groupTools.size,
+                        defaultLevel = local.defaultLevel,
+                        selected = groupLevel,
+                        hazeState = hazeState,
+                        onSelect = { v ->
+                            val next = local.serverLevels.toMutableMap()
+                            if (v.isEmpty()) next.remove(slug) else next[slug] = v
+                            push(local.copy(serverLevels = next))
+                        },
+                    ) {
+                        // 组内短名去重：native bash 与 termux_bash 兜底形态
+                        // 同组时短名都解析为 "bash"（默认安装双后端 + host
+                        // 在线即撞），撞名成员整体回退注册全名，行行可辨。
+                        val bareNames = groupTools.map { t ->
+                            RuntimeBridge.mcpToolBareName(t.name)
+                                ?: t.name.substringAfter("__")
+                        }
+                        val dupNames = bareNames.groupBy { it }
+                            .filterValues { it.size > 1 }.keys
+                        for ((i, t) in groupTools.withIndex()) {
+                            if (i > 0) HorizontalDivider()
+                            ApprovalToolRow(
+                                tool = t,
+                                displayName = bareNames[i].takeIf { it !in dupNames } ?: t.name,
+                                parentLevel = groupLevel ?: local.defaultLevel,
+                                explicitLevel = local.toolLevels[t.name],
+                                hazeState = hazeState,
+                                onSelect = { v ->
+                                    val next = local.toolLevels.toMutableMap()
+                                    if (v.isEmpty()) next.remove(t.name) else next[t.name] = v
+                                    push(local.copy(toolLevels = next))
+                                },
+                            )
+                        }
+                    }
+                }
+                if (hostTools.isNotEmpty()) {
+                    ApprovalGroupCard(
+                        title = "内置 / 宿主工具",
+                        toolCount = hostTools.size,
+                        defaultLevel = local.defaultLevel,
+                        selected = null,
+                        hazeState = hazeState,
+                        onSelect = null,
+                    ) {
+                        for ((i, t) in hostTools.withIndex()) {
+                            if (i > 0) HorizontalDivider()
+                            ApprovalToolRow(
+                                tool = t,
+                                displayName = t.name,
+                                parentLevel = local.defaultLevel,
+                                explicitLevel = local.toolLevels[t.name],
+                                hazeState = hazeState,
+                                onSelect = { v ->
+                                    val next = local.toolLevels.toMutableMap()
+                                    if (v.isEmpty()) next.remove(t.name) else next[t.name] = v
+                                    push(local.copy(toolLevels = next))
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 默认权限等级行：经典设置行布局（标签居左、值控件贴行右缘——与
+ * [CapabilityModelRow] 同款 SpaceBetween + 双 weight 限宽），值控件点开
+ * 玻璃弹层（[GlassDropdownMenu]，alignEnd 右对齐）。默认级是规则根值、
+ * 恒为显式生效，值控件恒用 primary 强调色。
+ */
+@Composable
+private fun ApprovalDefaultLevelRow(
+    selected: String,
+    hazeState: HazeState,
+    onSelect: (String) -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 6.dp),
+    ) {
+        Text(
+            "默认权限等级",
+            style = MaterialTheme.typography.titleSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        ApprovalLevelPicker(
+            options = APPROVAL_LEVEL_OPTIONS,
+            selected = selected,
+            explicit = true,
+            hazeState = hazeState,
+            onSelect = onSelect,
+        )
+    }
+}
+
+/**
+ * 工具权限分组卡：头部 = 组名 + 工具数 + 组级等级选择（[onSelect] = null
+ * 表示该组不参与 server_levels，如内置 / 宿主工具组）；内容 = 组内工具行。
+ */
+@Composable
+private fun ApprovalGroupCard(
+    title: String,
+    toolCount: Int,
+    defaultLevel: String,
+    selected: String?,
+    hazeState: HazeState,
+    onSelect: ((String) -> Unit)?,
+    content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "$toolCount 个工具",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
+                if (onSelect != null) {
+                    ApprovalLevelPicker(
+                        options = listOf(
+                            "" to "跟随默认（${approvalLevelLabel(defaultLevel)}）",
+                        ) + APPROVAL_LEVEL_OPTIONS,
+                        selected = selected ?: "",
+                        explicit = selected != null,
+                        hazeState = hazeState,
+                        onSelect = onSelect,
+                    )
+                }
+            }
+            content()
+        }
+    }
+}
+
+/**
+ * 单工具权限行：名称（等宽）+ 描述（单行截断）+ 当前等级选择（玻璃弹层）。
+ * 「跟随上级」选项的标签动态携带上级当前等级（继承可读）；显式设置以
+ * primary 色块区分继承态（见 [ApprovalLevelPicker]）。
+ */
+@Composable
+private fun ApprovalToolRow(
+    tool: ToolInfoUi,
+    displayName: String,
+    parentLevel: String,
+    explicitLevel: String?,
+    hazeState: HazeState,
+    onSelect: (String) -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                displayName,
+                style = MaterialTheme.typography.labelLarge,
+                fontFamily = MonoFont,
+            )
+            if (tool.description.isNotEmpty()) {
+                Text(
+                    tool.description,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        ApprovalLevelPicker(
+            options = listOf(
+                "" to "跟随上级（${approvalLevelLabel(parentLevel)}）",
+            ) + APPROVAL_LEVEL_OPTIONS,
+            selected = explicitLevel ?: "",
+            explicit = explicitLevel != null,
+            hazeState = hazeState,
+            onSelect = onSelect,
+        )
+    }
+}
+
+/**
+ * 等级值控件 + 玻璃弹层（与模型选择器同语言：值 + 展开箭头作行内锚点，
+ * 点击弹 [GlassDropdownMenu]，alignEnd 右对齐——值控件贴行右缘、弹层右
+ * 对齐展开，放不下自动上翻）。触发域收窄为值控件本身。
+ *
+ * 继承 vs 显式的区分留在行内值控件：[explicit] = 显式设置（primary 文字 +
+ * 淡色底），false = 继承（outline、无底）；弹层内选项用 Check 表达当前
+ * 选中（GlassDropdownItem.selected，ui.md 基线）。箭头随展开态旋转
+ * （graphicsLayer 绘制相位读取，对齐 CapabilityModelRow）。
+ *
+ * options 完全参数化，审批域之外同构复用：ask_user 默认等待时长行
+ * （[AskUserTimeoutRow]）即本控件的第二调用点。
+ */
+@Composable
+private fun ApprovalLevelPicker(
+    options: List<Pair<String, String>>,
+    selected: String,
+    explicit: Boolean,
+    hazeState: HazeState,
+    onSelect: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = options.firstOrNull { it.first == selected }?.second ?: selected
+    val arrowAngle by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        label = "approvalLevelArrow",
+    )
+    Box {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier
+                .clip(RoundedCornerShape(10.dp))
+                .background(
+                    if (explicit) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                    else Color.Transparent,
+                )
+                .clickable { expanded = true }
+                .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
+        ) {
+            Text(
+                selectedLabel,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (explicit) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.outline
+                },
+                maxLines = 1,
+            )
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                Icons.Filled.KeyboardArrowDown,
+                contentDescription = if (expanded) "收起等级选择" else "选择权限等级",
+                tint = MaterialTheme.colorScheme.outline,
+                // 绘制相位读取旋转角度：箭头动画不逐帧重组值行。
+                modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+            )
+        }
+        GlassDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            hazeState = hazeState,
+            items = options.map { (value, label) ->
+                GlassDropdownItem(
+                    value = value,
+                    label = label,
+                    selected = value == selected,
+                )
+            },
+            alignEnd = true,
+            onSelect = { onSelect(it.value) },
+        )
+    }
+}
+
 /** MCP 域状态快照（RUN_COMMAND / 端口探测）。 */
 private data class McpStatus(
     val probing: Boolean = true,
@@ -2032,11 +2760,16 @@ private data class McpStatus(
     val hostTools: Map<String, Int>? = null,
     /** 本轮检测已完成的项目（渐进渲染：检测完一项就显示一项；五个灯的 key）。 */
     val checked: Set<String> = emptySet(),
+    /** 「host 自动拉起进行中」过渡态（透传 probeMcpLights 步骤 ⑦ 的先行
+     *  emit；终态恒 false）——hostAlive 行经共享映射 mcpLightRow 显示
+     *  「MCP host 启动中…」InProgress 而非误报未运行。 */
+    val restartingHost: Boolean = false,
 )
 
 /** McpStatus → 五灯探测结果（共享映射 mcpLightRow 的入参形态；五灯
  *  key/字段一一对应，缺失的 restartedHost 以 false 兜底——渐进渲染中
- *  hostAlive 失败摘要只存在于子面板语境，设置页不消费该分支）。 */
+ *  hostAlive 失败摘要只存在于子面板语境，设置页不消费该分支；
+ *  restartingHost 过渡态透传（拉起窗口内 hostAlive 行显示启动中）。 */
 private fun McpStatus.toLights(): McpLightsResult = McpLightsResult(
     installed = termuxInstalled,
     perm = termuxPerm,
@@ -2045,6 +2778,7 @@ private fun McpStatus.toLights(): McpLightsResult = McpLightsResult(
     hostInstalled = hostInstalled,
     hostAlive = hostAlive,
     checked = checked,
+    restartingHost = restartingHost,
 )
 
 // 五个状态灯的 key（MCP_LIGHT_KEYS）与检测序：权威定义在 ui/McpLights.kt
@@ -2305,6 +3039,7 @@ private fun McpSection() {
                         hostInstalled = st.hostInstalled,
                         hostAlive = st.hostAlive,
                         checked = st.checked,
+                        restartingHost = st.restartingHost,
                     )
                 },
             )
@@ -2355,6 +3090,7 @@ private fun McpSection() {
                 missingCommands = missing,
                 hostTools = tools,
                 checked = MCP_LIGHT_KEYS.toSet(),
+                restartingHost = false,
             )
             status = final
             McpStatusCache.update(final)

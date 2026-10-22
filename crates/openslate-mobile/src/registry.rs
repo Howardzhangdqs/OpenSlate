@@ -257,6 +257,23 @@ impl RegistryStore {
         merge_metas(metas)
     }
 
+    /// video 输入模态（Submit 门控 §6.4 的 video 维）。`ModelMeta` 无
+    /// video 字段（L3 面向 vision/reasoning/tool 三个布尔），而 modalities
+    /// 只有 models.dev 给——这里直接读它的解析索引条目。
+    /// 返回 `None` = 未知（本地无 models.dev 数据 / 条目缺失 / 字段缺失）
+    /// → 门控按"caps 未知放行"处理。
+    pub fn supports_video(&self, model_id: &str) -> Option<bool> {
+        let map = self.parsed_map("models_dev")?;
+        let entry = openslate_core::model_registry::id_candidates(model_id)
+            .iter()
+            .find_map(|c| map.get(c))?;
+        entry
+            .get("modalities")?
+            .get("input")?
+            .as_array()
+            .map(|a| a.iter().any(|x| x.as_str() == Some("video")))
+    }
+
     /// 本地查询；三源全 miss 时在线单查 CloudPrice 兜底（模糊 resolver
     /// 能命中本地库没有的新模型）。
     pub async fn lookup_with_online_fallback(&self, model_id: &str) -> ModelMeta {

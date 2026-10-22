@@ -100,6 +100,9 @@ private fun AppNavHost(
                 onOpenSettings = { nav.navigate("settings") { launchSingleTop = true } },
                 onOpenAskUser = { nav.navigate("question-fullscreen") { launchSingleTop = true } },
                 onOpenReviewAskUser = { nav.navigate("question-review") { launchSingleTop = true } },
+                onOpenImageProcessingSettings = {
+                    nav.navigate("settings?toolTab=3") { launchSingleTop = true }
+                },
             )
         }
         // ask_user 全屏问卷：竖直滑入压在聊天上（「任务」而非「层级页」），
@@ -138,14 +141,24 @@ private fun AppNavHost(
             QuestionReviewScreen(onBack = { nav.popBackStack() })
         }
         // 二级页面：从右侧滑入、按返回时原路滑出（原生推入语义）。
+        // toolTab 深链（查看器对比块「跳转设置」→ settings?toolTab=3 直落
+        // 「工具 > 内置工具」处理图片分区）；query 可选，普通 "settings"
+        // 照常命中（default 0 = 首个二级 tab）。
         composable(
-            "settings",
+            "settings?toolTab={toolTab}",
+            arguments = listOf(
+                navArgument("toolTab") {
+                    type = NavType.IntType
+                    defaultValue = 0
+                },
+            ),
             enterTransition = { slideInHorizontally(tween(280)) { it } + fadeIn(tween(280)) },
             exitTransition = { slideOutHorizontally(tween(280)) { -it / 4 } + fadeOut(tween(280)) },
             popEnterTransition = { slideInHorizontally(tween(280)) { -it / 4 } + fadeIn(tween(280)) },
             popExitTransition = { slideOutHorizontally(tween(280)) { it } + fadeOut(tween(280)) },
-        ) {
+        ) { backStackEntry ->
             SettingsScreen(
+                initialToolTab = backStackEntry.arguments?.getInt("toolTab") ?: 0,
                 onBack = { nav.popBackStack() },
                 onOpenKeys = { nav.navigate("keys") { launchSingleTop = true } },
                 onOpenSource = { id ->

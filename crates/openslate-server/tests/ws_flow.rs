@@ -86,6 +86,7 @@ fn usage(in_tok: u32, out_tok: u32) -> Usage {
         output_tokens: out_tok,
         cached_input_tokens: None,
         reasoning_tokens: None,
+        image_tokens: None,
     }
 }
 
@@ -156,6 +157,12 @@ timeout_ms = 30000
 
 [approval]
 policy = "manual"
+
+# 测试夹具隔离：skill 发现会扫 ~/.agents/skills 等用户级目录
+# （wiring.rs discover 四根），开发机装了真实 skills 会泄漏进测试
+# 断言（config.skills 非空）。显式关闭保证目录为空（enabled=false 时空目录）。
+[skills]
+enabled = false
 "#,
         db_path.display(),
     );
@@ -317,6 +324,7 @@ async fn full_turn_with_streaming_tool_and_approval() {
         &mut ws,
         &ClientMsg::Submit {
             text: "读一下 Cargo.toml".into(),
+            attachments: None,
         },
     )
     .await;
@@ -449,6 +457,7 @@ async fn dual_connection_broadcast_consistency() {
         &mut a,
         &ClientMsg::Submit {
             text: "你好".into(),
+            attachments: None,
         },
     )
     .await;
@@ -495,6 +504,7 @@ async fn approval_first_answer_wins_late_gets_notice() {
         &mut a,
         &ClientMsg::Submit {
             text: "读文件".into(),
+            attachments: None,
         },
     )
     .await;
@@ -789,7 +799,7 @@ async fn rest_readonly_endpoints() {
         hello(&mut ws, None).await,
         ServerMsg::Snapshot { .. }
     ));
-    send_msg(&mut ws, &ClientMsg::Submit { text: "hi".into() }).await;
+    send_msg(&mut ws, &ClientMsg::Submit { text: "hi".into(), attachments: None }).await;
     collect_until(&mut ws, |m| matches!(m, ServerMsg::TurnOk { .. })).await;
     let sessions: serde_json::Value = reqwest::get(format!("{base}/sessions"))
         .await
@@ -811,7 +821,7 @@ async fn new_session_broadcasts_reset_and_fresh_snapshots() {
         assert!(matches!(hello(ws, None).await, ServerMsg::Snapshot { .. }));
     }
 
-    send_msg(&mut a, &ClientMsg::Submit { text: "hi".into() }).await;
+    send_msg(&mut a, &ClientMsg::Submit { text: "hi".into(), attachments: None }).await;
     collect_until(&mut a, |m| matches!(m, ServerMsg::TurnOk { .. })).await;
     collect_until(&mut b, |m| matches!(m, ServerMsg::TurnOk { .. })).await;
 
@@ -850,6 +860,7 @@ async fn submit_while_running_gets_notice() {
         &mut ws,
         &ClientMsg::Submit {
             text: "读文件".into(),
+            attachments: None,
         },
     )
     .await;
@@ -867,6 +878,7 @@ async fn submit_while_running_gets_notice() {
         &mut ws,
         &ClientMsg::Submit {
             text: "再来".into(),
+            attachments: None,
         },
     )
     .await;
@@ -915,6 +927,7 @@ async fn cancel_mid_turn_stops_engine() {
         &mut ws,
         &ClientMsg::Submit {
             text: "开始".into(),
+            attachments: None,
         },
     )
     .await;

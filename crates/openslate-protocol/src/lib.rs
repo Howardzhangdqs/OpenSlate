@@ -19,14 +19,102 @@ use std::collections::BTreeMap;
 use openslate_core::agent_tree::AgentTree;
 use openslate_core::approval::ApprovalRequest;
 use openslate_core::config::{AskTimeout, LimitsConfig, ModelConfig, ProviderConfig};
-use openslate_core::types::{Message, RunId, RunStatus, Usage};
+use openslate_core::types::{Attachment, Message, MessageRole, RunId, RunStatus, Usage};
 
 /// 当前协议版本。`hello.proto` 不等即拒连。
 ///
 /// v2（ask-user r4/r5）：新增 `ClientMsg::QuestionReply` 与
 /// `SnapshotDto.pending_questions`（问卷持久化 / 重启恢复 / 迟到答案）；
 /// 未发布期间追补 `ClientMsg::SetAskUserConfig`（`[ask_user]` 设置同步）。
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3（tool-approval P1a）：审批扩展——`ApprovalAnswerChoice` 新增
+/// `always_tool` / `session_mcp` / `always_mcp`；`ApprovalSummaryDto`
+/// 新增 `server` / `trigger` / `note`（Option，None 跳键，旧 payload
+/// 双向容忍）；新增 `ClientMsg::SetApprovalConfig` 与
+/// `ConfigViewDto.approval`（生效规则视图）。`EntryDto::Approval.decision`
+/// / `ApprovalResolved.choice` 为 String 值域扩展（新增 "always-tool" /
+/// "session-mcp" / "always-mcp"，由 session 层产生）。
+///
+/// v4（存储 v5 多模态输入）：新增 [`AttachmentDto`]（附件引用形状，
+/// 与 core `Attachment` 的持久化形状逐字段一致，`data` 永不过 wire）；
+/// `ClientMsg::Submit` 与 `EntryDto::User` 新增 `attachments` 可选字段
+/// （`serde(default)` + None 跳键——旧客户端 / 旧 payload 双向容忍，
+/// 既有样例字节不变）。图/视频混发等约束由 mobile dispatch 层门控，
+/// 协议层不表达。
+///
+/// v5（附件 token 响应侧回填）：[`AttachmentDto`] 新增 `tokens` 可选字段
+/// （u64，**真实模型响应**顺带携带的 image input tokens——OpenAI 系
+/// chat usage `prompt_tokens_details.image_tokens`；导入侧绝不预估，
+/// 发起 API 请求之前附件数据不上行任何服务器）。语义：单图 Submit 的
+/// 回合取**第一次**模型调用的值（agentic 循环里历史图每轮重发都计入
+/// usage，只有首次调用才是这张图的首次完整成本）；多图不拆分（无值）；
+/// 智谱 chat usage 不分模态 → 恒无值（UI 回退文件大小）。仅出现在
+/// `EntryDto::User.attachments[]`（transcript 快照 / 持久化条目），
+/// `ClientMsg::Submit` 方向忽略该字段。`serde(default)` + None 跳键，
+/// 旧 payload 双向容忍。
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// 附件引用（存储 v5 多模态输入，设计 §3/§7）。
+///
+/// 与 core [`Attachment`] 的**持久化形状**逐字段一致（`id` / `mime` /
+/// `filename`）；core 侧的内存字段 `data: Option<Arc<[u8]>>` 被
+/// `#[serde(skip)]`，永不序列化——DB 行 / 协议 wire / transcript 条目
+/// 里都只有本 DTO 这个引用形状，字节由 mobile ingest 层经 content-
+/// addressed 文件（`files/{sha256}.{ext}`）按 id 回填。
+///
+/// `mime` 为 ingest 归一化后的值：图像恒 `image/jpeg` / `image/png`
+/// （webp/gif 已转码 JPEG），视频 `video/mp4` / `video/x-matroska` /
+/// `video/quicktime`——即 wire 发送白名单本身（设计 §3.2）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentDto {
+    /// `att-<uuid>`（attachments 表主键）。
+    pub id: String,
+    /// 归一化后 mime（见类型注释）。
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// 实测 image input tokens（v5 响应侧回填）：本附件随 Submit 后
+    /// **第一次**模型调用 usage 里的 image tokens（provider 归一化；
+    /// 智谱 chat usage 不分模态 → 恒 None）。非导入侧预估——导入时绝不
+    /// 发网络请求。仅 `EntryDto::User` 出现；`ClientMsg::Submit` 忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+}
+
+impl From<&Attachment> for AttachmentDto {
+    fn from(a: &Attachment) -> Self {
+        Self {
+            id: a.id.clone(),
+            mime: a.mime.clone(),
+            filename: a.filename.clone(),
+            tokens: None,
+        }
+    }
+}
+
+impl From<Attachment> for AttachmentDto {
+    fn from(a: Attachment) -> Self {
+        Self {
+            id: a.id,
+            mime: a.mime,
+            filename: a.filename,
+            tokens: None,
+        }
+    }
+}
+
+impl From<AttachmentDto> for Attachment {
+    /// 引用形状 → core 混合形状：`data` 置 `None`（内存直达 provider 的
+    /// 字节由 mobile ingest / resume 回填层负责，绝不过协议）。
+    fn from(dto: AttachmentDto) -> Self {
+        Self {
+            id: dto.id,
+            mime: dto.mime,
+            filename: dto.filename,
+            data: None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DTO：审批
@@ -34,6 +122,9 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 审批横幅摘要（TUI ApprovalSummary 的协议镜像）。`arguments` 为
 /// 单行化 JSON，超过 120 字符截断加 `…`（与 TUI 展示约束一致）。
+///
+/// v3 新增字段全部 `Option` + None 跳键：旧客户端 / 旧快照双向安全
+/// （v2 形状的 payload 反序列化后新字段为 `None`）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalSummaryDto {
     pub tool_name: String,
@@ -41,6 +132,20 @@ pub struct ApprovalSummaryDto {
     pub agent_id: String,
     /// `"low"` / `"medium"` / `"high"`。
     pub risk_level: String,
+    /// MCP server 作用域（tool-approval P1a）：聚合形态 = 下游 slug
+    /// （`"github"`）；host 内置裸名 = host 前缀（`"termux"`）；非 MCP
+    /// 工具无此键。UI 的 (c)/(d) MCP 级批准选项据此显示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// 本次询问的触发来源：`"manual"`（等级 Manual 直问）/
+    /// `"auto_risk"`（Auto 等级下启发式风险 ≥ Medium——可能经 AI 审查
+    /// 后才弹人工）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// AI 审查理由（`auto_risk` 触发且 LLM 审查器判定高风险时携带；
+    /// `manual` 触发无此键）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// 审批摘要的参数截断上限（字符，非字节；CJK 安全）。
@@ -72,6 +177,9 @@ impl From<&ApprovalRequest> for ApprovalSummaryDto {
             arguments: clip_oneline(&args, APPROVAL_SUMMARY_CLIP_CHARS),
             agent_id: req.agent_id.clone(),
             risk_level: req.risk_level.to_string(),
+            server: req.server.clone(),
+            trigger: Some(req.trigger.to_string()),
+            note: req.note.clone(),
         }
     }
 }
@@ -83,7 +191,12 @@ pub struct PendingApprovalDto {
     pub summary: ApprovalSummaryDto,
 }
 
-/// 客户端审批应答的三种选择（对应 TUI 的 y / n / a）。
+/// 客户端审批应答的选择（tool-approval P1a 扩为六值）。
+///
+/// 前三值 = TUI 的 y / n / a 既有语义（`approve_all` ≡ 选项 (a) 当前
+/// 会话允许该工具，写会话级工具白名单）；后三值 = mobile 审批卡的
+/// 持久化 / MCP 作用域选项（(b) 一直允许该工具 / (c) 当前会话允许该
+/// MCP / (d) 一直允许该 MCP）。取消/禁止执行 = `deny`（选项 (e)）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalAnswerChoice {
@@ -91,6 +204,12 @@ pub enum ApprovalAnswerChoice {
     Deny,
     /// 本会话后续审批自动放行（写工具白名单）。
     ApproveAll,
+    /// 一直允许该工具（持久化 `[approval].tool_levels` = allow）。
+    AlwaysTool,
+    /// 当前会话允许该 MCP server 的全部工具（会话内存作用域）。
+    SessionMcp,
+    /// 一直允许该 MCP server（持久化 `[approval].server_levels` = allow）。
+    AlwaysMcp,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +328,10 @@ pub struct ToolEntryDetailDto {
 pub enum EntryDto {
     User {
         text: String,
+        /// 随行附件引用（v4 多模态输入；transcript 渲染缩略图用）。
+        /// `serde(default)` + None 跳键：旧 payload 双向容忍。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<AttachmentDto>>,
     },
     Assistant {
         text: String,
@@ -228,7 +351,10 @@ pub enum EntryDto {
     },
     Approval {
         tool_name: String,
-        /// `"approved"` / `"denied"` / `"approve-all"`（与 TUI 决议行一致）。
+        /// `"approved"` / `"denied"` / `"approve-all"`（与 TUI 决议行
+        /// 一致）；v3 起新增 `"always-tool"` / `"session-mcp"` /
+        /// `"always-mcp"`（由 session 层产生，协议侧为 String 值域
+        /// 扩展、无类型变化）。
         decision: String,
     },
     Delegate {
@@ -239,6 +365,108 @@ pub enum EntryDto {
     Meta {
         text: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// 消息投影 → 转写条目（存储 v5 §4，L6 共享函数）
+// ---------------------------------------------------------------------------
+
+/// 消息历史 → 转写条目的**共享投影**（存储 v5 设计 §4）。
+///
+/// 消费方：mobile 两级重建的回退路径（`transcript_entries` 为空——
+/// v5 之前的旧 run）；TUI `entry_from_message` 为同型独立实现（各自
+/// 的条目枚举不同，未做架构合并——见设计 follow-up）。
+///
+/// 语义（与原 mobile `messages_to_transcript` 逐条对齐）：
+/// - **User** → `User` 条目；`attachments` 引用形状随行（缩略图渲染；
+///   `data` 永不出现在投影里——`AttachmentDto::from` 只取 id/mime/
+///   filename）。
+/// - **Assistant** → 非空 `reasoning_content` 先出 `Reasoning` 条目，
+///   再出 `tool_calls` 的 `ToolCall` 条目（折叠路径终值 `Done{bytes: 0,
+///   truncated: false, elapsed_ms: None}`——live 实测时长只在内存里），
+///   最后非空白 `content` 出 `Assistant` 条目。
+/// - **Tool** → 不产生新条目：输出（前 2000 字符）并入**最近一条**
+///   匹配的 `ToolCall`（优先 `tool_call_id` 精确配对；消息无 id 时按
+///   工具名兜底）。悬挂 tool_calls（无 Tool 消息跟随时）保持 `Done`
+///   零字节形态——这正是 open_session 悬挂尾部 pop 的前置形态。
+/// - **System** → 跳过（provider 指令，非用户可见转写）。
+/// - `Approval` / `Delegate` / `StepBreak` / `Meta` **不可由消息投影**
+///   ——它们只存在于 `transcript_entries` 行（v5 真相源）或 live 事件，
+///   这正是两级重建优先读 entries 表的原因。
+///
+/// 纯函数：无 IO、无状态；空入参 → 空转写。
+pub fn project_from_messages(messages: &[Message]) -> Vec<EntryDto> {
+    let mut out = Vec::new();
+    for m in messages {
+        match m.role {
+            MessageRole::User => out.push(EntryDto::User {
+                text: m.content.clone(),
+                attachments: m
+                    .attachments
+                    .as_ref()
+                    .map(|atts| atts.iter().map(AttachmentDto::from).collect()),
+            }),
+            MessageRole::Assistant => {
+                // 思维链随消息持久化——恢复时还原为折叠的 Reasoning 条目。
+                if let Some(rc) = m.reasoning_content.as_ref().filter(|r| !r.is_empty()) {
+                    out.push(EntryDto::Reasoning { text: rc.clone() });
+                }
+                if let Some(tcs) = m.tool_calls.as_ref() {
+                    for tc in tcs {
+                        out.push(EntryDto::ToolCall {
+                            name: tc.name.clone(),
+                            // 预览截断（字符，CJK 安全）；全文在 detail.args。
+                            args: tc
+                                .arguments
+                                .to_string()
+                                .chars()
+                                .take(40)
+                                .collect::<String>(),
+                            call_id: Some(tc.id.0.clone()),
+                            status: ToolStatusDto::Done {
+                                bytes: 0,
+                                truncated: false,
+                                elapsed_ms: None,
+                            },
+                            detail: ToolEntryDetailDto {
+                                args: tc.arguments.to_string(),
+                                output: None,
+                            },
+                        });
+                    }
+                }
+                if !m.content.trim().is_empty() {
+                    out.push(EntryDto::Assistant {
+                        text: m.content.clone(),
+                    });
+                }
+            }
+            MessageRole::Tool => {
+                // 工具结果并入最近一条匹配的 ToolCall（id 精确配对优先，
+                // 无 id 时按名字兜底——与 TUI fold 语义同型）。
+                if let Some(EntryDto::ToolCall { detail, .. }) =
+                    out.iter_mut().rev().find_map(|e| {
+                        if let EntryDto::ToolCall { name, call_id, .. } = e {
+                            if call_id.as_deref()
+                                == m.tool_call_id.as_ref().map(|x| x.0.as_str())
+                                || (m.tool_call_id.is_none()
+                                    && name == m.name.as_deref().unwrap_or(""))
+                            {
+                                return Some(e);
+                            }
+                            None
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    detail.output = Some(m.content.chars().take(2000).collect::<String>());
+                }
+            }
+            MessageRole::System => {}
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +510,12 @@ pub struct SnapshotDto {
     pub proto: u32,
     pub session_id: String,
     pub session_label: String,
+    /// 当前会话 run 的 run_id（mobile 转写镜像键对齐：Kotlin 落盘/恢复
+    /// 以事件流内嵌的 run 键为准，不再旁路 FFI 直读实时态）。`None` =
+    /// 无持久化 run（server 投影自 `session_run`）。`serde(default)`：
+    /// 新代码反序列化旧快照（缺键）安全，旧客户端忽略未知字段，双向兼容。
+    #[serde(default)]
+    pub run_id: Option<String>,
     /// 转写条目镜像（字段名 `transcript`，同 spec §3）。
     pub transcript: Vec<EntryDto>,
     pub running: bool,
@@ -498,6 +732,17 @@ impl From<&AgentTree> for AgentNodeDto {
     }
 }
 
+/// `[approval]` 的生效规则视图（tool-approval P1a）：**映射后的真相**
+/// （legacy `policy`/`tools` 已并入，非 toml 原文），由 session 层经
+/// core `rules_from_config` 投影。level 字符串值域 `"manual" | "allow"
+/// | "auto"`（同 `ClientMsg::SetApprovalConfig`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalConfigViewDto {
+    pub default_level: String,
+    pub tool_levels: BTreeMap<String, String>,
+    pub server_levels: BTreeMap<String, String>,
+}
+
 /// 配置只读视图：`/provider` 浮层、REST `/api/config` 与 snapshot 的
 /// 同一份数据（GAP-1：客户端是零本地配置的纯消费者，本视图必须自足）。
 /// BTreeMap 保证 key 有序（快照 diff / 契约测试稳定）。
@@ -525,6 +770,11 @@ pub struct ConfigViewDto {
     /// 本地叠加配置路径（`./.openslate/openslate.toml`）；无本地配置时
     /// `None`（`--config` 显式指定时与 active 相同）。
     pub local_config: Option<String>,
+    /// 工具审批生效规则（v3，tool-approval P1a）。`None` = 装配层未
+    /// 填充（本阶段 session 层接线在 P1b）；None 跳键保证既有样例字节
+    /// 不变，旧快照 / 旧客户端双向容忍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalConfigViewDto>,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +791,12 @@ pub struct SessionListItemDto {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub cost_usd: f64,
+    /// run 级 token 聚合（存储 v5 `runs.input_tokens`；存量 run 无
+    /// 采集时为 0）。`serde(default)` + None 跳键：旧 payload 双向容忍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
 }
 
 /// notice 语义级别（渲染仅影响着色，不影响顺序）。
@@ -600,6 +856,13 @@ pub enum ClientMsg {
     /// 提交一轮用户输入。
     Submit {
         text: String,
+        /// 随行附件引用（v4 多模态输入）：id 均为 mobile FFI
+        /// `import_attachment` 返回的 `att-<uuid>`；门控（模态能力 /
+        /// 数量 / 体积 / 图视频互斥）在 mobile dispatch 层执行，拒绝经
+        /// notice 通道返回（设计 §3.3/§3.4/§6.4）。`serde(default)`：
+        /// 旧客户端（无字段）→ None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<AttachmentDto>>,
     },
     /// 审批应答。任一客户端首答生效；迟到应答收到定向 notice。
     ApprovalAnswer {
@@ -658,6 +921,20 @@ pub enum ClientMsg {
     SetAskUserConfig {
         default_timeout: AskUserTimeoutDto,
         mask_secrets: bool,
+    },
+    /// 工具审批规则写入（v3，tool-approval P1a；设置页「工具权限」）：
+    /// server **整段重写** `[approval]` 为新 schema（删 legacy
+    /// `policy`/`tools` 键）→ 重载 → rules 热更 → 广播 config_changed。
+    /// `default_level = None` 表示缺省（allow）。level 字符串值域
+    /// `"manual" | "allow" | "auto"`；`server_levels` 键 = 审批作用域
+    /// 标识（下游 slug / host 前缀，core `mcp::server_slug_of` 对齐）。
+    SetApprovalConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_level: Option<String>,
+        #[serde(default)]
+        tool_levels: BTreeMap<String, String>,
+        #[serde(default)]
+        server_levels: BTreeMap<String, String>,
     },
     /// 新增/更新 MCP server（Streamable HTTP 条目；手机端 mcp-host 场景）。
     /// headers 如 `{ "Authorization": "Bearer <token>" }`，可选。
@@ -748,7 +1025,9 @@ pub enum ServerMsg {
         summary: ApprovalSummaryDto,
     },
     /// 审批已裁决（首答后广播；所有客户端清横幅）。`choice` 值域同
-    /// [`ApprovalAnswerChoice`]（approve/deny/approve_all）。
+    /// [`ApprovalAnswerChoice`]（approve/deny/approve_all + v3 新增
+    /// always_tool/session_mcp/always_mcp 的连字符拼写
+    /// "always-tool"/"session-mcp"/"always-mcp"，由 session 层产生）。
     ApprovalResolved {
         id: u64,
         choice: String,

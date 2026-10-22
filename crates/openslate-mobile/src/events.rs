@@ -29,6 +29,10 @@ pub struct EventSink {
     alive: Arc<AtomicBool>,
     /// 保活泵线程句柄（回调 drop 后线程自然退出）。
     _pump: std::thread::JoinHandle<()>,
+    /// 事件观察 tap（mobile 内部用；附件 image tokens 回填在这里收
+    /// `Usage` / `TurnOk` / `TurnError`）。运行在**广播线程**上：必须
+    /// 快、非阻塞、绝不锁 core（引擎广播 TurnOk 时持有 core 锁）。
+    tap: Mutex<Option<Arc<dyn Fn(&ServerMsg) + Send + Sync>>>,
 }
 
 impl EventSink {
@@ -50,7 +54,14 @@ impl EventSink {
             tx: Mutex::new(Some(tx)),
             alive,
             _pump: pump,
+            tap: Mutex::new(None),
         })
+    }
+
+    /// 注册事件观察 tap（附件 image tokens 回填；见结构注释）。先注册
+    /// 先得，后注册覆盖（mobile 装配期一次性设置）。
+    pub fn set_tap(&self, tap: Arc<dyn Fn(&ServerMsg) + Send + Sync>) {
+        *self.tap.lock().unwrap_or_else(|e| e.into_inner()) = Some(tap);
     }
 
     /// 非 JSON 的协议消息直接入队（host call 信封走这里）。
@@ -63,6 +74,9 @@ impl EventSink {
     }
 
     fn emit_msg(&self, msg: ServerMsg) {
+        if let Some(tap) = self.tap.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            tap(&msg);
+        }
         let json = serde_json::to_string(&msg).unwrap_or_else(|_| {
             serde_json::to_string(&ServerMsg::Error {
                 code: "encode".into(),

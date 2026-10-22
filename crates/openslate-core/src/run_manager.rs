@@ -247,6 +247,7 @@ impl RunManager {
         progress: Option<&mut dyn ProgressCallback>,
     ) -> Result<ManagedRunResult, OpenSlateError> {
         let messages = vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: input.to_owned(),
             tool_call_id: None,
@@ -368,6 +369,7 @@ max_output_bytes = 10_000
                 output_tokens: 10,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);
@@ -418,6 +420,7 @@ max_output_bytes = 10_000
             ) -> Result<ToolOutput, crate::error::ToolError> {
                 let text = args["text"].as_str().unwrap_or("");
                 Ok(ToolOutput {
+                    attachments: None,
                     content: text.to_owned(),
                     bytes: text.len(),
                     duration_ms: 1,
@@ -444,6 +447,7 @@ max_output_bytes = 10_000
                     output_tokens: 20,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -457,6 +461,7 @@ max_output_bytes = 10_000
                     output_tokens: 5,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -527,6 +532,7 @@ max_output_bytes = 10_000
                     output_tokens: 50,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -539,6 +545,7 @@ max_output_bytes = 10_000
                     output_tokens: 100,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -593,6 +600,7 @@ output_price_per_mtok = 2.0
                     output_tokens: 100_000,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("tool_calls".into()),
             },
@@ -605,6 +613,7 @@ output_price_per_mtok = 2.0
                     output_tokens: 100_000,
                     cached_input_tokens: None,
                     reasoning_tokens: None,
+                    image_tokens: None,
                 }),
                 finish_reason: Some("stop".into()),
             },
@@ -644,6 +653,7 @@ output_price_per_mtok = 2.0
                 output_tokens: 7,
                 cached_input_tokens: None,
                 reasoning_tokens: None,
+                image_tokens: None,
             }),
             finish_reason: Some("stop".into()),
         }]);
@@ -716,6 +726,7 @@ model = "m"
         ) -> Result<ToolOutput, crate::error::ToolError> {
             let text = args["text"].as_str().unwrap_or("");
             Ok(ToolOutput {
+                attachments: None,
                 content: text.to_owned(),
                 bytes: text.len(),
                 duration_ms: 1,
@@ -815,6 +826,7 @@ model = "m"
                 run_id.clone(),
                 &provider,
                 &[Message {
+                    attachments: None,
                     role: MessageRole::User,
                     content: "hello".into(),
                     tool_call_id: None,
@@ -858,6 +870,7 @@ model = "m"
             .execute_with_history(
                 &provider1,
                 &[Message {
+                    attachments: None,
                     role: MessageRole::User,
                     content: "echo hi".into(),
                     tool_call_id: None,
@@ -874,6 +887,7 @@ model = "m"
         // The persisted stream is exactly what the sink observed, prefixed
         // by the user message the CLI layer writes directly.
         let restored: Vec<Message> = std::iter::once(Message {
+            attachments: None,
             role: MessageRole::User,
             content: "echo hi".into(),
             tool_call_id: None,
@@ -950,6 +964,7 @@ max_output_bytes = 10_000
                 run_id.clone(),
                 &provider,
                 &[Message {
+                    attachments: None,
                     role: MessageRole::User,
                     content: "go".into(),
                     tool_call_id: None,
@@ -999,6 +1014,7 @@ max_output_bytes = 10_000
         // 历史尾部悬挂一个 ask_user 调用（进程中断恢复后的典型形状）。
         let dangling: Vec<Message> = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "which db?".into(),
                 tool_call_id: None,
@@ -1007,6 +1023,7 @@ max_output_bytes = 10_000
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -1071,6 +1088,7 @@ max_output_bytes = 10_000
     #[tokio::test]
     async fn test_resume_from_tool_result_rejects_unknown_and_answered() {
         let dangling = vec![Message {
+            attachments: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -1109,6 +1127,7 @@ max_output_bytes = 10_000
         let answered = vec![
             dangling[0].clone(),
             Message {
+                attachments: None,
                 role: MessageRole::Tool,
                 content: "first".into(),
                 tool_call_id: Some(ToolCallId("tc-x".into())),
@@ -1179,6 +1198,7 @@ max_output_bytes = 10_000
                 RunId("cancelled-run".into()),
                 &provider,
                 &[Message {
+                    attachments: None,
                     role: MessageRole::User,
                     content: "go".into(),
                     tool_call_id: None,

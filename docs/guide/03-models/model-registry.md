@@ -52,10 +52,19 @@ pub fn source_by_id(id: &str) -> Option<&'static SourceDef>;  // L85
 1. 原始 id 归一化；
 2. 去 `@变体` 后缀（`glm-4.7@flash` → `glm-4.7`）；
 3. 取最后一个 `/` 后的尾段（去 provider 前缀，`zhipu/glm-4.7` → `glm-4.7`）；
-4. 尾段再去尾部日期快照：`-20251222`（8 位）或 `-251222`（6 位）纯数字段
-   （`claude-sonnet-4-5-20250929` → `claude-sonnet-4-5`）。
+4. 尾段去**尾部方括号上下文变体**（`glm-5.3-flash[1m]` / `[1M]` / `[long]` →
+   `glm-5.3-flash`）：`strip_trailing_bracket_suffix` 只剥最后一个**尾部** `[...]` 段，
+   方括号内容不限（同一基座的不同上下文窗口/时长变体共用基座元数据）；开头/中途的
+   方括号不是变体语义，不动；无尾部方括号时原样返回（规则 no-op）。**GLM-5.3-Flash
+   `[1m]` 场景（2026-10）**：模型 id 可带 `[1m]` 时长变体后缀，registry 只按基座收录；
+   miss → caps 未知 → mobile 门控放行，provider 错误原样透出（R7）。
+5. 再去尾部日期快照：`-20251222`（8 位）或 `-251222`（6 位）纯数字段
+   （`claude-sonnet-4-5-20250929` → `claude-sonnet-4-5`）。**方括号剥离在日期快照之前**
+   ——`-20251222[1m]` 这类叠加后缀应两段都剥掉。
 
-去重保序（`!out.contains(&n)`）。
+去重保序（`!out.contains(&n)`）。表驱动钉子：`bracket_variant_suffix_stripped_in_candidates`
+（大小写 / 其他方括号内容 / 无后缀 no-op / 中途方括号不剥 / 与 provider 前缀、@ 变体、
+日期快照叠加 / 未闭合不剥）+ 端到端 `bracket_variant_lookup_hits_base_entry_and_missing_cost_stays_none`。
 
 ### 3.3 `parse_source_map(format, v) -> HashMap<String, Value>`（L246-269）
 
@@ -103,6 +112,13 @@ pub struct ModelMeta {
 
 计价统一为 **USD / 百万 token**：LiteLLM per-token 值 × 1e6
 （`extract_litellm` 的 `pt` 闭包，L312-318，且 `.filter(|x| *x > 0.0)` 丢掉 0 值）。
+
+**无计价 ≠ 免费（zhipuai 场景，2026-10 拍板）**：zhipuai 官方条目（如
+`glm-5.3-flash`）models.dev / LiteLLM / CloudPrice 均无计价，多源合并后
+`input/output_price_per_mtok` 保持 `None`——registry 层**绝不落 0 冒充免费**。
+"未配置 → 成本记 0"的既有约定在 runtime `CostSpec::cost_of`
+（`is_configured()` 为 false 供 UI 标注未配置），registry 只负责把"未配置"如实
+传下去。钉子：`bracket_variant_lookup_hits_base_entry_and_missing_cost_stays_none`。
 
 钉死语义的单测：`merge_prefers_source_priority_and_fills_gaps`（L439，含「到达序倒排
 结果不变」断言）、`merge_priority_matches_source_names_and_unknowns`（L486，大小写不敏感
@@ -208,7 +224,25 @@ pub struct ModelMeta {
 | `registry_search(source_id, query, limit)` | `registry_search_json`（L487） | 搜索/浏览 |
 | 元数据补全查询 | `lookup_with_online_fallback`（L509） | 外包 10s 超时 + `meta_to_json` |
 
-## 8. 改动检查清单
+## 8. GLM-5.3-Flash 接入说明（多模态第一目标，2026-10 官方文档）
+
+registry 侧事实（models.dev 已有 `zhipuai/glm-5.3-flash` 条目，含 `video` input
+modality → 刷新后 caps 自动就位；`[1m]` 变体经 §3.2 第 4 步归一化命中基座；
+zhipuai 无计价 → §4.1 无计价约定）。供 provider / 门控 / UI 侧对照的官方约束：
+
+- **端点**：coding / paas / v4 三套端点均可调用 flash（base_url 配置事项，
+  工厂层 §4 见 `model-genai.md`）。
+- **thinking**：仅 `enabled`（开/关），强度走 `reasoning_effort`
+  （与 `GenaiConfig.reasoning_effort` 正交，无改动）。
+- **图像**：`image_url.url` 收 URL 或 **data: 前缀** base64（前缀必须带——vendor
+  `Binary::into_url()` 恰好满足）；≤5MB/6000²；jpg/png/jpeg；≤50 张。
+- **视频**：官方仅 URL 形态（≤200MB、mp4/mkv/mov）；**base64 data:URL 未文档化**
+  ——走实验开关（默认关，`experimental_video`，设计 §3.5），L5 真机实测后定走向。
+- **file 块互斥**：`file` 块与 `image_url`/`video_url` 互斥，图/文/视频别混
+  （OpenSlate 永不出 file 块；图+视频混发门控在 mobile 层）。
+- **无 `detail` 参数**：vendor video_url/image_url 补丁均不构造 detail。
+
+## 9. 改动检查清单
 
 - 动了数据源 / 合并策略 / 兜底规则 → 同步更新 `AGENTS.md`「模型元数据数据源」节 + 本文档；
   `model_registry.rs` 的单测是合并语义的钉子，**先改测试预期再改实现**。

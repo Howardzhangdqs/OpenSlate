@@ -76,6 +76,7 @@ impl Tool for GetVersionTool {
     }
     async fn execute(&self, _args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
+            attachments: None,
             content: "v0.2.0-ptc-demo".into(),
             bytes: 0,
             duration_ms: 0,
@@ -111,6 +112,7 @@ impl Tool for GithubListPrsTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolOutput, ToolError> {
         let state = args["state"].as_str().unwrap_or("all");
         Ok(ToolOutput {
+            attachments: None,
             content: format!("state={state}, open_prs=3, recent=[#101, #97, #88]"),
             bytes: 0,
             duration_ms: 0,

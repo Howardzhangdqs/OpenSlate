@@ -705,11 +705,19 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_tool_visibility(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_attachment_thumbnail(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_experimental_video(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_image_processing(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_builtin_tool_name_template(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_server_name(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_tool_name_template(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_import_attachment(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_list_provider_models(
     ): Int
@@ -741,7 +749,11 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends(
     ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_experimental_video(
+    ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_http_proxy(
+    ): Int
+    external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_image_processing(
     ): Int
     external fun uniffi_openslate_mobile_checksum_method_openslateruntime_set_mcp_builtin_tool_name_template(
     ): Int
@@ -790,11 +802,19 @@ internal object UniffiLib {
     ): Byte
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_agent_tool_visibility(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_attachment_thumbnail(`ptr`: Long,`id`: RustBuffer.ByValue,`maxPx`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_experimental_video(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_image_processing(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_builtin_tool_name_template(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_server_name(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_tool_name_template(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_import_attachment(`ptr`: Long,`sourcePath`: RustBuffer.ByValue,`declaredMime`: RustBuffer.ByValue,`filename`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_list_provider_models(`ptr`: Long,`provider`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -826,8 +846,12 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_exec_backends(`ptr`: Long,`backends`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_experimental_video(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_http_proxy(`ptr`: Long,`url`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_image_processing(`ptr`: Long,`maxDim`: Long,`maxMb`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_mcp_builtin_tool_name_template(`ptr`: Long,`template`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_openslate_mobile_fn_method_openslateruntime_set_mcp_server_name(`ptr`: Long,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -973,6 +997,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_agent_tool_visibility() and 0xFFFF) != 39909) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_attachment_thumbnail() and 0xFFFF) != 29246) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_experimental_video() and 0xFFFF) != 2474) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_image_processing() and 0xFFFF) != 45193) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_builtin_tool_name_template() and 0xFFFF) != 27774) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -980,6 +1013,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_get_mcp_tool_name_template() and 0xFFFF) != 47405) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_import_attachment() and 0xFFFF) != 60772) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_list_provider_models() and 0xFFFF) != 55302) {
@@ -1027,7 +1063,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends() and 0xFFFF) != 11970) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_experimental_video() and 0xFFFF) != 63038) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_http_proxy() and 0xFFFF) != 421) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_image_processing() and 0xFFFF) != 21375) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_mcp_builtin_tool_name_template() and 0xFFFF) != 59201) {
@@ -1311,6 +1353,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 /**
  * @suppress
  */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -1509,6 +1574,29 @@ public interface OpenSlateRuntimeInterface {
     fun `getAgentToolVisibility`(): kotlin.String
     
     /**
+     * 附件缩略图（des-2 Android lane 契约）。`id` = import_attachment
+     * 返回的附件 id；原图经 sha256 从 files 读出，长边缩到 `max_px`
+     * （只缩不放；`<=0` 按 256、上限 2048）后 JPEG q80 编码。返回
+     * `{"ok":true,"data":"<base64>","mime":"image/jpeg"}` 或
+     * `{"ok":false,"error":"…"}`（附件不存在 / 视频等非图像 / 文件
+     * 缺失 / 解码失败均走 error）。阻塞（磁盘 + 解码），IO 线程调用。
+     */
+    fun `getAttachmentThumbnail`(`id`: kotlin.String, `maxPx`: kotlin.Int): kotlin.String
+    
+    /**
+     * 读实验视频开关当前生效值（内存配置：装配期从落盘装载 + set 即时
+     * 更新，与 Submit 门控消费的值同源）。
+     */
+    fun `getExperimentalVideo`(): kotlin.Boolean
+    
+    /**
+     * 读图片处理双旋钮当前生效值（内存配置：装配期从落盘装载 + set
+     * 即时更新，与归一化消费的值同源）。返回
+     * `{"max_image_dim":N,"max_image_mb":M}`。
+     */
+    fun `getImageProcessing`(): kotlin.String
+    
+    /**
      * 读取当前生效的 builtin 工具名模板（小模板；未设置 / 空白 →
      * 默认 `"{prefix}_{tool}"`；读最新落盘配置）。作用于不含 `__`
      * 的裸上游名——聚合 host 内置 server 的裸名与桌面直连裸名共用
@@ -1530,6 +1618,17 @@ public interface OpenSlateRuntimeInterface {
      * 器名（聚合名 slug 段）、`{tool}` = 不带前缀的工具名。
      */
     fun `getMcpToolNameTemplate`(): kotlin.String
+    
+    /**
+     * 导入附件（PLAN §3.6；Kotlin 侧 cache 拷贝 + HEIC 预转码后调用，
+     * 路径传递不走 base64）。magic-byte 嗅探 → sha256 → 图像归一化
+     * （小图 JPEG/PNG header 快速通道 passthrough；其余按用户双旋钮
+     * 迭代压缩：≤max_dim 等比缩 + q85→70→55 → ×0.85 缩边至 ≤max_mb，
+     * 见 set_image_processing）→ files/ 落盘 → attachments 行（run_id
+     * NULL 暂存）。返回含 orig/处理后对比信息的 JSON（见 mobile-ffi.md
+     * 契约）或 `{"ok":false,"error":"…"}`。
+     */
+    fun `importAttachment`(`sourcePath`: kotlin.String, `declaredMime`: kotlin.String, `filename`: kotlin.String): kotlin.String
     
     /**
      * 拉取 provider 的可用模型清单（设置页 Provider 域"自动检测"）。
@@ -1631,10 +1730,32 @@ public interface OpenSlateRuntimeInterface {
     fun `setExecBackends`(`backends`: kotlin.String)
     
     /**
+     * 实验视频开关（存储 v5 §3.5；设置页「实验性功能」，L4→L6 交接，
+     * 签名与 L5 已约定）。写 openslate.toml
+     * `[attachments] experimental_video`（保留文件其余内容）+ 同步更新
+     * 运行中内存配置——Submit 附件门控下一轮即生效，无需重启。返回
+     * `{"ok":true}` 或 `{"ok":false,"error":"…"}`（落盘失败时内存
+     * 不变）。
+     */
+    fun `setExperimentalVideo`(`enabled`: kotlin.Boolean): kotlin.String
+    
+    /**
      * 设置 HTTP(S) 出站代理（受限网络：宿主可经 adb reverse 共享电脑
      * 代理）。进程级、立即生效于后续 provider 构建；空串清除。
      */
     fun `setHttpProxy`(`url`: kotlin.String)
+    
+    /**
+     * 图片处理双旋钮（设置页「图片最长边 / 处理后文件大小上限」）：
+     * `max_dim` = 等比缩放目标边长（值域 512–6000），`max_mb` = 处理后
+     * 大小上限 MB（值域 1–5；归一化迭代压缩 q85→70→55 → ×0.85 缩边的
+     * 达标线）。值域外 → `{"ok":false,"error":"…"}`（core validation
+     * 同源校验）。合法 → 写 openslate.toml `[attachments]` 两键（保留
+     * 文件其余内容）+ 同步更新运行中内存配置——下一次 import_attachment
+     * 即生效，无需重启。返回 `{"ok":true}` 或 `{"ok":false,"error":…}`
+     * （落盘失败时内存不变）。
+     */
+    fun `setImageProcessing`(`maxDim`: kotlin.Long, `maxMb`: kotlin.Long): kotlin.String
     
     /**
      * 设置 builtin 工具名模板：校验（与启动校验同一套规则：必须含
@@ -1838,6 +1959,64 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 
     
     /**
+     * 附件缩略图（des-2 Android lane 契约）。`id` = import_attachment
+     * 返回的附件 id；原图经 sha256 从 files 读出，长边缩到 `max_px`
+     * （只缩不放；`<=0` 按 256、上限 2048）后 JPEG q80 编码。返回
+     * `{"ok":true,"data":"<base64>","mime":"image/jpeg"}` 或
+     * `{"ok":false,"error":"…"}`（附件不存在 / 视频等非图像 / 文件
+     * 缺失 / 解码失败均走 error）。阻塞（磁盘 + 解码），IO 线程调用。
+     */override fun `getAttachmentThumbnail`(`id`: kotlin.String, `maxPx`: kotlin.Int): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_attachment_thumbnail(
+        it,
+        
+        FfiConverterString.lower(`id`),
+        FfiConverterInt.lower(`maxPx`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 读实验视频开关当前生效值（内存配置：装配期从落盘装载 + set 即时
+     * 更新，与 Submit 门控消费的值同源）。
+     */override fun `getExperimentalVideo`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_experimental_video(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 读图片处理双旋钮当前生效值（内存配置：装配期从落盘装载 + set
+     * 即时更新，与归一化消费的值同源）。返回
+     * `{"max_image_dim":N,"max_image_mb":M}`。
+     */override fun `getImageProcessing`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_image_processing(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * 读取当前生效的 builtin 工具名模板（小模板；未设置 / 空白 →
      * 默认 `"{prefix}_{tool}"`；读最新落盘配置）。作用于不含 `__`
      * 的裸上游名——聚合 host 内置 server 的裸名与桌面直连裸名共用
@@ -1886,6 +2065,31 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
     UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_get_mcp_tool_name_template(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * 导入附件（PLAN §3.6；Kotlin 侧 cache 拷贝 + HEIC 预转码后调用，
+     * 路径传递不走 base64）。magic-byte 嗅探 → sha256 → 图像归一化
+     * （小图 JPEG/PNG header 快速通道 passthrough；其余按用户双旋钮
+     * 迭代压缩：≤max_dim 等比缩 + q85→70→55 → ×0.85 缩边至 ≤max_mb，
+     * 见 set_image_processing）→ files/ 落盘 → attachments 行（run_id
+     * NULL 暂存）。返回含 orig/处理后对比信息的 JSON（见 mobile-ffi.md
+     * 契约）或 `{"ok":false,"error":"…"}`。
+     */override fun `importAttachment`(`sourcePath`: kotlin.String, `declaredMime`: kotlin.String, `filename`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_import_attachment(
+        it,
+        
+        FfiConverterString.lower(`sourcePath`),
+        FfiConverterString.lower(`declaredMime`),
+        FfiConverterString.lower(`filename`),_status)
 }
     }
     )
@@ -2172,6 +2376,28 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 
     
     /**
+     * 实验视频开关（存储 v5 §3.5；设置页「实验性功能」，L4→L6 交接，
+     * 签名与 L5 已约定）。写 openslate.toml
+     * `[attachments] experimental_video`（保留文件其余内容）+ 同步更新
+     * 运行中内存配置——Submit 附件门控下一轮即生效，无需重启。返回
+     * `{"ok":true}` 或 `{"ok":false,"error":"…"}`（落盘失败时内存
+     * 不变）。
+     */override fun `setExperimentalVideo`(`enabled`: kotlin.Boolean): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_set_experimental_video(
+        it,
+        
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * 设置 HTTP(S) 出站代理（受限网络：宿主可经 adb reverse 共享电脑
      * 代理）。进程级、立即生效于后续 provider 构建；空串清除。
      */override fun `setHttpProxy`(`url`: kotlin.String)
@@ -2185,6 +2411,31 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 }
     }
     
+    
+
+    
+    /**
+     * 图片处理双旋钮（设置页「图片最长边 / 处理后文件大小上限」）：
+     * `max_dim` = 等比缩放目标边长（值域 512–6000），`max_mb` = 处理后
+     * 大小上限 MB（值域 1–5；归一化迭代压缩 q85→70→55 → ×0.85 缩边的
+     * 达标线）。值域外 → `{"ok":false,"error":"…"}`（core validation
+     * 同源校验）。合法 → 写 openslate.toml `[attachments]` 两键（保留
+     * 文件其余内容）+ 同步更新运行中内存配置——下一次 import_attachment
+     * 即生效，无需重启。返回 `{"ok":true}` 或 `{"ok":false,"error":…}`
+     * （落盘失败时内存不变）。
+     */override fun `setImageProcessing`(`maxDim`: kotlin.Long, `maxMb`: kotlin.Long): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_openslate_mobile_fn_method_openslateruntime_set_image_processing(
+        it,
+        
+        FfiConverterLong.lower(`maxDim`),
+        FfiConverterLong.lower(`maxMb`),_status)
+}
+    }
+    )
+    }
     
 
     

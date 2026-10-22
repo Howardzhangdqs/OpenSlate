@@ -2,6 +2,7 @@ package dev.openslate.mobile.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -560,11 +561,17 @@ private fun ToolNameTemplateSection(onRecheck: () -> Unit) {
             )
         }
         // 展开区：说明灰字 + 两个模板行（行内交互原样）；仅此块参与纵向
-        // 展开 + 200ms 淡入淡出（ToolRow / McpToolGroupCard 同款参数）。
+        // 展开 + 220ms 淡入淡出（expand/shrink 与淡入淡出同拍
+        // FastOutSlowInEasing——此前 expand/shrink 走默认 spring，大高度
+        // 变化时弹簧尾巴拖沓；ToolRow / McpToolGroupCard 同款参数）。
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically() + fadeIn(tween(200)),
-            exit = shrinkVertically() + fadeOut(tween(200)),
+            enter = expandVertically(
+                animationSpec = tween(220, easing = FastOutSlowInEasing),
+            ) + fadeIn(tween(220, easing = FastOutSlowInEasing)),
+            exit = shrinkVertically(
+                animationSpec = tween(220, easing = FastOutSlowInEasing),
+            ) + fadeOut(tween(220, easing = FastOutSlowInEasing)),
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
@@ -824,7 +831,9 @@ private fun ToolNameTemplateSection(onRecheck: () -> Unit) {
  * 平滑跟随）。
  *
  * 动效对齐 ToolRow 范式：箭头随展开态旋转；头部两态是同一组合不重建；
- * 只有展开区参与纵向展开 + 200ms 淡入淡出。
+ * 只有展开区参与纵向展开 + 220ms 淡入淡出（expand/shrink 显式
+ * tween(220, FastOutSlowInEasing)，组卡高度变化由外层 animateContentSize
+ * 同规格平滑跟随——不再走默认软弹簧）。
  *
  * 总开关语义：全部可见 = 勾选；混合/全关 = 不勾选（混合态语义由统计行
  * 「N 个工具 · M 个可见」文字承载——工程无 TriState 先例，优先简单方案）。
@@ -857,7 +866,9 @@ private fun McpToolGroupCard(
             Modifier
                 .fillMaxWidth()
                 .clickable(onClick = onToggleExpand)
-                .animateContentSize()
+                .animateContentSize(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                )
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -911,8 +922,12 @@ private fun McpToolGroupCard(
             // 展开区：组内逐工具复用 ToolRow；仅此块参与淡入淡出与纵向展开。
             AnimatedVisibility(
                 visible = expanded,
-                enter = expandVertically() + fadeIn(tween(200)),
-                exit = shrinkVertically() + fadeOut(tween(200)),
+                enter = expandVertically(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                ) + fadeIn(tween(220, easing = FastOutSlowInEasing)),
+                exit = shrinkVertically(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                ) + fadeOut(tween(220, easing = FastOutSlowInEasing)),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     HorizontalDivider()
@@ -968,7 +983,8 @@ private fun McpToolGroupCard(
  * 动效原则（真机反馈调整）：头部行（名字/Checkbox/箭头）在收起/展开两态
  * 是同一组合——不重建、不交叉淡化；描述文本只存在一份、位置永不移动
  * （仅切 maxLines，高度变化由外层 animateContentSize 平滑）；只有参数
- * 详情区参与 AnimatedVisibility 的纵向展开 + 200ms 淡入淡出。警示标识
+ * 详情区参与 AnimatedVisibility 的纵向展开 + 220ms 淡入淡出（expand/shrink
+ * 与淡入淡出同拍 FastOutSlowInEasing）。警示标识
  * 的出现/消失是低频事件（仅重检翻面时），直接增删不做动画。
  */
 @Composable
@@ -1002,7 +1018,9 @@ private fun ToolRow(
             Modifier
                 .fillMaxWidth()
                 .clickable(onClick = onToggleExpand)
-                .animateContentSize()
+                .animateContentSize(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                )
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -1070,8 +1088,12 @@ private fun ToolRow(
             // 参数详情区：仅此块参与淡入淡出与纵向展开/收起，行头部不动。
             AnimatedVisibility(
                 visible = expanded,
-                enter = expandVertically() + fadeIn(tween(200)),
-                exit = shrinkVertically() + fadeOut(tween(200)),
+                enter = expandVertically(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                ) + fadeIn(tween(220, easing = FastOutSlowInEasing)),
+                exit = shrinkVertically(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                ) + fadeOut(tween(220, easing = FastOutSlowInEasing)),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     // 不可用提示行：图标 + 完整指引文案，随详情一起淡入淡出。

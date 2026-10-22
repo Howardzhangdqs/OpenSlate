@@ -15,7 +15,7 @@ use openslate_core::agent_tree::AgentTree;
 use openslate_core::run_manager::RunManager;
 use openslate_core::runtime::{CancellationToken, MessageSink};
 use openslate_core::types::{Message, MessageRole, RunId, RunStatus};
-use openslate_store_sqlite::recorder::RunRecorder;
+use openslate_store_sqlite::recorder::{RunFinal, RunRecorder};
 
 use crate::input::{expand_at_files, read_stdin_if_pipe, WorkspaceRoot};
 use crate::spinner::SpinnerCallback;
@@ -388,6 +388,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
             // restored conversation.
             if let Some(ref p) = params.prompt {
                 let user_message = Message {
+                    attachments: None,
                     role: MessageRole::User,
                     content: p.clone(),
                     tool_call_id: None,
@@ -421,6 +422,7 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
             let workspace_root = WorkspaceRoot::from_config_path(&ctx.config_path);
             let prompt = expand_at_files(&raw_prompt, &workspace_root);
             let user_message = Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: prompt.clone(),
                 tool_call_id: None,
@@ -540,7 +542,18 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
                     )
                 ) {
                     if let Some(ref rec) = recorder {
-                        if let Err(pe) = rec.finish("cancelled", None, 0.0).await {
+                        // Run never started: no usage was accumulated (v5 L2
+                        // token 聚合列记 0).
+                        if let Err(pe) = rec
+                            .finish_with(RunFinal {
+                                status: "cancelled".into(),
+                                output_json: None,
+                                cost_usd: 0.0,
+                                input_tokens: 0,
+                                output_tokens: 0,
+                            })
+                            .await
+                        {
                             tracing::warn!("Failed to persist cancelled status: {}", pe);
                         }
                     }
@@ -551,7 +564,16 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
                 // already exists (inserted upfront), flip it to `failed`.
                 if let Some(ref rec) = recorder {
                     let error_json = serde_json::json!({ "error": e.to_string() }).to_string();
-                    if let Err(pe) = rec.finish("failed", Some(&error_json), 0.0).await {
+                    if let Err(pe) = rec
+                        .finish_with(RunFinal {
+                            status: "failed".into(),
+                            output_json: Some(error_json),
+                            cost_usd: 0.0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        })
+                        .await
+                    {
                         tracing::warn!("Failed to persist run failure status: {}", pe);
                     }
                 }
@@ -581,7 +603,13 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
         if let Some(ref rec) = recorder {
             let output_json = serde_json::json!({ "output": partial }).to_string();
             if let Err(e) = rec
-                .finish("cancelled", Some(&output_json), result.total_cost_usd)
+                .finish_with(RunFinal {
+                    status: "cancelled".into(),
+                    output_json: Some(output_json),
+                    cost_usd: result.total_cost_usd,
+                    input_tokens: result.total_input_tokens,
+                    output_tokens: result.total_output_tokens,
+                })
                 .await
             {
                 tracing::warn!("Failed to persist cancelled status: {}", e);
@@ -596,16 +624,19 @@ pub async fn run_run_command(params: RunParams) -> Result<()> {
     }
 
     // 6.5 Run lifecycle finish (Phase 3): completed / interrupted / cancelled
-    //     states land on the run row with the final answer payload.
+    //     states land on the run row with the final answer payload. v5 L2:
+    //     ManagedRunResult 的 token 聚合同步落 runs 聚合列。
     if let Some(ref rec) = recorder {
         let final_message = extract_final_assistant_message(&result.messages);
         let output_json = serde_json::json!({ "output": final_message }).to_string();
         if let Err(e) = rec
-            .finish(
-                status_str(result.status),
-                Some(&output_json),
-                result.total_cost_usd,
-            )
+            .finish_with(RunFinal {
+                status: status_str(result.status).into(),
+                output_json: Some(output_json),
+                cost_usd: result.total_cost_usd,
+                input_tokens: result.total_input_tokens,
+                output_tokens: result.total_output_tokens,
+            })
             .await
         {
             tracing::warn!("Failed to persist run completion status: {}", e);
@@ -868,6 +899,7 @@ max_output_bytes = 65536
 
         let messages = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "hello".into(),
                 tool_call_id: None,
@@ -876,6 +908,7 @@ max_output_bytes = 65536
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "response".into(),
                 tool_call_id: None,
@@ -895,6 +928,7 @@ max_output_bytes = 65536
         use openslate_core::types::{Message, MessageRole};
 
         let messages = vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: "hello".into(),
             tool_call_id: None,
@@ -993,6 +1027,7 @@ model = "m2"
     fn test_jsonl_step_event_carries_tool_calls() {
         let result = synth_result(vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "list files".into(),
                 reasoning_content: None,
@@ -1001,6 +1036,7 @@ model = "m2"
                 tool_calls: None,
             },
             Message {
+            attachments: None,
             reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
@@ -1013,6 +1049,7 @@ model = "m2"
                 }]),
             },
             Message {
+                attachments: None,
                 role: MessageRole::Tool,
                 content: "a.txt".into(),
                 tool_call_id: Some(ToolCallId("call-7".into())),
@@ -1021,6 +1058,7 @@ model = "m2"
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "here is the list".into(),
                 tool_call_id: None,
@@ -1075,6 +1113,7 @@ model = "m2"
     fn test_jsonl_step_event_without_tool_calls_is_empty_array() {
         let result = synth_result(vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "hi".into(),
                 tool_call_id: None,
@@ -1083,6 +1122,7 @@ model = "m2"
                 reasoning_content: None,
             },
             Message {
+                attachments: None,
                 role: MessageRole::Assistant,
                 content: "hello".into(),
                 tool_call_id: None,
@@ -1121,6 +1161,7 @@ model = "m2"
     #[test]
     fn test_jsonl_run_end_carries_cost_value() {
         let mut result = synth_result(vec![Message {
+            attachments: None,
             role: MessageRole::User,
             content: "hi".into(),
             tool_call_id: None,
@@ -1231,6 +1272,7 @@ model = "m3"
         // Partial transcript as the Phase 3 sink would have written it.
         for m in [
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "go".into(),
                 reasoning_content: None,
@@ -1239,6 +1281,7 @@ model = "m3"
                 tool_calls: None,
             },
             Message {
+            attachments: None,
             reasoning_content: None,
                 role: MessageRole::Assistant,
                 content: String::new(),
@@ -1251,6 +1294,7 @@ model = "m3"
                 }]),
             },
             Message {
+                attachments: None,
                 role: MessageRole::Tool,
                 content: "a.txt".into(),
                 tool_call_id: Some(ToolCallId("tc-1".into())),
@@ -1293,6 +1337,7 @@ model = "m3"
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[2].role, MessageRole::Tool);
         rec2.write_message(&Message {
+            attachments: None,
             role: MessageRole::User,
             content: "continue".into(),
             tool_call_id: None,

@@ -1089,6 +1089,7 @@ impl Tool for AskUserTool {
         let started = Instant::now();
         let duration = || started.elapsed().as_millis() as u64;
         let output = |content: String, status: ToolOutputStatus| ToolOutput {
+            attachments: None,
             bytes: content.len(),
             content,
             duration_ms: duration(),
@@ -1617,18 +1618,22 @@ pub async fn startup_question_maintenance(
 // 审批豁免（Manual 全审模式下 ask_user 不触发审批，设计 §0）
 // ---------------------------------------------------------------------------
 
-/// 审批回调装饰器：ask_user 直通放行，其余委托内层桥。
+/// 审批回调装饰器：ask_user 直通放行，其余委托内层回调。
 ///
 /// 豁免实现点选最小侵入处——装饰 `manager.approval` 的 callback 槽
 /// （mobile 装配层），不动 core 审批逻辑、不动 `AppState.approval`
 /// （respond 通道照旧）。AutoExcept 默认门不含 ask_user，本装饰只对
 /// Manual 模式生效（其他模式 `needs_approval` 不会走到 callback）。
+///
+/// 内层泛化为 `Arc<dyn ApprovalCallback>`（tool-approval P1b）：mobile
+/// 装配链 `AskUserExemptApproval(AiReviewApproval(SessionApprovalBridge))`
+/// ——审查装饰器包在桥外、豁免器再包审查器。
 pub struct AskUserExemptApproval {
-    inner: Arc<openslate_session::approval::SessionApprovalBridge>,
+    inner: Arc<dyn openslate_core::approval::ApprovalCallback>,
 }
 
 impl AskUserExemptApproval {
-    pub fn new(inner: Arc<openslate_session::approval::SessionApprovalBridge>) -> Self {
+    pub fn new(inner: Arc<dyn openslate_core::approval::ApprovalCallback>) -> Self {
         Self { inner }
     }
 }
@@ -1985,6 +1990,7 @@ mod tests {
 
     fn tool_result_msg(id: &str, content: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(ToolCallId(id.into())),
@@ -1996,6 +2002,7 @@ mod tests {
 
     fn assistant_with_ask(id: &str) -> Message {
         Message {
+            attachments: None,
             role: MessageRole::Assistant,
             content: String::new(),
             tool_call_id: None,
@@ -2036,6 +2043,7 @@ mod tests {
 
         let mut history = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "go".into(),
                 tool_call_id: None,
@@ -2122,6 +2130,7 @@ mod tests {
 
         let mut history = vec![
             Message {
+                attachments: None,
                 role: MessageRole::User,
                 content: "go".into(),
                 tool_call_id: None,
@@ -2204,7 +2213,9 @@ mod tests {
 
     #[test]
     fn approval_exempt_passes_ask_user_through() {
-        use openslate_core::approval::{ApprovalCallback, ApprovalDecision, ApprovalRequest, RiskLevel};
+        use openslate_core::approval::{
+            ApprovalCallback, ApprovalDecision, ApprovalRequest, ApprovalTrigger, RiskLevel,
+        };
         use openslate_session::approval::SessionApprovalBridge;
         use openslate_session::state::MsgSink;
         use std::sync::Arc as StdArc;
@@ -2235,6 +2246,9 @@ mod tests {
             arguments: serde_json::json!({}),
             agent_id: "root".into(),
             risk_level: RiskLevel::Medium,
+            server: None,
+            trigger: ApprovalTrigger::Manual,
+            note: None,
         };
         // 若未豁免会阻塞在 mpsc recv（测试超时）；豁免则立即 Approved。
         let decision = exempt.decide(&req);

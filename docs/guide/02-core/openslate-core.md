@@ -21,7 +21,7 @@
 | 13 | `execution.rs` | 运行时执行树 |
 | 14 | `context.rs` | 子代理上下文隔离 |
 | 15 | `context_manager/` | 会话窗口管理 + 压缩 |
-| 16 | `approval.rs` | 审批闸门 |
+| 16 | `approval.rs` | 审批闸门（规则引擎） |
 | 17 | `skills.rs` | SKILL.md 发现与注入 |
 | 18 | `prompt.rs` | 提示词解析（profile 体系） |
 | 19 | `paths.rs` | 路径发现 |
@@ -30,19 +30,46 @@
 
 ---
 
-## 1. types.rs —— 领域 ID 与数据结构（443 行）
+## 1. types.rs —— 领域 ID 与数据结构（589 行）
 
 - `id_type!` 宏（:6-44）生成 newtype String 家族：`AgentId`/`RunId`/`StepId`/`ExecutionNodeId`/`ToolCallId`（:46-56）。均 derive `Debug/Clone/PartialEq/Eq/Hash/Serialize/Deserialize`，实现 `Display/FromStr(Infallible)/From<String>/From<&str>/AsRef<str>`。
 - `MessageRole`（:61）= system/user/assistant/tool（serde lowercase）。
-- `Message`（:70）：`role`/`content`/`tool_call_id?`/`name?`/`tool_calls?: Vec<ToolCall>`/`reasoning_content?`。`reasoning_content` 是 Anthropic 多轮 extended-thinking 语义：历史 thinking 块随 assistant 消息回传，持久化自动携带（依赖 vendor 过的 genai）。
-- `AgentConfig`（:87，字段语义见 [../01-architecture/domain-concepts.md](../01-architecture/domain-concepts.md)）。
-- `RunStatus`（:106）= running/completed/failed/interrupted/cancelled。
-- `StepKind(pub String)`（:116）+ 常量 `MODEL_CALL`/`TOOL_CALL`/`CHILD_AGENT_CALL`（:120-124）。
-- `ModelResponse`（:129）：content?/reasoning_content?/tool_calls/usage?/finish_reason?。
-- `ToolCall`（:142）：id/name/arguments(serde_json::Value)。
-- `Usage`（:150）：input/output_tokens(u32) + **additive** 字段 `cached_input_tokens?`/`reasoning_tokens?`（`#[serde(default)]`——旧 payload 反序列化为 None；cost 计算刻意忽略它们：cached 不重复计价，reasoning 已含在 output_tokens 里）。
-- `ModelStreamEvent`（:174）：`Delta`/`Reasoning`/`Usage`/`Done(ModelResponse)`。
-- `ToolOutput`（:190）：content/bytes/duration_ms/status（`ToolOutputStatus` = success/error/truncated，:200）。
+- `Message`（:70）：`role`/`content`/`tool_call_id?`/`name?`/`tool_calls?: Vec<ToolCall>`/`reasoning_content?`/`attachments?: Vec<Attachment>`。`reasoning_content` 是 Anthropic 多轮 extended-thinking 语义：历史 thinking 块随 assistant 消息回传，持久化自动携带（依赖 vendor 过的 genai）。`attachments` 是多模态输入侧 additive 字段（:87）：`#[serde(default, skip_serializing_if = "Option::is_none")]`——旧 payload（无该键）反序列化为 `None`，`None` 序列化时省略键，存量 wire/持久化行为不变（与 `reasoning_content` 同款兼容策略）。
+- `Attachment`（:94，多模态附件条目）：
+
+  | 字段 | 类型 | serde 行为 |
+  |------|------|-----------|
+  | `id` | `String` | 恒序列化（`att-<uuid>` 引用键） |
+  | `mime` | `String` | 恒序列化（归一化后 mime） |
+  | `filename` | `Option<String>` | `default` + None 省略 |
+  | `data` | `Option<Arc<[u8]>>` | **`#[serde(skip, default)]`：永不序列化，反序列化恒 `None`** |
+
+  derive 仅 `Debug/Clone/Serialize/Deserialize`（无 `PartialEq`）。**`data` 不过持久化线**：持久化形状 = `{id, mime, filename}` 引用（DB 与协议 wire 同形，字节本体走 content-addressed 文件系统）；`data` 只在内存中直达 provider——ingest 层填充、resume 时由 mobile 层从 store+files 回填，即使 JSON 里出现 `data` 键反序列化也会丢弃。设计依据：`docs/PLAN-storage-v5-multimodal.md` §6.1。
+- `AgentConfig`（:105，字段语义见 [../01-architecture/domain-concepts.md](../01-architecture/domain-concepts.md)）。
+- `RunStatus`（:124）= running/completed/failed/interrupted/cancelled。
+- `StepKind(pub String)`（:134）+ 常量 `MODEL_CALL`/`TOOL_CALL`/`CHILD_AGENT_CALL`（:138-142）。
+- `ModelResponse`（:147）：content?/reasoning_content?/tool_calls/usage?/finish_reason?。
+- `ToolCall`（:160）：id/name/arguments(serde_json::Value)。
+- `Usage`（:168）：input/output_tokens(u32) + **additive** 字段 `cached_input_tokens?`/`reasoning_tokens?`/`image_tokens?: Option<u64>`（`#[serde(default)]`——旧 payload 反序列化为 None；cost 计算刻意忽略它们：cached 不重复计价，reasoning 已含在 output_tokens 里，image 已含在 input_tokens 里）。`image_tokens` = image input tokens 的模态拆分（OpenAI 系 chat usage `prompt_tokens_details.image_tokens`，经 vendor 补丁 #3 + model-genai 映射；provider 不分模态则 None），落 `messages.meta_json` 供 mobile 重开时回放附件 token（06-mobile §12.5）。
+- `MessageMeta`（:194，单条消息采集元数据，derive 含 `Default`）：
+
+  | 字段 | 类型 | serde 行为 |
+  |------|------|-----------|
+  | `model_id` | `Option<String>` | default + None 省略 |
+  | `usage` | `Option<Usage>` | default + None 省略 |
+  | `finish_reason` | `Option<String>` | default + None 省略 |
+  | `latency_ms` | `Option<u64>` | default + None 省略 |
+
+  **不进 `Message` 本体**（Message 是 provider 回放单元，混入 usage 会在 convert/resume 回放路径泄漏给 provider）；assistant 消息专属，旁路落 store 的 `messages.meta_json`（v5），user/tool 行为 NULL。全空 `{}` 反序列化为全 `None`。设计依据：`docs/PLAN-storage-v5-multimodal.md` §2。
+- `ModelStreamEvent`（:207）：`Delta`/`Reasoning`/`Usage`/`Done(ModelResponse)`。
+- `ToolOutput`（:223）：content/bytes/duration_ms/status（`ToolOutputStatus` = success/error/truncated，:233）
+  + `attachments: Option<Vec<Attachment>>`（读图链路 2026-10-21，additive——旧 payload 反序列化
+  `None`、`None` 序列化省略）。MCP 工具返回 Image content block 时，`mcp::downgrade_content_blocks`
+  把 base64 解码为字节收集于此（id `tool-{n}`、filename None、**不落 attachments 表**——与用户
+  ingest 附件的 DB 行无关）；runtime 把它透传进 Tool Message 的 `attachments`（顺序/并行两路径，
+  runtime.rs 的 `attachments: output.attachments`），provider 层 1:N 展开（genai convert）。
+  `limit_tool_output` 截断时附件原样保留（截断只作用文本）。
+- serde 兼容锁定：types.rs 内测试覆盖旧 payload（无 `attachments`）→ `None`、`Message`/`Attachment`/`MessageMeta` 往返、`data` 永不出现于序列化输出（`message_old_payload_without_attachments`/`message_attachments_roundtrip`/`attachment_data_never_serialized`/`message_meta_serde_roundtrip`）。
 
 ## 2. provider.rs —— 模型调用抽象（275 行）
 
@@ -69,7 +96,7 @@
 - `ChildAgentCallable`（:50）：实现 `Tool`，name 恒 `"call_agent"`；schema 的 enum 字段钉死只允许自己的 agent_id（:82-98）；`execute` 是**桩**（:100 注释钉死——真正执行由 runner 拦截）。
 - `child_agent_definitions(child_ids, agent_tree)`（:119）：为树中存在的子代理生成 ToolDefinition。
 
-## 5. run_manager.rs —— run 编排入口（1045 行，测试占大半）
+## 5. run_manager.rs —— run 编排入口（1231 行，测试占大半）
 
 ```rust
 // :23
@@ -88,8 +115,8 @@ pub struct RunManager {
 - `new_run_id()`（:94）：UUID v4。
 - `execute_with_run_id(run_id, provider, prior_messages, cancel, progress) -> Result<ManagedRunResult>`（:118）：resolve root agent → TraceCollector 开 run span → 组 `AgentRunner`（快照 approval/sink/cancel）→ `run_root`。`prior_messages` 直接作 initial_messages（当前用户消息必须已在其中，不追加）；入口前已取消的 token 报 `RuntimeError::Cancelled`。
 - `resume_from_tool_result(run_id, provider, prior_messages, tool_call_id, result_content, cancel, progress)`（ask-user r5）：**迟到答案续跑入口**——先 `ask_user::append_late_tool_result` 补全悬挂 tool call 的 tool result（经 message_sink 先落盘），再走同一 `execute_with_run_id` 从该点重进模型循环；对模型与「答案即时返回」完全等价（迟到等价不变量）。幂等：已答/未知 id 报 `OpenSlateError::Validation`。
-- `execute_with_history`（:187）/`execute`（:207）：便捷包装。
-- `ManagedRunResult`（:46）：run_id/status/messages/total_steps/total_input_tokens/total_output_tokens/total_cost_usd（各层按各自模型计价后聚合）/execution_tree/model/trace。
+- `execute_with_history`（:187）/`execute`（:243）：便捷包装。
+- `ManagedRunResult`（:46）：run_id/status/messages/total_steps/total_input_tokens/total_output_tokens/total_cost_usd（各层按各自模型计价后聚合）/execution_tree/model/trace。**`total_*_tokens` 是 run 生命周期 token 聚合的权威来源**（v5 L2）：前端 finish 时经 `RunFinal` 落 `runs.input_tokens/output_tokens`（见 [openslate-session.md](openslate-session.md)）。
 
 ## 6. runner.rs —— 递归子代理编排器（3981 行，测试占大半）
 
@@ -106,25 +133,28 @@ pub struct RunManager {
 - 时间预算语义：每层拿**完整** `timeout_ms`（纯 LLM await 时间累积；审批等待与工具执行暂停计时）。
 - **message_sink 只给 root 层**（:107-112 注释：子层消息混入同一 run 行会破坏 resume 顺序）。
 
-## 7. runtime.rs —— 单 agent 主循环（3565 行，测试占大半）
+## 7. runtime.rs —— 单 agent 主循环（4080 行，测试占大半）
 
 - `DEFAULT_MAX_EMPTY_TURNS = 3`（:30）。
-- `MessageSink` trait（:47）+ `sink_append` 辅助（:53）。
-- 取消辅助：`interrupted_result`（:64，Interrupted + 部分转写）、`token_cancelled`（:86，None → pending 永不触发）、`cancelled_tool_message`（:95，`"[tool call cancelled before completion]"`）、`append_cancelled_tool_results`（:111，补合成 Tool 消息防悬空 tool_calls；**ask_user 豁免**——按工具名跳过，悬挂保留给迟到答案，ask-user r5 不变量，并行批 drain 的 None slot 同款豁免）。
-- `RuntimeLimits`（:126）：max_steps/max_depth/max_tool_calls/max_child_agent_calls/**timeout_ms**（回合级纯 LLM 时间预算，fix-21）/max_context_bytes/max_output_bytes/max_empty_turns/**parallel_tool_calls**。`Default`（:150）：steps=0(不限)/depth=4/tool_calls=20/child_calls=8/timeout=60s/ctx=64KB/out=64KB/empty=3/parallel=true。
-- `check_limits`（:167）：步/深/工具/子调用四闸。
-- `CostSpec`（:206）：`from_prices(in, out)` / `is_configured` / `cost_of(&Usage) -> f64`（per-mtok 计价；cached/reasoning additive 字段刻意忽略）。
-- `RunConfig`（:245）/`RunResult`（:279）/`StepResult`（:294）。
-- `execute_run`（:358）：**主循环**。流式事件→progress；tool_calls→审批→执行（并发批，join 点按 tool_call 序协调顺序敏感操作）→sink 落盘→循环。
-- `validate_tool_arguments`（:1069）。
+- `MessageSink` trait（:47）：`append(&Message)` + **`append_with_meta(&Message, &MessageMeta)`（v5 §2 元数据旁路）**。默认实现丢弃 meta 委托 `append` —— 只 override `append` 的第三方 sink 不破坏（测试钉死）。辅助：`sink_append`（:62，无 meta）/ `sink_append_with_meta`（:70，assistant 消息专用）。
+- **v5 §2 捕获点**（`execute_run` 内，assistant 消息构造处 :705-717）：流式/非流式两路径在 response 汇合点（:668）之后统一构造 `MessageMeta{model_id（当前请求模型）, usage/finish_reason（取 ModelResponse）, latency_ms（`call_start`（:519）Instant 差值，快照 :670）}`，随 assistant 消息走 `sink_append_with_meta`；**user/tool 消息维持无 meta 的 `append`**。meta 不进 `Message` 本体（provider 回放零泄漏），持久化层（RunRecorder override `append_with_meta`）落 `messages.meta_json`。
+- 取消辅助：`interrupted_result`（:85，Interrupted + 部分转写）、`token_cancelled`（:107，None → pending 永不触发）、`cancelled_tool_message`（:116，`"[tool call cancelled before completion]"`）、`append_cancelled_tool_results`（:146，补合成 Tool 消息防悬空 tool_calls；**ask_user 豁免**——按工具名跳过，悬挂保留给迟到答案，ask-user r5 不变量，并行批 drain 的 None slot 同款豁免）。
+- `RuntimeLimits`（:164）：max_steps/max_depth/max_tool_calls/max_child_agent_calls/**timeout_ms**（回合级纯 LLM 时间预算，fix-21）/max_context_bytes/max_output_bytes/max_empty_turns/**parallel_tool_calls**。`Default`（:188）：steps=0(不限)/depth=4/tool_calls=20/child_calls=8/timeout=60s/ctx=64KB/out=64KB/empty=3/parallel=true。
+- `check_limits`（:205）：步/深/工具/子调用四闸。
+- `CostSpec`（:244）：`from_prices(in, out)` / `is_configured` / `cost_of(&Usage) -> f64`（per-mtok 计价；cached/reasoning additive 字段刻意忽略）。
+- `RunConfig`（:283）/`RunResult`（:317）/`StepResult`（:332）。
+- `execute_run`（:399）：**主循环**。流式事件→progress；tool_calls→审批→执行（并发批，join 点按 tool_call 序协调顺序敏感操作）→sink 落盘→循环。
+- `validate_tool_arguments`（:1161）。
 
 ## 8. config/ —— 配置三件套（解析/合并/写回/校验）
 
 ### mod.rs
 
-- `OpenSlateConfig`（:57）：project?/database?/prompts?/limits?/providers/models/**levels: HashMap<String,String>**（:78）/trace?/mcp?/builtin_tools/skills/ptc/approval?/tui/**ask_user**（ask-user：`[ask_user]` 段）。
+- `OpenSlateConfig`（:57）：project?/database?/prompts?/limits?/providers/models/**levels: HashMap<String,String>**（:78）/trace?/mcp?/builtin_tools/skills/ptc/approval?/tui/**ask_user**（ask-user：`[ask_user]` 段）/**attachments**（多模态输入：`[attachments]` 段，存储 v5 §6.6）。
 - `AskUserConfig`（default_timeout: `AskTimeout` + mask_secrets: bool——**已消费**：mobile 装配期注入 core 脱敏器闭包的开关短路（默认 Never/true，deny_unknown_fields））/ `AskTimeout`（`Never | Seconds(u64)`，serde 外部标签：`"never"` / `{ seconds = 300 }`）。
-- `ProviderConfig`（:197）/ `ModelConfig`（:223）/ `LimitsConfig`（:147，`#[serde(default)]` 整段缺省）/ `TraceConfig`（:249）/ `McpConfig`+`McpServerConfig`（:270/:281）+ `TransportConfig`（:295，stdio/HTTP）/ `AgentsConfig`（:320）/ `BuiltinToolsConfig`（:332）/ `SkillsConfig`（:360）/ `TuiConfig`+`TuiIconsConfig`（:381/:395）/ `PtcConfig`（:403）/ `ApprovalPolicySetting`（:456）+ `ApprovalConfig`（:473，`to_policy()` :485）。
+- **`AttachmentsConfig`（`[attachments]`，多模态输入 §6.6；2026-10-21 图片处理用户可配置）**：`max_image_dim=2048`（**用户旋钮**：等比缩放目标边长，值域 512–6000）/ `max_image_mb=5`（**用户旋钮**：**处理后**大小上限 MB，值域 1–5——语义自「ingest 入口源文件上限（旧默认 10）」迁移，入口防呆改固定 50MB 常量，归一化迭代压缩 q85→70→55 → ×0.85 缩边以此达标，地板 dim 1024）/ `max_video_mb=50`（视频落盘上限，passthrough 不转码）/ `max_inline_video_mb=20`（data:URL 内联发送上限）/ `max_inline_total_mb=25`（单请求附件总字节）/ `experimental_video=false`（实验视频开关）。整段 `#[serde(default)]`（缺省即安全值）、deny_unknown_fields、Copy；validation 边界（`validation::attachments_floor_errors`）：512 ≤ dim ≤ 6000、1 ≤ max_image_mb ≤ 5（= ingest 出口 ≤5MB/≤6000² provider 公共分母）、其余 mb ≥ 1。消费方在 openslate-mobile（ingest / Submit 门控 / 回填封顶）；写回：mobile FFI setter（`set_image_processing` / `set_experimental_video`，toml_edit 原地改写）。
+- `ProviderConfig`（:197）/ `ModelConfig`（:223）/ `LimitsConfig`（:147，`#[serde(default)]` 整段缺省）/ `TraceConfig`（:249）/ `McpConfig`+`McpServerConfig`（:270/:281）+ `TransportConfig`（:295，stdio/HTTP）/ `AgentsConfig`（:320）/ `BuiltinToolsConfig`（:332）/ `SkillsConfig`（:360）/ `TuiConfig`+`TuiIconsConfig`（:381/:395）/ `PtcConfig`（:403）/ `ApprovalPolicySetting`（:518，legacy `policy` 键拼写）+ `ToolApprovalLevelSetting`（:533，新 schema 等级拼写 "manual"/"allow"/"auto"）+ `ApprovalConfig`（:556）。
+- **`ApprovalConfig`（`[approval]`）双 schema 共存（tool-approval）**：legacy `policy`（+`tools`）保留可解析（旧文件零破坏，`to_policy()` :579）；新键 `default_level: Option` / `tool_levels: BTreeMap<String, 等级>` / `server_levels: BTreeMap<String, 等级>`（键 = 审批作用域 slug，聚合下游 / host 前缀，见 `mcp::server_slug_of`）。生效规则统一经 `approval::rules_from_config` 推导（legacy 铺底 → 新键覆盖），配置层不自算。
 - 解析函数：`parse_openslate_toml`（:525）/ `AgentFrontmatter`（:544）/ `derive_id_from_filename`（:562，agent id 缺省从文件名派生）/ `parse_agent_markdown`（:591，YAML frontmatter + 正文=default_prompt）/ `parse_agents_dir`（:636）。
 - **注意**：config 类型只 derive Deserialize（协议侧镜像 DTO 是为了不给 core 加 Serialize）。
 
@@ -134,7 +164,7 @@ pub struct RunManager {
 
 ### persist.rs
 
-- 格式保持写回（toml_edit：注释/布局存活）。API：`upsert_provider`（:163）/ `upsert_model`（:187）/ `set_level`（:225）/ `remove_level`（:254）/ `set_capability`（:279）/ `remove_model_entry`（:308）/ `remove_provider`（:315）/ `upsert_mcp_server`（:330）/ `remove_mcp_server`（:386）/ `upsert_env_key`（:430，`.env` 0600）/ `set_agent_tool_lists`（:522）。
+- 格式保持写回（toml_edit：注释/布局存活）。API：`upsert_provider`（:163）/ `upsert_model`（:187）/ `set_level`（:225）/ `remove_level`（:254）/ `set_capability`（:279）/ `remove_model_entry` / `remove_provider` / `upsert_mcp_server` / `remove_mcp_server` / `upsert_env_key`（`.env` 0600）/ `set_agent_tool_lists` / **`set_approval_section`（:330，tool-approval：整段重写 `[approval]` 为新 schema——删除 legacy `policy`/`tools` 键（设置页写入即迁移）；只写非默认值（default=Allow 与缺省等价省略键、空 map 不写子表）；全默认（Allow + 两 map 空）**整段删除**；其余内容逐字节保真；幂等）**。
 - **红线**：配置写入永远走本模块，禁手拼 TOML 字符串。
 
 ### validation.rs
@@ -144,8 +174,8 @@ pub struct RunManager {
 
 ## 9. model_config.rs —— 别名解析（469 行）
 
-- 常量：`CAP_MAIN`/`CAP_COMPACT`/`CAP_TITLE`（:20-24）+ `CAPABILITIES`（:27）。
-- `capability_title`（:30）/ `capability_alias(config, cap) -> String`（:46，缺省回退 main→"main"、title→"fast"；compact 的 "fast" 缺省仅保留函数兼容——session 引擎未绑定时继承会话当前模型，不消费该缺省）。
+- 常量：`CAP_MAIN`/`CAP_COMPACT`/`CAP_TITLE`/`CAP_REVIEW`（:31 = `"review"`，审批 AI 审查模型，tool-approval）+ `CAPABILITIES`（:34，四值；SetCapability 校验白名单即此表）。
+- `capability_title`（:42，`CAP_REVIEW` → "审批审查"）/ `capability_alias(config, cap) -> String`（:46，缺省回退 main→"main"、title→"fast"；compact 与 review 的 "fast" 缺省仅保留函数兼容——**review 无硬缺省**：session 引擎/AI 审查未绑定 review 一律**继承会话当前模型**（compact 同款运行时语义），不消费该缺省）。
 - `ResolvedModel`（:61）：解析结果（model_id + 计价等）；`cost_spec()`（:86）→ `CostSpec`。
 - `resolve_model(config, alias) -> Result<ResolvedModel, ConfigError>`（:111）：levels 映射优先，无 levels 段直接查 models（legacy 保持）。`reasoning_effort` 容忍归一（:145-162）：七档全集 none/minimal/low/medium/high/xhigh/max 白名单透传——**none = 显式关闭思考**（wire 发 `"reasoning_effort":"none"`，与缺省不传参的 Auto 语义不同；仅支持的家族有效，GLM-5.2 / Gemini 2.5）；非法值 warn 后按 None（配置瑕疵不炸 provider 构建，wire 少带字段回落 provider 默认）。
 - `resolve_all_models`（:158）：批量。
@@ -163,7 +193,11 @@ pub struct RunManager {
 - `McpTool`（:146，impl Tool；`namespace()` 返回 server_alias 驱动 PTC 的 `tools.<server>.<method>` 路径；调用带 `DEFAULT_CALL_TIMEOUT` 超时，:224-238）。
 - `McpConnectionGuard`（:272）：连接保活（`push`/`append`/`len`/`graceful_shutdown`）。**必须活得比 ToolRegistry 久**（AppContext 字段声明序保证，wiring.rs:43-58；`append` 供无热重载缝的前端把拆分的 builtin/外部两个 guard 合一保活）。
 - `set_mcp_auth_override`（:76）。
-- ContentBlock 处理（:120-137）：Resource/Image 出占位符；`#[non_exhaustive]` 兜底 warn。
+- **`server_slug_of(exposed_name, namespace) -> Option<String>`（:217，审批作用域的权威反解，tool-approval）**：registry 暴露名 → MCP server 标识——`namespace = None`（native / HostTool / in-process builtin）→ `None`（非 MCP 无 server 作用域）；含 `__`（聚合形态，如 `termux_github__create_issue`）→ 首个 `__` 前段剥 `{namespace}_` 前缀 = 下游 slug（→ `"github"`，剥后为空回退 namespace）；裸名形态（如 `termux_bash`）→ namespace 本身（host 前缀组，host 内全部工具共享一个审批作用域）。精度局限：只认「首个 `__` 分界 + 前缀」形状（默认大模板 `{prefix}_{server}__{tool}` 的自然产物），用户改 `tool_name_template` 无 `__` 时回落 host 前缀组；Kotlin `mcpServerSlugOf` 语义对齐。消费方：审批规则 `ApprovalRules.servers` 键、`ApprovalSummaryDto.server`、UI (c)/(d) MCP 级选项。
+- ContentBlock 处理（`downgrade_content_blocks`）：Text 拼接；**Image 双通道**（2026-10-21）——base64
+  解码收进 `Vec<Attachment>`（`ToolOutput.attachments`，id `tool-{n}`；畸形 base64 warn + 占位、
+  不中断）+ 文本占位 `[image: {mime}, {N} bytes]` 保留；Audio/Resource/ResourceLink/未知出占位符；
+  `#[non_exhaustive]` 兜底 warn。返回 `(String, Vec<Attachment>)`。
 - v1 决策：桌面端无热重载；连接/调用失败非致命（warn + skip）。mobile 端例外——运行期热重载（`MobileRuntime::reload_mcp` 复用 wiring 的 `connect_external_mcp`）。
 - 工具注册名模板（**双模板模型**）：`[mcp].tool_name_template`（大模板，三占位符）与 `[mcp].builtin_tool_name_template`（小模板）——`{prefix}`=`[mcp.servers]` 键名（mobile「前缀」设置控制其值）、`{server}`=上游聚合名的 slug 段、`{tool}`=不带服务器前缀的裸工具名。**上游名含 `__`（聚合形态 `slug__tool`）才走大模板**（缺省 `"{prefix}_{server}__{tool}"`，`DEFAULT_TOOL_NAME_TEMPLATE`，单趟展开、值不二次展开）；**不含 `__` 的裸名走小模板**（占位符仅 `{prefix}`/`{tool}`——裸名没有 slug 段，缺省 `"{prefix}_{tool}"`，`DEFAULT_BUILTIN_TOOL_NAME_TEMPLATE`）。两个默认值均与历史 `{prefix}_{upstream}` 展开逐字节一致（默认配置零影响）。**注意：无 `__` 路径同时覆盖 host-builtin 裸名（聚合 host 内置 server 列出的 bash/read_file 等）与桌面直连裸名，用户改 `builtin_tool_name_template` 同时影响两者**（同一条展开分支）。`format_tool_name(template, builtin_template, prefix, upstream)` 收模板对、内部按上游形态分流（唯一的展开实现，勿在别处复制）；`McpTool::from_definition` 带 `Option<&str>` 模板对，只改 `exposed_name`（`definition_name`/`namespace` 语义不变）。校验两套独立：`validate_mcp_tool_name_template`（必须含 `{tool}`、三占位符外余量限 `[A-Za-z0-9_.-]`、字面 `__` 合法）；`validate_mcp_builtin_tool_name_template`（必须含 `{tool}`、禁 `{server}`、strip 占位符后**禁字面 `__`** 且限 `[A-Za-z0-9_.-]`——裸名注册不得与聚合形态 `slug__tool` 混淆；strip 会合并相邻分隔符，`{prefix}_{tool}_x` 一并被保守拒收）。生效值统一经 `McpConfig::builtin_template_or_default()`（None/空白回落默认，装配/reload/FFI 共用接缝）。落盘 `persist::set_mcp_tool_name_template` / `set_mcp_builtin_tool_name_template`（空串删键回默认）。
 - 前缀改名（= `{prefix}` 展开值）：`persist::rename_mcp_server(path, old, new)`（toml_edit 整子表搬移，transport/headers 随迁；单键直取、多键须精确命中 old）；`validate_mcp_server_name`：非空、`[A-Za-z0-9_.-]`、**不含 `__`**（键名会泄入裸名/小模板展开路径（默认即 legacy `prefix_{tool}` 形）与 UI 启发式——**刻意不接入 `validate_config`**，桌面手写配置不受 mobile 聚合约束）。mobile FFI `get/set_mcp_server_name` 读写，改名后经 reload 热生效。
@@ -199,13 +233,16 @@ pub struct RunManager {
 - `needs_compact(messages, max_messages, max_bytes, reserve) -> bool`（:16）。
 - `compact(&mut messages, system_prompt, max_msgs, max_bytes, summarize) -> CompactResult`（:42）：LLM 摘要；summarize 返回 None（provider 失败/空白回复）→ **机械拼接兜底**（内建，永不失败）。
 
-## 16. approval.rs —— 审批闸门（585 行）
+## 16. approval.rs —— 审批闸门 / 规则引擎（1322 行，测试占大半）
 
-（概念语义见 [../01-architecture/domain-concepts.md](../01-architecture/domain-concepts.md) Approval 节。）
+（概念语义见 [../01-architecture/domain-concepts.md](../01-architecture/domain-concepts.md) Approval 节；审批链时序见 [dataflow.md](../01-architecture/dataflow.md) §4.1。）
 
-- `ApprovalPolicy`（:17，Default=Auto）/ `RiskLevel`（:26，Display 为 "low"/"medium"/"high"）/ `ApprovalRequest`（:47）/ `ApprovalDecision`（:60）/ `ApprovalCallback`（:74，同步阻塞设计）/ `ApprovalManager`（:81，Clone）。
-- `needs_approval`（:114，AutoExcept 忽略大小写精确匹配）/ `assess_risk`（:131，子串启发式；`run_code` 硬编码 High + P2 deferral 注释）/ `create_request`（:204）/ **`check`**（:231，聚合闸门；决策全走 tracing target=`openslate_approval`，不写 store）/ `auto_approve`（:271）/ `deny`（:276）/ `policy()`（:280）。
-- 模块头注释（:1-10）：**每个**工具调用（含 call_agent 与 run_code）都过 check，无绕过路径。
+- **规则引擎（tool-approval）**：`ToolApprovalLevel`（:75）= `Manual`（每次必问，trigger=Manual）/ **`Allow`（默认值，从不问）** / `Auto`（自动判断：启发式 Low 放行、Medium/High 进审批链，trigger=AutoRisk；`as_str()` = "manual"/"allow"/"auto"）；`ApprovalRules`（:121）= `{default_level, tools: BTreeMap, servers: BTreeMap}`，评估序 **tools > servers > default_level**（`level_for` :146；精确未命中做 ASCII 大小写不敏感回退——保 legacy AutoExcept 语义）。
+- `ApprovalManager`（:307，Clone）字段 = `rules: Arc<RwLock<ApprovalRules>>`（Clone 共享同一 cell → 热更新对进行中回合生效；毒化容忍）+ `callback: Option<Arc<dyn ApprovalCallback>>`。构造：`new(policy)`（legacy 经 `rules_from_policy` 映射）/ `auto()`（= default=Allow）/ `manual()` / **`with_rules(handle)`（:342，装配侧正道——与 bridge 共享同一 cell，P0-5）**。热更 API：`rules_handle()`（:351 外部改写入口）/ `set_rules()`（:356）/ `rules()`（:364 快照）。
+- **`check(&self, tool_name, server: Option<&str>, args, agent_id)`**（:506，聚合闸门）：规则快照评估等级（锁外）→ 不需要（Allow / Auto+Low）→ `Approved`；需要且有 callback → `callback.decide()`（同步阻塞）；需要但无 callback → `Approved`（非交互直通，CLI `NonInteractiveGate` 依赖该语义）。`ApprovalRequest`（:266）携带 `server: Option<String>`（审批作用域）/ `trigger: ApprovalTrigger`（:248 = Manual/AutoRisk，P0-2）/ `note: Option<String>`（AI 审查理由——core 恒 None，mobile 审查装饰器回填）。
+- `rules_from_policy`（:193，**P0-4 钉死勿改**：`Auto`→default=Allow；`Manual`→default=Manual；`AutoExcept(list)`→default=Allow + tools[每项]=Manual）；**`rules_from_config(&OpenSlateConfig)`**（:218，单一推导函数——装配 / config_ops 重载 / always_* 持久化**三个调用点共用**，防各处推导漂移：Allow 基线 → legacy `policy`(+`tools`) 铺底 → `default_level` 覆盖 → `tool_levels`/`server_levels` 逐键合并；`[approval]` 段缺省 = 纯 Allow 基线，**mobile 的 Auto 默认是装配层显式 opt-in，不在这里做**）。
+- 兼容层：`needs_approval`（:381，旧三型语义，不感知 server 作用域与 Auto）/ `policy()`（:579，owned——规则快照重建 legacy 三型；`to_legacy_policy` :170：default=Auto 无法用 legacy 表达，有损降级为 `Auto`，仅供旧装配路径 round-trip）；`assess_risk`（:398，子串启发式；`run_code` 硬编码 High——一次审批盖全脚本，per-bridge-tool 审批是 P2 deferral）；`create_request`（:472）/ `auto_approve` / `deny`。
+- 模块头注释：**每个**工具调用（含 call_agent 与 run_code）都过 check，无绕过路径；runner.rs `ToolExecutor::execute` 顶部闸口从 registry `namespace()` 经 `mcp::server_slug_of` 反解注入 server 作用域（runner.rs:1259-1267）。决策审计走 tracing target=`openslate_approval`，不写 store。
 
 ## 17. skills.rs —— SKILL.md 发现（974 行）
 

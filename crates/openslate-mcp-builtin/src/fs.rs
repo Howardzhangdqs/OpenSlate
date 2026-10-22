@@ -10,9 +10,17 @@
 //!   LLM instead of surfacing as a protocol error.
 //! - Structurally invalid arguments (e.g. an empty `path`) return
 //!   `Err(McpError::invalid_params(...))`.
+//!
+//! `read_file` 读图（2026-10）：字节读 + magic-byte 嗅探——图像
+//! （JPEG/PNG/WebP/GIF）经归一化（长边 ≤2048 / ≤5MB / JPEG q85，小 PNG
+//! passthrough）后以 `[text 说明, image block]` 双块返回；非 UTF-8 的
+//! 视频/二进制给结构化错误提示（视频不支持直接读取）。归一化在本
+//! crate（host 侧）执行：mcp-host 与 CLI in-process 共用同一实现，避免
+//! 原图 base64 走 JSON-RPC。
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::tool::ToolRouter,
@@ -161,6 +169,156 @@ fn success_text(content: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(content)])
 }
 
+// ── read_file 读图（2026-10）：magic-byte 嗅探 + 精简归一化 ─────────────────
+//
+// 归一化上移到 host 侧（mcp-host / CLI in-process 同一实现）：相机原图
+// （动辄 10MB+）先缩放重编码再出口，避免 5MB 级 base64 走 JSON-RPC。
+// 语义与 openslate-mobile attachments::normalize_image 对齐（常量同源），
+// 但本 crate 不能依赖 openslate-mobile（host/Termux 进程），故精简复刻。
+
+/// 归一化长边上限（mobile 侧 `max_image_dim` 默认值）。
+const MAX_IMAGE_DIM: u32 = 2048;
+/// 归一化出口字节 / PNG passthrough 上限。
+const MAX_NORMALIZED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// 归一化出口像素总数上限（防呆断言）。
+const MAX_IMAGE_PIXELS: u64 = 6000 * 6000;
+/// JPEG 重编码质量（与 mobile 侧一致）。
+const JPEG_QUALITY: u8 = 85;
+
+/// magic-byte 嗅探：仅识别 read_file 能处理的图像格式（jpeg/png/webp/gif）。
+/// 返回 `None` = 非图像（调用方再走 UTF-8 文本 / 二进制提示分支）。
+/// 视频（mp4/mkv/mov）在本期不支持读取，嗅出来只用于提示文案。
+fn sniff_image(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return Some("image/jpeg");
+    }
+    if data.len() >= 8 && data[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return Some("image/png");
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
+        return Some("image/gif");
+    }
+    None
+}
+
+/// 嗅探视频容器（mp4/mkv/mov）——仅用于二进制提示文案，不读取。
+fn sniff_video(data: &[u8]) -> Option<&'static str> {
+    if data.len() >= 4 && data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return Some("video/x-matroska");
+    }
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        let brand = &data[8..12];
+        return if brand == b"qt  " {
+            Some("video/quicktime")
+        } else {
+            Some("video/mp4")
+        };
+    }
+    None
+}
+
+/// 图像归一化（对齐 mobile attachments::normalize_image）：
+///
+/// - **快速通道（零解码零编码零重采样）**：JPEG/PNG header-only 读尺寸
+///   （不碰像素），长边 ≤2048 且 ≤5MB → **字节原样 passthrough**
+///   （JPEG 本就在出口白名单内；EXIF 方向不处理，字节原样保留，方向
+///   解释交给 provider——全解码路径同样不处理，行为一致）；
+/// - 其余（超尺寸/超体积的 jpeg/png、webp、gif）→ 缩到长边 ≤2048
+///   （只缩不放，`CatmullRom` 快档——纯 Rust 无 SIMD 下比 Lanczos3 快
+///   数倍，2048 降采样画质对视觉模型够用）+ JPEG q85 重编码；动图取
+///   首帧；
+/// - 出口硬校验：≤5MB、像素 ≤6000²（两条路径都执行；2048+q85 实际
+///   ~0.3–2MB，断言防呆）。
+///
+/// 分段耗时打 stderr（本 crate 零日志依赖；stdio transport 下 stderr
+/// 是安全的诊断通道，stdout 才是协议通道）：`attachment timing: …`，
+/// 与 mobile 侧 alog 格式统一。
+fn normalize_image(bytes: &[u8], sniffed: &'static str) -> Result<(&'static str, Vec<u8>), String> {
+    let t_start = std::time::Instant::now();
+
+    // ── 快速通道：JPEG/PNG header 判定后直接 passthrough ──────────
+    if matches!(sniffed, "image/jpeg" | "image/png") {
+        if let Some((w, h)) = header_dimensions(bytes) {
+            let t_header = t_start.elapsed();
+            if w.max(h) <= MAX_IMAGE_DIM && bytes.len() <= MAX_NORMALIZED_IMAGE_BYTES {
+                if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+                    return Err(format!("图像像素超限（{w}×{h} > 6000²）"));
+                }
+                eprintln!(
+                    "attachment timing: sniff_header={}ms decode=0ms resize=0ms encode=0ms \
+                     fast_path={sniffed}_passthrough {w}x{h} total={}ms",
+                    t_header.as_millis(),
+                    t_start.elapsed().as_millis()
+                );
+                return Ok((sniffed, bytes.to_vec()));
+            }
+        }
+        // header 解析失败（畸形/截断）→ 全解码路径给准确错误。
+    }
+
+    // ── 全解码路径（超尺寸/超体积 JPEG、PNG，webp/gif 转码）────────
+    let t_header = t_start.elapsed();
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| format!("图像解码失败（{sniffed}）：{e}"))?;
+    let t_decode = t_start.elapsed();
+    let max_dim = img.width().max(img.height());
+
+    let out = if max_dim > MAX_IMAGE_DIM {
+        // CatmullRom（见函数文档）：纯 Rust resize 快档，真机（P10 lite
+        // 级 SoC）上 Lanczos3 数秒太贵。
+        img.resize(
+            MAX_IMAGE_DIM,
+            MAX_IMAGE_DIM,
+            image::imageops::FilterType::CatmullRom,
+        )
+    } else {
+        img
+    };
+    let t_resize = t_start.elapsed();
+    let mut jpeg = Vec::with_capacity(256 * 1024);
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY);
+    out.to_rgb8()
+        .write_with_encoder(encoder)
+        .map_err(|e| format!("JPEG 重编码失败：{e}"))?;
+    let t_encode = t_start.elapsed();
+
+    let (w, h) = (out.width() as u64, out.height() as u64);
+    if w * h > MAX_IMAGE_PIXELS {
+        return Err(format!("归一化后像素超限（{w}×{h} > 6000²）"));
+    }
+    if jpeg.len() > MAX_NORMALIZED_IMAGE_BYTES {
+        return Err(format!(
+            "归一化后图像超 5MB（{:.1} MB）",
+            jpeg.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    eprintln!(
+        "attachment timing: sniff_header={}ms decode={}ms resize={}ms encode={}ms \
+         transcode {sniffed} {w}x{h} {}B→{}B total={}ms",
+        t_header.as_millis(),
+        (t_decode - t_header).as_millis(),
+        (t_resize - t_decode).as_millis(),
+        (t_encode - t_resize).as_millis(),
+        bytes.len(),
+        jpeg.len(),
+        t_start.elapsed().as_millis()
+    );
+    Ok(("image/jpeg", jpeg))
+}
+
+/// header-only 尺寸读取（不解码像素；SOF/IHDR/容器头）。畸形/截断返回
+/// `None`——调用方回落全解码路径（解码器给准确错误）。
+fn header_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
 #[tool_router]
 impl FsServer {
     /// Create a server confined to the given workspace root. The root is
@@ -177,7 +335,7 @@ impl FsServer {
         }
     }
 
-    #[tool(description = "Read the contents of a file at the given path (within workspace)")]
+    #[tool(description = "Read a file at the given path (within workspace). UTF-8 text files return their content; image files (JPEG/PNG/WebP/GIF) are normalized (≤2048px, ≤5MB) and returned as image content the model can see directly")]
     async fn read_file(
         &self,
         Parameters(args): Parameters<ReadFileParams>,
@@ -191,13 +349,57 @@ impl FsServer {
             Err(e) => return Ok(error_text(e.message())),
         };
 
-        let content = match tokio::fs::read_to_string(&full_path).await {
-            Ok(c) => c,
+        // 字节读（不再 read_to_string）：UTF-8 校验挪到文本分支，图像/
+        // 二进制按 magic-byte 嗅探分流。
+        let bytes = match tokio::fs::read(&full_path).await {
+            Ok(b) => b,
             Err(e) => {
                 return Ok(error_text(format!("Failed to read '{}': {}", args.path, e)));
             }
         };
-        Ok(success_text(content))
+
+        // ── 图像分支：归一化 + [text, image] 双 block ──────────────────
+        if let Some(sniffed) = sniff_image(&bytes) {
+            let filename = full_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(args.path.as_str());
+            return match normalize_image(&bytes, sniffed) {
+                Ok((mime, data)) => {
+                    let text = format!(
+                        "[image file: {}, {}, {} bytes (normalized from {} bytes) \
+— the image itself is attached below; no need to read it again]",
+                        filename, mime, data.len(), bytes.len()
+                    );
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    Ok(CallToolResult::success(vec![
+                        ContentBlock::text(text),
+                        ContentBlock::image(b64, mime),
+                    ]))
+                }
+                Err(e) => Ok(error_text(format!(
+                    "Failed to read '{}' as image: {}",
+                    args.path, e
+                ))),
+            };
+        }
+
+        // ── 文本分支：UTF-8 校验（对齐旧 read_to_string 行为）──────────
+        match String::from_utf8(bytes) {
+            Ok(content) => Ok(success_text(content)),
+            Err(err) => {
+                let bytes = err.into_bytes();
+                let hint = match sniff_video(&bytes) {
+                    Some(mime) => format!("binary file ({} bytes, {})", bytes.len(), mime),
+                    None => format!("binary or non-UTF-8 file ({} bytes)", bytes.len()),
+                };
+                Ok(error_text(format!(
+                    "Failed to read '{}': {} — only UTF-8 text and images \
+(JPEG/PNG/WebP/GIF) can be read directly; videos are not supported",
+                    args.path, hint
+                )))
+            }
+        }
     }
 
     #[tool(description = "Write content to a file within the workspace")]
@@ -384,6 +586,148 @@ mod tests {
             .await
             .expect_err("empty path must be invalid params");
         assert!(format!("{err}").contains("path"));
+    }
+
+    // ── read_file：读图（2026-10）────────────────────────────────────
+
+    /// 提取第一个 image block（base64 数据 + mime）。
+    fn first_image(result: &rmcp::model::CallToolResult) -> Option<(String, String)> {
+        result.content.iter().find_map(|c| match c {
+            rmcp::model::ContentBlock::Image(img) => {
+                Some((img.data.clone(), img.mime_type.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([9, 140, 60]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode png");
+        buf
+    }
+
+    fn jpeg_bytes(w: u32, h: u32, q: u8) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 30, 30]));
+        let mut buf = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, q);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .expect("encode jpeg");
+        buf
+    }
+
+    fn b64_decode(s: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(s).expect("valid base64")
+    }
+
+    /// 小 PNG：passthrough（mime 保持 png、字节逐字保留），结果 =
+    /// [text 说明, image block] 双块。
+    #[tokio::test]
+    async fn read_file_small_png_returns_image_block_passthrough() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let png = png_bytes(64, 64);
+        std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+
+        let client = client_in(&dir).await;
+        let result = call(&client, "read_file", rmcp::object!({"path": "shot.png"})).await;
+        assert!(!is_error(&result), "{}", first_text(&result));
+        assert_eq!(result.content.len(), 2, "text 说明 + image block");
+        let text = first_text(&result);
+        assert!(text.contains("[image file: shot.png"), "{text}");
+        assert!(text.contains("image/png"), "{text}");
+        let (data, mime) = first_image(&result).expect("image block present");
+        assert_eq!(mime, "image/png", "小 PNG passthrough 保 PNG");
+        assert_eq!(b64_decode(&data), png, "passthrough 字节逐字保留");
+    }
+
+    /// 超尺寸 JPEG（3000×2000）：归一化——mime 转 jpeg、长边 ≤2048、
+    /// ≤5MB、可解码。
+    #[tokio::test]
+    async fn read_file_oversize_jpeg_normalized_to_2048_jpeg() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("big.jpg"), jpeg_bytes(3000, 2000, 95)).unwrap();
+
+        let client = client_in(&dir).await;
+        let result = call(&client, "read_file", rmcp::object!({"path": "big.jpg"})).await;
+        assert!(!is_error(&result), "{}", first_text(&result));
+        let (data, mime) = first_image(&result).expect("image block present");
+        assert_eq!(mime, "image/jpeg");
+        let bytes = b64_decode(&data);
+        assert!(bytes.len() <= 5 * 1024 * 1024, "{} bytes ≤ 5MB", bytes.len());
+        let decoded = image::load_from_memory(&bytes).expect("归一化产物可解码");
+        assert_eq!(decoded.width().max(decoded.height()), 2048);
+    }
+
+    /// 视频（伪 ftyp 头）：结构化错误提示（mime + 字节数），无 image block。
+    #[tokio::test]
+    async fn read_file_video_reports_binary_notice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mp4 = vec![0, 0, 0, 0];
+        mp4.extend_from_slice(b"ftypisom");
+        // 0xFF 填充：真实视频 payload 必然非 UTF-8（顺带保证走二进制分支，
+        // 而不是全零字节被当成合法 UTF-8 文本）。
+        mp4.extend(std::iter::repeat(0xFF).take(1024));
+        std::fs::write(dir.path().join("clip.mp4"), &mp4).unwrap();
+
+        let client = client_in(&dir).await;
+        let result = call(&client, "read_file", rmcp::object!({"path": "clip.mp4"})).await;
+        assert!(is_error(&result));
+        let text = first_text(&result);
+        assert!(text.contains("video/mp4"), "{text}");
+        assert!(text.contains(&mp4.len().to_string()), "{text}");
+        assert!(first_image(&result).is_none());
+    }
+
+    /// 未知二进制（非 UTF-8、无图像/视频魔数）：同样结构化错误提示。
+    #[tokio::test]
+    async fn read_file_unknown_binary_reports_notice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob: Vec<u8> = (0..256u32).map(|i| (i % 256) as u8).collect();
+        std::fs::write(dir.path().join("blob.bin"), &blob).unwrap();
+
+        let client = client_in(&dir).await;
+        let result = call(&client, "read_file", rmcp::object!({"path": "blob.bin"})).await;
+        assert!(is_error(&result));
+        assert!(first_text(&result).contains("binary"), "{}", first_text(&result));
+    }
+
+    /// 归一化出口断言（防呆）：纯函数直测——webp/gif 入口交给 image crate
+    /// 解码路径（同 normalize_image 主干），这里锁定常量护栏。
+    #[test]
+    fn normalize_output_bounds_hold() {
+        // 小 PNG passthrough。
+        let png = png_bytes(32, 32);
+        let (mime, out) = normalize_image(&png, "image/png").unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(out, png);
+        // 大 JPEG → jpeg ≤2048。
+        let (mime, out) = normalize_image(&jpeg_bytes(4000, 3000, 95), "image/jpeg").unwrap();
+        assert_eq!(mime, "image/jpeg");
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert_eq!(decoded.width().max(decoded.height()), 2048);
+        assert!(out.len() <= 5 * 1024 * 1024);
+    }
+
+    /// 快速通道（零转码，与 mobile attachments 同款修复）：小 JPEG
+    /// （长边 ≤2048、≤5MB）字节原样 passthrough。
+    #[test]
+    fn normalize_small_jpeg_passthrough_zero_transcode() {
+        let jpeg = jpeg_bytes(640, 480, 90);
+        let (mime, out) = normalize_image(&jpeg, "image/jpeg").unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(out, jpeg, "小 JPEG 快速通道必须逐字节保留（零转码）");
+    }
+
+    /// 畸形 JPEG（header 读不出尺寸）→ 回落全解码路径给准确错误。
+    #[test]
+    fn normalize_truncated_jpeg_falls_back_to_decoder_error() {
+        let broken = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00];
+        let err = normalize_image(&broken, "image/jpeg").unwrap_err();
+        assert!(err.contains("图像解码失败"), "{err}");
     }
 
     // ── write_file ──

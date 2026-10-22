@@ -3,6 +3,7 @@
 //! 这些字符串就是线格式契约本身——任何字段增删改名都会在这里红灯，
 //! 改契约必须同步升 `PROTOCOL_VERSION` 并与 client 侧协商。
 
+use openslate_core::types::Attachment;
 use openslate_protocol::*;
 
 /// 通用断言：序列化 == 样例字节，且样例可反序列化回原值（往返）。
@@ -98,6 +99,7 @@ fn config_view() -> ConfigViewDto {
         active_config: "/home/u/p/.openslate/openslate.toml".into(),
         global_config: Some("/home/u/.config/openslate/openslate.toml".into()),
         local_config: Some("/home/u/p/.openslate/openslate.toml".into()),
+        approval: None,
     }
 }
 
@@ -107,6 +109,9 @@ fn summary_dto() -> ApprovalSummaryDto {
         arguments: r#"{"command":"cargo test"}"#.into(),
         agent_id: "root".into(),
         risk_level: "high".into(),
+        server: None,
+        trigger: None,
+        note: None,
     }
 }
 
@@ -137,9 +142,85 @@ fn client_submit() {
     assert_wire(
         ClientMsg::Submit {
             text: "你好".into(),
+            attachments: None,
         },
         r#"{"type":"submit","text":"你好"}"#,
     );
+}
+
+/// v4：Submit 带附件引用（id = FFI `import_attachment` 返回值；门控在
+/// mobile dispatch 层，协议只透传引用形状）。
+#[test]
+fn client_submit_with_attachments() {
+    assert_wire(
+        ClientMsg::Submit {
+            text: "看这张图".into(),
+            attachments: Some(vec![
+                AttachmentDto {
+                    id: "att-1".into(),
+                    mime: "image/jpeg".into(),
+                    filename: Some("cat.jpg".into()),
+                    tokens: None,
+                },
+                AttachmentDto {
+                    id: "att-2".into(),
+                    mime: "video/mp4".into(),
+                    filename: None,
+                    tokens: None,
+                },
+            ]),
+        },
+        r#"{"type":"submit","text":"看这张图","attachments":[{"id":"att-1","mime":"image/jpeg","filename":"cat.jpg"},{"id":"att-2","mime":"video/mp4"}]}"#,
+    );
+    // 旧格式（无 attachments 键）→ None（serde default，旧客户端零感知）。
+    let de: ClientMsg = serde_json::from_str(r#"{"type":"submit","text":"hi"}"#).unwrap();
+    assert_eq!(
+        de,
+        ClientMsg::Submit {
+            text: "hi".into(),
+            attachments: None,
+        }
+    );
+    // 空数组显式发送（合法：等价于没有附件，mobile 门控按空集放行）。
+    let de: ClientMsg =
+        serde_json::from_str(r#"{"type":"submit","text":"hi","attachments":[]}"#).unwrap();
+    assert_eq!(
+        de,
+        ClientMsg::Submit {
+            text: "hi".into(),
+            attachments: Some(Vec::new()),
+        }
+    );
+}
+
+/// v4：AttachmentDto 与 core `Attachment` 的持久化形状互转（`data`
+/// 永不过 wire——core 侧 `#[serde(skip)]`，From 转换置 None）。
+#[test]
+fn attachment_dto_core_roundtrip() {
+    let core = Attachment {
+        id: "att-9".into(),
+        mime: "image/png".into(),
+        filename: Some("shot.png".into()),
+        data: Some(std::sync::Arc::from(&b"png-bytes"[..])),
+    };
+    let dto = AttachmentDto::from(&core);
+    assert_eq!(
+        dto,
+        AttachmentDto {
+            id: "att-9".into(),
+            mime: "image/png".into(),
+            filename: Some("shot.png".into()),
+            tokens: None,
+        }
+    );
+    let back = Attachment::from(dto);
+    assert_eq!(back.id, "att-9");
+    assert_eq!(back.mime, "image/png");
+    assert_eq!(back.filename.as_deref(), Some("shot.png"));
+    assert!(back.data.is_none(), "data 绝不经协议/core 引用形状复活");
+    // serde 形状：data 不出现在 core Attachment 序列化里（skip）。
+    let ser = serde_json::to_string(&core).unwrap();
+    assert_eq!(ser, r#"{"id":"att-9","mime":"image/png","filename":"shot.png"}"#);
 }
 
 #[test]
@@ -152,6 +233,17 @@ fn client_approval_answer() {
         assert_wire(
             ClientMsg::ApprovalAnswer { id: 7, choice },
             &format!(r#"{{"type":"approval_answer","id":7,"choice":"{lit}"}}"#),
+        );
+    }
+    // v3 新增选择（审批卡持久化 / MCP 作用域选项；定稿线格式逐字对齐）。
+    for (choice, lit) in [
+        (ApprovalAnswerChoice::AlwaysTool, "always_tool"),
+        (ApprovalAnswerChoice::SessionMcp, "session_mcp"),
+        (ApprovalAnswerChoice::AlwaysMcp, "always_mcp"),
+    ] {
+        assert_wire(
+            ClientMsg::ApprovalAnswer { id: 42, choice },
+            &format!(r#"{{"type":"approval_answer","id":42,"choice":"{lit}"}}"#),
         );
     }
 }
@@ -372,6 +464,87 @@ fn client_set_api_key() {
     );
 }
 
+#[test]
+fn client_set_approval_config() {
+    // v3（tool-approval P1a）：定稿线格式逐字对齐。
+    let mut tool_levels = std::collections::BTreeMap::new();
+    tool_levels.insert("bash".to_string(), "manual".to_string());
+    assert_wire(
+        ClientMsg::SetApprovalConfig {
+            default_level: Some("auto".into()),
+            tool_levels,
+            server_levels: std::collections::BTreeMap::new(),
+        },
+        r#"{"type":"set_approval_config","default_level":"auto","tool_levels":{"bash":"manual"},"server_levels":{}}"#,
+    );
+    // default_level 缺省（None → 键不出现）；server_levels 非空样例。
+    let mut tool_levels = std::collections::BTreeMap::new();
+    tool_levels.insert("read_file".to_string(), "allow".to_string());
+    let mut server_levels = std::collections::BTreeMap::new();
+    server_levels.insert("github".to_string(), "allow".to_string());
+    assert_wire(
+        ClientMsg::SetApprovalConfig {
+            default_level: None,
+            tool_levels,
+            server_levels,
+        },
+        r#"{"type":"set_approval_config","tool_levels":{"read_file":"allow"},"server_levels":{"github":"allow"}}"#,
+    );
+    // 空 maps 缺省容忍（serde default）。
+    let de: ClientMsg = serde_json::from_str(r#"{"type":"set_approval_config"}"#).unwrap();
+    match de {
+        ClientMsg::SetApprovalConfig {
+            default_level,
+            tool_levels,
+            server_levels,
+        } => {
+            assert_eq!(default_level, None);
+            assert!(tool_levels.is_empty());
+            assert!(server_levels.is_empty());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn config_view_approval_section() {
+    // v3：ApprovalConfigViewDto 样例字节（字段序 = 声明序）。
+    let mut tool_levels = std::collections::BTreeMap::new();
+    tool_levels.insert("bash".to_string(), "manual".to_string());
+    let mut server_levels = std::collections::BTreeMap::new();
+    server_levels.insert("github".to_string(), "allow".to_string());
+    let approval = ApprovalConfigViewDto {
+        default_level: "auto".into(),
+        tool_levels,
+        server_levels,
+    };
+    assert_eq!(
+        serde_json::to_string(&approval).unwrap(),
+        r#"{"default_level":"auto","tool_levels":{"bash":"manual"},"server_levels":{"github":"allow"}}"#
+    );
+
+    // ConfigViewDto.approval：None → 键不出现（既有样例字节不变）；
+    // Some → 序列化在视图尾部（最后声明的字段）。
+    let mut view = config_view();
+    let base = serde_json::to_string(&view).unwrap();
+    assert!(!base.contains("\"approval\""), "{base}");
+    view.approval = Some(approval);
+    let with_approval = serde_json::to_string(&view).unwrap();
+    assert!(
+        with_approval.ends_with(
+            r#","approval":{"default_level":"auto","tool_levels":{"bash":"manual"},"server_levels":{"github":"allow"}}}"#
+        ),
+        "{with_approval}"
+    );
+
+    // 旧视图（无 approval 键）→ 反序列化为 None（旧快照容忍）；
+    // 新视图往返 Some。
+    let de: ConfigViewDto = serde_json::from_str(&base).unwrap();
+    assert_eq!(de.approval, None);
+    let de: ConfigViewDto = serde_json::from_str(&with_approval).unwrap();
+    assert_eq!(de.approval, view.approval);
+}
+
 // ---- ServerMsg：20 个变体 ------------------------------------------------
 
 #[test]
@@ -380,8 +553,12 @@ fn server_snapshot() {
         proto: PROTOCOL_VERSION,
         session_id: "s-a1b2c3d4".into(),
         session_label: "openslate 会话".into(),
+        run_id: None,
         transcript: vec![
-            EntryDto::User { text: "hi".into() },
+            EntryDto::User {
+                text: "hi".into(),
+                attachments: None,
+            },
             EntryDto::Assistant {
                 text: "hello".into(),
             },
@@ -408,7 +585,7 @@ fn server_snapshot() {
         ServerMsg::Snapshot {
             session: Box::new(snap),
         },
-        r#"{"type":"snapshot","session":{"proto":2,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
+        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","run_id":null,"transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
     );
 }
 
@@ -432,7 +609,7 @@ fn server_snapshot_pending_questions() {
         ServerMsg::Snapshot {
             session: Box::new(snap.clone()),
         },
-        r#"{"type":"snapshot","session":{"proto":2,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
+        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","run_id":null,"transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
     );
     // status 全集（生命周期 pending → answered | declined | superseded | expired）。
     for (status, lit) in [
@@ -459,6 +636,7 @@ fn pending_questions_empty_snapshot() -> SnapshotDto {
         proto: PROTOCOL_VERSION,
         session_id: "s-a1b2c3d4".into(),
         session_label: "openslate 会话".into(),
+        run_id: None,
         transcript: vec![],
         running: false,
         depth_cur: 0,
@@ -483,9 +661,33 @@ fn pending_questions_empty_snapshot() -> SnapshotDto {
             active_config: "/dev/null".into(),
             global_config: None,
             local_config: None,
+            approval: None,
         },
         session_stats: SessionStatsDto::default(),
     }
+}
+
+#[test]
+fn server_snapshot_run_id() {
+    // C4：快照携带当前 run 的 run_id——mobile 转写镜像的落盘/恢复键改从
+    // 事件流内嵌值取（快照 / turn_ok summary），不再旁路 FFI 直读实时态。
+    // 带值往返保 Some；None 序列化为 null（键恒在，仿 pending_questions
+    // 先例）；旧快照缺键 → serde default 反序列化为 None（双向兼容）。
+    let mut snap = pending_questions_empty_snapshot();
+    snap.run_id = Some("run-c4".into());
+    let ser = serde_json::to_string(&snap).unwrap();
+    assert!(ser.contains(r#""run_id":"run-c4""#), "{ser}");
+    let de: SnapshotDto = serde_json::from_str(&ser).unwrap();
+    assert_eq!(de.run_id.as_deref(), Some("run-c4"));
+
+    snap.run_id = None;
+    let ser_none = serde_json::to_string(&snap).unwrap();
+    assert!(ser_none.contains(r#""run_id":null"#), "{ser_none}");
+    // 剥掉该键模拟旧快照：缺键 → None。
+    let legacy = ser_none.replace(r#","run_id":null"#, "");
+    assert!(!legacy.contains("run_id"), "{legacy}");
+    let de: SnapshotDto = serde_json::from_str(&legacy).unwrap();
+    assert_eq!(de.run_id, None);
 }
 
 #[test]
@@ -521,6 +723,7 @@ fn server_stream_events() {
                 output_tokens: 20,
                 cached_input_tokens: Some(5),
                 reasoning_tokens: None,
+                image_tokens: None,
             },
         },
         r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":20,"cached_input_tokens":5,"reasoning_tokens":null}}"#,
@@ -535,6 +738,7 @@ fn server_tool_events() {
         ServerMsg::ToolStart {
             name: "read_file".into(),
             args: r#"{"path":"Cargo.toml"}"#.into(),
+            call_id: None,
         },
         r#"{"type":"tool_start","name":"read_file","args":"{\"path\":\"Cargo.toml\"}"}"#,
     );
@@ -544,6 +748,7 @@ fn server_tool_events() {
             bytes: 1024,
             truncated: false,
             preview: None,
+            call_id: None,
         },
         r#"{"type":"tool_end","name":"read_file","bytes":1024,"truncated":false}"#,
     );
@@ -569,6 +774,8 @@ fn server_tool_events() {
 
 #[test]
 fn server_approval_events() {
+    // v2 形状（新字段 None → 键不出现）：既是 v3 的"无 server 作用域 /
+    // 旧值"样例，也是旧 payload 的解析锚点。
     assert_wire_server(
         ServerMsg::ApprovalRequested {
             id: 3,
@@ -576,12 +783,46 @@ fn server_approval_events() {
         },
         r#"{"type":"approval_requested","id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}}"#,
     );
+    // v3：summary 新增 server / trigger / note（字段序 = 结构体声明序，
+    // 全部 Option + None 跳键）。
+    let mut summary = summary_dto();
+    summary.server = Some("github".into());
+    summary.trigger = Some("auto_risk".into());
+    summary.note = Some("AI 审查判定高风险：rm -rf 不可逆删除".into());
+    assert_wire_server(
+        ServerMsg::ApprovalRequested { id: 9, summary },
+        r#"{"type":"approval_requested","id":9,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high","server":"github","trigger":"auto_risk","note":"AI 审查判定高风险：rm -rf 不可逆删除"}}"#,
+    );
+    // 旧 payload 容忍（v2 形状的 approval_requested / summary 无新字段
+    // → 反序列化成功，新字段为 None）。
+    let de: ServerMsg = serde_json::from_str(
+        r#"{"type":"approval_requested","id":3,"summary":{"tool_name":"bash","arguments":"x","agent_id":"root","risk_level":"high"}}"#,
+    )
+    .unwrap();
+    match de {
+        ServerMsg::ApprovalRequested { summary, .. } => {
+            assert_eq!(summary.tool_name, "bash");
+            assert_eq!(summary.server, None);
+            assert_eq!(summary.trigger, None);
+            assert_eq!(summary.note, None);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
     assert_wire_server(
         ServerMsg::ApprovalResolved {
             id: 3,
             choice: "approve".into(),
         },
         r#"{"type":"approval_resolved","id":3,"choice":"approve"}"#,
+    );
+    // v3：ApprovalResolved.choice 新字符串值（String 值域扩展，由
+    // session 层产生）。
+    assert_wire_server(
+        ServerMsg::ApprovalResolved {
+            id: 3,
+            choice: "always-mcp".into(),
+        },
+        r#"{"type":"approval_resolved","id":3,"choice":"always-mcp"}"#,
     );
 }
 
@@ -596,6 +837,7 @@ fn server_turn_events() {
         total_cost_usd: 0.01,
         model: "glm-4".into(),
         messages: vec![openslate_core::types::Message {
+            attachments: None,
             role: openslate_core::types::MessageRole::User,
             content: "hi".into(),
             tool_call_id: None,
@@ -665,6 +907,34 @@ fn server_notice_error() {
 #[test]
 fn entry_dto_variants() {
     let cases: Vec<(EntryDto, &str)> = vec![
+        // v4：User 带附件引用（transcript 缩略图渲染用；filename None
+        // 跳键，字段序 = 声明序）。
+        (
+            EntryDto::User {
+                text: "看图".into(),
+                attachments: Some(vec![AttachmentDto {
+                    id: "att-7".into(),
+                    mime: "image/jpeg".into(),
+                    filename: None,
+                    tokens: None,
+                }]),
+            },
+            r#"{"kind":"user","text":"看图","attachments":[{"id":"att-7","mime":"image/jpeg"}]}"#,
+        ),
+        // v5：User 附件带实测 tokens（响应侧回填后的 transcript 形状；
+        // tokens None 跳键，字段序 = 声明序）。
+        (
+            EntryDto::User {
+                text: "看图".into(),
+                attachments: Some(vec![AttachmentDto {
+                    id: "att-8".into(),
+                    mime: "image/png".into(),
+                    filename: Some("shot.png".into()),
+                    tokens: Some(728),
+                }]),
+            },
+            r#"{"kind":"user","text":"看图","attachments":[{"id":"att-8","mime":"image/png","filename":"shot.png","tokens":728}]}"#,
+        ),
         (
             EntryDto::Reasoning {
                 text: "想一想".into(),
@@ -741,11 +1011,36 @@ fn approval_summary_from_request() {
         arguments: serde_json::json!({"command": "cargo test"}),
         agent_id: "root".into(),
         risk_level: openslate_core::approval::RiskLevel::High,
+        server: None,
+        trigger: openslate_core::approval::ApprovalTrigger::Manual,
+        note: None,
     };
     let dto = ApprovalSummaryDto::from(&req);
     assert_eq!(dto.tool_name, "bash");
     assert_eq!(dto.arguments, r#"{"command":"cargo test"}"#);
     assert_eq!(dto.risk_level, "high");
+    // v3：新字段经 From 透传（trigger 用 Display；None 字段为 None）。
+    assert_eq!(dto.server, None);
+    assert_eq!(dto.trigger.as_deref(), Some("manual"));
+    assert_eq!(dto.note, None);
+
+    // server/note 有值时的透传 + trigger Display（auto_risk）。
+    let req = openslate_core::approval::ApprovalRequest {
+        tool_name: "termux_github__create_issue".into(),
+        arguments: serde_json::json!({}),
+        agent_id: "root".into(),
+        risk_level: openslate_core::approval::RiskLevel::High,
+        server: Some("github".into()),
+        trigger: openslate_core::approval::ApprovalTrigger::AutoRisk,
+        note: Some("AI 审查判定高风险：疑似删除仓库".into()),
+    };
+    let dto = ApprovalSummaryDto::from(&req);
+    assert_eq!(dto.server.as_deref(), Some("github"));
+    assert_eq!(dto.trigger.as_deref(), Some("auto_risk"));
+    assert_eq!(
+        dto.note.as_deref(),
+        Some("AI 审查判定高风险：疑似删除仓库")
+    );
 }
 
 #[test]
@@ -756,6 +1051,9 @@ fn approval_summary_clips_long_args() {
         arguments: serde_json::json!({ "cmd": long }),
         agent_id: "root".into(),
         risk_level: openslate_core::approval::RiskLevel::Medium,
+        server: None,
+        trigger: openslate_core::approval::ApprovalTrigger::AutoRisk,
+        note: None,
     };
     let dto = ApprovalSummaryDto::from(&req);
     assert!(dto.arguments.chars().count() <= 120 + 1); // 120 + …
@@ -798,7 +1096,12 @@ fn provider_model_dto_roundtrip_with_core() {
 #[test]
 fn protocol_version_pinned() {
     // v2：ask_user 问卷（question_reply + snapshot.pending_questions）。
-    assert_eq!(PROTOCOL_VERSION, 2);
+    // v3：审批扩展（answer 新 choice / summary 新字段 / set_approval_config
+    // + config_view.approval）。
+    // v4：多模态输入（AttachmentDto + Submit/User attachments 字段；
+    // 样例字节对旧 payload 逐字节不变——快照内嵌 proto 除外，随版本走）。
+    // v5：AttachmentDto.tokens（响应侧 image tokens 回填；导入侧不预估）。
+    assert_eq!(PROTOCOL_VERSION, 5);
 }
 
 #[test]

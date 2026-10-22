@@ -644,6 +644,15 @@ object RuntimeBridge {
             // Rust 装配（磁盘 bootstrap + sqlite + tokio）可能阻塞数秒，
             // 必须离线主线程（否则 ANR / UI 冻结）。
             withContext(Dispatchers.IO) {
+                // 清理历史 bug 遗留的僵尸镜像（org.json null 陷阱曾把部分
+                // turn_error 落盘键污染成 "null" → transcripts/null.json；
+                // 修复后永不再读写，一次性删除）。
+                runCatching {
+                    java.io.File(java.io.File(appContext.filesDir, "transcripts"), "null.json")
+                        .takeIf { it.exists() }?.let {
+                            if (it.delete()) Log.i(TAG, "cleaned zombie transcript mirror null.json")
+                        }
+                }
                 val configDir = appContext.filesDir.resolve("openslate").absolutePath
                 val workspaceDir = appContext.filesDir.resolve("workspace").absolutePath
                 val dataDir = appContext.filesDir.resolve("data").absolutePath
@@ -1983,7 +1992,9 @@ object RuntimeBridge {
                 // 落盘键取 TurnSummaryDto 自带的 run_id（wire 契约恒有），
                 // 与本事件同时到达 → 键与 _state.entries 严格同代；不读
                 // FFI 实时态（open_session 并发换 run 时会错位）。
-                persistTranscriptAsync(obj.optJSONObject("summary")?.optString("run_id")?.ifBlank { null })
+                // optStringOrNull：optString 对 JSON null 返回字面量 "null"
+                // （org.json 陷阱）——曾致镜像写入 transcripts/null.json 僵尸文件。
+                persistTranscriptAsync(obj.optJSONObject("summary")?.optStringOrNull("run_id"))
             }
             "turn_error" -> mutate {
                 copy(
@@ -2447,7 +2458,9 @@ object RuntimeBridge {
         dropPendingEcho()
         // 快照内嵌 run 键（协议 run_id）：镜像仲裁用它，不读 FFI 实时态——
         // 快照在泵协程 FIFO 内到达，键与本快照的 entries 天然同源同代。
-        lastKnownRunId = session.optString("run_id").ifBlank { null }
+        // optStringOrNull 防 JSON null→"null" 字面量（新会话快照 run_id
+        // 合法为 null——run 懒创建；旧写法曾把镜像键污染成 "null"）。
+        lastKnownRunId = session.optStringOrNull("run_id")
         val transcript = session.optJSONArray("transcript") ?: return
         // ask_user 恢复关联表：tool_call 条目的 call_id（仅 DB 重建条目携带，
         // live 条目恒缺省）→ fullArgs。pending_questions 回放按 tool_call_id
@@ -3254,7 +3267,10 @@ object RuntimeBridge {
     // ── 本地 transcript 持久化（含思维链/元数据，Rust 侧不持久化这些）──
 
     private fun transcriptFile(runId: String): java.io.File? =
-        appContext?.let { java.io.File(java.io.File(it.filesDir, "transcripts"), "$runId.json") }
+        // "null"/空串防御：org.json optString 陷阱曾把镜像键污染成 "null"
+        //（JSON null → 字面量），读写一概拒绝该键。
+        if (runId.isBlank() || runId == "null") null
+        else appContext?.let { java.io.File(java.io.File(it.filesDir, "transcripts"), "$runId.json") }
 
     /**
      * turn 结束后落盘当前聊天流（后台线程；tmp+rename 原子替换，

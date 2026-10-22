@@ -514,7 +514,10 @@ pub struct SnapshotDto {
     /// 以事件流内嵌的 run 键为准，不再旁路 FFI 直读实时态）。`None` =
     /// 无持久化 run（server 投影自 `session_run`）。`serde(default)`：
     /// 新代码反序列化旧快照（缺键）安全，旧客户端忽略未知字段，双向兼容。
-    #[serde(default)]
+    /// None 时缺键不序列化——避免 wire 上出现 `"run_id":null`（Kotlin
+    /// org.json 的 optString 对 JSON null 返回字面量 "null"，曾把本地
+    /// 转写镜像键污染成 "null" 僵尸文件，见 RuntimeBridge 修复注释）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     /// 转写条目镜像（字段名 `transcript`，同 spec §3）。
     pub transcript: Vec<EntryDto>,

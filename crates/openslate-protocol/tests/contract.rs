@@ -586,7 +586,7 @@ fn server_snapshot() {
         ServerMsg::Snapshot {
             session: Box::new(snap),
         },
-        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","run_id":null,"transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
+        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
     );
 }
 
@@ -610,7 +610,7 @@ fn server_snapshot_pending_questions() {
         ServerMsg::Snapshot {
             session: Box::new(snap.clone()),
         },
-        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","run_id":null,"transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
+        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
     );
     // status 全集（生命周期 pending → answered | declined | superseded | expired）。
     for (status, lit) in [
@@ -672,8 +672,10 @@ fn pending_questions_empty_snapshot() -> SnapshotDto {
 fn server_snapshot_run_id() {
     // C4：快照携带当前 run 的 run_id——mobile 转写镜像的落盘/恢复键改从
     // 事件流内嵌值取（快照 / turn_ok summary），不再旁路 FFI 直读实时态。
-    // 带值往返保 Some；None 序列化为 null（键恒在，仿 pending_questions
-    // 先例）；旧快照缺键 → serde default 反序列化为 None（双向兼容）。
+    // 带值往返保 Some；None 序列化为**缺键**（skip_serializing_if——wire
+    // 上不出现 `"run_id":null`：Kotlin org.json 的 optString 对 JSON null
+    // 返回字面量 "null"，曾污染镜像键）；旧快照缺键 → serde default
+    // 反序列化为 None（双向兼容）。
     let mut snap = pending_questions_empty_snapshot();
     snap.run_id = Some("run-c4".into());
     let ser = serde_json::to_string(&snap).unwrap();
@@ -683,9 +685,11 @@ fn server_snapshot_run_id() {
 
     snap.run_id = None;
     let ser_none = serde_json::to_string(&snap).unwrap();
-    assert!(ser_none.contains(r#""run_id":null"#), "{ser_none}");
+    assert!(!ser_none.contains("run_id"), "{ser_none}");
+    let de: SnapshotDto = serde_json::from_str(&ser_none).unwrap();
+    assert_eq!(de.run_id, None);
     // 剥掉该键模拟旧快照：缺键 → None。
-    let legacy = ser_none.replace(r#","run_id":null"#, "");
+    let legacy = ser.replace(r#","run_id":"run-c4""#, "");
     assert!(!legacy.contains("run_id"), "{legacy}");
     let de: SnapshotDto = serde_json::from_str(&legacy).unwrap();
     assert_eq!(de.run_id, None);

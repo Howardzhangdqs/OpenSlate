@@ -38,8 +38,8 @@ MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ─
 | `src/attachments.rs` | ~1400 | `import_attachment`、`sniff_mime`、`normalize_image`（header 快速通道 + 迭代压缩）、`gate_submit_attachments`、`AttachmentDataProxy`、`refill_message_attachment_data` | 附件 ingest（多模态输入，存储 v5 §3）：magic-byte 嗅探 → sha256 content-addressing → 图像归一化（小图 JPEG/PNG header-only 零转码 passthrough；其余按用户双旋钮**迭代压缩达标** q85→70→55 → ×0.85 缩边，地板 1024）→ 视频 passthrough → 落盘；Submit 门控矩阵；请求路径字节装载代理（见 §12）。**导入纯本地零网络**（token 数由响应侧回填，见 §12.5）；全程分段耗时日志 |
 | `src/transcripts.rs` | ~640 | `SyncState`（`persist_range`/`flush_now`/`invalidate`）、`sync_loop`、`rebuild_transcript`、`heal_truncated_tail`、`DANGLING_TAIL_META`/`INCOMPLETE_TURN_META`/`HEAL_META` | transcript 持久化（存储 v5 §4 + 历史转写丢失修复 C1/C3）：SyncState 收口的增量同步 + 三个高危时刻的强制冲刷 + 两级重建（entries 优先 / 消息投影回退 / 截断自愈）+ 存储健康横幅（见 §13）；sync_loop 兼附件 tokens 回填消费点（见 §12.5） |
 | `src/attachment_tokens.rs` | ~330 | `AttachmentTokenBackfill`、`overlay_tokens_from_messages` | 附件 image tokens **响应侧回填**（协议 v5）：EventSink tap 闩首次调用值 → sync_loop 落 transcript → 重开经 messages.meta_json 重放（见 §12.5） |
-| `src/output_storer.rs` | ~200 | `MobileOutputStorer` | 长输出落盘 storer（长输出落盘 + output_query C3）：实现 core `ToolOutputStorer` 接缝——超限工具输出 sha256 寻址 → zstd-3 压缩 → store v6 `tool_outputs` 行 + `files/outputs/{sha}.zst`；任何失败返回 `None`（core 回落旧截断路径，绝不失败回合）。store 经 `SharedStore`（OnceLock 后注，AttachmentDataProxy 同款接缝）在 assemble_state 后由 create_with 注入；进程级单槽 `set_tool_output_storer` 随进程生灭（shutdown 无需清理）；装配启动序列挂 `gc_orphan_output_files`（失败仅告警） |
-| `src/output_query.rs` | ~1100 | `OutputQueryTool`、`OUTPUT_QUERY_TOOL` | output_query 内置工具（长输出落盘 + output_query C4）：模型按 `[STORED OUTPUT ref=…]` 标记取回落盘全文的 head/tail/lines/grep/wc 五算子查询；64KB 块式行迭代核心（改造自 uutils/coreutils head，MIT 署名）一份共用；累计封顶 = `max_output_bytes` 生效值；免审批（见 §15） |
+| `src/output_storer.rs` | ~200 | `MobileOutputStorer` | 长输出落盘 storer（长输出落盘 + output_query C3）：实现 core `ToolOutputStorer` 接缝——超限工具输出 sha256 寻址 → zstd-3 压缩 → store `tool_outputs` 行 + `files/outputs/{sha}.zst`；**ref = 会话内自增短 id `out-N`**（同 run 同 sha 幂等复用既有 ref，分配在 storer 串行路径、唯一索引兜底）；任何失败返回 `None`（core 回落旧截断路径，绝不失败回合）。store 经 `SharedStore`（OnceLock 后注，AttachmentDataProxy 同款接缝）在 assemble_state 后由 create_with 注入；进程级单槽 `set_tool_output_storer` 随进程生灭（shutdown 无需清理）；装配启动序列挂 `gc_orphan_output_files`（失败仅告警） |
+| `src/output_query.rs` | ~1200 | `OutputQueryTool`、`OUTPUT_QUERY_TOOL` | output_query 内置工具（长输出落盘 + output_query C4）：模型按 `[STORED OUTPUT ref=…]` 标记取回落盘全文的 head/tail/lines/grep/wc 五算子查询；**ref 会话内唯一短 id，`(run_id, ref)` 精确匹配严格会话隔离**（跨会话 ref 不可解析）；64KB 块式行迭代核心（改造自 uutils/coreutils head，MIT 署名）一份共用；累计封顶 = `max_output_bytes` 生效值；免审批（见 §15） |
 | `src/registry.rs` | 541+ | `RegistryStore` | 模型元数据注册表本地存储（ZSTD 压缩 + 内存缓存 + 更新）；`supports_video`（models.dev modalities 直读——Submit 门控的 video 维） |
 | `src/alog.rs` | 92 | `alog!` 宏、`TAG`、`install_panic_hook` | logcat 桥（Android 直打 `__android_log_print`，desktop 空操作） |
 
@@ -393,9 +393,10 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 - **AppState 接线**：工具本体随即 move 进 registry，接线经共享
   `Arc<OnceLock<Weak<AppState>>>`（`state_handle()` 交出）在 `create_with` 尾段
   `set(Arc::downgrade(&state))`（`AskUserContext.wire` 同款防环先例）。用途两个：
-  ① `find_tool_output` 的 `prefer_run`（当前 run 优先）；② 累计输出封顶 =
+  ① `find_tool_output(当前 run_id, ref)` 的**会话域**（严格隔离，见 §15.2）；
+  ② 累计输出封顶 =
   `RuntimeLimits::from_config(&config).max_output_bytes` 生效值（0 = 不限）。未接线 /
-  AppState 已释放（shutdown 后）→ prefer_run=None + 缺省 64KiB。
+  AppState 已释放（shutdown 后）→ 无当前 run + 缺省 64KiB。
 - **装配前调用**（注入窗口，正常流程不可达——注入先于首个回合）：返回明确错误文案
   `output_query is not available: the output store is not wired yet …`（status=Error，
   不是 Err/panic）。
@@ -405,8 +406,14 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 
 ### 15.2 行为语义
 
-- **数据链**：`ref` 校验（`out-` + 16 hex，去掉前缀）→ `find_tool_output(ref16, 当前 run 优先)`
-  → 无行返回 Error 文案（含期望格式 + 从 `[STORED OUTPUT` 标记取 ref 的提示）→
+- **ref 形态与会话隔离**（用户拍板 2026-10-22）：ref 是**会话内唯一**的自增短 id
+  （`out-N`，由 output_storer 按 run 内序号分配——同 run 同 sha 幂等复用既有 ref）。
+  行查找为 `find_tool_output(当前 run_id, ref)` 的 **`(run_id, ref)` 精确匹配**：
+  一个 run 的 ref 不能被其他 run 解析（跨 run 同 ref 各自的行互不可见），无「当前
+  run 优先 / 任意 run 回落」路径；无当前 run（未接线 / shutdown 后）返回明确错误。
+- **数据链**：`ref` 校验（`out-` + 1..16 hex）→
+  `find_tool_output(当前 run_id, ref)` → 无行返回 Error 文案（含期望格式 +
+  「ref 仅本会话内有效」提示 + 从 `[STORED OUTPUT` 标记取 ref 的提示）→
   `read_tool_output_bytes(sha64)` → zstd 解压（纯内存，≤1MiB 量级，对齐 storer 的不
   spawn_blocking 约定）→ **`len == orig_bytes` 完整性校验**（不等报错——防半写文件/内容
   错位被静默错读）→ 按 op 切片。参数校验错误（op 与字段不匹配 / start>end / n 越界 /
@@ -437,8 +444,10 @@ termux-only 命名矩阵（MCP 提供裸 `bash` 时）：HostTool 顶替 `bash`�
 
 ### 15.3 测试面
 
-`output_query.rs` 内嵌 15 个用例：五算子矩阵、末行无换行、CRLF 保 `\r`、空输出、1MiB 单行
+`output_query.rs` 内嵌 16 个用例：五算子矩阵、末行无换行、CRLF 保 `\r`、空输出、1MiB 单行
 （含「命中行超 cap 计数不展示」钉死）、64KB 块边界跨行、多字节封顶劈裂（65536 切点落
-`中` 字节中间 → 65535 边界）、grep ignore_case、参数错误文案矩阵（13 组）、未知 ref、
-orig_bytes 完整性失败、装配前错误、`LineScanner` 单元直测（空内容/空行/EOF 后 skip）。
+`中` 字节中间 → 65535 边界）、grep ignore_case、参数错误文案矩阵（15 组，含 ref 1..16
+hex 边界）、未知 ref、**跨会话隔离**（run-2 查 run-1 的 ref → Error + 会话隔离文案，
+run-1 对照组仍可解析）、orig_bytes 完整性失败、装配前错误（store 未注入 / 无当前 run）、
+`LineScanner` 单元直测（空内容/空行/EOF 后 skip）。
 装配链回归：`tests/runtime_flow.rs` 默认白名单断言含 `output_query`。

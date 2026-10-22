@@ -181,7 +181,7 @@ mcp-builtin 路线是两条不同的注册通路：没有 `[builtin_tools]` 开�
 
 | 参数 | 类型 | 语义 |
 |------|------|------|
-| `ref` | string | 落盘输出引用 `out-` + 16 hex，取自上一条工具结果里的 `[STORED OUTPUT ref="out-…" …]` 标记 |
+| `ref` | string | 落盘输出引用 `out-` + 1..16 hex（会话内自增短 id，如 `out-3`），取自**本会话**上一条工具结果里的 `[STORED OUTPUT ref="out-…" …]` 标记——**ref 仅在本会话内有效**，跨会话查询返回未知 ref 错误 |
 | `op` | enum | `head`（前 N 行）/ `tail`（末 N 行）/ `lines`（行区间，1-based 闭区间）/ `grep`（带行号正则）/ `wc`（行/字节计数） |
 | `n` | int | head/tail 行数（默认 50，上限 2000） |
 | `start` / `end` | int | lines 区间（1-based，inclusive） |
@@ -192,6 +192,8 @@ mcp-builtin 路线是两条不同的注册通路：没有 `[builtin_tools]` 开�
 tail 末行无换行也算一行；grep 恒带行号 + 尾注 `showing M of T matches`；wc 返回
 `lines: N, bytes: M`（无末行换行加 note）；**累计输出封顶 = `[limits].max_output_bytes`
 生效值**（超限字符边界截断 + `[output_query: result truncated at N bytes …]` 尾注）；
-数据链带 `len == orig_bytes` 完整性校验（防损坏静默错读）。预览标记联动与全链路见
+数据链带 `len == orig_bytes` 完整性校验（防损坏静默错读）；行查找为
+`find_tool_output(当前 run_id, ref)` 的 **run 内精确匹配**（严格会话隔离，无跨 run
+回落）。预览标记联动与全链路见
 [06-mobile/call-chains.md §3.4](../06-mobile/call-chains.md)（一图流）与
 [06-mobile/openslate-mobile.md §15](../06-mobile/openslate-mobile.md)（注册与接线）。

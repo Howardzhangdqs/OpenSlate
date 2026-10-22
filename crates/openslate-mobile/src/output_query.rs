@@ -8,8 +8,10 @@
 //!
 //! ## 数据链（与 C6 详情弹窗 `tool_output_by_call_id` 同源）
 //!
-//! `ref` 校验（`out-` + 16 hex）→ `find_tool_output(ref16, 当前 run 优先)`
-//! → 无行返回 status=Error 文案（含期望格式提示）→
+//! `ref` 校验（`out-` + 1..16 hex）→ `find_tool_output(当前 run_id, ref)`
+//! （**严格会话隔离**：`(run_id, ref)` 精确匹配，一个 run 的 ref 不能被
+//! 其他 run 解析——用户拍板 2026-10-22）→ 无行返回 status=Error 文案
+//! （含期望格式与「ref 仅本会话内有效」提示）→
 //! `read_tool_output_bytes(sha64)` → zstd 解压（纯内存操作，量级 ≤1MiB
 //! 传输上限，对齐 output_storer 的「不单独 spawn_blocking」约定）→
 //! **校验 `len == orig_bytes`**（防半写文件/内容错位被静默错读）→ 切片。
@@ -100,10 +102,10 @@ const MAX_N: usize = 2000;
 /// 64KB 读块（uutils head `BUF_SIZE` 同值）。
 const READ_CHUNK: usize = 65_536;
 
-/// 工具 description（设计定稿文案 + CRLF 行为注明）。
+/// 工具 description（设计定稿文案 + CRLF 行为注明 + 会话隔离声明）。
 const OUTPUT_QUERY_DESCRIPTION: &str = "Query the full text of a stored tool output. Long tool outputs are not shown \
 inline; instead the tool result contains a marker like \
-[STORED OUTPUT ref=\"out-...\" size=N lines=M] with a head/tail preview, and the \
+[STORED OUTPUT ref=\"out-3\" size=N lines=M] with a head/tail preview, and the \
 full text is stored on disk. \
 Use this tool when a previous tool result contained that marker and you need \
 more than the preview: find errors in the middle of build logs (grep), read a \
@@ -114,6 +116,8 @@ Workflow tips: \
 around them (e.g. start=120, end=140) for context. \
 - wc gives total lines/bytes to choose sensible ranges. \
 - Line numbers are 1-based. ref comes from the [STORED OUTPUT ...] marker. \
+- refs are scoped to the current session: only refs from tool results in \
+this conversation can be queried. \
 - Lines are split on \\n only; a trailing \\r (CRLF file) stays at the end of \
 each returned line.";
 
@@ -220,8 +224,8 @@ enum Op {
 
 /// 校验 + 归一化后的查询（错误文案直接回喂模型自纠）。
 struct ParsedQuery {
-    /// `ref` 去 `out-` 前缀后的 16 hex。
-    ref16: String,
+    /// 完整 ref（`out-N` 会话内自增短 id；`out-` + 1..16 位 hex）。
+    ref_id: String,
     op: Op,
     /// head/tail 行数（已含缺省 50 与 1..=2000 钳制校验）。
     n: usize,
@@ -232,9 +236,10 @@ struct ParsedQuery {
     pattern: Option<regex::Regex>,
 }
 
-/// `ref` 期望格式提示（参数错误与未知 ref 共用）。
-const REF_HINT: &str = "expected \"out-\" followed by exactly 16 hex characters (e.g. \"out-ab12cd34ef56ab78\") \
-taken from the '[STORED OUTPUT ref=\"out-...\" ...]' marker in a previous tool result";
+/// `ref` 期望格式提示（参数错误与未知 ref 共用；注明会话内有效）。
+const REF_HINT: &str = "expected \"out-\" followed by 1 to 16 hex characters (e.g. \"out-3\") \
+taken from the '[STORED OUTPUT ref=\"out-...\" ...]' marker in a previous tool result; \
+refs are only valid within the current session";
 
 fn parse_int_field(args: &Value, key: &str) -> Result<Option<i64>, String> {
     match args.get(key) {
@@ -254,11 +259,12 @@ fn parse_query(args: &Value) -> Result<ParsedQuery, String> {
         .and_then(|r| r.as_str())
         .ok_or_else(|| format!("'ref' is required; {REF_HINT}"))?
         .to_owned();
-    let ref16 = ref_id
-        .strip_prefix("out-")
-        .filter(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| format!("'ref' has an invalid format ({ref_id:?}); {REF_HINT}"))?
-        .to_owned();
+    let ref_ok = ref_id.strip_prefix("out-").is_some_and(|hex| {
+        !hex.is_empty() && hex.len() <= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    if !ref_ok {
+        return Err(format!("'ref' has an invalid format ({ref_id:?}); {REF_HINT}"));
+    }
 
     let op = match args.get("op").and_then(|o| o.as_str()) {
         Some("head") => Op::Head,
@@ -322,7 +328,7 @@ fn parse_query(args: &Value) -> Result<ParsedQuery, String> {
     };
 
     Ok(ParsedQuery {
-        ref16,
+        ref_id,
         op,
         n,
         start,
@@ -429,7 +435,9 @@ impl OutputQueryTool {
 
     /// `(当前 run_id, max_output_bytes 生效值)`。未接线 / AppState 已
     /// 释放（shutdown 后）→ `(None, RuntimeLimits 缺省 64KiB)`；cap 为 0
-    /// = 不限（与 core limit 的 0 = unlimited 约定一致）。
+    /// = 不限（与 core limit 的 0 = unlimited 约定一致）。run_id 为
+    /// `None` 时 execute 返回明确错误——ref 解析严格按 run 域，无会话
+    /// 即无处可查（生产不可达：接线先于首个回合）。
     fn session_context(&self) -> (Option<String>, usize) {
         let cap = RuntimeLimits::default().max_output_bytes as usize;
         let Some(state) = self.state.get().and_then(Weak::upgrade) else {
@@ -458,7 +466,7 @@ impl Tool for OutputQueryTool {
             "properties": {
                 "ref": {
                     "type": "string",
-                    "description": "stored-output reference, e.g. \"out-ab12cd34ef56ab78\" (from the '[STORED OUTPUT ref=...]' marker in a previous tool result)"
+                    "description": "stored-output reference, e.g. \"out-3\" (from the '[STORED OUTPUT ref=...]' marker in a previous tool result; refs are scoped to the current session)"
                 },
                 "op": {
                     "type": "string",
@@ -517,14 +525,23 @@ impl Tool for OutputQueryTool {
             ));
         };
 
-        // ③ 行查找（当前 run 优先）。
-        let (prefer_run, cap) = self.session_context();
-        let record = match store.find_tool_output(&query.ref16, prefer_run.as_deref()).await {
+        // ③ 行查找（严格会话隔离：`(当前 run, ref)` 精确匹配——一个
+        //    run 的 ref 不能被其他 run 解析）。
+        let (run_id, cap) = self.session_context();
+        let Some(run_id) = run_id else {
+            return Ok(error(
+                "output_query is not available: no active session (this should resolve right \
+                 after session start; if it persists, restart the app)"
+                    .to_owned(),
+            ));
+        };
+        let record = match store.find_tool_output(&run_id, &query.ref_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return Ok(error(format!(
-                    "unknown stored-output ref \"out-{}\": no stored output matches this reference. {REF_HINT}",
-                    query.ref16
+                    "unknown stored-output ref \"{}\" in this session: no stored output matches \
+                     this reference. {REF_HINT}",
+                    query.ref_id
                 )))
             }
             Err(e) => return Ok(error(format!("stored-output lookup failed: {e}"))),
@@ -548,7 +565,7 @@ impl Tool for OutputQueryTool {
         let decoded = match zstd::decode_all(zst.as_slice()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                crate::alog!("output_query: zstd 解压失败 (ref=out-{}): {e}", query.ref16);
+                crate::alog!("output_query: zstd 解压失败 (ref={}): {e}", query.ref_id);
                 return Ok(error(format!(
                     "stored-output decompression failed: {e}"
                 )));
@@ -556,8 +573,8 @@ impl Tool for OutputQueryTool {
         };
         if decoded.len() != record.orig_bytes as usize {
             crate::alog!(
-                "output_query: 完整性校验失败 (ref=out-{}): decoded={} recorded={}",
-                query.ref16,
+                "output_query: 完整性校验失败 (ref={}): decoded={} recorded={}",
+                query.ref_id,
                 decoded.len(),
                 record.orig_bytes
             );
@@ -571,7 +588,7 @@ impl Tool for OutputQueryTool {
         let text = match String::from_utf8(decoded) {
             Ok(text) => text,
             Err(e) => {
-                crate::alog!("output_query: 落盘内容非 UTF-8 (ref=out-{}): {e}", query.ref16);
+                crate::alog!("output_query: 落盘内容非 UTF-8 (ref={}): {e}", query.ref_id);
                 return Ok(error("stored-output content is not valid UTF-8".to_owned()));
             }
         };
@@ -690,7 +707,8 @@ mod tests {
         (dir, store)
     }
 
-    /// 落盘一条输出（orig/lines 按原文真实值），返回 ref_id。
+    /// 落盘一条输出（orig/lines 按原文真实值），返回 ref。
+    /// ref 按会话内自增序号分配（与 MobileOutputStorer 同款算法）。
     async fn store_output(store: &SqliteStore, content: &str) -> String {
         store_output_raw(store, content, content.len(), content.lines().count()).await
     }
@@ -706,10 +724,17 @@ mod tests {
         let data_zst = zstd::encode_all(content.as_bytes(), 3).expect("zstd");
         // 行 id 是 PRIMARY KEY（行级唯一），测试用 uuid 防冲突。
         let id = format!("out-{}", uuid::Uuid::new_v4().simple());
+        // ref = 会话内自增序号（storer 同款：max + 1）
+        let n = store
+            .max_tool_output_ref_num("run-1")
+            .await
+            .expect("max ref num")
+            + 1;
         store
             .insert_tool_output(
                 &id,
                 "run-1",
+                &format!("out-{n}"),
                 &sha,
                 "bash",
                 orig_bytes as i64,
@@ -718,15 +743,128 @@ mod tests {
                 1000,
             )
             .await
-            .expect("insert");
-        format!("out-{}", &sha[..16])
+            .expect("insert")
     }
 
-    /// 未接线 AppState 的工具（prefer_run=None、cap=64KiB 缺省）。
-    fn tool(store: &Arc<SqliteStore>) -> OutputQueryTool {
+    /// Nop 传输出口（AppState 装配的哑件）。
+    struct NopSink;
+    impl openslate_session::state::MsgSink for NopSink {
+        fn broadcast(&self, _msg: openslate_protocol::ServerMsg) {}
+        fn send_to(&self, _conn_id: u64, _msg: openslate_protocol::ServerMsg) -> bool {
+            false
+        }
+        fn conn_ids(&self) -> Vec<u64> {
+            Vec::new()
+        }
+        fn count(&self) -> usize {
+            0
+        }
+        fn close_all(&self) {}
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// 构造最小 AppState（session_run = `run_id`）并把工具接线到它——
+    /// ref 解析严格限定该 run（生产：`state_handle()` 在 `create_with`
+    /// 尾段 set `Arc::downgrade(&state)`）。
+    async fn wired_tool(store: &Arc<SqliteStore>, run_id: &str) -> OutputQueryTool {
+        use openslate_session::state::{
+            AppState, ConfigPaths, CoreInner, ProviderFactory, SessionCore, SessionRun,
+        };
+
+        let config = openslate_core::config::parse_openslate_toml(
+            r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#,
+        )
+        .expect("fixture parses");
+        let agents = openslate_core::config::AgentsConfig {
+            agents: vec![openslate_core::types::AgentConfig {
+                hidden_tools: Vec::new(),
+                id: openslate_core::types::AgentId("root".into()),
+                name: "Root".into(),
+                model: "main".into(),
+                children: vec![],
+                tools: vec![],
+                default_prompt: "root prompt".into(),
+            }],
+        };
+        let recorder = openslate_store_sqlite::recorder::RunRecorder::resume(
+            (**store).clone(),
+            openslate_core::types::RunId(run_id.into()),
+            "root",
+        )
+        .await
+        .expect("recorder");
+        let inner = CoreInner {
+            session_id: "oq-test-session".into(),
+            session_label: "oq-test".into(),
+            history: Vec::new(),
+            transcript: Vec::new(),
+            running: false,
+            compacting: false,
+            depth_cur: 0,
+            agents_running: 0,
+            tool_calls_cur: 0,
+            model_alias: "main".into(),
+            cancel: None,
+            config,
+            agents_cfg: agents.clone(),
+            agent_tree: openslate_core::agent_tree::AgentTree::from_configs(&agents.agents)
+                .expect("tree builds"),
+            skills: Vec::new(),
+            store: None,
+            session_run: Some(SessionRun {
+                run_id: openslate_core::types::RunId(run_id.into()),
+                recorder: Arc::new(recorder),
+            }),
+            manager: None,
+            engine_task: None,
+            paths: ConfigPaths {
+                active: std::path::PathBuf::from("/dev/null"),
+                global: None,
+                local: None,
+            },
+            stats: Default::default(),
+            stream: Default::default(),
+            tool_timers: Default::default(),
+            pending_step_meta: None,
+        };
+        let sink: Arc<dyn openslate_session::state::MsgSink> = Arc::new(NopSink);
+        let factory: ProviderFactory =
+            Arc::new(|_cfg: &openslate_core::config::OpenSlateConfig, _alias: &str| {
+                Err(anyhow::anyhow!("test stub provider"))
+            });
+        let state = Arc::new(AppState {
+            core: Arc::new(SessionCore::new(inner)),
+            sink: sink.clone(),
+            approval: Arc::new(openslate_session::approval::SessionApprovalBridge::new(sink)),
+            auth_token: None,
+            provider_factory: factory,
+            origin: "test",
+            _mcp: openslate_core::mcp::McpConnectionGuard::default(),
+        });
+
         let shared: SharedStore = Arc::new(OnceLock::new());
         let _ = shared.set(store.clone());
-        OutputQueryTool::new(shared)
+        let tool = OutputQueryTool::new(shared);
+        let _ = tool.state_handle().set(Arc::downgrade(&state));
+        // 工具持 Weak：AppState 必须比工具活得久（生产由 MobileRuntime
+        // 持有）。测试用 forget 保活——每用例一次 Arc 泄漏，量级可忽略。
+        std::mem::forget(state);
+        tool
+    }
+
+    /// 接线到 run-1 的工具（会话隔离查找 + cap=64KiB 缺省）。
+    async fn tool(store: &Arc<SqliteStore>) -> OutputQueryTool {
+        wired_tool(store, "run-1").await
     }
 
     async fn run(tool: &OutputQueryTool, args: Value) -> ToolOutput {
@@ -750,7 +888,7 @@ mod tests {
         let (_dir, store) = setup_store().await;
         let content = "l1\nl2\nl3\nl4\nl5\n"; // 5 行（末行有换行）
         let ref_id = store_output(&store, content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         // head 默认 n=50 → 全部 5 行。
         let out = run(&t, args(&ref_id, "head", json!({}))).await;
@@ -787,7 +925,7 @@ mod tests {
         // 3 行，末行无换行（str::lines() 仍记 3 行）。
         let content = "a\nb\nc";
         let ref_id = store_output(&store, content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let out = run(&t, args(&ref_id, "tail", json!({ "n": 2 }))).await;
         assert_eq!(out.content, "b\nc", "末行无换行也算一行");
@@ -808,7 +946,7 @@ mod tests {
         let (_dir, store) = setup_store().await;
         let content = "one\r\ntwo\r\nthree\r\n";
         let ref_id = store_output(&store, content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         // \r 留在行内（不按 str::lines() 剥离）。
         let out = run(&t, args(&ref_id, "grep", json!({ "pattern": "two" }))).await;
@@ -822,7 +960,7 @@ mod tests {
     async fn empty_content_degrades_cleanly() {
         let (_dir, store) = setup_store().await;
         let ref_id = store_output(&store, "").await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let out = run(&t, args(&ref_id, "wc", json!({}))).await;
         assert_eq!(out.content, "lines: 0, bytes: 0");
@@ -841,7 +979,7 @@ mod tests {
         let (_dir, store) = setup_store().await;
         let big = format!("x{}", "y".repeat(1_048_576)); // 1MiB + 1 单行
         let ref_id = store_output(&store, &big).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         // head/tail n=1 → 整行（读块恒 64KB，行缓冲按行长累积）。
         let out = run(&t, args(&ref_id, "head", json!({ "n": 1 }))).await;
@@ -874,7 +1012,7 @@ mod tests {
         // grep / head n=1 三面钉住。）
         let content = format!("{}\n{}\n", "a".repeat(65_530), "b".repeat(100));
         let ref_id = store_output(&store, &content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         // head n=1：line1 完整（首块内）。
         let out = run(&t, args(&ref_id, "head", json!({ "n": 1 }))).await;
@@ -900,7 +1038,7 @@ mod tests {
         // 单行 90_000B 中文（3B/字）→ head n=1 超 64KiB cap。
         let content = "中".repeat(30_000);
         let ref_id = store_output(&store, &content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let out = run(&t, args(&ref_id, "head", json!({ "n": 1 }))).await;
         assert_eq!(out.status, ToolOutputStatus::Success);
@@ -922,7 +1060,7 @@ mod tests {
         // 5000 行 × ~40B ≈ 200KB → 超 64KiB。
         let content: String = (0..5000).map(|i| format!("match-line-{i:04}-paddingpadding\n")).collect();
         let ref_id = store_output(&store, &content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let out = run(&t, args(&ref_id, "grep", json!({ "pattern": "match" }))).await;
         assert!(out.content.contains("showing "));
@@ -946,7 +1084,7 @@ mod tests {
         let (_dir, store) = setup_store().await;
         let content = "ERROR: boom\ninfo: ok\n";
         let ref_id = store_output(&store, content).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let out = run(&t, args(&ref_id, "grep", json!({ "pattern": "error" }))).await;
         assert_eq!(out.content, "showing 0 of 0 matches", "默认大小写敏感");
@@ -961,13 +1099,15 @@ mod tests {
     async fn argument_errors_are_plain_text_error_outputs() {
         let (_dir, store) = setup_store().await;
         let ref_id = store_output(&store, "x\n").await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let cases: Vec<(Value, &str)> = vec![
-            // ref 缺失 / 格式非法。
+            // ref 缺失 / 格式非法（1..16 hex 边界）。
             (json!({ "op": "wc" }), "'ref' is required"),
             (args("not-a-ref", "wc", json!({})), "invalid format"),
             (args("out-zzzz", "wc", json!({})), "invalid format"),
+            (args("out-", "wc", json!({})), "invalid format"),
+            (args(&format!("out-{}", "a".repeat(17)), "wc", json!({})), "invalid format"),
             // op 非法。
             (args(&ref_id, "middle", json!({})), "must be one of"),
             (json!({ "ref": ref_id }), "'op' is required"),
@@ -1012,7 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_ref_error_mentions_marker_hint() {
         let (_dir, store) = setup_store().await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         // 合法格式但无行。
         let out = run(&t, args("out-0000000000000000", "wc", json!({}))).await;
@@ -1023,6 +1163,49 @@ mod tests {
             "提示从标记取 ref: {}",
             out.content
         );
+        assert!(
+            out.content.contains("current session"),
+            "错误文案注明 ref 仅本会话内有效: {}",
+            out.content
+        );
+    }
+
+    /// **跨会话隔离**：run-1 落盘的 ref 在第二个会话（run-2）查询 →
+    /// Error（严格 `(run_id, ref)` 匹配，绝不回落其他 run 的行）。
+    #[tokio::test]
+    async fn cross_session_ref_is_not_resolvable() {
+        let (_dir, store) = setup_store().await;
+        store
+            .insert_run("run-2", None, "root", "running", "{}", 2000)
+            .await
+            .expect("run-2");
+        let content = "session-one log\n".to_owned() + &"k".repeat(9000);
+        let run1_ref = store_output(&store, &content).await; // 落在 run-1
+
+        // 第二个会话查同一个 ref → Error（不是 Success、不是回落内容）
+        let t2 = wired_tool(&store, "run-2").await;
+        let out = run(&t2, args(&run1_ref, "wc", json!({}))).await;
+        assert_eq!(out.status, ToolOutputStatus::Error, "got: {}", out.content);
+        assert!(
+            out.content.contains(&format!("unknown stored-output ref \"{run1_ref}\" in this session")),
+            "got: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("current session"),
+            "注明会话隔离语义: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("session-one log"),
+            "run-1 的内容绝不泄漏给 run-2"
+        );
+
+        // 对照：run-1 自己的会话仍可解析同一 ref
+        let t1 = wired_tool(&store, "run-1").await;
+        let out = run(&t1, args(&run1_ref, "wc", json!({}))).await;
+        assert_eq!(out.status, ToolOutputStatus::Success);
+        assert!(out.content.contains(&format!("lines: {}", content.lines().count())));
     }
 
     #[tokio::test]
@@ -1031,7 +1214,7 @@ mod tests {
         // orig_bytes 伪造 +42 → 解压后 len != orig_bytes。
         let content = "hello\nworld\n";
         let ref_id = store_output_raw(&store, content, content.len() + 42, 2).await;
-        let t = tool(&store);
+        let t = tool(&store).await;
 
         let out = run(&t, args(&ref_id, "wc", json!({}))).await;
         assert_eq!(out.status, ToolOutputStatus::Error);
@@ -1046,12 +1229,27 @@ mod tests {
 
     #[tokio::test]
     async fn store_not_wired_returns_explicit_error() {
+        // ① store 未注入（装配窗口）
         let t = OutputQueryTool::new(Arc::new(OnceLock::new()));
         let out = run(&t, args("out-0000000000000000", "wc", json!({}))).await;
         assert_eq!(out.status, ToolOutputStatus::Error);
         assert!(
             out.content.contains("not available"),
             "装配前调用的明确错误文案: {}",
+            out.content
+        );
+
+        // ② store 已注入但 AppState 未接线（无当前 run）——严格会话隔离
+        //    下无处可查，明确报错而非回落任意 run
+        let (_dir, store) = setup_store().await;
+        let shared: SharedStore = Arc::new(OnceLock::new());
+        let _ = shared.set(store.clone());
+        let t = OutputQueryTool::new(shared);
+        let out = run(&t, args("out-1", "wc", json!({}))).await;
+        assert_eq!(out.status, ToolOutputStatus::Error);
+        assert!(
+            out.content.contains("no active session"),
+            "无会话时的明确错误文案: {}",
             out.content
         );
     }

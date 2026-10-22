@@ -1397,11 +1397,11 @@ impl MobileRuntime {
     ///
     /// 长输出闭环（C6，零新 FFI 面）：命中消息的 content 若带
     /// `[STORED OUTPUT ref="out-…"` 标记（core 分叉点替换的落盘预览），
-    /// 按 ref16 反查 `tool_outputs` 行 → 读 `files/outputs/{sha}.zst`
-    /// 解压 → 校验 `len == orig_bytes` → 返回全文（封顶 512 KiB：头
-    /// 448 KiB + 省略行 + 尾 64 KiB，UTF-8 字符边界安全截断）。
-    /// 行缺失 / 文件缺失 / 解压失败 / 长度不符 / 无标记 → **返回 content
-    /// 原文**（预览本身可读，现降级语义不变）。
+    /// 按 `(当前 run, ref)` 反查 `tool_outputs` 行（严格会话隔离）→ 读
+    /// `files/outputs/{sha}.zst` 解压 → 校验 `len == orig_bytes` → 返回
+    /// 全文（封顶 512 KiB：头 448 KiB + 省略行 + 尾 64 KiB，UTF-8 字符
+    /// 边界安全截断）。行缺失 / 文件缺失 / 解压失败 / 长度不符 / 无
+    /// 标记 → **返回 content 原文**（预览本身可读，现降级语义不变）。
     ///
     /// `None`（miss）场景与降级：call_id 为空/未知；history 被
     /// auto_compact 换成摘要；call_agent 子代理的工具（子代理 history
@@ -1427,9 +1427,19 @@ impl MobileRuntime {
 
     /// 长输出全文展开（C6）：content 带落盘标记则取回全文（封顶截断），
     /// 任何失败回落 content 原文。
-    fn expand_stored_output(&self, content: String, prefer_run: Option<&str>) -> String {
-        let Some(ref16) = parse_stored_output_ref16(&content) else {
+    fn expand_stored_output(&self, content: String, run_id: Option<&str>) -> String {
+        let Some(ref_id) = parse_stored_output_ref(&content) else {
             return content; // 无标记：普通（截断）输出，原文返回
+        };
+        // 无当前 run（会话未开 run / 已关闭）→ 无处可查（严格会话隔离，
+        // 不回落其他 run 的行），回落预览。
+        let Some(run_id) = run_id else {
+            tracing::debug!(
+                target: "openslate_mobile",
+                ref_id,
+                "stored output row lookup skipped: no active run; fallback to preview"
+            );
+            return content;
         };
         // store 未装配（无 DB 配置）→ 回落。
         let Some(store) = self.state.core.lock().store.clone() else {
@@ -1444,14 +1454,14 @@ impl MobileRuntime {
             rt.handle().clone()
         };
         let expanded = handle.block_on(async move {
-            // 行缺失（ref 失效 / run 已删）→ None → 回落
+            // 行缺失（ref 失效 / run 已删 / ref 属其他会话）→ None → 回落
             let Some(record) = store
-                .find_tool_output(ref16, prefer_run)
+                .find_tool_output(run_id, ref_id)
                 .await
                 .ok()
                 .flatten()
             else {
-                tracing::debug!(target: "openslate_mobile", ref_id = ref16, "stored output row missing; fallback to preview");
+                tracing::debug!(target: "openslate_mobile", ref_id, "stored output row missing; fallback to preview");
                 return None;
             };
             // 文件缺失（崩溃窗口 / 手动清理）→ None → 回落
@@ -1467,7 +1477,7 @@ impl MobileRuntime {
             if text.len() != record.orig_bytes as usize {
                 tracing::warn!(
                     target: "openslate_mobile",
-                    ref_id = ref16,
+                    ref_id,
                     decoded = text.len(),
                     recorded = record.orig_bytes,
                     "stored output size mismatch; falling back to preview"
@@ -2068,20 +2078,26 @@ fn cap_stored_full_text(text: String) -> String {
     )
 }
 
-/// 从 Tool 消息 content 解析首个落盘标记的 ref16（16 hex）。
+/// 从 Tool 消息 content 解析首个落盘标记的 ref（完整 `out-…` 形态）。
 ///
 /// 头行格式（core `build_preview` 冻结）：
-/// `[STORED OUTPUT ref="out-{16hex}" size=… lines=…]`。解析用 core 的
-/// `STORED_OUTPUT_MARKER` 常量定位 + 前缀逐段剥（不用正则：格式冻结、
-/// 单一形态，手工解析零依赖且更快）。无标记 / 形状不符 → `None`。
-fn parse_stored_output_ref16(content: &str) -> Option<&str> {
+/// `[STORED OUTPUT ref="out-{1..16 hex}" size=… lines=…]`。ref 是会话内
+/// 自增短 id（`out-3`；旧 16hex 形态同样可解析——格式上界 16 位）。
+/// 解析用 core 的 `STORED_OUTPUT_MARKER` 常量定位 + 前缀逐段剥（不用
+/// 正则：格式冻结、单一形态，手工解析零依赖且更快）。无标记 / 形状
+/// 不符 → `None`。
+fn parse_stored_output_ref(content: &str) -> Option<&str> {
     let marker = openslate_core::output_store::STORED_OUTPUT_MARKER;
     let start = content.find(marker)?;
     let rest = content[start + marker.len()..].trim_start();
-    let rest = rest.strip_prefix("ref=\"out-")?;
-    let ref16 = rest.get(..16)?;
-    if ref16.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(ref16)
+    let after = rest.strip_prefix("ref=\"out-")?;
+    // ref 以闭引号终结（短 id 如 out-3 的长度不固定）
+    let end = after.find('"')?;
+    let hex = &after[..end];
+    if !hex.is_empty() && hex.len() <= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // 返回完整 ref（含 out- 前缀，与 store 的 ref 列同构）：
+        // rest 此刻以 `ref="out-…` 开头，`"ref=\""` 占 5 字节。
+        Some(&rest[5..5 + 4 + end])
     } else {
         None
     }
@@ -3829,9 +3845,11 @@ mod tests {
             guard.as_ref().expect("runtime alive").handle().clone()
         };
 
-        // sha + 行/文件（C1 API：zst 由调用方压好）
+        // sha + 行/文件（C1 API：zst 由调用方压好）。ref 用旧 16hex 形态
+        // （sha 前 16 位）——顺带钉住短 id 之外的格式上界解析路径。
         use sha2::{Digest, Sha256};
         let sha_hex = format!("{:x}", Sha256::digest(full_text.as_bytes()));
+        let ref_id = format!("out-{}", &sha_hex[..16]);
         let data_zst = zstd::encode_all(full_text.as_bytes(), 3).expect("zst");
         handle.block_on(async {
             store
@@ -3842,6 +3860,7 @@ mod tests {
                 .insert_tool_output(
                     "out-c6",
                     "run-c6",
+                    &ref_id,
                     &sha_hex,
                     "bash",
                     full_text.len() as i64,
@@ -3851,6 +3870,20 @@ mod tests {
                 )
                 .await
                 .expect("tool output row");
+            // 会话身份：严格会话隔离下查找按 (run, ref) 精确匹配，
+            // session_run 必须指向落盘行所在的 run-c6。
+            let recorder = openslate_store_sqlite::recorder::RunRecorder::resume(
+                store.clone(),
+                openslate_core::types::RunId("run-c6".into()),
+                "root",
+            )
+            .await
+            .expect("recorder");
+            let mut inner = runtime.state.core.lock();
+            inner.session_run = Some(openslate_session::state::SessionRun {
+                run_id: openslate_core::types::RunId("run-c6".into()),
+                recorder: Arc::new(recorder),
+            });
         });
         if delete_file {
             std::fs::remove_file(
@@ -3892,6 +3925,36 @@ mod tests {
             });
         }
         (runtime, sha_hex, preview, dir)
+    }
+
+    /// 落盘标记 ref 解析（短 id / 16hex 上界 / 非法形状）。
+    #[test]
+    fn parse_stored_output_ref_short_and_legacy_forms() {
+        let marker_of = |r: &str| {
+            format!("[STORED OUTPUT ref=\"{r}\" size=1 lines=1]\npreview")
+        };
+        // 短 id（v7 会话内自增序号）
+        assert_eq!(parse_stored_output_ref(&marker_of("out-3")), Some("out-3"));
+        assert_eq!(parse_stored_output_ref(&marker_of("out-42")), Some("out-42"));
+        // 16hex 长形态（格式上界）
+        assert_eq!(
+            parse_stored_output_ref(&marker_of("out-ab12cd34ef56ab78")),
+            Some("out-ab12cd34ef56ab78")
+        );
+        // 标记不在行首（前面有任意文本）也能定位
+        assert_eq!(
+            parse_stored_output_ref(&format!("noise\n{}", marker_of("out-7"))),
+            Some("out-7")
+        );
+        // 非法形状 → None
+        assert_eq!(parse_stored_output_ref(&marker_of("out-")), None, "空 hex");
+        assert_eq!(
+            parse_stored_output_ref(&marker_of(&format!("out-{}", "a".repeat(17)))),
+            None,
+            "超 16 位"
+        );
+        assert_eq!(parse_stored_output_ref(&marker_of("out-zzzz")), None, "非 hex");
+        assert_eq!(parse_stored_output_ref("plain content"), None, "无标记");
     }
 
     /// C6：有标记 → 行+文件齐全时取回全文（== 落盘原文）。

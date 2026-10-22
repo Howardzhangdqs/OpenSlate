@@ -582,18 +582,22 @@ mask 全文（mask_tool_output 提前到 fork 之前——落盘的必须是脱�
 T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user 豁免）
   超阈值 && 宿主注册了 storer（mobile = MobileOutputStorer，进程级单槽）
     → sha256 内容寻址 → zstd-3 → files/outputs/{sha}.zst 先落文件
-    → 再插 tool_outputs 行（schema v6，(run_id, sha) 唯一）
+    → 再插 tool_outputs 行（schema v7：(run_id, sha) 唯一 + (run_id, ref) 唯一；
+      ref = 会话内自增短 id out-N——先按 (run, sha) 查既有行命中则复用其 ref，
+      未命中 max 序号 +1 分配）
                                         【写序不变量：先文件后行后 message——
                                           崩溃窗口内行在则文件必在】
     → storer 返回 None（任何一步失败）→ core 回落旧 limit 截断路径，回合照常
         ▼
 对话内替换为冻结格式预览（core output_store.rs build_preview，~2.3KB：
-  [STORED OUTPUT ref="out-{sha256前16hex}" size=N lines=M] 头行
+  [STORED OUTPUT ref="out-N" size=N lines=M] 头行（ref 为会话内短 id）
   + 头 ≤1024B + [... N bytes omitted (M lines) — use output_query to inspect ...]
   + 尾 ≤1024B；UTF-8 字符边界安全；status=Truncated）
         │
         ├─► 模型侧取回：output_query 工具（mobile output_query.rs，C4）
-        │     ref 校验（out-+16hex）→ find_tool_output（当前 run 优先）
+        │     ref 校验（out-+1..16hex）→ find_tool_output(当前 run_id, ref)
+        │     【严格会话隔离：(run, ref) 精确匹配，跨 run 的 ref 不可解析
+        │       ——错误文案注明 ref 仅本会话内有效】
         │     → read_tool_output_bytes → zstd 解压 → len==orig_bytes 完整性校验
         │     → head/tail/lines/grep/wc 切片（64KB 块式行迭代，行内 \r 保留）
         │     → 累计封顶 = [limits].max_output_bytes 生效值（超限字符边界截断
@@ -703,8 +707,10 @@ core runtime 发射 on_tool_start/on_tool_end（带 &tc.id.0）
                 锁 state.core → 扫 CoreInner.history
                 role==Tool && tool_call_id==Some(call_id) → clone content（解锁后再展开）
                 content 带 [STORED OUTPUT ref="out-… 标记（长输出落盘预览，C6）→
-                  parse_stored_output_ref16（core STORED_OUTPUT_MARKER 定位，16 hex）
-                  → store.find_tool_output(ref16, 当前 run_id 优先)
+                  parse_stored_output_ref（core STORED_OUTPUT_MARKER 定位，1..16 hex）
+                  → store.find_tool_output(当前 run_id, ref)
+                    【严格会话隔离：(run, ref) 精确匹配；无当前 run / ref 属其他
+                      会话 → 查无行 → 回落预览】
                   → read_tool_output_bytes(sha256) → zstd 解压 → len==orig_bytes 校验
                   → 全文返回（封顶 512 KiB：头 448 KiB + 省略行 + 尾 64 KiB，字符边界安全）
       取更长者显示：longerOf(fullOut, tc.output)——host 工具的 Kotlin 缓存可能比

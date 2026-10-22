@@ -550,7 +550,14 @@ private fun LineNumberedCode(body: String, language: String, modifier: Modifier 
         value = buildSyntaxAnnotatedString(body, language, tokenizer, theme)
     }.value
 
-    val lines = remember(body) { body.removeSuffix("\n").split("\n") }
+    // lines 必须与被切的 highlighted 同源派生：produceState 在 body 变更
+    // 后的首帧仍持有上一代高亮串（异步重算中），若 lines 取自新 body，
+    // 新偏移会切在旧串上 → StringIndexOutOfBoundsException（流式增量
+    // 首帧的必现窗口，曾致对话结束渲染时主线程崩溃退场）。同源派生下
+    // 偏移与被切串恒为同一代，旧一代仅表现为内容晚一帧刷新。
+    val lines = remember(highlighted) {
+        highlighted.text.removeSuffix("\n").split("\n")
+    }
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
     // 行号列宽：以最大行号字符串（与渲染完全相同的 style）实测宽度；
@@ -596,7 +603,11 @@ private fun LineNumberedCode(body: String, language: String, modifier: Modifier 
                 val lineStart = start
                 start += line.length + 1
                 // subSequence 会保留并平移该行内的高亮 span；空行占位保持行高。
-                val lineText = highlighted.subSequence(lineStart, lineStart + line.length)
+                // 双端 clamp 兜底：同源派生下恒不越界，此为对未来派生方式
+                // 漂移的防御（越界即主线程 FATAL，代价必须无限高）。
+                val from = lineStart.coerceAtMost(highlighted.length)
+                val to = (lineStart + line.length).coerceAtMost(highlighted.length)
+                val lineText = highlighted.subSequence(from, to)
                     .ifEmpty { AnnotatedString(" ") }
                 Text(
                     text = lineText,

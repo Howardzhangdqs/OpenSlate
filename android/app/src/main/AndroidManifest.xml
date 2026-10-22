@@ -5,6 +5,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 回合期唤醒锁（AgentService，normal 级免弹窗）：WAKE_LOCK = CPU
+         唤醒（PARTIAL_WAKE_LOCK）；ACCESS_WIFI_STATE = WifiLock 创建所需
+         （WIFI_MODE_FULL_HIGH_PERF 抑制 Wi-Fi 省电断连，保流式连接）。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- termux.run：Termux 的 RUN_COMMAND 自定义权限（dangerous runtime
          permission，可在系统设置 → 应用 → OpenSlate → 权限 中授予，或经
          Shizuku 一键 pm grant；Termux 未装时无副作用）。 -->

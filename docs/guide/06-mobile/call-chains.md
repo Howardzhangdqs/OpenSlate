@@ -626,7 +626,10 @@ MainActivity.onCreate
   → AgentService.start(ctx)（startForegroundService）
   → AgentService.onCreate
       startForegroundWithNotification（API 34+ 走 SPECIAL_USE 重载）
+      createTurnLocks（PARTIAL_WAKE_LOCK + WifiLock，只创建不获取）
       lifecycleScope.launch { RuntimeBridge.start(this@AgentService) }
+      lifecycleScope.launch { RuntimeBridge.state.collect { running ?持锁 : 释放 } }
+        【回合期唤醒锁：FGS 只保进程不保网络/CPU，见 §4.2】
   → RuntimeBridge.start（startMutex 防重入；Dispatchers.IO——装配可能阻塞数秒）
       1. 组 MobilePathsDto：filesDir/openslate | filesDir/workspace | filesDir/data | cacheDir/openslate
       2. McpHostManager.token(ctx) → uniffi setMcpHostToken(token)   【必须在 create 前】
@@ -650,10 +653,13 @@ MainActivity.onCreate
 
 App 退到后台：前台服务存活，runtime 与事件流不受影响（POST_NOTIFICATIONS + FOREGROUND_SERVICE_SPECIAL_USE）。
 
+后台保网络机制：FGS 只保**进程**不保网络/CPU——切后台后系统照常进 doze/省电，会掐断模型流式连接（"error decoding response body"）。AgentService 由回合运行态驱动持锁：收集 `RuntimeBridge.state` 的 `running` 字段，true → `acquire`（`PARTIAL_WAKE_LOCK`（tag `openslate:turn`，灭屏保 CPU）+ `WifiLock(WIFI_MODE_FULL_HIGH_PERF)`（抑制 Wi-Fi 省电断连）），false → 立即释放（空闲不长持耗电）；onDestroy 强制释放兜底。MIUI 类激进省电不保证 100% 拦截，回合级重试是另一轨的兜底。
+
 ### 4.3 关停
 
 ```text
 AgentService.onDestroy
+  → releaseTurnLocks（唤醒锁强制释放兜底——收集协程可能被 DESTROYED 截断）
   → runBlocking { withTimeoutOrNull(2_500) { RuntimeBridge.shutdown() } }
       【宁可短暂阻塞主线程也要同步等——lifecycleScope 协程会被 DESTROYED
         竞态截断，Rust 收尾做一半 = run 僵尸 + SQLite 撕裂】

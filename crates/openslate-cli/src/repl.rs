@@ -691,6 +691,10 @@ impl ReplSession {
                     println!("    max_context_messages={}", limits.max_context_messages);
                     println!("    max_context_bytes={}", limits.max_context_bytes);
                     println!("    max_output_bytes={}", limits.max_output_bytes);
+                    println!(
+                        "    output_store_threshold={}",
+                        limits.output_store_threshold
+                    );
                 } else {
                     println!("  limits: (using defaults)");
                 }

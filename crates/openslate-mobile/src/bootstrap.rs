@@ -255,6 +255,9 @@ auto_compact = true
 max_context_bytes = 60000
 max_context_messages = 220
 max_turn_output_bytes = 131072
+# 长输出落盘阈值（字节）：工具输出超过该值时全文（脱敏后）落 SQLite，
+# 对话内替换为头尾预览，模型可用 output_query 取回全文。0 = 关闭。
+output_store_threshold = 16384
 # 无总时长预算（i64::MAX；TOML 整数为 i64 域，u64::MAX 字面量会被
 # toml_edit 拒绝 → persist 层写回失败）；挂死防护 = 每请求 60s 无新数据即断。
 timeout_ms = 9223372036854775807

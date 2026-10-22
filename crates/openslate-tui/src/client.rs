@@ -222,6 +222,7 @@ pub fn config_from_view(view: &ConfigViewDto) -> openslate_core::config::OpenSla
         max_context_messages: view.limits.max_context_messages,
         max_context_bytes: view.limits.max_context_bytes,
         max_output_bytes: view.limits.max_output_bytes,
+        output_store_threshold: view.limits.output_store_threshold,
         auto_compact: view.limits.auto_compact,
         parallel_tool_calls: view.limits.parallel_tool_calls,
     };
@@ -266,6 +267,7 @@ pub fn view_from_config(config: &openslate_core::config::OpenSlateConfig) -> Con
             max_context_messages: 200,
             max_context_bytes: 512000,
             max_output_bytes: 65536,
+            output_store_threshold: 16384,
             auto_compact: true,
             parallel_tool_calls: true,
         });
@@ -1002,6 +1004,7 @@ mod tests {
                 max_context_messages: 200,
                 max_context_bytes: 512000,
                 max_output_bytes: 65536,
+                output_store_threshold: 16384,
                 auto_compact: true,
                 parallel_tool_calls: true,
             },

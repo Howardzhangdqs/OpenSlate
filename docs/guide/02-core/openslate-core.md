@@ -1,6 +1,6 @@
 # 02-1 · openslate-core 模块详解
 
-> 领域核心 crate（`crates/openslate-core/src/`，lib.rs 声明 21 个顶层模块，其中 `config/` 与 `context_manager/` 是目录模块——按 20 个文件组逐一详解）。**不依赖任何前端/传输**；workspace 内仅依赖 `openslate-mcp-builtin` 与 `openslate-ptc`。模块声明见 `src/lib.rs:1-21`；`prelude` 重导出 callable/config/context_manager/error/paths/provider/types（lib.rs:23-31）。
+> 领域核心 crate（`crates/openslate-core/src/`，lib.rs 声明 22 个顶层模块，其中 `config/` 与 `context_manager/` 是目录模块——按 21 个文件组逐一详解）。**不依赖任何前端/传输**；workspace 内仅依赖 `openslate-mcp-builtin` 与 `openslate-ptc`。模块声明见 `src/lib.rs:1-22`；`prelude` 重导出 callable/config/context_manager/error/paths/provider/types（lib.rs:23-31）。
 
 ## 模块地图
 
@@ -27,6 +27,7 @@
 | 19 | `paths.rs` | 路径发现 |
 | 20 | `trace.rs` + `error.rs` | Chrome Trace 导出 / 错误类型 |
 | 21 | `ask_user.rs` | ask_user 消息历史手术与合成文案（迟到答案/悬挂修复） |
+| 22 | `output_store.rs` | 长输出落盘接缝（ToolOutputStorer 注册槽 + 预览构造，C2） |
 
 ---
 
@@ -139,8 +140,9 @@ pub struct RunManager {
 - `MessageSink` trait（:47）：`append(&Message)` + **`append_with_meta(&Message, &MessageMeta)`（v5 §2 元数据旁路）**。默认实现丢弃 meta 委托 `append` —— 只 override `append` 的第三方 sink 不破坏（测试钉死）。辅助：`sink_append`（:62，无 meta）/ `sink_append_with_meta`（:70，assistant 消息专用）。
 - **v5 §2 捕获点**（`execute_run` 内，assistant 消息构造处 :705-717）：流式/非流式两路径在 response 汇合点（:668）之后统一构造 `MessageMeta{model_id（当前请求模型）, usage/finish_reason（取 ModelResponse）, latency_ms（`call_start`（:519）Instant 差值，快照 :670）}`，随 assistant 消息走 `sink_append_with_meta`；**user/tool 消息维持无 meta 的 `append`**。meta 不进 `Message` 本体（provider 回放零泄漏），持久化层（RunRecorder override `append_with_meta`）落 `messages.meta_json`。
 - 取消辅助：`interrupted_result`（:85，Interrupted + 部分转写）、`token_cancelled`（:107，None → pending 永不触发）、`cancelled_tool_message`（:116，`"[tool call cancelled before completion]"`）、`append_cancelled_tool_results`（:146，补合成 Tool 消息防悬空 tool_calls；**ask_user 豁免**——按工具名跳过，悬挂保留给迟到答案，ask-user r5 不变量，并行批 drain 的 None slot 同款豁免）。
-- `RuntimeLimits`（:164）：max_steps/max_depth/max_tool_calls/max_child_agent_calls/**timeout_ms**（回合级纯 LLM 时间预算，fix-21）/max_context_bytes/max_output_bytes/max_empty_turns/**parallel_tool_calls**。`Default`（:188）：steps=0(不限)/depth=4/tool_calls=20/child_calls=8/timeout=60s/ctx=64KB/out=64KB/empty=3/parallel=true。
+- `RuntimeLimits`（:164）：max_steps/max_depth/max_tool_calls/max_child_agent_calls/**timeout_ms**（回合级纯 LLM 时间预算，fix-21）/max_context_bytes/max_output_bytes/**output_store_threshold**（长输出落盘阈值，C2：0=关，默认 16384；未注册 storer 时无效）/max_empty_turns/**parallel_tool_calls**。`Default`（:188）：steps=0(不限)/depth=4/tool_calls=20/child_calls=8/timeout=60s/ctx=64KB/out=64KB/store=16KB/empty=3/parallel=true。
 - `check_limits`（:205）：步/深/工具/子调用四闸。
+- **`fork_stored_output(config, tool_name, output)`（私有 async，C2）**：长输出落盘分叉，顺序/并行两路径共用。工具结果三段处理 **mask → fork → limit**（C2 起 mask 提前到最前——落盘的必须是脱敏后文本，vault 凭据绝不落盘；limit 保留为最后兜底）：`ask_user` 豁免（问卷重建链依赖全量原文）/阈值 0 或输出 ≤ 阈值直通/未注册 storer 或 `store` 返回 None（存储不可用）原样回落 limit 路径——双路径降级阶梯不变；命中则 content 换 `build_preview` 预览、status 置 `Truncated`（progress truncated 链路零改动），见 [output_store.rs](#22-output_storers-长输出落盘接缝c2)。
 - `CostSpec`（:244）：`from_prices(in, out)` / `is_configured` / `cost_of(&Usage) -> f64`（per-mtok 计价；cached/reasoning additive 字段刻意忽略）。
 - `RunConfig`（:283）/`RunResult`（:317）/`StepResult`（:332）。
 - `execute_run`（:399）：**主循环**。流式事件→progress；tool_calls→审批→执行（并发批，join 点按 tool_call 序协调顺序敏感操作）→sink 落盘→循环。
@@ -153,7 +155,7 @@ pub struct RunManager {
 - `OpenSlateConfig`（:57）：project?/database?/prompts?/limits?/providers/models/**levels: HashMap<String,String>**（:78）/trace?/mcp?/builtin_tools/skills/ptc/approval?/tui/**ask_user**（ask-user：`[ask_user]` 段）/**attachments**（多模态输入：`[attachments]` 段，存储 v5 §6.6）。
 - `AskUserConfig`（default_timeout: `AskTimeout` + mask_secrets: bool——**已消费**：mobile 装配期注入 core 脱敏器闭包的开关短路（默认 Never/true，deny_unknown_fields））/ `AskTimeout`（`Never | Seconds(u64)`，serde 外部标签：`"never"` / `{ seconds = 300 }`）。
 - **`AttachmentsConfig`（`[attachments]`，多模态输入 §6.6；2026-10-21 图片处理用户可配置）**：`max_image_dim=2048`（**用户旋钮**：等比缩放目标边长，值域 512–6000）/ `max_image_mb=5`（**用户旋钮**：**处理后**大小上限 MB，值域 1–5——语义自「ingest 入口源文件上限（旧默认 10）」迁移，入口防呆改固定 50MB 常量，归一化迭代压缩 q85→70→55 → ×0.85 缩边以此达标，地板 dim 1024）/ `max_video_mb=50`（视频落盘上限，passthrough 不转码）/ `max_inline_video_mb=20`（data:URL 内联发送上限）/ `max_inline_total_mb=25`（单请求附件总字节）/ `experimental_video=false`（实验视频开关）。整段 `#[serde(default)]`（缺省即安全值）、deny_unknown_fields、Copy；validation 边界（`validation::attachments_floor_errors`）：512 ≤ dim ≤ 6000、1 ≤ max_image_mb ≤ 5（= ingest 出口 ≤5MB/≤6000² provider 公共分母）、其余 mb ≥ 1。消费方在 openslate-mobile（ingest / Submit 门控 / 回填封顶）；写回：mobile FFI setter（`set_image_processing` / `set_experimental_video`，toml_edit 原地改写）。
-- `ProviderConfig`（:197）/ `ModelConfig`（:223）/ `LimitsConfig`（:147，`#[serde(default)]` 整段缺省）/ `TraceConfig`（:249）/ `McpConfig`+`McpServerConfig`（:270/:281）+ `TransportConfig`（:295，stdio/HTTP）/ `AgentsConfig`（:320）/ `BuiltinToolsConfig`（:332）/ `SkillsConfig`（:360）/ `TuiConfig`+`TuiIconsConfig`（:381/:395）/ `PtcConfig`（:403）/ `ApprovalPolicySetting`（:518，legacy `policy` 键拼写）+ `ToolApprovalLevelSetting`（:533，新 schema 等级拼写 "manual"/"allow"/"auto"）+ `ApprovalConfig`（:556）。
+- `ProviderConfig`（:197）/ `ModelConfig`（:223）/ `LimitsConfig`（:147，`#[serde(default)]` 整段缺省；含 **`output_store_threshold`**（C2 长输出落盘阈值，默认 16384、0=关闭，validation 值域 0 或 4096..=16MiB））/ `TraceConfig`（:249）/ `McpConfig`+`McpServerConfig`（:270/:281）+ `TransportConfig`（:295，stdio/HTTP）/ `AgentsConfig`（:320）/ `BuiltinToolsConfig`（:332）/ `SkillsConfig`（:360）/ `TuiConfig`+`TuiIconsConfig`（:381/:395）/ `PtcConfig`（:403）/ `ApprovalPolicySetting`（:518，legacy `policy` 键拼写）+ `ToolApprovalLevelSetting`（:533，新 schema 等级拼写 "manual"/"allow"/"auto"）+ `ApprovalConfig`（:556）。
 - **`ApprovalConfig`（`[approval]`）双 schema 共存（tool-approval）**：legacy `policy`（+`tools`）保留可解析（旧文件零破坏，`to_policy()` :579）；新键 `default_level: Option` / `tool_levels: BTreeMap<String, 等级>` / `server_levels: BTreeMap<String, 等级>`（键 = 审批作用域 slug，聚合下游 / host 前缀，见 `mcp::server_slug_of`）。生效规则统一经 `approval::rules_from_config` 推导（legacy 铺底 → 新键覆盖），配置层不自算。
 - 解析函数：`parse_openslate_toml`（:525）/ `AgentFrontmatter`（:544）/ `derive_id_from_filename`（:562，agent id 缺省从文件名派生）/ `parse_agent_markdown`（:591，YAML frontmatter + 正文=default_prompt）/ `parse_agents_dir`（:636）。
 - **注意**：config 类型只 derive Deserialize（协议侧镜像 DTO 是为了不给 core 加 Serialize）。
@@ -285,7 +287,18 @@ pub struct RunManager {
 - `append_late_tool_result(&mut Vec<Message>, tool_call_id, content) -> Result<Message, AskUserError>`：**迟到答案补全**——插入位置 = 声明处 assistant 之后的连续结果段末尾（常态即尾部）；幂等（已答 → `AlreadyAnswered` 首答者赢；未知 id → `ToolCallNotFound`）。
 - `repair_dangling_tool_calls(&mut Vec<Message>, DanglingClosure::{Superseded, Expired}) -> Vec<Message>`：**悬挂修复**——ask_user 按关卷原因取文案、兄弟兜底 `INTERRUPTED_RESULT`，全部插入合法位置；返回合成消息供落库；修复后无悬挂（测试钉死）。
 - `AskUserError`（thiserror）：ToolCallNotFound / AlreadyAnswered；经 `OpenSlateError::Validation` 映射进引擎错误面。
-- **工具输出脱敏注册表**（ask_user secret 子系统的 core 消费点；`SecretMasker` 类型）：`set_secret_masker(Option)` 整体替换（测试复位）/ `push_secret_masker` 追加（mobile 装配期，多 runtime 并行叠加安全）/ `mask_secrets(&str)` 依次应用全部已注册脱敏器 / `mask_tool_output(ToolOutput)`（content 替换 + **实际发生替换时追加 `MASKED_NOTE` 内部提示**（`<system-note>Output masked: …</system-note>`，tool result 内容的一部分、不注入独立 system 消息）+ bytes 重算）。消费点在 runtime.rs 工具结果形成处（顺序/并行两路径，output-size 上限之后、`tool_end` preview / 消息历史 / tracing preview 之前）；无注册恒等（桌面零影响）。值源与 `[ask_user] mask_secrets` 开关由宿主注入的闭包负责（与 `mcp::set_mcp_auth_override` 同款进程级接缝模式）。
+- **工具输出脱敏注册表**（ask_user secret 子系统的 core 消费点；`SecretMasker` 类型）：`set_secret_masker(Option)` 整体替换（测试复位）/ `push_secret_masker` 追加（mobile 装配期，多 runtime 并行叠加安全）/ `mask_secrets(&str)` 依次应用全部已注册脱敏器 / `mask_tool_output(ToolOutput)`（content 替换 + **实际发生替换时追加 `MASKED_NOTE` 内部提示**（`<system-note>Output masked: …</system-note>`，tool result 内容的一部分、不注入独立 system 消息）+ bytes 重算）。消费点在 runtime.rs 工具结果形成处（顺序/并行两路径；C2 起位于 output-size 上限与长输出落盘分叉**之前**——mask → fork → limit，落盘文本必脱敏；`tool_end` preview / 消息历史 / tracing preview 形成之前全覆盖）；无注册恒等（桌面零影响）。值源与 `[ask_user] mask_secrets` 开关由宿主注入的闭包负责（与 `mcp::set_mcp_auth_override` 同款进程级接缝模式）。
+
+## 22. output_store.rs —— 长输出落盘接缝（C2）
+
+output_query 配套的 core 侧接缝（设计「长输出落盘 + output_query」C2 步）：
+
+- `StoredOutput { ref_id, orig_bytes, line_count }`：落盘回执（预览构造用）。
+- `ToolOutputStorer` trait（async）：`store(run_id, tool_name, content) -> Option<StoredOutput>`；实现吞错（持久化失败不 kill run），`None` = 存储不可用 → 引擎回落旧 limit 路径。
+- **进程级单槽注册**（与 `set_shell_env_source` / `set_secret_masker` 同款接缝）：`set_tool_output_storer(Option<Arc<dyn ToolOutputStorer>>)` / `current_storer()`。**未注册（CLI/TUI/server 桌面形态）时分叉点直通，行为与旧截断路径完全一致**。
+- `STORED_OUTPUT_MARKER = "[STORED OUTPUT"`（预览头行前缀，**格式冻结**：UI 恢复链与 mobile 全文读取都按它识别）/ `PREVIEW_EDGE_BYTES = 1024`（头尾字节预算）。
+- `build_preview(tool_name, &StoredOutput, content) -> String`：首行元数据（`ref="…" size=… lines=…`）+ head ≤1KB + 省略行（`[... {omitted} bytes omitted ({总行数} lines) — use output_query to inspect ...]`，omitted = orig_bytes − head − tail 的诚实值）+ tail ≤1KB；字节截断按 UTF-8 字符边界回退/前进（对齐 mcp-builtin shell.rs truncate 先例，中文/emoji 不劈裂）。
+- 配置面：`[limits].output_store_threshold`（u32，默认 16384，0=关闭，serde default——存量配置自动获得；validation 值域 `0 或 4096..=16MiB`，下限理由 = 预览固定 ~2.3KB，低于 4096 会出现预览比原文长）。镜像链：`LimitsConfig` → `RuntimeLimits`/`RunConfig`（runner 透传）→ protocol `LimitsDto`（serde default 16384，additive 兼容不 bump proto）→ TUI `config_from_view`/`view_from_config`。mobile 默认 toml（bootstrap.rs）显式写 `output_store_threshold = 16384`。
 
 ## 跨模块注意事项
 

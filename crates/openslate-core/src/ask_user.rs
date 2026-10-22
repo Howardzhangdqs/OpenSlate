@@ -115,10 +115,12 @@ pub fn mask_secrets(text: &str) -> String {
 /// 对工具输出应用脱敏（content 替换 + 实际发生替换时追加
 /// [`MASKED_NOTE`] + bytes 重算）。
 ///
-/// 消费点在 core runtime 的工具结果形成处（顺序/并行两条路径共用），
-/// 位于 output-size 上限之后、`tool_end` preview / 消息历史 / tracing
-/// preview 形成之前——三处模型与日志可见面一次全覆盖。提示长度为固定
-/// 小常数（~230B），在 size 上限之后追加不会破坏其防灌爆语义。
+/// 消费点在 core runtime 的工具结果形成处（顺序/并行两条路径共用）。
+/// C2 起位于 output-size 上限与长输出落盘分叉**之前**（mask → fork →
+/// limit：落盘的必须是脱敏后文本，vault 凭据绝不落盘）、`tool_end`
+/// preview / 消息历史 / tracing preview 形成之前——四处模型/日志/磁盘
+/// 可见面一次全覆盖。提示长度为固定小常数（~230B），在 size 上限之前
+/// 追加不会破坏其防灌爆语义（追加后 limit 照常封顶）。
 pub fn mask_tool_output(mut output: crate::types::ToolOutput) -> crate::types::ToolOutput {
     let mut masked = mask_secrets(&output.content);
     if masked != output.content {

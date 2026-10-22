@@ -274,6 +274,7 @@ impl RuntimeLimits {
                 timeout_ms: l.timeout_ms,
                 max_context_bytes: l.max_context_bytes,
                 max_output_bytes: l.max_output_bytes,
+                output_store_threshold: l.output_store_threshold,
                 max_empty_turns: crate::runtime::DEFAULT_MAX_EMPTY_TURNS,
                 parallel_tool_calls: l.parallel_tool_calls,
             })

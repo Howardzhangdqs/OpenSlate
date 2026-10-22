@@ -178,6 +178,12 @@ pub struct LimitsConfig {
     pub max_context_messages: u32,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    /// 长输出落盘阈值（字节，output_query 配套）。工具输出超过该值
+    /// 且宿主注册了 `ToolOutputStorer` 时，全文（脱敏后）落盘、对话内
+    /// 替换为头尾预览，模型可用 `output_query` 取回全文。`0` = 关闭
+    /// （走旧截断路径）。默认 16384。未注册 storer 的宿主
+    /// （CLI/TUI/server）行为完全不变。
+    pub output_store_threshold: u32,
     /// Auto-compact the conversation history (LLM summary via the `fast`
     /// model, mechanical-concatenation fallback) once it crosses the
     /// context limits, before a turn is dispatched. Default: on. The
@@ -200,6 +206,7 @@ impl Default for LimitsConfig {
             max_context_messages: 16,
             max_context_bytes: 64_000,
             max_output_bytes: 65_536,
+            output_store_threshold: 16_384,
             auto_compact: true,
             parallel_tool_calls: true,
         }
@@ -858,6 +865,7 @@ mod tests {
         assert_eq!(limits.max_context_messages, 16);
         assert_eq!(limits.max_context_bytes, 64_000);
         assert_eq!(limits.max_output_bytes, 65_536);
+        assert_eq!(limits.output_store_threshold, 16_384);
         assert!(limits.auto_compact);
         assert!(limits.parallel_tool_calls);
     }
@@ -885,6 +893,30 @@ max_steps = 5
 "#;
         let config = parse_openslate_toml(toml).expect("should parse");
         assert!(config.limits.expect("limits").parallel_tool_calls);
+    }
+
+    // ── [limits].output_store_threshold（长输出落盘，C2）─────────────────
+
+    #[test]
+    fn parse_limits_output_store_threshold_defaults_when_absent() {
+        // 存量配置（无该键）自动获得默认 16384；显式 0 = 关闭。
+        let toml = r#"
+[limits]
+max_steps = 5
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(
+            config.limits.expect("limits").output_store_threshold,
+            16_384
+        );
+
+        let toml = r#"
+[limits]
+max_steps = 5
+output_store_threshold = 0
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.limits.expect("limits").output_store_threshold, 0);
     }
 
     // ── [ask_user]（Agent 向用户提问；ask-user 设计 r4）─────────────────

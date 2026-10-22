@@ -192,6 +192,7 @@ Kotlin 侧实际取值（RuntimeBridge.kt:252-255）：`filesDir/openslate`、`f
 | `limits.max_context_bytes` | `60000` |
 | `limits.max_context_messages` | `220` |
 | `limits.max_turn_output_bytes` | `131072` |
+| `limits.output_store_threshold` | `16384`（C2 长输出落盘阈值：工具输出超阈值全文（脱敏后）落 SQLite、对话内换头尾预览，模型经 `output_query` 取回；`0` = 关闭） |
 | `limits.timeout_ms` | `9223372036854775807`（i64::MAX——无总时长预算；挂死防护 = 每请求 60s 无新数据即断） |
 
 ## 5. `events.rs` 详解（事件出口）

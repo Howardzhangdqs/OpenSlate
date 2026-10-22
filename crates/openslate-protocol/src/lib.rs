@@ -684,8 +684,18 @@ pub struct LimitsDto {
     pub max_context_messages: u32,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    /// 长输出落盘阈值（C2；`0` = 关闭）。serde default = 16384：旧
+    /// server 载荷缺该键时客户端镜像取与 `LimitsConfig::default()` 一致
+    /// 的值（additive 兼容，proto 版本不 bump）。
+    #[serde(default = "default_output_store_threshold")]
+    pub output_store_threshold: u32,
     pub auto_compact: bool,
     pub parallel_tool_calls: bool,
+}
+
+/// [`LimitsDto::output_store_threshold`] 的 serde 缺省（= 配置默认）。
+fn default_output_store_threshold() -> u32 {
+    16_384
 }
 
 impl From<&LimitsConfig> for LimitsDto {
@@ -699,6 +709,7 @@ impl From<&LimitsConfig> for LimitsDto {
             max_context_messages: l.max_context_messages,
             max_context_bytes: l.max_context_bytes,
             max_output_bytes: l.max_output_bytes,
+            output_store_threshold: l.output_store_threshold,
             auto_compact: l.auto_compact,
             parallel_tool_calls: l.parallel_tool_calls,
         }

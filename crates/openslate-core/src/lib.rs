@@ -10,6 +10,7 @@ pub mod execution;
 pub mod mcp;
 pub mod model_config;
 pub mod model_registry;
+pub mod output_store;
 pub mod paths;
 pub mod prompt;
 pub mod provider;

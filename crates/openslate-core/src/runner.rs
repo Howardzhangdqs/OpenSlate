@@ -575,6 +575,7 @@ impl<'a> AgentRunner<'a> {
             max_steps: self.limits.max_steps,
             max_context_bytes: self.limits.max_context_bytes,
             max_output_bytes: self.limits.max_output_bytes,
+            output_store_threshold: self.limits.output_store_threshold,
             max_empty_turns: self.limits.max_empty_turns,
             tool_definitions: self.tool_definitions_for(&root.id),
             timeout_ms: self.limits.timeout_ms,
@@ -700,6 +701,7 @@ impl<'a> AgentRunner<'a> {
                 max_steps: self.limits.max_steps,
                 max_context_bytes: self.limits.max_context_bytes,
                 max_output_bytes: self.limits.max_output_bytes,
+                output_store_threshold: self.limits.output_store_threshold,
                 max_empty_turns: self.limits.max_empty_turns,
                 tool_definitions: self.tool_definitions_for(&agent_id),
                 // fix-22: every layer — child, grandchild, ... — runs with

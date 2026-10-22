@@ -177,6 +177,11 @@ pub struct RuntimeLimits {
     pub timeout_ms: u64,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    /// 长输出落盘阈值（字节，C2）：工具输出超过该值且宿主注册了
+    /// `ToolOutputStorer` 时全文（脱敏后）落盘、对话内替换为头尾预览
+    /// （见 [`crate::output_store`]）。`0` = 关闭；未注册 storer 时
+    /// 本值无效（分叉点直通，行为与旧路径一致）。
+    pub output_store_threshold: u32,
     pub max_empty_turns: u32,
     /// P2-1: direct tool calls within one step execute concurrently.
     /// `false` restores the fully sequential tool loop (escape hatch for
@@ -195,6 +200,7 @@ impl Default for RuntimeLimits {
             timeout_ms: 60_000,
             max_context_bytes: 64_000,
             max_output_bytes: 65_536,
+            output_store_threshold: 16_384,
             max_empty_turns: DEFAULT_MAX_EMPTY_TURNS,
             parallel_tool_calls: true,
         }
@@ -230,6 +236,52 @@ pub fn check_limits(
         });
     }
     Ok(())
+}
+
+/// 长输出落盘分叉（C2，顺序/并行两条路径共用）。
+///
+/// 前置条件：调用点已对 `output` 完成**全文脱敏**（mask_tool_output
+/// 提前到 fork 之前——落盘的必须是脱敏后文本，vault 凭据绝不落盘）。
+/// 判定用 `content.len()`（现网工具的 `bytes` 与之一致）。
+///
+/// - `ask_user` 豁免：问卷输出短且结构化，且 Android 回看页按全量
+///   原文重建问卷，预览化会破坏该链路；
+/// - 阈值 `0` = 关闭；未注册 storer / `store` 返回 `None`（存储不可用）
+///   → 原样返回，调用点随后的 limit 兜底照常生效（双路径降级阶梯
+///   不变：fork 只是 limit 之前的一层可选优化）；
+/// - 命中 → content 替换为 [`crate::output_store::build_preview`] 预览，
+///   status 置 `Truncated`（与 limit 截断同语义，UI/progress 的
+///   truncated 标记链路零改动）。
+async fn fork_stored_output(
+    config: &RunConfig,
+    tool_name: &str,
+    output: ToolOutput,
+) -> ToolOutput {
+    if tool_name == crate::ask_user::ASK_USER_TOOL
+        || config.output_store_threshold == 0
+        || output.content.len() <= config.output_store_threshold as usize
+    {
+        return output;
+    }
+    let Some(storer) = crate::output_store::current_storer() else {
+        return output;
+    };
+    match storer
+        .store(&config.run_id.0, tool_name, &output.content)
+        .await
+    {
+        Some(stored) => {
+            let content =
+                crate::output_store::build_preview(tool_name, &stored, &output.content);
+            ToolOutput {
+                bytes: content.len(),
+                content,
+                status: ToolOutputStatus::Truncated,
+                ..output
+            }
+        }
+        None => output,
+    }
 }
 
 /// Per-model pricing snapshot (P2-3), resolved from
@@ -289,6 +341,10 @@ pub struct RunConfig {
     pub max_steps: u32,
     pub max_context_bytes: u32,
     pub max_output_bytes: u32,
+    /// 长输出落盘阈值（字节，C2；语义同
+    /// [`RuntimeLimits::output_store_threshold`]）。由 runner 从
+    /// `RuntimeLimits` 透传，execute_run 的分叉点读取。
+    pub output_store_threshold: u32,
     pub max_empty_turns: u32,
     pub tool_definitions: Vec<crate::provider::ToolDefinition>,
     /// Round-level budget for TOTAL LLM request time in milliseconds
@@ -794,25 +850,40 @@ pub async fn execute_run(
                         out = execute_tool_safely(tool_executor, &tc.name, &tc.arguments) => out,
                     };
 
+                    // Secret masking (ask_user vault values) — FIRST, over the
+                    // FULL output: every downstream surface formed after this
+                    // point (the stored copy via the fork below, the size cap,
+                    // the `tool_end` preview, the tool result message, the
+                    // tracing preview) sees the masked content. Hoisted ahead
+                    // of the size cap in C2 so the stored full text is the
+                    // masked text — vault credentials never hit disk. No-op
+                    // unless the host registered a masker (see
+                    // `ask_user::set_secret_masker`).
+                    let output = crate::ask_user::mask_tool_output(output);
+
+                    // Long-output fork (C2, output_query seam): oversized
+                    // output goes to the host-registered
+                    // `ToolOutputStorer` and the conversation carries a
+                    // head/tail preview instead (model retrieves the full
+                    // text via output_query). Passes through untouched when
+                    // disabled / under threshold / no storer registered /
+                    // store unavailable — see `fork_stored_output`.
+                    let output = fork_stored_output(&config, &tc.name, output).await;
+
                     // Global output-size backstop: cap the tool output at
                     // `max_output_bytes` before it enters the conversation, so a
                     // runaway tool (typically an external MCP server without its
                     // own truncation) cannot flood the context. Builtin tools that
-                    // already truncate (e.g. shell's 64KB cap) simply end up with
+                    // already truncate (e.g. shell's cap) simply end up with
                     // the smaller of the two limits. `0` disables the cap
-                    // (same convention as `max_steps`).
+                    // (same convention as `max_steps`). Stays LAST as the
+                    // final backstop behind the C2 fork (preview is ~2.3KB,
+                    // normally passes through untouched).
                     let output = if config.max_output_bytes > 0 {
                         crate::tool::limit_tool_output(output, config.max_output_bytes as usize)
                     } else {
                         output
                     };
-
-                    // Secret masking (ask_user vault values): applied before the
-                    // `tool_end` preview, the tool result message and the tracing
-                    // preview are formed, so every model/log-visible surface sees
-                    // the masked content. No-op unless the host registered a
-                    // masker (see `ask_user::set_secret_masker`).
-                    let output = crate::ask_user::mask_tool_output(output);
 
                     let truncated = output.bytes > 80;
                     if let Some(cb) = progress.as_mut() {
@@ -981,6 +1052,13 @@ pub async fn execute_run(
                 for (tc, slot) in response.tool_calls.iter().zip(slots.iter_mut()) {
                     match slot.take() {
                         Some(output) => {
+                            // Secret masking — same point/ordering as the
+                            // sequential path above: mask the FULL output
+                            // first (C2 hoisted it ahead of the size cap so
+                            // the stored copy is masked too), then the
+                            // stored-output fork, then the size backstop.
+                            let output = crate::ask_user::mask_tool_output(output);
+                            let output = fork_stored_output(&config, &tc.name, output).await;
                             let output = if config.max_output_bytes > 0 {
                                 crate::tool::limit_tool_output(
                                     output,
@@ -989,9 +1067,6 @@ pub async fn execute_run(
                             } else {
                                 output
                             };
-                            // Secret masking — same point as the sequential
-                            // path above (before preview/history/tracing).
-                            let output = crate::ask_user::mask_tool_output(output);
                             let truncated = output.bytes > 80;
                             if let Some(cb) = progress.as_mut() {
                                 cb.on_tool_end(
@@ -1356,6 +1431,7 @@ mod tests {
             max_steps: 10,
             max_context_bytes: 100_000,
             max_output_bytes: 10_000,
+            output_store_threshold: 16_384,
             max_empty_turns: DEFAULT_MAX_EMPTY_TURNS,
             tool_definitions: vec![],
             timeout_ms: 60_000,
@@ -2216,6 +2292,7 @@ mod tests {
         assert_eq!(limits.timeout_ms, 60_000);
         assert_eq!(limits.max_context_bytes, 64_000);
         assert_eq!(limits.max_output_bytes, 65_536);
+        assert_eq!(limits.output_store_threshold, 16_384);
         assert_eq!(limits.max_empty_turns, DEFAULT_MAX_EMPTY_TURNS);
     }
 
@@ -2870,6 +2947,347 @@ mod tests {
         let tool_msg = &result.messages[2];
         assert_eq!(tool_msg.content.len(), 5_000);
         assert!(!tool_msg.content.contains("[TRUNCATED"));
+    }
+
+    // ── 长输出落盘分叉（C2，output_store 接缝）──────────────────────────
+
+    /// 记录型 mock storer：捕获收到的全文，按 `succeed` 返回回执或 None。
+    struct MockStorer {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>, // (run_id, tool, content)
+        succeed: bool,
+    }
+
+    impl MockStorer {
+        fn new(succeed: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                succeed,
+            })
+        }
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().expect("storer poisoned").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::output_store::ToolOutputStorer for MockStorer {
+        async fn store(
+            &self,
+            run_id: &str,
+            tool_name: &str,
+            content: &str,
+        ) -> Option<crate::output_store::StoredOutput> {
+            self.calls.lock().expect("storer poisoned").push((
+                run_id.to_owned(),
+                tool_name.to_owned(),
+                content.to_owned(),
+            ));
+            self.succeed.then_some(crate::output_store::StoredOutput {
+                ref_id: "ref-test-1".to_owned(),
+                orig_bytes: content.len(),
+                line_count: content.matches('\n').count() + 1,
+            })
+        }
+    }
+
+    /// 单工具调用 + 收尾的 provider 序列。
+    fn one_tool_call_provider(tool: &str) -> MockProvider {
+        MockProvider::new(vec![
+            ModelResponse {
+                reasoning_content: None,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: ToolCallId("tc-1".into()),
+                    name: tool.into(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ])
+    }
+
+    /// 运行一条工具调用并返回 Tool 消息内容（fork 测试共用骨架；进程级
+    /// storer/masker 槽位先复位，测后再复位；MASKER_TEST_MUTEX 串行化
+    /// 所有动全局槽位的测试，防并行测试串扰）。
+    async fn run_one_tool(
+        config: RunConfig,
+        provider: MockProvider,
+        content: String,
+    ) -> (String, Arc<MockStorer>) {
+        let _guard = crate::ask_user::MASKER_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::ask_user::set_secret_masker(None);
+        let storer = MockStorer::new(true);
+        crate::output_store::set_tool_output_storer(Some(storer.clone()));
+        let executor = HugeOutputExecutor { content };
+        let result = execute_run(&provider, config, "m1", &executor, None, None, None)
+            .await
+            .expect("run should succeed");
+        crate::output_store::set_tool_output_storer(None);
+        crate::ask_user::set_secret_masker(None);
+        let tool_msg = &result.messages[2];
+        assert_eq!(tool_msg.role, MessageRole::Tool);
+        (tool_msg.content.clone(), storer)
+    }
+
+    #[tokio::test]
+    async fn fork_boundary_at_threshold_passes_through() {
+        // 恰好等于阈值：直通（原文进对话，storer 未被调用）。
+        let mut config = default_config();
+        config.output_store_threshold = 1_000;
+        config.max_output_bytes = 0; // 排除 limit 兜底干扰
+        let (content, storer) = run_one_tool(
+            config,
+            one_tool_call_provider("big"),
+            "x".repeat(1_000),
+        )
+        .await;
+        assert_eq!(content, "x".repeat(1_000));
+        assert!(storer.calls().is_empty(), "at-threshold must not fork");
+    }
+
+    #[tokio::test]
+    async fn fork_threshold_plus_one_stores_and_replaces_with_preview() {
+        // 阈值 +1：分叉——全文落盘、对话内换预览（顺序路径：
+        // parallel_tool_calls = false 强制串行循环）。
+        let mut config = default_config();
+        config.output_store_threshold = 1_000;
+        config.max_output_bytes = 0;
+        config.parallel_tool_calls = false;
+        let (content, storer) = run_one_tool(
+            config,
+            one_tool_call_provider("big"),
+            "x".repeat(1_001),
+        )
+        .await;
+        let calls = storer.calls();
+        assert_eq!(calls.len(), 1, "over-threshold must store once");
+        assert_eq!(calls[0].0, "test-run", "run_id passed through");
+        assert_eq!(calls[0].1, "big", "tool_name passed through");
+        assert_eq!(calls[0].2.len(), 1_001, "full text stored");
+        assert!(
+            content.starts_with(crate::output_store::STORED_OUTPUT_MARKER),
+            "preview marker first: {content}"
+        );
+        assert!(content.contains("ref=\"ref-test-1\""));
+        assert!(content.contains("size=1001"));
+        assert!(content.contains("use output_query to inspect"));
+        assert!(content.len() < 3_000, "preview stays tiny");
+    }
+
+    #[tokio::test]
+    async fn fork_without_storer_registered_passes_through() {
+        // 未注册 storer：分叉点直通（桌面 CLI/TUI/server 形态），旧 limit
+        // 路径行为不变。
+        let _guard = crate::ask_user::MASKER_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::ask_user::set_secret_masker(None);
+        crate::output_store::set_tool_output_storer(None);
+        let mut config = default_config();
+        config.output_store_threshold = 100; // 远小于输出
+        config.max_output_bytes = 10_000;
+        let executor = HugeOutputExecutor {
+            content: "z".repeat(5_000),
+        };
+        let result = execute_run(
+            &one_tool_call_provider("big"),
+            config,
+            "m1",
+            &executor,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("run should succeed");
+        let tool_msg = &result.messages[2];
+        assert_eq!(tool_msg.content.len(), 5_000, "no fork, no limit hit");
+        assert!(!tool_msg
+            .content
+            .contains(crate::output_store::STORED_OUTPUT_MARKER));
+    }
+
+    #[tokio::test]
+    async fn fork_storer_none_falls_back_to_limit_path() {
+        // storer 返回 None（存储不可用）：回落旧 limit 路径——limit 兜底
+        // 照常把超限输出截断（双路径降级阶梯不变）。
+        let _guard = crate::ask_user::MASKER_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::ask_user::set_secret_masker(None);
+        let storer = MockStorer::new(false);
+        crate::output_store::set_tool_output_storer(Some(storer));
+        let mut config = default_config();
+        config.output_store_threshold = 100;
+        config.max_output_bytes = 200;
+        let executor = HugeOutputExecutor {
+            content: "w".repeat(5_000),
+        };
+        let result = execute_run(
+            &one_tool_call_provider("big"),
+            config,
+            "m1",
+            &executor,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("run should succeed");
+        crate::output_store::set_tool_output_storer(None);
+        let tool_msg = &result.messages[2];
+        assert!(tool_msg.content.contains("[TRUNCATED"), "limit backstop");
+        assert!(!tool_msg
+            .content
+            .contains(crate::output_store::STORED_OUTPUT_MARKER));
+    }
+
+    #[tokio::test]
+    async fn fork_exempts_ask_user() {
+        // ask_user 豁免：即使超阈值也不落盘（问卷重建链依赖全量原文）。
+        let mut config = default_config();
+        config.output_store_threshold = 100;
+        config.max_output_bytes = 0;
+        let (content, storer) = run_one_tool(
+            config,
+            one_tool_call_provider(crate::ask_user::ASK_USER_TOOL),
+            "q".repeat(500),
+        )
+        .await;
+        assert_eq!(content, "q".repeat(500), "ask_user passes through");
+        assert!(storer.calls().is_empty(), "ask_user never stored");
+    }
+
+    #[tokio::test]
+    async fn fork_threshold_zero_disables() {
+        // threshold = 0：关闭（同 max_steps 的 0 语义），超限输出直通。
+        let mut config = default_config();
+        config.output_store_threshold = 0;
+        config.max_output_bytes = 0;
+        let (content, storer) =
+            run_one_tool(config, one_tool_call_provider("big"), "k".repeat(9_999)).await;
+        assert_eq!(content.len(), 9_999);
+        assert!(storer.calls().is_empty(), "disabled fork never stores");
+    }
+
+    #[tokio::test]
+    async fn fork_receives_masked_content_mask_runs_first() {
+        // mask 先于 store：落盘的是脱敏后文本（vault 凭据绝不落盘）。
+        // 假 masker 把 SECRETVALUE 替换成 ***；输出超阈值触发分叉。
+        let _guard = crate::ask_user::MASKER_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::ask_user::push_secret_masker(Arc::new(|text: &str| {
+            text.replace("SECRETVALUE", "***")
+        }));
+        let storer = MockStorer::new(true);
+        crate::output_store::set_tool_output_storer(Some(storer.clone()));
+        let mut config = default_config();
+        config.output_store_threshold = 100;
+        config.max_output_bytes = 0;
+        let executor = HugeOutputExecutor {
+            content: format!("leak SECRETVALUE here {}", "p".repeat(500)),
+        };
+        let result = execute_run(
+            &one_tool_call_provider("big"),
+            config,
+            "m1",
+            &executor,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("run should succeed");
+        crate::output_store::set_tool_output_storer(None);
+        crate::ask_user::set_secret_masker(None);
+        let calls = storer.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !calls[0].2.contains("SECRETVALUE"),
+            "stored text must be masked: {}",
+            &calls[0].2[..calls[0].2.len().min(80)]
+        );
+        assert!(calls[0].2.contains("***"), "masked replacement present");
+        // 对话内预览同样脱敏。
+        let tool_msg = &result.messages[2];
+        assert!(!tool_msg.content.contains("SECRETVALUE"));
+        assert!(tool_msg
+            .content
+            .contains(crate::output_store::STORED_OUTPUT_MARKER));
+    }
+
+    #[tokio::test]
+    async fn fork_applies_to_parallel_batch_path() {
+        // 并行 batch 路径同样分叉：两条直接工具调用各自落盘、各自换预览。
+        let _guard = crate::ask_user::MASKER_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::ask_user::set_secret_masker(None);
+        let storer = MockStorer::new(true);
+        crate::output_store::set_tool_output_storer(Some(storer.clone()));
+        let mut config = default_config();
+        config.output_store_threshold = 100;
+        config.max_output_bytes = 0;
+        config.parallel_tool_calls = true; // 走并行分支（非 call_agent/run_code）
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                reasoning_content: None,
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: ToolCallId("tc-1".into()),
+                        name: "big_a".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: ToolCallId("tc-2".into()),
+                        name: "big_b".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+                usage: None,
+                finish_reason: Some("tool_calls".into()),
+            },
+            ModelResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                reasoning_content: None,
+                usage: None,
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+        let executor = HugeOutputExecutor {
+            content: "b".repeat(600),
+        };
+        let result = execute_run(&provider, config, "m1", &executor, None, None, None)
+            .await
+            .expect("run should succeed");
+        crate::output_store::set_tool_output_storer(None);
+        let calls = storer.calls();
+        assert_eq!(calls.len(), 2, "both parallel calls stored");
+        let stored_tools: Vec<&str> = calls.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert_eq!(stored_tools, vec!["big_a", "big_b"], "stored in call order");
+        for (idx, tool) in ["big_a", "big_b"].iter().enumerate() {
+            let msg = &result.messages[2 + idx];
+            assert_eq!(msg.role, MessageRole::Tool);
+            assert!(
+                msg.content
+                    .starts_with(crate::output_store::STORED_OUTPUT_MARKER),
+                "{tool} preview: {}",
+                msg.content
+            );
+        }
     }
 
     // ── Per-step persistence sink (Phase 3) ──────────────────────────────

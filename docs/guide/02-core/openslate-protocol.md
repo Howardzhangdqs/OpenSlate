@@ -139,7 +139,7 @@ hello 成功后定向发送的全量快照：`proto`/`session_id`/`session_label
 
 - `ProviderDto`（:244）：base_url/api_key_env/adapter?/title?/max_attempts/retry_base_ms；`From<&ProviderConfig>` :259 + `From<ProviderDto> for ProviderConfig` :272 双向。
 - `ModelDto`（:287）：provider/model/限额/能力布尔/计价/**reasoning_effort**（`Option<String>` 七档含 none=显式关闭，`skip_serializing_if` None 跳键——wire 契约零变化）；双向 From :306/:322。
-- `LimitsDto`（:348）：`From<&LimitsConfig>` :361——server 侧已解析默认值（Option 语义解掉）。
+- `LimitsDto`（:348）：`From<&LimitsConfig>` :361——server 侧已解析默认值（Option 语义解掉）。含 **`output_store_threshold`**（C2 additive 字段，`#[serde(default = …)]` = 16384：旧 server 载荷缺键时客户端镜像取配置默认值，proto 不 bump）。
 - `AgentNodeDto`（:381）：`From<&AgentTree>` :388 递归展开，children 顺序 = 配置声明序。
 - `SkillInfoDto`（:340）：name + description（tier-1 渐进披露）。
 

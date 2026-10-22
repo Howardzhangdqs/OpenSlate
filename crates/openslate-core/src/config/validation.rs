@@ -186,6 +186,25 @@ pub fn validate_config(config: &OpenSlateConfig, agents: &AgentsConfig) -> Vec<V
                 message: "timeout_ms must be > 0".into(),
             });
         }
+        // 8b. `[limits].output_store_threshold`（长输出落盘，C2）：值域
+        //     `0`（关闭）或 `4096..=16_777_216`（16MiB）。下限 4096 的
+        //     理由：落盘预览固定 ~2.3KB（头尾各 ≤1KB + 两行元数据），
+        //     阈值低于 4096 会出现「预览比原文长」的荒谬形态；上限
+        //     16MiB 防单条工具输出无限膨胀（存储层按条全文落盘）。
+        if !(limits.output_store_threshold == 0
+            || (4096..=16_384 * 1024).contains(&limits.output_store_threshold))
+        {
+            errors.push(ValidationError {
+                field: "limits.output_store_threshold".into(),
+                message: format!(
+                    "output_store_threshold must be 0 (disabled) or in 4096..=16777216 (got {}; \
+                     the stored-output preview is a fixed ~2.3KB so a threshold below 4096 \
+                     could produce a preview LONGER than the original, and values above \
+                     16MiB would let a single tool output balloon the store)",
+                    limits.output_store_threshold
+                ),
+            });
+        }
     }
 
     // ── New validation rules (9–18; rules 17 and 18's value half are
@@ -1046,6 +1065,39 @@ max_output_bytes = 65536
                 children: children.into_iter().map(|c| AgentId(c.into())).collect(),
                 default_prompt: prompt.into(),
             }],
+        }
+    }
+
+    // ── Rule 8b: [limits].output_store_threshold（长输出落盘，C2）──────
+
+    #[test]
+    fn output_store_threshold_zero_and_bounds_are_valid() {
+        let mut config = valid_config();
+        for value in [0u32, 4096, 16_384, 16_384 * 1024] {
+            config.limits.as_mut().expect("limits").output_store_threshold = value;
+            let errors = validate_config(&config, &valid_agents());
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.field == "limits.output_store_threshold"),
+                "value {value} in range must be valid: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_store_threshold_out_of_range_is_error() {
+        let mut config = valid_config();
+        for value in [1u32, 4095, 16_384 * 1024 + 1] {
+            config.limits.as_mut().expect("limits").output_store_threshold = value;
+            let errors = validate_config(&config, &valid_agents());
+            let finding = errors
+                .iter()
+                .find(|e| e.field == "limits.output_store_threshold")
+                .unwrap_or_else(|| panic!("value {value} must be rejected: {errors:?}"));
+            // 错误信息说明区间（0 或 4096..=16777216）。
+            assert!(finding.message.contains("0 (disabled)"), "{finding:?}");
+            assert!(finding.message.contains("4096..=16777216"), "{finding:?}");
         }
     }
 

@@ -1162,18 +1162,13 @@ private fun ModelEffortPickerRow(
             .fillMaxWidth()
             .padding(horizontal = 4.dp, vertical = 6.dp),
     ) {
-        // 模型组：微标签 + 软底胶囊控件（Box 仅包控件——弹层锚点独立）。
-        // 档位组隐藏时本组独占行，控件按内容塌缩（不留空右缘标签）。
+        // 模型组：软底胶囊控件（Box 仅包控件——弹层锚点独立）。无标签
+        // （用户拍板：纯下拉框自释义）。档位组隐藏时本组独占行，控件按
+        // 内容塌缩。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.weight(1f, fill = false),
         ) {
-            Text(
-                "模型",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.outline,
-            )
-            Spacer(Modifier.width(4.dp))
             Box(modifier = Modifier.weight(1f, fill = false)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -1230,19 +1225,13 @@ private fun ModelEffortPickerRow(
                 )
             }
         }
-        // 思考强度组：微标签 + 档位控件贴右缘；条目不支持档位 → 整组不
-        // 组合（组件内判定），不留空右缘标签。
+        // 思考强度组：档位控件贴右缘，无标签（用户拍板）；条目不支持
+        // 档位 → 整组不组合（组件内判定）。
         effortModel?.let { m ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.weight(1f, fill = false),
             ) {
-                Text(
-                    "思考强度",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                )
-                Spacer(Modifier.width(4.dp))
                 ThinkingEffortRow(
                     model = m,
                     hazeState = hazeState,

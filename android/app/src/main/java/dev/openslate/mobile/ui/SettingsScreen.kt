@@ -220,7 +220,7 @@ fun SettingsScreen(
             // 既有索引 0/1/2 语义不动——深链硬编码（主 tab=2 工具、
             // settings?toolTab=3 二级 tab）与存量 saveable 不受影响。──
             androidx.compose.material3.TabRow(selectedTabIndex = tab) {
-                val tabs = listOf("通用" to 0, "模型" to 1, "工具" to 2, "智能体" to 3)
+                val tabs = listOf("通用" to 0, "模型" to 1, "工具" to 2)
                 for ((label, idx) in tabs) {
                     androidx.compose.material3.Tab(
                         selected = tab == idx,
@@ -322,6 +322,10 @@ fun SettingsScreen(
                             )
                             AccentSwatchRow(selectedId = accent, onSelect = onAccentChange)
                         }
+                        // ── 角色定位（agent persona / system prompt 编辑）──
+                        // 用户拍板：与「外观」同为通用 tab 下的平级 Section，
+                        // 不占独立主 tab。
+                        AgentPersonaSection(snackbarHostState)
                     }
                     1 -> {
                         // ── 模型域二级 tab：会话 / Provider（「模型数据源」
@@ -460,10 +464,8 @@ fun SettingsScreen(
                             }
                         }
                     }
-                    3 -> {
-                        // ── 智能体域（尾插）：角色定位（system prompt 源）编辑 ──
-                        AgentPersonaSection(snackbarHostState)
-                    }
+                    // 原「智能体」主 tab 已撤：角色定位并入通用 tab（用户拍板，
+                    // 与「外观」平级）——AgentPersonaSection 调用见 tab 0。
                 }
             }
             }

@@ -392,6 +392,9 @@ private fun GlassDropdownMenuItem(
             Spacer(Modifier.width(GlassItemIconGap))
         }
         Column(Modifier.weight(1f)) {
+            // 超宽主/副文字尾缘淡出（同 SoftPickerCapsule 值文本视觉，
+            // 见 ui/TextFade.kt）：仅真溢出（如极端长文超屏幕上限）才挂。
+            var labelOverflowed by remember { mutableStateOf(false) }
             Text(
                 item.label,
                 style = MaterialTheme.typography.bodyMedium,
@@ -402,15 +405,20 @@ private fun GlassDropdownMenuItem(
                     MaterialTheme.colorScheme.onSurface
                 },
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                overflow = TextOverflow.Clip,
+                onTextLayout = { labelOverflowed = it.didOverflowWidth },
+                modifier = Modifier.fadeOutTrailingEdgeIf(labelOverflowed),
             )
             item.subtitle?.let {
+                var subtitleOverflowed by remember { mutableStateOf(false) }
                 Text(
                     it,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    overflow = TextOverflow.Clip,
+                    onTextLayout = { subtitleOverflowed = it.didOverflowWidth },
+                    modifier = Modifier.fadeOutTrailingEdgeIf(subtitleOverflowed),
                 )
             }
         }

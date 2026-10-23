@@ -18,6 +18,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,7 +41,8 @@ import dev.chrisbanes.haze.HazeState
  * 控件（SettingsScreen [ModelEffortPickerRow] 模型胶囊 / ThinkingEffortRow、
  * ComposerPanel ModelPickerRow / EffortPickerRow）共用的「胶囊本体」——
  * SoftButton 同族软底（primary 12% 透明底 + 10dp 圆角 + 34dp 最小触达高度
- * + 12/4dp 内边距）+ 左当前值文本（weight 吃满剩余宽、超长 Ellipsis）+
+ * + 12/4dp 内边距）+ 左当前值文本（weight 吃满剩余宽、超长尾缘淡出
+ *   ——渐变掩膜替代省略号，见 ui/TextFade.kt）+
  * 右 KeyboardArrowDown（展开 180° 旋转，graphicsLayer 绘制相位读取——旋转
  * 不逐帧重组整行）+ 本体 Box 锚弹 [GlassDropdownMenu]（alignEnd 右对齐，
  * 四处消费点均右对齐故不参数化）。
@@ -123,14 +127,21 @@ internal fun SoftPickerCapsule(
                 )
                 .padding(horizontal = 12.dp, vertical = 4.dp),
         ) {
+            // 值文本超宽处理：尾缘淡出替代省略号（2026-10 拍板）——
+            // onTextLayout 检测溢出后才挂渐变掩膜（短文本不淡出），
+            // overflow 用 Clip 保证掩膜作用在完整截断文本上（Ellipsis
+            // 会先截成「…」再淡出，语义重复）。
+            var valueOverflowed by remember { mutableStateOf(false) }
             Text(
                 text = value,
                 style = textStyle,
                 color = valueColor,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                overflow = TextOverflow.Clip,
+                onTextLayout = { valueOverflowed = it.didOverflowWidth },
                 modifier = valueModifier
                     .weight(1f)
+                    .fadeOutTrailingEdgeIf(valueOverflowed)
                     .then(
                         if (controlContentDescription != null) {
                             // 控件级语义已含当前值，清掉裸文本语义避免

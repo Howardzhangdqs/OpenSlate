@@ -1,6 +1,5 @@
 package dev.openslate.mobile.ui
 
-import android.content.Context
 import android.os.Build
 import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
@@ -22,7 +21,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -49,9 +47,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.semantics.clearAndSetSemantics
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -505,9 +500,10 @@ internal fun composerInlineStatus(
 private const val DropdownReopenSuppressMs = 250L
 
 /**
- * 模型下拉控件（输入面板内，双控件行的左/主控件）：无静态标签的软底下拉框，SoftButton 同族
- * 语言——语义 primary 低透明度底 + 同色文字、10dp 圆角、34dp 最小触达
- * 高度；形态为「左当前值 + 右下拉箭头」的选择框。点击整块弹玻璃弹层
+ * 模型下拉控件（输入面板内，双控件行的左/主控件）：无静态标签的软底下拉框，
+ * 胶囊本体 = 共用内核 [SoftPickerCapsule]（SoftButton 同族语言——语义
+ * primary 低透明度底 + 同色文字、10dp 圆角、34dp 最小触达高度；形态为
+ * 「左当前值 + 右下拉箭头」的选择框）。点击整块弹玻璃弹层
  * （[GlassDropdownMenu]，与面板同族磨砂语言；Haze 局部模糊聊天内容，
  * 贴底自动向上展开），选中项带 Check 图标（ui.md 基线）；切换走
  * onSelectModel（ChatScreen 接 RuntimeBridge.selectModel：set_model
@@ -517,8 +513,15 @@ private const val DropdownReopenSuppressMs = 250L
  * 内部 entry 键不直出 UI，选中比对/回传仍用原始条目键。
  *
  * 无障碍：静态标签删除后，语义上移到控件级 contentDescription（「选择
- * 本次对话模型，当前 X」，展开态换「收起」措辞）；当前值 Text 清空自身
- * 文本语义，避免与控件描述重复播报裸模型名。
+ * 本次对话模型，当前 X」，展开态换「收起」措辞——经内核
+ * controlContentDescription 通道，值文本自身语义被清空），避免 TalkBack
+ * 把模型名读两遍。
+ *
+ * 面板专属差异（经内核参数注入，逻辑留在本组件）：值文本挂 sharedBounds
+ * 锚点（valueModifier——聚焦展开/收起时与输入框常驻状态行模型名做
+ * 「输入框 ↔ 卡片」bounds 缩放位移）；dismiss 后同手势重开抑制窗口；
+ * 未配置模型（无可选项）时禁用照 SoftButton 禁用态降底色到 5%
+ * （disabledBackgroundAlpha）；弹层非聚焦（focusable = false 保键盘）。
  *
  * modifier 由调用方注入宽度（双控件行里传 weight(1f) 占主宽度；effort
  * 下拉不显示时独占整行效果不变）。
@@ -553,118 +556,88 @@ private fun ModelPickerRow(
         modelAlias.isEmpty() -> "未设置"
         else -> RuntimeBridge.modelAliasDisplay(currentEntry, config)
     }
-    val arrowAngle by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "panelModelArrow",
-    )
-    Box(modifier) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                // 软底选择框（SoftButton 同族公式）：primary 12% 透明底；
-                // 未配置模型（无可选项）照 SoftButton 禁用态降到 5%。
-                .heightIn(min = 34.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(
-                    MaterialTheme.colorScheme.primary.copy(
-                        alpha = if (options.isNotEmpty()) 0.12f else 0.05f,
-                    ),
-                )
-                .clickable(enabled = options.isNotEmpty()) {
-                    if (SystemClock.elapsedRealtime() - lastDismissElapsedMs > DropdownReopenSuppressMs) {
-                        expanded = true
-                    }
+    SoftPickerCapsule(
+        value = if (options.isEmpty() || modelAlias.isEmpty()) {
+            AnnotatedString(currentDisplay)
+        } else {
+            // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont 子集。
+            buildAnnotatedString {
+                withStyle(SpanStyle(fontFamily = MonoFont)) {
+                    append(currentDisplay)
                 }
-                .semantics {
-                    // 行内静态标签已删，控件语义在此补足；可见值文本的
-                    // 语义被清空（见下），TalkBack 只播报这一句。
-                    contentDescription =
-                        if (expanded) "收起模型选择，当前 $currentDisplay"
-                        else "选择本次对话模型，当前 $currentDisplay"
-                }
-                .padding(horizontal = 12.dp, vertical = 4.dp),
-        ) {
-            // sharedBounds 锚点：与输入框常驻状态行的模型名同 key——聚焦
-            // 展开/收起时做「输入框 ↔ 卡片」bounds 缩放位移（320ms，FOOM
-            // 曲线 FastOutSlowInEasing）；面板关闭时另一侧未组合，本修饰
-            // 无匹配即原样渲染。
-            val modelSharedBounds = with(sharedTransitionScope) {
-                Modifier.sharedBounds(
-                    rememberSharedContentState(key = "composer.model"),
-                    animatedVisibilityScope = animatedVisibilityScope,
-                    boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
-                )
             }
-            Text(
-                // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
-                // 子集；「未配置/未设置」等纯状态分支保持默认字体。
-                text = if (options.isEmpty() || modelAlias.isEmpty()) {
-                    AnnotatedString(currentDisplay)
-                } else {
-                    buildAnnotatedString {
-                        withStyle(SpanStyle(fontFamily = MonoFont)) {
-                            append(currentDisplay)
-                        }
-                    }
-                },
-                style = MaterialTheme.typography.labelLarge,
-                color = if (options.isEmpty()) {
-                    MaterialTheme.colorScheme.outline
-                } else {
-                    MaterialTheme.colorScheme.primary
-                },
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = modelSharedBounds
-                    .weight(1f)
-                    // 控件级 contentDescription 已含当前值，清掉裸文本
-                    // 语义避免 TalkBack 把模型名读两遍。
-                    .clearAndSetSemantics { },
+        },
+        valueColor = if (options.isEmpty()) {
+            MaterialTheme.colorScheme.outline
+        } else {
+            MaterialTheme.colorScheme.primary
+        },
+        textStyle = MaterialTheme.typography.labelLarge,
+        expanded = expanded,
+        onExpand = {
+            if (SystemClock.elapsedRealtime() - lastDismissElapsedMs > DropdownReopenSuppressMs) {
+                expanded = true
+            }
+        },
+        onDismissRequest = {
+            expanded = false
+            lastDismissElapsedMs = SystemClock.elapsedRealtime()
+        },
+        enabled = options.isNotEmpty(),
+        // 未配置模型（无可选项）照 SoftButton 禁用态降到 5%。
+        disabledBackgroundAlpha = 0.05f,
+        controlContentDescription = if (expanded) {
+            "收起模型选择，当前 $currentDisplay"
+        } else {
+            "选择本次对话模型，当前 $currentDisplay"
+        },
+        hazeState = hazeState,
+        items = options.map { opt ->
+            GlassDropdownItem(value = opt.entry, label = opt.label, selected = opt.entry == currentEntry)
+        },
+        labelFontFamily = MonoFont,
+        // 非聚焦 Popup：弹层不抢窗口焦点 → 输入框保焦、键盘不收（面板
+        // 不塌）；代价 BACK 不先关弹层，composer 场景可接受（详见
+        // GlassDropdownMenu kdoc）。
+        focusable = false,
+        onSelect = { opt -> onSelectModel(opt.value) },
+        // sharedBounds 锚点：与输入框常驻状态行的模型名同 key——聚焦
+        // 展开/收起时做「输入框 ↔ 卡片」bounds 缩放位移（320ms，FOOM
+        // 曲线 FastOutSlowInEasing）；面板关闭时另一侧未组合，本修饰
+        // 无匹配即原样渲染。
+        valueModifier = with(sharedTransitionScope) {
+            Modifier.sharedBounds(
+                rememberSharedContentState(key = "composer.model"),
+                animatedVisibilityScope = animatedVisibilityScope,
+                boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
             )
-            Spacer(Modifier.width(4.dp))
-            Icon(
-                Icons.Filled.KeyboardArrowDown,
-                // 描述语义已上移控件级，箭头自身不再播报。
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.outline,
-                // 同 SettingsScreen.CapabilityModelRow：绘制相位读取，避免逐帧重组。
-                modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
-            )
-        }
-        GlassDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = {
-                expanded = false
-                lastDismissElapsedMs = SystemClock.elapsedRealtime()
-            },
-            hazeState = hazeState,
-            items = options.map { opt ->
-                GlassDropdownItem(value = opt.entry, label = opt.label, selected = opt.entry == currentEntry)
-            },
-            labelFontFamily = MonoFont,
-            alignEnd = true,
-            // 非聚焦 Popup：弹层不抢窗口焦点 → 输入框保焦、键盘不收
-            // （面板不塌）。代价：BACK 不再先关弹层（作用于底层界面），
-            // composer 场景可接受——点选/点外部均正常关闭。
-            focusable = false,
-            onSelect = { opt -> onSelectModel(opt.value) },
-        )
-    }
+        },
+        modifier = modifier,
+    )
 }
 
 /**
- * Thinking Effort 下拉（双控件行右半，与模型下拉各占 50%）：软底同族
- * 视觉——primary
- * 12% 透明底 + 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头（展开
- * 180° 旋转）。仅当前模型解析到条目且 [ReasoningEffortLevels.allowed]
- * 有支持档位时由调用方组合——不显示时不占位。选项 = 「默认」+ 支持档
+ * Thinking Effort 下拉（双控件行右半，与模型下拉各占 50%）：胶囊
+ * 本体 = 共用内核 [SoftPickerCapsule]（软底同族视觉——primary 12% 透明底
+ * + 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头展开 180° 旋转；
+ * labelMedium 档与设置页 ThinkingEffortRow 一致）。仅当前模型解析到条目
+ * 且 [ReasoningEffortLevels.allowed] 有支持档位时由调用方组合——不显示时
+ * 不占位（模型下拉独占整行）。选项 = 「默认」+ 支持档
  * 位（同 [ReasoningEffortLevels.label] 文案）；当前值 = 条目
- * reasoning_effort（null / 越界显示「默认」）。
+ * reasoning_effort（null / 越界显示「默认」）；档位名非模型 ID，
+ * 不注入 MonoFont 子集。
  *
  * 选中语义 = 改模型条目配置：onSelectEffort 回传 (entry, effort)，由
  * ChatScreen 用 config 里原 ModelUi copy 改字段后 upsertModel 回写
  * （选了即落盘，config_changed 回刷面板回显）——与模型选择的「选了即
  * 默认」同语义层级；null = Auto（不传参，跟随 provider 默认）。
+ *
+ * 面板专属差异（经内核参数注入，逻辑留在本组件）：值文本挂 sharedBounds
+ * 锚点（valueModifier，key composer.effort——与输入框常驻状态行 effort
+ * 档位做 bounds 位移过渡）；dismiss 后同手势重开抑制窗口（同
+ * ModelPickerRow 四场景语义）；控件级语义（「思考档位，当前 X」，展开态
+ * 换「收起」措辞）；弹层非聚焦（focusable = false 保键盘，取舍见
+ * GlassDropdownMenu kdoc）。
  *
  * 设置页会话域功能模型行的档位次行（SettingsScreen ThinkingEffortRow）
  * 同链路直改条目 reasoning_effort、措辞同源（label +「默认」）——功能行
@@ -687,88 +660,52 @@ private fun EffortPickerRow(
     // ModelPickerRow（本控件同款，onSelect 后弹层内部同样走
     // onDismissRequest，选中即记时刻）。
     var lastDismissElapsedMs by remember { mutableStateOf(0L) }
-    val arrowAngle by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "panelEffortArrow",
-    )
     // 越界值（换模型后旧档位不在新支持列表）→ 按「默认」显示与回显。
     val currentEffort = current?.takeIf { it in levels }
-    Box(modifier) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                // 宽度由外层 Box 承接（weight 在调用方的双控件行注入，
-                // 对各占 50%）；fillMaxWidth 铺满 Box，值文本 weight(1f)
-                // 吸收富余宽度，超长档位名省略。
-                .fillMaxWidth()
-                .heightIn(min = 34.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                .clickable {
-                    if (SystemClock.elapsedRealtime() - lastDismissElapsedMs > DropdownReopenSuppressMs) {
-                        expanded = true
-                    }
-                }
-                .semantics {
-                    // 控件级语义（值文本自身语义被清空，见下），TalkBack
-                    // 只播报这一句；展开态换「收起」措辞，与模型下拉一致。
-                    val cur = currentEffort?.let { ReasoningEffortLevels.label(it) } ?: "默认"
-                    contentDescription =
-                        if (expanded) "收起思考档位选择，当前 $cur" else "思考档位，当前 $cur"
-                }
-                .padding(horizontal = 12.dp, vertical = 4.dp),
-        ) {
-            Text(
-                text = currentEffort?.let { ReasoningEffortLevels.label(it) } ?: "默认",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                // sharedBounds 锚点同模型下拉（key composer.effort）：与
-                // 输入框常驻状态行的 effort 档位做 bounds 位移过渡。
-                modifier = with(sharedTransitionScope) {
-                    Modifier.sharedBounds(
-                        rememberSharedContentState(key = "composer.effort"),
-                        animatedVisibilityScope = animatedVisibilityScope,
-                        boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
-                    )
-                }
-                    .weight(1f)
-                    .clearAndSetSemantics { },
+    // 当前值显示与控件级无障碍描述共用同一字符串。
+    val currentLabel = currentEffort?.let { ReasoningEffortLevels.label(it) } ?: "默认"
+    SoftPickerCapsule(
+        value = AnnotatedString(currentLabel),
+        valueColor = MaterialTheme.colorScheme.primary,
+        textStyle = MaterialTheme.typography.labelMedium,
+        expanded = expanded,
+        onExpand = {
+            if (SystemClock.elapsedRealtime() - lastDismissElapsedMs > DropdownReopenSuppressMs) {
+                expanded = true
+            }
+        },
+        onDismissRequest = {
+            expanded = false
+            lastDismissElapsedMs = SystemClock.elapsedRealtime()
+        },
+        controlContentDescription = if (expanded) {
+            "收起思考档位选择，当前 $currentLabel"
+        } else {
+            "思考档位，当前 $currentLabel"
+        },
+        hazeState = hazeState,
+        items = listOf(
+            // GlassDropdownItem.value 非空类型：空串表达「默认」，回传
+            // 时 ifEmpty 归 null（与 EditModelDialog 选择器同约定）。
+            GlassDropdownItem(value = "", label = "默认", selected = currentEffort == null),
+        ) + levels.map { lvl ->
+            GlassDropdownItem(
+                value = lvl,
+                label = ReasoningEffortLevels.label(lvl),
+                selected = lvl == currentEffort,
             )
-            Spacer(Modifier.width(4.dp))
-            Icon(
-                Icons.Filled.KeyboardArrowDown,
-                // 描述语义已上移控件级，箭头自身不再播报。
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.outline,
-                // 同模型下拉：绘制相位读取，避免逐帧重组。
-                modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+        },
+        focusable = false,
+        onSelect = { opt -> onSelectEffort(entry, opt.value.ifEmpty { null }) },
+        // sharedBounds 锚点同模型下拉（key composer.effort）：与
+        // 输入框常驻状态行的 effort 档位做 bounds 位移过渡。
+        valueModifier = with(sharedTransitionScope) {
+            Modifier.sharedBounds(
+                rememberSharedContentState(key = "composer.effort"),
+                animatedVisibilityScope = animatedVisibilityScope,
+                boundsTransform = { _, _ -> tween(320, easing = FastOutSlowInEasing) },
             )
-        }
-        GlassDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = {
-                expanded = false
-                lastDismissElapsedMs = SystemClock.elapsedRealtime()
-            },
-            hazeState = hazeState,
-            items = listOf(
-                // GlassDropdownItem.value 非空类型：空串表达「默认」，回传
-                // 时 ifEmpty 归 null（与 EditModelDialog 选择器同约定）。
-                GlassDropdownItem(value = "", label = "默认", selected = currentEffort == null),
-            ) + levels.map { lvl ->
-                GlassDropdownItem(
-                    value = lvl,
-                    label = ReasoningEffortLevels.label(lvl),
-                    selected = lvl == currentEffort,
-                )
-            },
-            // 档位名非模型 ID，不注入 MonoFont 子集。
-            alignEnd = true,
-            // 非聚焦 Popup 同模型下拉：键盘不收；BACK 取舍见 ModelPickerRow。
-            focusable = false,
-            onSelect = { opt -> onSelectEffort(entry, opt.value.ifEmpty { null }) },
-        )
-    }
+        },
+        modifier = modifier,
+    )
 }

@@ -43,7 +43,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -112,14 +111,10 @@ import dev.openslate.mobile.bridge.approvalLevelLabel
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import dev.openslate.mobile.bridge.ProviderUi
 import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.bridge.TermuxDiagnostics
@@ -1106,11 +1101,12 @@ private fun CapabilityModelRow(
 /**
  * 模型 + 思考强度单行双控件（可复用件；当前 [CapabilityModelRow] 两处
  * 功能行消费，未来新增功能行等条目选择场景直接复用）：**Section 标题即
- * 功能名**（本行不重复上屏功能名标签），行内两组「微标签 + 控件」左右
- * 分布——「模型」组居左、「思考强度」组贴行右缘（SpaceBetween 中间撑
- * 开、两端对齐）；两控件软底胶囊同语言
- * （primary 12% 透明底 + 10dp 圆角 + 34dp 最小高度），各自独立 Box 锚弹
- * 共享玻璃弹层（[GlassDropdownMenu] alignEnd 右对齐各自控件、互不影响）。
+ * 功能名**（本行不重复上屏功能名标签），行内两组控件左右分布——「模型」
+ * 组居左、「思考强度」组贴行右缘（SpaceBetween 中间撑开、两端对齐；
+ * 两组各占半行，档位组隐藏时模型组独占整行）；两控件胶囊本体均为共用
+ * 内核 [SoftPickerCapsule]
+ * （SoftButton 同族软底规格 + 玻璃弹层 alignEnd 右对齐各自控件、互不
+ * 影响），值文本构建与档位写入留在本组件。
  *
  * 复用契约（解析在调用方、展示与档位写入在组件）：
  * - 调用方解析：[bound] = 生效模型条目键（解析链调用方自定——capability
@@ -1147,14 +1143,9 @@ private fun ModelEffortPickerRow(
             selected = m.entry == bound,
         )
     }
-    val arrowAngle by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "modelEffortArrow",
-    )
-    // 单行双控件布局：「模型」组（微标签 + 控件）居左、「思考强度」组
-    // （微标签 + 控件）贴行右缘，SpaceBetween 中间撑开、两端对齐；两组
-    // 等权 fill=false——控件随值内容自然塌缩，weight 只在内容超 share
-    // 时截断（Ellipsis）。
+    // 单行双控件布局：「模型」组居左、「思考强度」组贴行右缘，SpaceBetween
+    // 中间撑开、两端对齐；两组各占半行、合计撑满整行，档位组隐藏时
+    // 模型组独占整行。
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1162,72 +1153,43 @@ private fun ModelEffortPickerRow(
             .fillMaxWidth()
             .padding(horizontal = 4.dp, vertical = 6.dp),
     ) {
-        // 模型组：软底胶囊控件（Box 仅包控件——弹层锚点独立）。无标签
-        // （用户拍板：纯下拉框自释义）。两组各占半行、合计撑满整行；
-        // 档位组隐藏时本组独占整行宽。
+        // 模型组：无标签（用户拍板：纯下拉框自释义）。值文本三态构建
+        // （模型名内嵌 MonoFont 子集、状态分支默认字体）与未绑定弱化色
+        // 留在本组件，胶囊本体与弹层交 [SoftPickerCapsule]。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.weight(1f),
         ) {
-            Box(modifier = Modifier.weight(1f)) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 34.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                        .clickable(enabled = items.isNotEmpty()) { expanded = true }
-                        .padding(horizontal = 12.dp, vertical = 4.dp),
-                ) {
-                    Text(
-                        // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
-                        // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
-                        text = when {
-                            items.isEmpty() -> AnnotatedString(emptyLabel)
-                            bound == null -> AnnotatedString(unsetLabel)
-                            else -> buildAnnotatedString {
-                                withStyle(SpanStyle(fontFamily = MonoFont)) {
-                                    append(RuntimeBridge.modelAliasDisplay(bound, config))
-                                }
-                            }
-                        },
-                        style = MaterialTheme.typography.labelLarge,
-                        color = if (bound == null) {
-                            MaterialTheme.colorScheme.outline
-                        } else {
-                            MaterialTheme.colorScheme.primary
-                        },
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        // 撑满布局：文本区吃满胶囊宽（左对齐），箭头钉在
-                        // 右缘，超长模型名 Ellipsis。
-                        modifier = Modifier.weight(1f),
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Icon(
-                        Icons.Filled.KeyboardArrowDown,
-                        contentDescription = if (expanded) "收起模型选择" else "选择模型",
-                        tint = MaterialTheme.colorScheme.outline,
-                        // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
-                        // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
-                        // 叠加弹层 Haze 模糊时表现为旋转卡顿）。
-                        modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
-                    )
-                }
-                GlassDropdownMenu(
-                    expanded = expanded,
-                    onDismissRequest = { expanded = false },
-                    hazeState = hazeState,
-                    items = items,
-                    labelFontFamily = MonoFont,
-                    alignEnd = true,
-                    onSelect = { onModelSelected(it.value) },
-                )
-            }
+            SoftPickerCapsule(
+                value = when {
+                    items.isEmpty() -> AnnotatedString(emptyLabel)
+                    bound == null -> AnnotatedString(unsetLabel)
+                    else -> buildAnnotatedString {
+                        withStyle(SpanStyle(fontFamily = MonoFont)) {
+                            append(RuntimeBridge.modelAliasDisplay(bound, config))
+                        }
+                    }
+                },
+                valueColor = if (bound == null) {
+                    MaterialTheme.colorScheme.outline
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
+                textStyle = MaterialTheme.typography.labelLarge,
+                expanded = expanded,
+                onExpand = { expanded = true },
+                onDismissRequest = { expanded = false },
+                enabled = items.isNotEmpty(),
+                arrowContentDescription = if (expanded) "收起模型选择" else "选择模型",
+                hazeState = hazeState,
+                items = items,
+                labelFontFamily = MonoFont,
+                onSelect = { onModelSelected(it.value) },
+                modifier = Modifier.weight(1f),
+            )
         }
-        // 思考强度组：档位控件占右半行，无标签（用户拍板）；与模型组间
-        // 8dp 呼吸隙；条目不支持档位 → 整组不组合（模型组独占整行）。
+        // 思考强度组：无标签（用户拍板）；与模型组间 8dp 呼吸隙；条目
+        // 不支持档位 → 整组不组合（模型组独占整行）。
         effortModel?.let { m ->
             Spacer(Modifier.width(8.dp))
             Row(
@@ -1254,8 +1216,8 @@ private fun ModelEffortPickerRow(
  * （同源，config_changed 回刷）——条目共享语义只在本 kdoc 说明、不上 UI
  * （用户反馈：条目名提示副文案喧宾夺主，已删）。
  *
- * 形态 = 紧凑软底胶囊（对话页 EffortPickerRow 同款：primary 12% 透明底 +
- * 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头展开 180° 旋转）；本体
+ * 形态 = 紧凑软底胶囊（共用内核 [SoftPickerCapsule]，对话页
+ * EffortPickerRow 同款规格；左当前档位 + 右箭头展开 180° 旋转）；本体
  * 无静态标签——微标签「思考强度」由宿主组（[ModelEffortPickerRow]）提供，
  * 读屏语义由控件内箭头描述承载。条目不支持档位
  * （[ReasoningEffortLevels.allowed] 返回 null）→ 本控件自隐（调用方无需
@@ -1282,76 +1244,43 @@ private fun ThinkingEffortRow(
     val levels = ReasoningEffortLevels.allowed(model.supportsReasoning, model.modelId) ?: return
     var expanded by remember { mutableStateOf(false) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
-    val arrowAngle by animateFloatAsState(
-        targetValue = if (expanded) 180f else 0f,
-        label = "effortRowArrow",
-    )
     val current = model.reasoningEffort?.takeIf { it in levels }
     val currentLabel = current?.let { ReasoningEffortLevels.label(it) } ?: "默认"
-    Box(modifier) {
-        // 紧凑软底胶囊（对话页 EffortPickerRow 同款规格）：左当前档位 +
-        // 右箭头；无静态标签（宿主行即语义）。撑满宿主给定的半行宽：
-        // 文本区吃满（左对齐），箭头钉右缘，超长档位名 Ellipsis。
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 34.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                .clickable { expanded = true }
-                .padding(horizontal = 12.dp, vertical = 4.dp),
-        ) {
-            Text(
-                text = currentLabel,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
+    SoftPickerCapsule(
+        value = AnnotatedString(currentLabel),
+        valueColor = MaterialTheme.colorScheme.primary,
+        textStyle = MaterialTheme.typography.labelMedium,
+        expanded = expanded,
+        onExpand = { expanded = true },
+        onDismissRequest = { expanded = false },
+        arrowContentDescription = if (expanded) {
+            "收起思考强度选择，当前 $currentLabel"
+        } else {
+            "思考强度，当前 $currentLabel"
+        },
+        hazeState = hazeState,
+        items = listOf(
+            // 空串表达「默认」，回传 ifEmpty 归 null（与 EffortPickerRow /
+            // EditModelDialog 选择器同约定）。
+            GlassDropdownItem(value = "", label = "默认", selected = current == null),
+        ) + levels.map { lvl ->
+            GlassDropdownItem(
+                value = lvl,
+                label = ReasoningEffortLevels.label(lvl),
+                selected = lvl == current,
             )
-            Spacer(Modifier.width(4.dp))
-            Icon(
-                Icons.Filled.KeyboardArrowDown,
-                // 无静态标签：控件语义经箭头描述承载（读屏播报当前档位）。
-                contentDescription = if (expanded) {
-                    "收起思考强度选择，当前 $currentLabel"
-                } else {
-                    "思考强度，当前 $currentLabel"
-                },
-                tint = MaterialTheme.colorScheme.outline,
-                // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
-                // 不逐帧重组整行（对齐输入面板双控件）。
-                modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
-            )
-        }
-        GlassDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            hazeState = hazeState,
-            items = listOf(
-                // 空串表达「默认」，回传 ifEmpty 归 null（与 EffortPickerRow /
-                // EditModelDialog 选择器同约定）。
-                GlassDropdownItem(value = "", label = "默认", selected = current == null),
-            ) + levels.map { lvl ->
-                GlassDropdownItem(
-                    value = lvl,
-                    label = ReasoningEffortLevels.label(lvl),
-                    selected = lvl == current,
-                )
-            },
-            alignEnd = true,
-            onSelect = { opt ->
-                val effort = opt.value.ifEmpty { null }
-                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                    val ok = RuntimeBridge.upsertModel(model.copy(reasoningEffort = effort))
-                    if (!ok) {
-                        scope.launch { snackbar.showSnackbar("思考强度保存失败") }
-                    }
+        },
+        onSelect = { opt ->
+            val effort = opt.value.ifEmpty { null }
+            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val ok = RuntimeBridge.upsertModel(model.copy(reasoningEffort = effort))
+                if (!ok) {
+                    scope.launch { snackbar.showSnackbar("思考强度保存失败") }
                 }
-            },
-        )
-    }
+            }
+        },
+        modifier = modifier,
+    )
 }
 
 /**

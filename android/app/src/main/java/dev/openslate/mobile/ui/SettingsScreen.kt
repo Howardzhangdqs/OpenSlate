@@ -362,25 +362,10 @@ fun SettingsScreen(
                         // 框聚焦面板的选择器直接选定（选了即落盘为启动默认，
                         // RuntimeBridge.selectModel 双写）；上下文压缩不再出
                         // 现在 UI（未绑定时 core 侧继承会话模型）。
-                        // ── 会话域：思考强度（当前主对话模型 reasoning_effort
-                        // 直改）──置顶本域（标题生成模型之前）：思考档位直接
-                        // 塑造当前对话的每一回合回复（主对话模型本体），下方
-                        // 两行是其下游辅助自动化——「本体在前、辅助在后」的
-                        // 视觉顺。主模型未解析到条目或家族表无支持档位 → 整节
-                        // 隐藏不占位（对齐 ComposerPanel EffortPickerRow）。
-                        resolvedCurrentModel(state.modelAlias, config)?.let { main ->
-                            ReasoningEffortLevels.allowed(main.supportsReasoning, main.modelId)?.let { levels ->
-                                Section(title = "思考强度") {
-                                    Text(
-                                        "当前对话模型的思考档位，改动立即落盘生效，对话页输入框面板" +
-                                            "同步回显；「默认」= 不传参、跟随 provider 默认。",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.outline,
-                                    )
-                                    ThinkingEffortRow(main, levels, config, hazeState, snackbarHostState)
-                                }
-                            }
-                        }
+                        // 功能行内嵌的思考强度次行见 CapabilityModelRow /
+                        // ThinkingEffortRow（档位随各自行内生效条目；主对话
+                        // 模型的档位编辑处在对话页输入面板 EffortPickerRow，
+                        // 本域不设独立入口）。
                         Section(title = "标题生成模型") {
                             Text(
                                 "新会话的标题用哪个模型条目生成，改动立即落盘生效。" +
@@ -388,7 +373,14 @@ fun SettingsScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.outline,
                             )
-                            CapabilityModelRow("title", "会话标题生成", config, hazeState)
+                            CapabilityModelRow(
+                                "title",
+                                "会话标题生成",
+                                config,
+                                hazeState,
+                                snackbarHostState,
+                                state.modelAlias,
+                            )
                         }
                         // ── 会话域：审批审查模型（capability=review）──────
                         // 「自动判断」审批等级的 AI 审查器；未绑定 → 继承会话
@@ -405,6 +397,8 @@ fun SettingsScreen(
                                 "审批风险审查",
                                 config,
                                 hazeState,
+                                snackbarHostState,
+                                state.modelAlias,
                                 unsetLabel = "跟随会话模型",
                             )
                         }
@@ -1060,12 +1054,19 @@ private fun Section(
 }
 
 /**
- * 功能模型绑定行（会话页；现仅「标题生成」在用——主对话模型已移至对话页
- * 输入框聚焦面板的选择器直选，compact 不再暴露）：功能名居左、当前绑定
- * 模型居右、箭头指示可点；整行点击弹出共享玻璃弹层（[GlassDropdownMenu]，
- * 与对话页「本次对话模型」选择器同族磨砂语言），直选 models 条目，选中即
- * setCapability 落盘（main 改绑由 Rust 热切换会话模型并广播 model_changed，
- * 下回合即生效）。
+ * 功能模型绑定行（会话域；「标题生成」「审批审查」两处在用——主对话模型
+ * 已移至对话页输入框聚焦面板的选择器直选，compact 不再暴露）：功能名居左、
+ * 当前绑定模型居右、箭头指示可点；整行点击弹出共享玻璃弹层
+ * （[GlassDropdownMenu]，与对话页「本次对话模型」选择器同族磨砂语言），
+ * 直选 models 条目，选中即 setCapability 落盘（main 改绑由 Rust 热切换
+ * 会话模型并广播 model_changed，下回合即生效）。
+ *
+ * 模型行下方内嵌思考强度次行（[ThinkingEffortRow]，左缩进表从属）：档位
+ * 编辑**本行生效条目**的 reasoning_effort——运行时标题/审查链由条目自动
+ * 带入 effort（Rust provider 构建请求时处理，零协议改动）。次行目标条目 =
+ * 行内已解析条目；未解析出条目（如 review 未绑定「跟随会话模型」）→ 回退
+ * 会话主模型条目（[resolvedCurrentModel]，运行时即继承它）——副文案注明
+ * 实际编辑的条目；两功能绑同一条目时两行档位同值联动。
  *
  * 当前值解析（与 Rust capability_alias + resolve_model 同序）：生效别名 =
  * capabilities[cap]，缺省回退 main→"main"、其余→"fast"；再经
@@ -1078,6 +1079,10 @@ private fun CapabilityModelRow(
     title: String,
     config: ConfigUi,
     hazeState: HazeState,
+    // 页内轻提示通道（档位次行写失败用），透传 [ThinkingEffortRow]。
+    snackbar: SnackbarHostState,
+    // 会话主模型别名（档位次行在行内条目未解析出时的回退解析入口）。
+    modelAlias: String,
     // 未绑定（capabilities 无此键）时的显示文案：「未设置」为缺省；
     // review 等继承型功能传「跟随会话模型」。
     unsetLabel: String = "未设置",
@@ -1089,6 +1094,11 @@ private fun CapabilityModelRow(
     val currentEntry = RuntimeBridge.modelEntryOf(stored ?: fallback, config)
     val entries = config.models.map { it.entry }.toSet()
     val bound = currentEntry.takeIf { it in entries }
+    // 档位次行的目标条目 = 行内已解析条目；未解析出条目（如 review 未绑定
+    // 「跟随会话模型」）→ 回退会话主模型条目（运行时即继承它，编辑同一
+    // 字段）。仍解析不出 → 次行不出现（组件内对不支持档位同样自隐）。
+    val effortModel = bound?.let { e -> config.models.firstOrNull { it.entry == e } }
+        ?: resolvedCurrentModel(modelAlias, config)
     val items = config.models.map { m ->
         GlassDropdownItem(
             value = m.entry,
@@ -1100,106 +1110,124 @@ private fun CapabilityModelRow(
         targetValue = if (expanded) 180f else 0f,
         label = "capModelArrow",
     )
-    Box {
-        // 经典设置项布局：标签居左、当前值控件（值 + 箭头）贴行右缘
-        // （SpaceBetween + 双方 weight 限宽兜底：值至多占 2/3，超出单行
-        // Ellipsis 截断，标签恒保至少 1/3）。触发域收窄：仅右侧当前值
-        // 控件可点弹层，行其余区域不响应点击。
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 4.dp, vertical = 6.dp),
-        ) {
-            Text(
-                title,
-                style = MaterialTheme.typography.titleSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
-            )
+    Column {
+        // 模型行 + 弹层（Box 仅包本行：模型弹层锚点不因次行增删漂移，
+        // 展开位置仍紧贴模型行下方）。
+        Box {
+            // 经典设置项布局：标签居左、当前值控件（值 + 箭头）贴行右缘
+            // （SpaceBetween + 双方 weight 限宽兜底：值至多占 2/3，超出单行
+            // Ellipsis 截断，标签恒保至少 1/3）。触发域收窄：仅右侧当前值
+            // 控件可点弹层，行其余区域不响应点击。
             Row(
                 verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier
-                    .weight(2f, fill = false)
-                    .clip(RoundedCornerShape(10.dp))
-                    .clickable(enabled = items.isNotEmpty()) { expanded = true }
-                    .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 6.dp),
             ) {
                 Text(
-                    // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
-                    // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
-                    text = when {
-                        items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
-                        bound == null -> AnnotatedString(unsetLabel)
-                        else -> buildAnnotatedString {
-                            withStyle(SpanStyle(fontFamily = MonoFont)) {
-                                append(RuntimeBridge.modelAliasDisplay(bound, config))
-                            }
-                        }
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (bound == null) {
-                        MaterialTheme.colorScheme.outline
-                    } else {
-                        MaterialTheme.colorScheme.primary
-                    },
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
-                Spacer(Modifier.width(4.dp))
-                Icon(
-                    Icons.Filled.KeyboardArrowDown,
-                    contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
-                    tint = MaterialTheme.colorScheme.outline,
-                    // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
-                    // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
-                    // 叠加弹层 Haze 模糊时表现为旋转卡顿）。
-                    modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .weight(2f, fill = false)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = items.isNotEmpty()) { expanded = true }
+                        .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
+                ) {
+                    Text(
+                        // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
+                        // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
+                        text = when {
+                            items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
+                            bound == null -> AnnotatedString(unsetLabel)
+                            else -> buildAnnotatedString {
+                                withStyle(SpanStyle(fontFamily = MonoFont)) {
+                                    append(RuntimeBridge.modelAliasDisplay(bound, config))
+                                }
+                            }
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (bound == null) {
+                            MaterialTheme.colorScheme.outline
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Icon(
+                        Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
+                        tint = MaterialTheme.colorScheme.outline,
+                        // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
+                        // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
+                        // 叠加弹层 Haze 模糊时表现为旋转卡顿）。
+                        modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+                    )
+                }
             }
+            GlassDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                hazeState = hazeState,
+                items = items,
+                labelFontFamily = MonoFont,
+                alignEnd = true,
+                onSelect = { RuntimeBridge.setCapability(cap, it.value) },
+            )
         }
-        GlassDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            hazeState = hazeState,
-            items = items,
-            labelFontFamily = MonoFont,
-            alignEnd = true,
-            onSelect = { RuntimeBridge.setCapability(cap, it.value) },
-        )
+        // 思考强度次行：从属模型行（左缩进 16dp 表层级）；目标条目解析见
+        // kdoc——条目不支持档位 → 次行自隐不占位（组件内判定）。
+        effortModel?.let { m ->
+            ThinkingEffortRow(
+                model = m,
+                config = config,
+                hazeState = hazeState,
+                snackbar = snackbar,
+                modifier = Modifier.padding(start = 16.dp, end = 4.dp, bottom = 6.dp),
+            )
+        }
     }
 }
 
 /**
- * 思考强度设置行（会话域，[CapabilityModelRow] 同款布局语言）：标题居左
- * （副行挂当前主模型名——[RuntimeBridge.modelAliasDisplay] 输出，MonoFont
- * 值样式弱化为 labelSmall + outline 作副行层级）、档位值控件贴行右缘
- * （值 + 箭头，GlassDropdownMenu alignEnd 右对齐）；触发域收窄为仅值控件
- * 可点（同 CapabilityModelRow）。
+ * 思考强度次行（功能模型行 [CapabilityModelRow] 内嵌的档位选择器，紧贴
+ * 模型行下方、左缩进表从属）：编辑**本行生效条目**的 reasoning_effort——
+ * 运行时标题/审查链由条目自动带入 effort（Rust provider 构建请求时处理，
+ * 零协议改动）。功能未绑定（如 review「跟随会话模型」）时运行时继承会话
+ * 主模型，调用方已把目标条目回退解析到主条目再传入；两种情形都经副文案
+ * 「档位随模型条目：{条目名}」如实注明——两功能绑同一条目时两行档位同值
+ * 联动（同源，config_changed 回刷）。
  *
- * 与对话页 ComposerPanel 的 EffortPickerRow 同源：编辑的都是**当前主对话
- * 模型条目**的 reasoning_effort，本行无独立状态源——选中即 config 原条目
- * copy 改字段后 upsertModel 落盘（persist + config_changed 回刷），对话页
- * 与本行经同一 config 回证后恒同值。措辞亦同源：null =「默认」（不传参、
- * 跟随 provider 默认），档位名 = [ReasoningEffortLevels.label]（协议原词
- * + 中文括注）；档位名非模型 ID，弹层不注入 MonoFont 子集（两处同取舍）。
- * 越界值（换模型后旧档位不在新支持列表）按「默认」显示（回显兜底与
- * EffortPickerRow 同语义；落盘值本身不在此清洗）。
+ * 与对话页 ComposerPanel 的 EffortPickerRow 同链路：条目 reasoning_effort
+ * 无第二状态源——选中即条目 copy 改字段后 upsertModel 落盘（persist +
+ * config_changed 回刷，对话页面板与本行同回证）。措辞同源：null =「默认」
+ * （不传参、跟随 provider 默认），档位名 = [ReasoningEffortLevels.label]
+ * （协议原词 + 中文括注）；档位名非模型 ID，弹层不注入 MonoFont 子集。
+ * 条目不支持档位（[ReasoningEffortLevels.allowed] 返回 null）→ 本行自隐
+ * （调用方无需预判）；越界值按「默认」显示（回显兜底与 EffortPickerRow
+ * 同语义；落盘值本身不在此清洗）。
  *
  * 写入失败走页内 snackbar 通道（[ImageProcessingSection] 同款：IO 写 FFI、
- * 失败回主线程提示；成功路径无本地乐观态——config 即唯一状态源，
- * config_changed 回刷回显）。
+ * 失败回主线程提示；成功路径无本地乐观态——config 即唯一状态源）。
  */
 @Composable
 private fun ThinkingEffortRow(
     model: ModelUi,
-    levels: List<String>,
     config: ConfigUi,
     hazeState: HazeState,
     snackbar: SnackbarHostState,
+    modifier: Modifier = Modifier,
 ) {
+    // 条目不支持档位 → 整行不组合（对齐 EffortPickerRow 的不占位语义）。
+    val levels = ReasoningEffortLevels.allowed(model.supportsReasoning, model.modelId) ?: return
     var expanded by remember { mutableStateOf(false) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val arrowAngle by animateFloatAsState(
@@ -1207,30 +1235,34 @@ private fun ThinkingEffortRow(
         label = "effortRowArrow",
     )
     val current = model.reasoningEffort?.takeIf { it in levels }
-    Box {
-        // 经典设置项布局（CapabilityModelRow 同款）：标签居左、值控件贴行
-        // 右缘（SpaceBetween + 双方 weight 限宽兜底：值至多占 2/3，超出
-        // 单行 Ellipsis 截断，标签恒保至少 1/3）。
+    Box(modifier) {
+        // 次级设置行：标签（含条目名副文案）居左、值控件贴行右缘
+        // （SpaceBetween + weight 限宽：标签至多 2/3、值至多 1/3，
+        // 超出单行 Ellipsis 截断）；触发域仅值控件可点（同宿主模型行）。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 4.dp, vertical = 6.dp),
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Column(
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier.weight(2f, fill = false),
             ) {
                 Text(
                     "思考强度",
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.labelLarge,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    RuntimeBridge.modelAliasDisplay(model.entry, config),
+                    // 副文案注明实际编辑的条目（共享语义如实呈现，不藏着）：
+                    // 条目名内嵌 MonoFont 子集（同宿主模型行的值渲染）。
+                    buildAnnotatedString {
+                        append("档位随模型条目：")
+                        withStyle(SpanStyle(fontFamily = MonoFont)) {
+                            append(RuntimeBridge.modelAliasDisplay(model.entry, config))
+                        }
+                    },
                     style = MaterialTheme.typography.labelSmall,
-                    fontFamily = MonoFont,
                     color = MaterialTheme.colorScheme.outline,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -1240,18 +1272,17 @@ private fun ThinkingEffortRow(
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .weight(2f, fill = false)
+                    .weight(1f, fill = false)
                     .clip(RoundedCornerShape(10.dp))
                     .clickable { expanded = true }
                     .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
             ) {
                 Text(
                     text = current?.let { ReasoningEffortLevels.label(it) } ?: "默认",
-                    style = MaterialTheme.typography.labelLarge,
+                    style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
                 )
                 Spacer(Modifier.width(4.dp))
                 Icon(
@@ -1259,7 +1290,7 @@ private fun ThinkingEffortRow(
                     contentDescription = if (expanded) "收起思考强度选择" else "选择思考强度",
                     tint = MaterialTheme.colorScheme.outline,
                     // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
-                    // 不逐帧重组整行（对齐 CapabilityModelRow）。
+                    // 不逐帧重组整行（对齐宿主模型行）。
                     modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
                 )
             }

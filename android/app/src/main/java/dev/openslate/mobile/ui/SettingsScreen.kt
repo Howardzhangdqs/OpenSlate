@@ -375,7 +375,6 @@ fun SettingsScreen(
                             )
                             CapabilityModelRow(
                                 "title",
-                                "会话标题生成",
                                 config,
                                 hazeState,
                                 snackbarHostState,
@@ -394,7 +393,6 @@ fun SettingsScreen(
                             )
                             CapabilityModelRow(
                                 "review",
-                                "审批风险审查",
                                 config,
                                 hazeState,
                                 snackbarHostState,
@@ -1073,7 +1071,6 @@ private fun Section(
 @Composable
 private fun CapabilityModelRow(
     cap: String,
-    title: String,
     config: ConfigUi,
     hazeState: HazeState,
     // 页内轻提示通道（档位控件写失败用），透传 [ThinkingEffortRow]。
@@ -1096,7 +1093,6 @@ private fun CapabilityModelRow(
     val effortModel = bound?.let { e -> config.models.firstOrNull { it.entry == e } }
         ?: resolvedCurrentModel(modelAlias, config)
     ModelEffortPickerRow(
-        label = title,
         config = config,
         bound = bound,
         effortModel = effortModel,
@@ -1109,9 +1105,10 @@ private fun CapabilityModelRow(
 
 /**
  * 模型 + 思考强度单行双控件（可复用件；当前 [CapabilityModelRow] 两处
- * 功能行消费，未来新增功能行等条目选择场景直接复用）：功能名标签居左、
- * 模型选择控件居中、思考强度控件贴行右缘——对话页输入框聚焦面板双控件
- * 行（ModelPickerRow | EffortPickerRow）同形态；两控件软底胶囊同语言
+ * 功能行消费，未来新增功能行等条目选择场景直接复用）：**Section 标题即
+ * 功能名**（本行不重复上屏功能名标签），行内两组「微标签 + 控件」左右
+ * 分布——「模型」组居左、「思考强度」组贴行右缘（SpaceBetween 中间撑
+ * 开、两端对齐）；两控件软底胶囊同语言
  * （primary 12% 透明底 + 10dp 圆角 + 34dp 最小高度），各自独立 Box 锚弹
  * 共享玻璃弹层（[GlassDropdownMenu] alignEnd 右对齐各自控件、互不影响）。
  *
@@ -1119,8 +1116,9 @@ private fun CapabilityModelRow(
  * - 调用方解析：[bound] = 生效模型条目键（解析链调用方自定——capability
  *   行镜像 capability_alias + resolve_model；null = 未解析/未绑定，模型
  *   控件显示 [unsetLabel] 弱化态）；[effortModel] = 档位目标条目（null =
- *   档位控件不显示；条目不支持档位时组件内亦自隐，模型控件独占剩余
- *   行宽）；模型选中回传条目键经 [onModelSelected] 落盘（写入语义调用方
+ *   档位整组不显示；条目不支持档位时组件内亦自隐，模型组独占行、
+ *   自然塌缩不留空右缘标签）；模型选中回传条目键经 [onModelSelected]
+ *   落盘（写入语义调用方
  *   定——capability 行走 setCapability）。
  * - 组件内置：档位写入 = 条目 copy 改 reasoning_effort 后 IO upsertModel
  *   （失败经 [snackbar] 页内提示）——reasoning_effort 是条目字段、无第二
@@ -1129,7 +1127,6 @@ private fun CapabilityModelRow(
  */
 @Composable
 private fun ModelEffortPickerRow(
-    label: String,
     config: ConfigUi,
     bound: String?,
     effortModel: ModelUi?,
@@ -1154,10 +1151,10 @@ private fun ModelEffortPickerRow(
         targetValue = if (expanded) 180f else 0f,
         label = "modelEffortArrow",
     )
-    // 单行双控件布局：功能名标签居左、模型选择控件居中、思考强度控件贴
-    // 行右缘（SpaceBetween：首尾贴边、中间控件居中；两个加权控件
-    // fill=false 内容优先、weight 只作截断上限——模型名最长给 2 份，档位
-    // 值短给 1 份，标签短文案不占权重）。
+    // 单行双控件布局：「模型」组（微标签 + 控件）居左、「思考强度」组
+    // （微标签 + 控件）贴行右缘，SpaceBetween 中间撑开、两端对齐；两组
+    // 等权 fill=false——控件随值内容自然塌缩，weight 只在内容超 share
+    // 时截断（Ellipsis）。
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1165,79 +1162,94 @@ private fun ModelEffortPickerRow(
             .fillMaxWidth()
             .padding(horizontal = 4.dp, vertical = 6.dp),
     ) {
-        Text(
-            label,
-            style = MaterialTheme.typography.titleSmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        // 模型选择控件（软底胶囊同输入面板 ModelPickerRow 语言；Box 仅包
-        // 本控件——弹层锚点不随档位控件增删漂移）。条目不支持档位时右侧
-        // 控件不组合，本控件独占剩余宽度（回到标签左 / 值右的经典设置行）。
-        Box(modifier = Modifier.weight(2f, fill = false)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 34.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
-                    .clickable(enabled = items.isNotEmpty()) { expanded = true }
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
-                    // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
-                    text = when {
-                        items.isEmpty() -> AnnotatedString(emptyLabel)
-                        bound == null -> AnnotatedString(unsetLabel)
-                        else -> buildAnnotatedString {
-                            withStyle(SpanStyle(fontFamily = MonoFont)) {
-                                append(RuntimeBridge.modelAliasDisplay(bound, config))
+        // 模型组：微标签 + 软底胶囊控件（Box 仅包控件——弹层锚点独立）。
+        // 档位组隐藏时本组独占行，控件按内容塌缩（不留空右缘标签）。
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.weight(1f, fill = false),
+        ) {
+            Text(
+                "模型",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            Spacer(Modifier.width(4.dp))
+            Box(modifier = Modifier.weight(1f, fill = false)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .heightIn(min = 34.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                        .clickable(enabled = items.isNotEmpty()) { expanded = true }
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                ) {
+                    Text(
+                        // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
+                        // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
+                        text = when {
+                            items.isEmpty() -> AnnotatedString(emptyLabel)
+                            bound == null -> AnnotatedString(unsetLabel)
+                            else -> buildAnnotatedString {
+                                withStyle(SpanStyle(fontFamily = MonoFont)) {
+                                    append(RuntimeBridge.modelAliasDisplay(bound, config))
+                                }
                             }
-                        }
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (bound == null) {
-                        MaterialTheme.colorScheme.outline
-                    } else {
-                        MaterialTheme.colorScheme.primary
-                    },
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    // 值文本吸收富余宽度：箭头贴控件右缘（输入面板同款）。
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(4.dp))
-                Icon(
-                    Icons.Filled.KeyboardArrowDown,
-                    contentDescription = if (expanded) "收起${label}的模型选择" else "选择${label}的模型",
-                    tint = MaterialTheme.colorScheme.outline,
-                    // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
-                    // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
-                    // 叠加弹层 Haze 模糊时表现为旋转卡顿）。
-                    modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (bound == null) {
+                            MaterialTheme.colorScheme.outline
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        // 值文本内容优先 + 上限截断：胶囊随值塌缩（箭头贴
+                        // 胶囊右缘，输入面板同款）。
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Icon(
+                        Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (expanded) "收起模型选择" else "选择模型",
+                        tint = MaterialTheme.colorScheme.outline,
+                        // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
+                        // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
+                        // 叠加弹层 Haze 模糊时表现为旋转卡顿）。
+                        modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+                    )
+                }
+                GlassDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false },
+                    hazeState = hazeState,
+                    items = items,
+                    labelFontFamily = MonoFont,
+                    alignEnd = true,
+                    onSelect = { onModelSelected(it.value) },
                 )
             }
-            GlassDropdownMenu(
-                expanded = expanded,
-                onDismissRequest = { expanded = false },
-                hazeState = hazeState,
-                items = items,
-                labelFontFamily = MonoFont,
-                alignEnd = true,
-                onSelect = { onModelSelected(it.value) },
-            )
         }
-        // 思考强度控件：无静态标签（行内右缘位置即语义，与输入面板双控件
-        // 行一致）；条目不支持档位 → 不组合不占位（组件内判定）。
+        // 思考强度组：微标签 + 档位控件贴右缘；条目不支持档位 → 整组不
+        // 组合（组件内判定），不留空右缘标签。
         effortModel?.let { m ->
-            ThinkingEffortRow(
-                model = m,
-                hazeState = hazeState,
-                snackbar = snackbar,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.weight(1f, fill = false),
-            )
+            ) {
+                Text(
+                    "思考强度",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+                Spacer(Modifier.width(4.dp))
+                ThinkingEffortRow(
+                    model = m,
+                    hazeState = hazeState,
+                    snackbar = snackbar,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+            }
         }
     }
 }
@@ -1252,8 +1264,8 @@ private fun ModelEffortPickerRow(
  * （用户反馈：条目名提示副文案喧宾夺主，已删）。
  *
  * 形态 = 紧凑软底胶囊（对话页 EffortPickerRow 同款：primary 12% 透明底 +
- * 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头展开 180° 旋转）；**无
- * 静态标签**——行内右缘位置即语义（与输入面板双控件行一致，用户拍板），
+ * 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头展开 180° 旋转）；本体
+ * 无静态标签——微标签「思考强度」由宿主组（[ModelEffortPickerRow]）提供，
  * 读屏语义由控件内箭头描述承载。条目不支持档位
  * （[ReasoningEffortLevels.allowed] 返回 null）→ 本控件自隐（调用方无需
  * 预判，模型控件独占行宽）；越界值按「默认」显示（回显兜底与
@@ -1286,12 +1298,12 @@ private fun ThinkingEffortRow(
     val current = model.reasoningEffort?.takeIf { it in levels }
     val currentLabel = current?.let { ReasoningEffortLevels.label(it) } ?: "默认"
     Box(modifier) {
-        // 紧凑软底胶囊（对话页 EffortPickerRow 同款规格）：无静态标签，
-        // 左当前档位 + 右箭头；值文本吸收富余宽度，箭头贴控件右缘。
+        // 紧凑软底胶囊（对话页 EffortPickerRow 同款规格）：左当前档位 +
+        // 右箭头；微标签「思考强度」由宿主组提供，胶囊随值内容自然塌缩
+        // （值文本内容优先 + 上限截断，箭头贴胶囊右缘）。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
-                .fillMaxWidth()
                 .heightIn(min = 34.dp)
                 .clip(RoundedCornerShape(10.dp))
                 .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
@@ -1304,7 +1316,7 @@ private fun ThinkingEffortRow(
                 color = MaterialTheme.colorScheme.primary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f, fill = false),
             )
             Spacer(Modifier.width(4.dp))
             Icon(

@@ -665,6 +665,10 @@ private fun ModelPickerRow(
  * ChatScreen 用 config 里原 ModelUi copy 改字段后 upsertModel 回写
  * （选了即落盘，config_changed 回刷面板回显）——与模型选择的「选了即
  * 默认」同语义层级；null = Auto（不传参，跟随 provider 默认）。
+ *
+ * 设置页「模型 → 会话」的「思考强度」行（SettingsScreen
+ * ThinkingEffortRow）编辑的是同一字段、措辞同源（label +「默认」）——
+ * 两处无独立状态源，config_changed 回证后恒同值。
  */
 @Composable
 private fun EffortPickerRow(

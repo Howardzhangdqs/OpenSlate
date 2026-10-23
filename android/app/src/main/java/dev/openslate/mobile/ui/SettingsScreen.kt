@@ -362,6 +362,25 @@ fun SettingsScreen(
                         // 框聚焦面板的选择器直接选定（选了即落盘为启动默认，
                         // RuntimeBridge.selectModel 双写）；上下文压缩不再出
                         // 现在 UI（未绑定时 core 侧继承会话模型）。
+                        // ── 会话域：思考强度（当前主对话模型 reasoning_effort
+                        // 直改）──置顶本域（标题生成模型之前）：思考档位直接
+                        // 塑造当前对话的每一回合回复（主对话模型本体），下方
+                        // 两行是其下游辅助自动化——「本体在前、辅助在后」的
+                        // 视觉顺。主模型未解析到条目或家族表无支持档位 → 整节
+                        // 隐藏不占位（对齐 ComposerPanel EffortPickerRow）。
+                        resolvedCurrentModel(state.modelAlias, config)?.let { main ->
+                            ReasoningEffortLevels.allowed(main.supportsReasoning, main.modelId)?.let { levels ->
+                                Section(title = "思考强度") {
+                                    Text(
+                                        "当前对话模型的思考档位，改动立即落盘生效，对话页输入框面板" +
+                                            "同步回显；「默认」= 不传参、跟随 provider 默认。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.outline,
+                                    )
+                                    ThinkingEffortRow(main, levels, config, hazeState, snackbarHostState)
+                                }
+                            }
+                        }
                         Section(title = "标题生成模型") {
                             Text(
                                 "新会话的标题用哪个模型条目生成，改动立即落盘生效。" +
@@ -1149,6 +1168,127 @@ private fun CapabilityModelRow(
             labelFontFamily = MonoFont,
             alignEnd = true,
             onSelect = { RuntimeBridge.setCapability(cap, it.value) },
+        )
+    }
+}
+
+/**
+ * 思考强度设置行（会话域，[CapabilityModelRow] 同款布局语言）：标题居左
+ * （副行挂当前主模型名——[RuntimeBridge.modelAliasDisplay] 输出，MonoFont
+ * 值样式弱化为 labelSmall + outline 作副行层级）、档位值控件贴行右缘
+ * （值 + 箭头，GlassDropdownMenu alignEnd 右对齐）；触发域收窄为仅值控件
+ * 可点（同 CapabilityModelRow）。
+ *
+ * 与对话页 ComposerPanel 的 EffortPickerRow 同源：编辑的都是**当前主对话
+ * 模型条目**的 reasoning_effort，本行无独立状态源——选中即 config 原条目
+ * copy 改字段后 upsertModel 落盘（persist + config_changed 回刷），对话页
+ * 与本行经同一 config 回证后恒同值。措辞亦同源：null =「默认」（不传参、
+ * 跟随 provider 默认），档位名 = [ReasoningEffortLevels.label]（协议原词
+ * + 中文括注）；档位名非模型 ID，弹层不注入 MonoFont 子集（两处同取舍）。
+ * 越界值（换模型后旧档位不在新支持列表）按「默认」显示（回显兜底与
+ * EffortPickerRow 同语义；落盘值本身不在此清洗）。
+ *
+ * 写入失败走页内 snackbar 通道（[ImageProcessingSection] 同款：IO 写 FFI、
+ * 失败回主线程提示；成功路径无本地乐观态——config 即唯一状态源，
+ * config_changed 回刷回显）。
+ */
+@Composable
+private fun ThinkingEffortRow(
+    model: ModelUi,
+    levels: List<String>,
+    config: ConfigUi,
+    hazeState: HazeState,
+    snackbar: SnackbarHostState,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val arrowAngle by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        label = "effortRowArrow",
+    )
+    val current = model.reasoningEffort?.takeIf { it in levels }
+    Box {
+        // 经典设置项布局（CapabilityModelRow 同款）：标签居左、值控件贴行
+        // 右缘（SpaceBetween + 双方 weight 限宽兜底：值至多占 2/3，超出
+        // 单行 Ellipsis 截断，标签恒保至少 1/3）。
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp, vertical = 6.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f, fill = false),
+            ) {
+                Text(
+                    "思考强度",
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    RuntimeBridge.modelAliasDisplay(model.entry, config),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = MonoFont,
+                    color = MaterialTheme.colorScheme.outline,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(2f, fill = false)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { expanded = true }
+                    .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
+            ) {
+                Text(
+                    text = current?.let { ReasoningEffortLevels.label(it) } ?: "默认",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "收起思考强度选择" else "选择思考强度",
+                    tint = MaterialTheme.colorScheme.outline,
+                    // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
+                    // 不逐帧重组整行（对齐 CapabilityModelRow）。
+                    modifier = Modifier.graphicsLayer { rotationZ = arrowAngle },
+                )
+            }
+        }
+        GlassDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            hazeState = hazeState,
+            items = listOf(
+                // 空串表达「默认」，回传 ifEmpty 归 null（与 EffortPickerRow /
+                // EditModelDialog 选择器同约定）。
+                GlassDropdownItem(value = "", label = "默认", selected = current == null),
+            ) + levels.map { lvl ->
+                GlassDropdownItem(
+                    value = lvl,
+                    label = ReasoningEffortLevels.label(lvl),
+                    selected = lvl == current,
+                )
+            },
+            alignEnd = true,
+            onSelect = { opt ->
+                val effort = opt.value.ifEmpty { null }
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val ok = RuntimeBridge.upsertModel(model.copy(reasoningEffort = effort))
+                    if (!ok) {
+                        scope.launch { snackbar.showSnackbar("思考强度保存失败") }
+                    }
+                }
+            },
         )
     }
 }

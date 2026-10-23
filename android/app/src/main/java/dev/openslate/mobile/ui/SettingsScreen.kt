@@ -178,6 +178,9 @@ fun SettingsScreen(
         key = "toolTabV3",
     ) { mutableStateOf(if (initialToolTab >= 0) initialToolTab.coerceIn(0, 3) else 0) }
     var modelTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+    // 通用域二级 Tab 选中态（0=外观、1=角色定位）。新状态无存量索引错位面，
+    // 无需显式 key（对照 toolTabV3 先例——只有索引进化才要换 key 丢弃旧值）。
+    var generalTab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
 
     // API key 存在性批量预取（IO 线程）：Keystore 解密是 binder IPC + AES-GCM，
     // 单次 5~50ms；此前在 provider 行组合期同步查、每次重组都查 → 进设置页必卡一帧。
@@ -227,6 +230,19 @@ fun SettingsScreen(
                         onClick = { tab = idx },
                         text = { Text(label) },
                     )
+                }
+            }
+
+            // ── 通用域二级 Tab：外观 / 角色定位（吸顶，同模型/工具域模式）──
+            if (tab == 0) {
+                androidx.compose.material3.TabRow(selectedTabIndex = generalTab) {
+                    for ((label, idx) in listOf("外观" to 0, "角色定位" to 1)) {
+                        androidx.compose.material3.Tab(
+                            selected = generalTab == idx,
+                            onClick = { generalTab = idx },
+                            text = { Text(label) },
+                        )
+                    }
                 }
             }
 
@@ -283,7 +299,10 @@ fun SettingsScreen(
             ) {
                 when (tab) {
                     0 -> {
-                        // ── 通用域：外观（主题模式 + 主题色归组一节）──────
+                        // ── 通用域二级路由：外观 / 角色定位 ──
+                        when (generalTab) {
+                            0 -> {
+                        // ── 外观（主题模式 + 主题色归组一节）──────
                         // 原平级「主题」「主题色」两节收进一个 Section：Section
                         // 组件无嵌套层级视觉（标题同为 titleMedium），嵌套会
                         // 双标题打架——改为节内行内标签（titleSmall）+
@@ -321,11 +340,15 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.outline,
                             )
                             AccentSwatchRow(selectedId = accent, onSelect = onAccentChange)
+                            }
+                            }
+                            1 -> {
+                                // ── 角色定位（agent persona / system prompt
+                                // 编辑）：通用域二级 tab（用户拍板，与「外观」
+                                // 平级子页）。
+                                AgentPersonaSection(snackbarHostState)
+                            }
                         }
-                        // ── 角色定位（agent persona / system prompt 编辑）──
-                        // 用户拍板：与「外观」同为通用 tab 下的平级 Section，
-                        // 不占独立主 tab。
-                        AgentPersonaSection(snackbarHostState)
                     }
                     1 -> {
                         // ── 模型域二级 tab：会话 / Provider（「模型数据源」

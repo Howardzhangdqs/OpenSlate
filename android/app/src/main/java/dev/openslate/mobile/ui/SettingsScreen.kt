@@ -1163,16 +1163,17 @@ private fun ModelEffortPickerRow(
             .padding(horizontal = 4.dp, vertical = 6.dp),
     ) {
         // 模型组：软底胶囊控件（Box 仅包控件——弹层锚点独立）。无标签
-        // （用户拍板：纯下拉框自释义）。档位组隐藏时本组独占行，控件按
-        // 内容塌缩。
+        // （用户拍板：纯下拉框自释义）。两组各占半行、合计撑满整行；
+        // 档位组隐藏时本组独占整行宽。
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.weight(1f, fill = false),
+            modifier = Modifier.weight(1f),
         ) {
-            Box(modifier = Modifier.weight(1f, fill = false)) {
+            Box(modifier = Modifier.weight(1f)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
+                        .fillMaxWidth()
                         .heightIn(min = 34.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
@@ -1199,9 +1200,9 @@ private fun ModelEffortPickerRow(
                         },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        // 值文本内容优先 + 上限截断：胶囊随值塌缩（箭头贴
-                        // 胶囊右缘，输入面板同款）。
-                        modifier = Modifier.weight(1f, fill = false),
+                        // 撑满布局：文本区吃满胶囊宽（左对齐），箭头钉在
+                        // 右缘，超长模型名 Ellipsis。
+                        modifier = Modifier.weight(1f),
                     )
                     Spacer(Modifier.width(4.dp))
                     Icon(
@@ -1225,18 +1226,19 @@ private fun ModelEffortPickerRow(
                 )
             }
         }
-        // 思考强度组：档位控件贴右缘，无标签（用户拍板）；条目不支持
-        // 档位 → 整组不组合（组件内判定）。
+        // 思考强度组：档位控件占右半行，无标签（用户拍板）；与模型组间
+        // 8dp 呼吸隙；条目不支持档位 → 整组不组合（模型组独占整行）。
         effortModel?.let { m ->
+            Spacer(Modifier.width(8.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier.weight(1f),
             ) {
                 ThinkingEffortRow(
                     model = m,
                     hazeState = hazeState,
                     snackbar = snackbar,
-                    modifier = Modifier.weight(1f, fill = false),
+                    modifier = Modifier.weight(1f),
                 )
             }
         }
@@ -1288,11 +1290,12 @@ private fun ThinkingEffortRow(
     val currentLabel = current?.let { ReasoningEffortLevels.label(it) } ?: "默认"
     Box(modifier) {
         // 紧凑软底胶囊（对话页 EffortPickerRow 同款规格）：左当前档位 +
-        // 右箭头；微标签「思考强度」由宿主组提供，胶囊随值内容自然塌缩
-        // （值文本内容优先 + 上限截断，箭头贴胶囊右缘）。
+        // 右箭头；无静态标签（宿主行即语义）。撑满宿主给定的半行宽：
+        // 文本区吃满（左对齐），箭头钉右缘，超长档位名 Ellipsis。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
+                .fillMaxWidth()
                 .heightIn(min = 34.dp)
                 .clip(RoundedCornerShape(10.dp))
                 .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
@@ -1305,7 +1308,7 @@ private fun ThinkingEffortRow(
                 color = MaterialTheme.colorScheme.primary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(4.dp))
             Icon(

@@ -266,8 +266,9 @@ Termux 未启动/被冻结/停止态时，RUN_COMMAND 的结果 PendingIntent �
   host 启动中…」过渡态（secondary，host 未起不误报 Termux 未运行）、未装/
   无权限/通道 NoResponse（=「Termux 未运行」）或其余通道失败/host 未装按五灯
   终态分流 error 色；error 卡点终态时子面板**自动展开**——聚焦即见
-  检测卡在哪一步，host 运行中保持收起，用户手动切换过则本聚焦会话
-  不再自动干预）
+  检测卡在哪一步，恢复运行（hostAlive 终态）时**自动收起**回归常态
+  首行并补刷 ComposerMcpStatus 计数/名单，host 运行中打开保持收起，
+  用户手动切换过则本聚焦会话不再自动干预）
   → 探测阶梯复用 detectTermuxStatus（MCP host 探活 → 安装/权限 →
     echo ok 通道往返），状态-动作矩阵：
       Checking      → spinner「正在探测 Termux…」

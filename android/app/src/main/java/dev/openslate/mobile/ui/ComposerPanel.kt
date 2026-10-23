@@ -79,11 +79,13 @@ import dev.openslate.mobile.bridge.TermuxDiagnostics
  *   门控由 ChatScreen 全局观察承担——从 Termux 切回即触发重检，不要求
  *   面板展开）。首行 Termux 文案/颜色本身也由五灯快照推导（与设置页
  *   同口径，host 拉起期间显示「MCP host 启动中…」过渡态）。右缘
- *   MCP / tools 计数保留原状、不参与点击。五灯子面板在首行状态为卡点
- *   终态（error 色：Termux 未装/无权限/通道未放行/未运行、host 未装/
- *   未运行）时**自动展开**——聚焦即见检测卡在哪一步，无需手动点击；
- *   host 运行中保持收起（现状）；用户手动切换过则本聚焦会话不再自动
- *   干预。
+ *   MCP / tools 计数保留原状、不参与点击。五灯子面板自动展开/收起（仅
+ *   自动路径，用户手动切换过则本聚焦会话不再干预）：首行卡点终态
+ *   （error 色：Termux 未装/无权限/通道未放行/未运行、host 未装/未运行）
+ *   自动展开——聚焦即见检测卡在哪一步，无需手动点击；恢复运行
+ *   （[mcpLightsHostAlive] 终态）自动收起，回归常态首行（「Termux 运行
+ *   中」+ MCP/tools 计数与 server 名单，恢复时补刷一次
+ *   ComposerMcpStatusTracker）；host 运行中打开面板保持收起（现状）。
  * - 未聚焦时 AnimatedVisibility 不参与组合，高度/间距零变化（硬性要求）。
  *
  * 生命周期：
@@ -186,23 +188,48 @@ internal fun ComposerFocusPanel(
                     // 子面板（下方 AnimatedVisibility）；状态色文案保留，
                     // 尾缘箭头随展开态 180° 旋转（ModelPickerRow 同语言）。
                     var termuxExpanded by remember { mutableStateOf(false) }
-                    // 手动切换标记：用户点过首行后，本聚焦会话不再自动展开
-                    // （自动展开只服务「没想到要手点」的场景，不与用户意志
-                    // 拉锯；面板收起即随 remember 一并重置，下次聚焦重新武装）。
+                    // 手动切换标记：用户点过首行后，本聚焦会话不再自动
+                    // 展开/收起（自动动作只服务「没想到要手点」的场景，
+                    // 不与用户意志拉锯；面板收起即随 remember 一并重置，
+                    // 下次聚焦重新武装）。
                     var lightsUserToggled by remember { mutableStateOf(false) }
+                    // 本次展开出自自动路径的标记：用于恢复运行时对称地
+                    // 自动收起（手动展开不受影响）。
+                    var lightsAutoExpanded by remember { mutableStateOf(false) }
                     // 卡点终态判定 = 首行 error 色（未安装/无权限/通道未放
                     // 行/未运行/host 未装/host 未运行；运行/启动中/检测中均
                     // 非 error）。复用 termuxLiveStatus 同一推导源的颜色，
-                    // 不另设一套 when，两处口径不会漂移。
+                    // 不另设一套 when，两处口径不会漂移。恢复运行判定用
+                    // mcpLightsHostAlive（termuxLiveStatus 首分支同源）——
+                    // 不用 secondary 色宽判，「MCP host 启动中…」过渡态不
+                    // 触发收起。
                     val lightsBlocked = termuxColor == MaterialTheme.colorScheme.error
-                    // 非运行终态自动展开五灯子面板：此时聚焦输入框的用户多半
-                    // 正想「为什么发不出去」，直接亮出检测到哪一步，免一次
-                    // 手动点击；host 运行中保持现状收起。展开即触发下方既有
-                    // 的 gateRefresh（含自动拉起 host），与手动展开同一条路。
-                    // 以 blocked 布尔为 key：探测期间 blocked 不翻转就不重跑，
-                    // 用户手动收起后不会被自动顶开。
-                    LaunchedEffect(lightsBlocked) {
-                        if (lightsBlocked && !lightsUserToggled) termuxExpanded = true
+                    val lightsRunning = mcpLightsHostAlive(lights)
+                    // 自动展开/收起（对称闭环）：非运行终态聚焦即亮出卡在
+                    // 哪一步，免手动点击；随后恢复运行（hostAlive 终态）时
+                    // 自动收起，回归常态首行——「Termux 运行中」+ MCP/tools
+                    // 计数与 server 名单。仅限自动路径（用户手动切换过则不
+                    // 再干预）。展开即触发下方既有的 gateRefresh（含自动拉
+                    // 起 host），与手动展开同一条路；以两个布尔为 key——
+                    // 状态不翻转不重跑，手动收起后不会被自动顶开。
+                    LaunchedEffect(lightsBlocked, lightsRunning) {
+                        when {
+                            lightsBlocked && !lightsUserToggled && !lightsAutoExpanded -> {
+                                lightsAutoExpanded = true
+                                termuxExpanded = true
+                            }
+                            lightsRunning && lightsAutoExpanded && !lightsUserToggled -> {
+                                lightsAutoExpanded = false
+                                termuxExpanded = false
+                            }
+                        }
+                    }
+                    // 恢复运行时补刷 MCP/tools 计数与 server 名单：面板常开
+                    // 期间 live 只在聚焦瞬间刷一次（上方 visible 效应），不
+                    // 补刷则收起态首行停留在死亡期的「—/0/空名单」。单飞
+                    // CAS，与聚焦刷新并发调用无叠加。
+                    LaunchedEffect(lightsRunning) {
+                        if (lightsRunning) ComposerMcpStatusTracker.refresh(context)
                     }
                     val termuxArrowAngle by animateFloatAsState(
                         targetValue = if (termuxExpanded) 180f else 0f,
@@ -298,9 +325,9 @@ internal fun ComposerFocusPanel(
                         )
                     }
                     // ── MCP 五灯子面板：首行状态区点击展开/收起；卡点终态
-                    // （error 色）时自动展开（见上方 LaunchedEffect），host
-                    // 运行中保持收起。折叠语言对齐 ToolNameTemplateSection
-                    // （expandVertically +
+                    // （error 色）时自动展开、恢复运行时自动收起（见上方
+                    // LaunchedEffect），host 运行中打开保持收起。折叠语言
+                    // 对齐 ToolNameTemplateSection（expandVertically +
                     // 200ms 淡入淡出）。数据 = McpLightsTracker（与设置页 MCP
                     // 区同一探测管线 probeMcpLights、同一五灯映射 mcpLightRow
                     // ——五项独立判定成败）；展开时走 gateRefresh（无快照/非
@@ -414,6 +441,14 @@ private fun composerModelOptions(config: ConfigUi): List<ComposerModelOption> =
 internal fun resolvedCurrentModel(modelAlias: String, config: ConfigUi): ModelUi? =
     config.models.firstOrNull { it.entry == RuntimeBridge.modelEntryOf(modelAlias, config) }
 
+/** host 探活通过（=「Termux 运行中」终态）：[termuxLiveStatus] 首分支
+ *  的判定独立成函数，聚焦面板子面板的自动展开/收起复用同一口径，
+ *  两处不会漂移。 */
+internal fun mcpLightsHostAlive(lights: McpLightsUiState): Boolean {
+    val res = lights.result ?: return false
+    return "hostAlive" in res.checked && res.hostAlive
+}
+
 /** 首行 Termux 状态文案 + 语义色（面板首行与输入框状态点共用）：由五灯
  *  快照（[McpLightsTracker] → [McpLightsUiState]）推导——与设置页 MCP 区
  *  同一口径。自上而下取首个命中：host 探活通过即「Termux 运行中」；host
@@ -430,7 +465,7 @@ internal fun termuxLiveStatus(lights: McpLightsUiState): Pair<String, Color> {
         } else {
             "未检测" to MaterialTheme.colorScheme.outline
         }
-        "hostAlive" in res.checked && res.hostAlive ->
+        mcpLightsHostAlive(lights) ->
             "Termux 运行中" to MaterialTheme.colorScheme.secondary
         res.restartingHost ->
             "MCP host 启动中…" to MaterialTheme.colorScheme.secondary

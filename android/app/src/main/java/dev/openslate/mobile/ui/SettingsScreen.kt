@@ -1055,29 +1055,20 @@ private fun Section(
 
 /**
  * 功能模型绑定行（会话域；「标题生成」「审批审查」两处在用——主对话模型
- * 已移至对话页输入框聚焦面板的选择器直选，compact 不再暴露）：**单行双
- * 控件**（对话页输入框聚焦面板双控件行同形态）——功能名标签居左、模型
- * 选择控件居中、思考强度控件贴行右缘；两控件软底胶囊同语言（primary 12%
- * 透明底 + 10dp 圆角 + 34dp 最小高度，对齐输入面板 ModelPickerRow /
- * EffortPickerRow），各自弹共享玻璃弹层（[GlassDropdownMenu] alignEnd 右
- * 对齐各自控件、锚点互不影响），直选 models 条目 / 档位，选中即
- * setCapability / upsertModel 落盘（main 改绑由 Rust 热切换会话模型并
- * 广播 model_changed，下回合即生效）。
+ * 已移至对话页输入框聚焦面板的选择器直选，compact 不再暴露）：解析当前
+ * 生效条目后交 [ModelEffortPickerRow] 渲染单行双控件（模型 + 思考强度），
+ * 模型选中即 setCapability 落盘（main 改绑由 Rust 热切换会话模型并广播
+ * model_changed，下回合即生效）。
  *
- * 思考强度控件（[ThinkingEffortRow]，无静态标签——行内右缘位置即语义，
- * 与输入面板一致；读屏语义由控件内箭头描述承载）：编辑**本行生效条目**
- * 的 reasoning_effort——运行时标题/审查链由条目自动带入 effort（Rust
- * provider 构建请求时处理，零协议改动）。目标条目 = 行内已解析条目；
- * 未解析出条目（如 review 未绑定「跟随会话模型」）→ 回退会话主模型条目
- * （[resolvedCurrentModel]，运行时即继承它）；两功能绑同一条目时两行档位
- * 同值联动——编辑对象条目名不上 UI，语义见 [ThinkingEffortRow] kdoc。
- * 条目不支持档位 → 右控件不组合，模型控件独占剩余宽度（回到标签左 /
- * 值右的经典设置行）。
- *
- * 当前值解析（与 Rust capability_alias + resolve_model 同序）：生效别名 =
- * capabilities[cap]，缺省回退 main→"main"、其余→"fast"；再经
+ * 生效条目解析（与 Rust capability_alias + resolve_model 同序）：生效别名
+ * = capabilities[cap]，缺省回退 main→"main"、其余→"fast"；再经
  * [RuntimeBridge.modelEntryOf] 的 levels 遗留兜底解析到条目。解析不出条目
  * （悬空代号 / 条目已删）显示「未设置」——重选条目即自愈。
+ *
+ * 档位目标条目 = 行内已解析条目；未解析出条目（如 review 未绑定「跟随
+ * 会话模型」）→ 回退会话主模型条目（[resolvedCurrentModel]，运行时即
+ * 继承它）；两功能绑同一条目时两行档位同值联动（条目共享语义随
+ * [ThinkingEffortRow]，见其 kdoc）。
  */
 @Composable
 private fun CapabilityModelRow(
@@ -1093,7 +1084,6 @@ private fun CapabilityModelRow(
     // review 等继承型功能传「跟随会话模型」。
     unsetLabel: String = "未设置",
 ) {
-    var expanded by remember { mutableStateOf(false) }
     val stored = config.capabilities[cap]
     val fallback = if (cap == "main") "main" else "fast"
     // 生效别名（镜像 capability_alias）→ 实际条目（镜像 resolve_model 首步）。
@@ -1105,6 +1095,54 @@ private fun CapabilityModelRow(
     // 字段）。仍解析不出 → 档位控件不出现（组件内对不支持档位同样自隐）。
     val effortModel = bound?.let { e -> config.models.firstOrNull { it.entry == e } }
         ?: resolvedCurrentModel(modelAlias, config)
+    ModelEffortPickerRow(
+        label = title,
+        config = config,
+        bound = bound,
+        effortModel = effortModel,
+        onModelSelected = { RuntimeBridge.setCapability(cap, it) },
+        hazeState = hazeState,
+        snackbar = snackbar,
+        unsetLabel = unsetLabel,
+    )
+}
+
+/**
+ * 模型 + 思考强度单行双控件（可复用件；当前 [CapabilityModelRow] 两处
+ * 功能行消费，未来新增功能行等条目选择场景直接复用）：功能名标签居左、
+ * 模型选择控件居中、思考强度控件贴行右缘——对话页输入框聚焦面板双控件
+ * 行（ModelPickerRow | EffortPickerRow）同形态；两控件软底胶囊同语言
+ * （primary 12% 透明底 + 10dp 圆角 + 34dp 最小高度），各自独立 Box 锚弹
+ * 共享玻璃弹层（[GlassDropdownMenu] alignEnd 右对齐各自控件、互不影响）。
+ *
+ * 复用契约（解析在调用方、展示与档位写入在组件）：
+ * - 调用方解析：[bound] = 生效模型条目键（解析链调用方自定——capability
+ *   行镜像 capability_alias + resolve_model；null = 未解析/未绑定，模型
+ *   控件显示 [unsetLabel] 弱化态）；[effortModel] = 档位目标条目（null =
+ *   档位控件不显示；条目不支持档位时组件内亦自隐，模型控件独占剩余
+ *   行宽）；模型选中回传条目键经 [onModelSelected] 落盘（写入语义调用方
+ *   定——capability 行走 setCapability）。
+ * - 组件内置：档位写入 = 条目 copy 改 reasoning_effort 后 IO upsertModel
+ *   （失败经 [snackbar] 页内提示）——reasoning_effort 是条目字段、无第二
+ *   状态源；**条目共享语义**（两处绑同一条目即档位同值联动，经
+ *   config_changed 回刷）随 [ThinkingEffortRow] 生效，见其 kdoc。
+ */
+@Composable
+private fun ModelEffortPickerRow(
+    label: String,
+    config: ConfigUi,
+    bound: String?,
+    effortModel: ModelUi?,
+    onModelSelected: (String) -> Unit,
+    hazeState: HazeState,
+    snackbar: SnackbarHostState,
+    modifier: Modifier = Modifier,
+    // 未解析出条目（[bound] = null）时模型控件的显示文案。
+    unsetLabel: String = "未设置",
+    // models 空（无可选条目）时模型控件的显示文案（控件禁用不可点）。
+    emptyLabel: String = "先在 Provider 页添加模型",
+) {
+    var expanded by remember { mutableStateOf(false) }
     val items = config.models.map { m ->
         GlassDropdownItem(
             value = m.entry,
@@ -1114,21 +1152,21 @@ private fun CapabilityModelRow(
     }
     val arrowAngle by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
-        label = "capModelArrow",
+        label = "modelEffortArrow",
     )
-    // 单行双控件（对话页输入面板双控件行同形态）：功能名标签居左、模型
-    // 选择控件居中、思考强度控件贴行右缘（SpaceBetween：首尾贴边、中间
-    // 控件居中；两个加权控件 fill=false 内容优先、weight 只作截断上限——
-    // 模型名最长给 2 份，档位值短给 1 份，标签短文案不占权重）。
+    // 单行双控件布局：功能名标签居左、模型选择控件居中、思考强度控件贴
+    // 行右缘（SpaceBetween：首尾贴边、中间控件居中；两个加权控件
+    // fill=false 内容优先、weight 只作截断上限——模型名最长给 2 份，档位
+    // 值短给 1 份，标签短文案不占权重）。
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = 4.dp, vertical = 6.dp),
     ) {
         Text(
-            title,
+            label,
             style = MaterialTheme.typography.titleSmall,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -1151,7 +1189,7 @@ private fun CapabilityModelRow(
                     // 当前值 = 模型标识（modelAliasDisplay 输出）→ 内嵌 MonoFont
                     // 子集；「先在…添加/未设置」等纯状态分支保持默认字体。
                     text = when {
-                        items.isEmpty() -> AnnotatedString("先在 Provider 页添加模型")
+                        items.isEmpty() -> AnnotatedString(emptyLabel)
                         bound == null -> AnnotatedString(unsetLabel)
                         else -> buildAnnotatedString {
                             withStyle(SpanStyle(fontFamily = MonoFont)) {
@@ -1173,7 +1211,7 @@ private fun CapabilityModelRow(
                 Spacer(Modifier.width(4.dp))
                 Icon(
                     Icons.Filled.KeyboardArrowDown,
-                    contentDescription = if (expanded) "收起${title}的模型选择" else "选择${title}的模型",
+                    contentDescription = if (expanded) "收起${label}的模型选择" else "选择${label}的模型",
                     tint = MaterialTheme.colorScheme.outline,
                     // graphicsLayer lambda 读动画值＝绘制相位读取：箭头旋转
                     // 不再逐帧重组整行（该行含 AnnotatedString 构建，重组昂贵，
@@ -1188,7 +1226,7 @@ private fun CapabilityModelRow(
                 items = items,
                 labelFontFamily = MonoFont,
                 alignEnd = true,
-                onSelect = { RuntimeBridge.setCapability(cap, it.value) },
+                onSelect = { onModelSelected(it.value) },
             )
         }
         // 思考强度控件：无静态标签（行内右缘位置即语义，与输入面板双控件
@@ -1205,7 +1243,7 @@ private fun CapabilityModelRow(
 }
 
 /**
- * 思考强度控件（功能模型行 [CapabilityModelRow] 行内的档位选择器，贴行
+ * 思考强度控件（[ModelEffortPickerRow] 行内的档位选择器，贴行
  * 右缘）：编辑**本行生效条目**的 reasoning_effort——运行时标题/审查链由
  * 条目自动带入 effort（Rust provider 构建请求时处理，零协议改动）。功能
  * 未绑定（如 review「跟随会话模型」）时运行时继承会话主模型，调用方已把

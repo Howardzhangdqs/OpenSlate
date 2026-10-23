@@ -405,6 +405,9 @@ private fun GlassDropdownMenuItem(
                     MaterialTheme.colorScheme.onSurface
                 },
                 maxLines = 1,
+                // 同 SoftPickerCapsule 值文本：关折行，超宽才是水平截断
+                // （默认折行 + maxLines=1 = 折走的行整行消失）。
+                softWrap = false,
                 overflow = TextOverflow.Clip,
                 onTextLayout = { labelOverflowed = it.didOverflowWidth },
                 modifier = Modifier.fadeOutTrailingEdgeIf(labelOverflowed),
@@ -416,6 +419,7 @@ private fun GlassDropdownMenuItem(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline,
                     maxLines = 1,
+                    softWrap = false,
                     overflow = TextOverflow.Clip,
                     onTextLayout = { subtitleOverflowed = it.didOverflowWidth },
                     modifier = Modifier.fadeOutTrailingEdgeIf(subtitleOverflowed),

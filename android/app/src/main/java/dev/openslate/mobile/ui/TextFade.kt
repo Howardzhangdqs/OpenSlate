@@ -24,8 +24,10 @@ import androidx.compose.ui.unit.dp
  * - **仅溢出时挂载**（调用方经 Text `onTextLayout` 的 `didOverflowWidth`
  *   检测后用 [fadeOutTrailingEdgeIf] 条件挂上）：短文本不淡出，避免
  *   完整内容被无端吃掉一截；
- * - 配套 Text 的 overflow 必须是 [androidx.compose.ui.text.style.TextOverflow.Clip]：
- *   Ellipsis 会先截成「…」再淡出，视觉语义重复。
+ * - 配套 Text 参数：overflow 必须是 [androidx.compose.ui.text.style.TextOverflow.Clip]
+ *   （Ellipsis 会先截成「…」再淡出，视觉语义重复）**且 softWrap = false**
+ *   （默认折行 + maxLines=1 会把超宽文本折到第二行整行裁掉，不是水平
+ *   截断——2026-10 真机实测「provider 名后的模型名整个消失」即此因）。
  */
 internal fun Modifier.fadeOutTrailingEdge(fadeWidth: Dp = 20.dp): Modifier =
     graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)

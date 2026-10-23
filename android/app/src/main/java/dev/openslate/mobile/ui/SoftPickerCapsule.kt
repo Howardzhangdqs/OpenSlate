@@ -137,6 +137,10 @@ internal fun SoftPickerCapsule(
                 style = textStyle,
                 color = valueColor,
                 maxLines = 1,
+                // softWrap 必须关：默认折行 + maxLines=1 会把超宽文本折到
+                // 第二行整行裁掉（真机实测「模型名消失」），关掉才是水平
+                // 截断——尾缘淡出掩膜的正确作用面。
+                softWrap = false,
                 overflow = TextOverflow.Clip,
                 onTextLayout = { valueOverflowed = it.didOverflowWidth },
                 modifier = valueModifier

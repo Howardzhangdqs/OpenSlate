@@ -1065,8 +1065,9 @@ private fun Section(
  * 编辑**本行生效条目**的 reasoning_effort——运行时标题/审查链由条目自动
  * 带入 effort（Rust provider 构建请求时处理，零协议改动）。次行目标条目 =
  * 行内已解析条目；未解析出条目（如 review 未绑定「跟随会话模型」）→ 回退
- * 会话主模型条目（[resolvedCurrentModel]，运行时即继承它）——副文案注明
- * 实际编辑的条目；两功能绑同一条目时两行档位同值联动。
+ * 会话主模型条目（[resolvedCurrentModel]，运行时即继承它）；两功能绑同一
+ * 条目时两行档位同值联动——编辑对象条目名不上 UI，语义见
+ * [ThinkingEffortRow] kdoc。
  *
  * 当前值解析（与 Rust capability_alias + resolve_model 同序）：生效别名 =
  * capabilities[cap]，缺省回退 main→"main"、其余→"fast"；再经
@@ -1188,7 +1189,6 @@ private fun CapabilityModelRow(
         effortModel?.let { m ->
             ThinkingEffortRow(
                 model = m,
-                config = config,
                 hazeState = hazeState,
                 snackbar = snackbar,
                 modifier = Modifier.padding(start = 16.dp, end = 4.dp, bottom = 6.dp),
@@ -1202,18 +1202,21 @@ private fun CapabilityModelRow(
  * 模型行下方、左缩进表从属）：编辑**本行生效条目**的 reasoning_effort——
  * 运行时标题/审查链由条目自动带入 effort（Rust provider 构建请求时处理，
  * 零协议改动）。功能未绑定（如 review「跟随会话模型」）时运行时继承会话
- * 主模型，调用方已把目标条目回退解析到主条目再传入；两种情形都经副文案
- * 「档位随模型条目：{条目名}」如实注明——两功能绑同一条目时两行档位同值
- * 联动（同源，config_changed 回刷）。
+ * 主模型，调用方已把目标条目回退解析到主条目再传入；两功能绑同一条目时
+ * 两行档位同值联动（同源，config_changed 回刷）——条目共享语义只在本
+ * kdoc 说明、不上 UI（用户反馈：条目名提示副文案喧宾夺主，已删）。
  *
- * 与对话页 ComposerPanel 的 EffortPickerRow 同链路：条目 reasoning_effort
- * 无第二状态源——选中即条目 copy 改字段后 upsertModel 落盘（persist +
- * config_changed 回刷，对话页面板与本行同回证）。措辞同源：null =「默认」
- * （不传参、跟随 provider 默认），档位名 = [ReasoningEffortLevels.label]
- * （协议原词 + 中文括注）；档位名非模型 ID，弹层不注入 MonoFont 子集。
- * 条目不支持档位（[ReasoningEffortLevels.allowed] 返回 null）→ 本行自隐
- * （调用方无需预判）；越界值按「默认」显示（回显兜底与 EffortPickerRow
- * 同语义；落盘值本身不在此清洗）。
+ * 布局 = 紧凑单行左右式（对话页 EffortPickerRow 的左右结构同语言）：
+ * 标签居左、值控件（当前档位 + 箭头）贴行右缘，GlassDropdownMenu
+ * alignEnd 与宿主模型行值控件右缘对齐。与对话页同链路：条目
+ * reasoning_effort 无第二状态源——选中即条目 copy 改字段后 upsertModel
+ * 落盘（persist + config_changed 回刷，对话页面板与本行同回证）。措辞
+ * 同源：null =「默认」（不传参、跟随 provider 默认），档位名 =
+ * [ReasoningEffortLevels.label]（协议原词 + 中文括注）；档位名非模型 ID，
+ * 弹层不注入 MonoFont 子集。条目不支持档位
+ * （[ReasoningEffortLevels.allowed] 返回 null）→ 本行自隐（调用方无需
+ * 预判）；越界值按「默认」显示（回显兜底与 EffortPickerRow 同语义；
+ * 落盘值本身不在此清洗）。
  *
  * 写入失败走页内 snackbar 通道（[ImageProcessingSection] 同款：IO 写 FFI、
  * 失败回主线程提示；成功路径无本地乐观态——config 即唯一状态源）。
@@ -1221,7 +1224,6 @@ private fun CapabilityModelRow(
 @Composable
 private fun ThinkingEffortRow(
     model: ModelUi,
-    config: ConfigUi,
     hazeState: HazeState,
     snackbar: SnackbarHostState,
     modifier: Modifier = Modifier,
@@ -1236,43 +1238,26 @@ private fun ThinkingEffortRow(
     )
     val current = model.reasoningEffort?.takeIf { it in levels }
     Box(modifier) {
-        // 次级设置行：标签（含条目名副文案）居左、值控件贴行右缘
-        // （SpaceBetween + weight 限宽：标签至多 2/3、值至多 1/3，
-        // 超出单行 Ellipsis 截断）；触发域仅值控件可点（同宿主模型行）。
+        // 紧凑单行左右式（对话页 EffortPickerRow 的左右结构同语言）：
+        // 标签居左、值控件（值 + 箭头）贴行右缘（SpaceBetween + 双方
+        // weight 限宽兜底，与宿主模型行同比例 1:2，超出单行 Ellipsis
+        // 截断）；触发域仅值控件可点（同宿主模型行）。
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Column(
-                modifier = Modifier.weight(2f, fill = false),
-            ) {
-                Text(
-                    "思考强度",
-                    style = MaterialTheme.typography.labelLarge,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    // 副文案注明实际编辑的条目（共享语义如实呈现，不藏着）：
-                    // 条目名内嵌 MonoFont 子集（同宿主模型行的值渲染）。
-                    buildAnnotatedString {
-                        append("档位随模型条目：")
-                        withStyle(SpanStyle(fontFamily = MonoFont)) {
-                            append(RuntimeBridge.modelAliasDisplay(model.entry, config))
-                        }
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
-            }
+            Text(
+                "思考强度",
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .weight(1f, fill = false)
+                    .weight(2f, fill = false)
                     .clip(RoundedCornerShape(10.dp))
                     .clickable { expanded = true }
                     .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),

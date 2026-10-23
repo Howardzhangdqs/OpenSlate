@@ -68,6 +68,7 @@
 | [android-build.md](07-build-dev/android-build.md) | 交叉编译脚本解析、APK 构建安装、logcat |
 | [troubleshooting.md](07-build-dev/troubleshooting.md) | 19 条构建/运行问题：症状/原因/解法 |
 | [reference-repos.md](07-build-dev/reference-repos.md) | `.ref/` 参考项目源码：浅克隆、更新脚本、不入库 |
+| [code-locate.md](07-build-dev/code-locate.md) | 代码快速定位：symbol_brief 符号大纲（Rust LSP / Kotlin ast-grep）、AST 模式搜索 |
 
 ### 08-conventions/ — 代码与协作约定（改动前必读）
 

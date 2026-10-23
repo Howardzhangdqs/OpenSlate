@@ -13,7 +13,6 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -324,8 +323,9 @@ internal fun ComposerFocusPanel(
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                         modifier = Modifier.padding(vertical = 7.dp),
                     )
-                    // 双控件行：模型下拉与 Thinking Effort 下拉各占
-                    // 50%（各 weight(1f)）；effort 控件仅当前模型
+                    // 双控件行：模型下拉与 Thinking Effort 下拉宽度比
+                    // 6:4（weight(0.6f)/weight(0.4f)，用户拍板——与设置页
+                    // ModelEffortPickerRow 同比）；effort 控件仅当前模型
                     // 解析到条目且家族表有支持档位时组合，未选/
                     // 不支持时模型下拉独占整行（不占位）。
                     val currentModel = resolvedCurrentModel(modelAlias, config)
@@ -340,7 +340,7 @@ internal fun ComposerFocusPanel(
                             modelAlias, config, onSelectModel, hazeState,
                             sharedTransitionScope = sharedTransitionScope,
                             animatedVisibilityScope = animatedVisibilityScope,
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(0.6f),
                         )
                         if (currentModel != null && effortLevels != null) {
                             EffortPickerRow(
@@ -350,7 +350,7 @@ internal fun ComposerFocusPanel(
                                 onSelectEffort = onSelectEffort,
                                 sharedTransitionScope = sharedTransitionScope,
                                 animatedVisibilityScope = animatedVisibilityScope,
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier.weight(0.4f),
                                 hazeState = hazeState,
                             )
                         }
@@ -523,7 +523,7 @@ private const val DropdownReopenSuppressMs = 250L
  * 未配置模型（无可选项）时禁用照 SoftButton 禁用态降底色到 5%
  * （disabledBackgroundAlpha）；弹层非聚焦（focusable = false 保键盘）。
  *
- * modifier 由调用方注入宽度（双控件行里传 weight(1f) 占主宽度；effort
+ * modifier 由调用方注入宽度（双控件行里传 weight(0.6f) 占主宽度；effort
  * 下拉不显示时独占整行效果不变）。
  */
 @Composable
@@ -617,7 +617,7 @@ private fun ModelPickerRow(
 }
 
 /**
- * Thinking Effort 下拉（双控件行右半，与模型下拉各占 50%）：胶囊
+ * Thinking Effort 下拉（双控件行右副控件，与模型下拉宽度比 6:4）：胶囊
  * 本体 = 共用内核 [SoftPickerCapsule]（软底同族视觉——primary 12% 透明底
  * + 10dp 圆角 + 34dp 最小高度，左当前档位 + 右箭头展开 180° 旋转；
  * labelMedium 档与设置页 ThinkingEffortRow 一致）。仅当前模型解析到条目

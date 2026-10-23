@@ -1103,8 +1103,8 @@ private fun CapabilityModelRow(
  * 功能行消费，未来新增功能行等条目选择场景直接复用）：**Section 标题即
  * 功能名**（本行不重复上屏功能名标签），行内两组控件左右分布——「模型」
  * 组居左、「思考强度」组贴行右缘（SpaceBetween 中间撑开、两端对齐；
- * 两组各占半行，档位组隐藏时模型组独占整行）；两控件胶囊本体均为共用
- * 内核 [SoftPickerCapsule]
+ * 宽度比 6:4 = 模型组 weight(0.6f) / 档位组 weight(0.4f)，档位组隐藏时
+ * 模型组独占整行）；两控件胶囊本体均为共用内核 [SoftPickerCapsule]
  * （SoftButton 同族软底规格 + 玻璃弹层 alignEnd 右对齐各自控件、互不
  * 影响），值文本构建与档位写入留在本组件。
  *
@@ -1144,8 +1144,8 @@ private fun ModelEffortPickerRow(
         )
     }
     // 单行双控件布局：「模型」组居左、「思考强度」组贴行右缘，SpaceBetween
-    // 中间撑开、两端对齐；两组各占半行、合计撑满整行，档位组隐藏时
-    // 模型组独占整行。
+    // 中间撑开、两端对齐；宽度比 6:4（用户拍板：模型名天然比档位名长，
+    // 主次宽度随信息量），档位组隐藏时模型组独占整行。
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1158,7 +1158,7 @@ private fun ModelEffortPickerRow(
         // 留在本组件，胶囊本体与弹层交 [SoftPickerCapsule]。
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(0.6f),
         ) {
             SoftPickerCapsule(
                 value = when {
@@ -1194,7 +1194,7 @@ private fun ModelEffortPickerRow(
             Spacer(Modifier.width(8.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(0.4f),
             ) {
                 ThinkingEffortRow(
                     model = m,

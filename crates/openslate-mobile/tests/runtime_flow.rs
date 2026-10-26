@@ -390,7 +390,7 @@ fn mobile_runtime_tool_visibility_roundtrip() {
         serde_json::from_str(&runtime.get_agent_tool_visibility_json()).unwrap();
     assert_eq!(
         vis["tools"],
-        serde_json::json!(["mobile.ping", "bash", "termux_bash", "output_query"])
+        serde_json::json!(["mobile.ping", "bash", "termux_bash", "output_query", "notify"])
     );
     assert_eq!(vis["hidden_tools"], serde_json::json!([]));
 
@@ -481,5 +481,706 @@ fn mobile_runtime_agent_persona_roundtrip() {
         "You are a helpful AI assistant."
     );
 
+    runtime.shutdown();
+}
+
+// ═══ notify 工具全链路（S1+S1b；设计 §8.1 + oracle 补充三条）══════════
+
+/// 独立小 runtime 打开 data_dir 的库（runtime 收束后查询复用；
+/// runtime.rs 测试的 scratch_store 同款）。
+fn scratch_store(
+    paths: &MobilePaths,
+) -> (
+    tokio::runtime::Runtime,
+    openslate_store_sqlite::store::SqliteStore,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let db = paths.data_dir.join("openslate.db").display().to_string();
+    let store = rt
+        .block_on(async {
+            let s = openslate_store_sqlite::store::SqliteStore::new(&db).await?;
+            s.run_migrations().await?;
+            anyhow::Ok(s)
+        })
+        .unwrap();
+    (rt, store)
+}
+
+/// 模型点名叫 notify 的一步脚本（tool_call 参数可覆盖）。
+fn notify_call_step(call_id: &str, args: serde_json::Value) -> Vec<ModelStreamEvent> {
+    vec![ModelStreamEvent::Done(ModelResponse {
+        reasoning_content: None,
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: ToolCallId(call_id.into()),
+            name: "notify".into(),
+            arguments: args,
+        }],
+        usage: None,
+        finish_reason: Some("tool_calls".into()),
+    })]
+}
+
+/// 轮询 DB 直到条件满足（on_cancel_all 的行收卷是后台异步任务）。
+fn eventually<T>(mut probe: impl FnMut() -> Option<T>, deadline: Duration) -> T {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = probe() {
+            return v;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "条件在 {deadline:?} 内未满足"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 等待回合终态事件（turn_ok 或 turn_error——cancel 路径两态皆可能）。
+fn wait_turn_terminal(
+    collector: &Collector,
+    rx: &std_mpsc::Receiver<()>,
+    deadline: Duration,
+) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let all = collector.events.lock().unwrap().clone();
+        if let Some(ev) = all
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "turn_ok" || e["type"] == "turn_error")
+        {
+            return ev.clone();
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "回合终态超时；已收到: {:?}",
+            all.iter()
+                .map(|e| e.get("type").and_then(|t| t.as_str()).unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
+        rx.recv_timeout(Duration::from_millis(200)).ok();
+    }
+}
+
+/// 非 wait：信封 → 宿主 resolve posted:true → ToolOutput 入历史。
+#[test]
+fn notify_roundtrip() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![
+        notify_call_step(
+            "call-n1",
+            serde_json::json!({
+                "id": "export-done", "title": "导出完成", "message": "已导出 128 张照片",
+                "kind": "normal"
+            }),
+        ),
+        text_response("已经通知你了。"),
+    ]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"通知我导出结果"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    assert_eq!(envelope["tool"].as_str().unwrap(), "notify");
+    assert_eq!(envelope["args"]["v"], 1, "信封版本 v:1");
+    assert_eq!(envelope["args"]["id"], "export-done");
+    assert_eq!(envelope["args"]["kind"], "normal");
+    assert!(envelope["args"].get("wait").is_none(), "非 wait 省键");
+    let id = envelope["id"].as_u64().unwrap();
+    assert!(runtime.resolve_host_call(
+        id,
+        true,
+        r#"{"posted":true,"id":"export-done","kind":"normal","channel":"agent_messages"}"#.to_owned()
+    ));
+
+    let events = collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "tool_start" && e["name"] == "notify"),
+        "应有 notify 的 tool_start"
+    );
+
+    // 工具结果入历史（posted 文案 + 结构化 JSON 并存）。
+    let (srt, store) = scratch_store(&paths);
+    let msgs = srt.block_on(async {
+        openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &runtime.current_run_id().unwrap())
+            .await
+            .unwrap()
+    });
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m.role == openslate_core::types::MessageRole::Tool
+            && m.tool_call_id.as_ref().map(|i| i.0.as_str()) == Some("call-n1"))
+        .expect("notify 工具结果入历史");
+    assert!(
+        tool_msg.content.contains("Notification posted (id=export-done") &&
+            tool_msg.content.contains("\"posted\":true"),
+        "posted 文案: {}",
+        tool_msg.content
+    );
+    runtime.shutdown();
+}
+
+/// 权限未授予：posted:false 是业务结果（ok=true 语义），模型收到指引
+/// 文案，回合正常完成。
+#[test]
+fn notify_permission_denied() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![
+        notify_call_step(
+            "call-n2",
+            serde_json::json!({"title": "任务完成", "message": "批量重命名完成"}),
+        ),
+        text_response("好的，我在回复里说明。"),
+    ]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"通知我"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    let id = envelope["id"].as_u64().unwrap();
+    assert!(runtime.resolve_host_call(
+        id,
+        true,
+        r#"{"posted":false,"reason":"permission_denied"}"#.to_owned()
+    ));
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+    let (srt, store) = scratch_store(&paths);
+    let msgs = srt.block_on(async {
+        openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, &runtime.current_run_id().unwrap())
+            .await
+            .unwrap()
+    });
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m.tool_call_id.as_ref().map(|i| i.0.as_str()) == Some("call-n2"))
+        .expect("工具结果入历史");
+    assert!(
+        tool_msg.content.contains("未授予通知权限"),
+        "permission_denied 指引文案: {}",
+        tool_msg.content
+    );
+    runtime.shutdown();
+}
+
+/// wait:true 即时路径：点按钮 resolve → action outcome 入历史 + 行关卷。
+#[test]
+fn notify_wait_immediate_path_roundtrip() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![
+        notify_call_step(
+            "call-n3",
+            serde_json::json!({
+                "title": "确认删除", "message": "要删除 3 个旧导出文件吗？",
+                "kind": "important", "wait": true, "timeout": 60,
+                "actions": [
+                    {"label": "删除", "style": "positive"},
+                    {"label": "取消", "style": "destructive"},
+                    {"label": "回复", "reply": true}
+                ]
+            }),
+        ),
+        text_response("好，已删除。"),
+    ]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"问我要不要删"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    // 信封契约（D9：run_id 内嵌 args）。
+    assert_eq!(envelope["tool"].as_str().unwrap(), "notify");
+    assert_eq!(envelope["args"]["wait"], true);
+    assert_eq!(envelope["args"]["timeout"], 60);
+    assert_eq!(
+        envelope["args"]["run_id"],
+        runtime.current_run_id().unwrap(),
+        "D9：run_id 内嵌 args（信封顶层无 run_id）"
+    );
+    assert!(envelope.get("run_id").is_none(), "信封顶层不带 run_id");
+    let id = envelope["id"].as_u64().unwrap();
+    assert!(runtime.resolve_host_call(
+        id,
+        true,
+        r#"{"outcome":"action","label":"删除","value":"用户在通知上点了「删除」"}"#.to_owned()
+    ));
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+    // 工具结果 + 行状态（action 关卷；request_id = host call id）。
+    let (srt, store) = scratch_store(&paths);
+    let (tool_content, row_status) = srt.block_on(async {
+        let msgs = openslate_store_sqlite::recorder::RunRecorder::load_messages(
+            &store,
+            &runtime.current_run_id().unwrap(),
+        )
+        .await
+        .unwrap();
+        let content = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_ref().map(|i| i.0.as_str()) == Some("call-n3"))
+            .expect("wait 工具结果入历史")
+            .content
+            .clone();
+        let row = store.get_pending_notification(&id.to_string()).await.unwrap();
+        (content, row.map(|r| r.status))
+    });
+    assert!(
+        tool_content.contains("用户在通知上点了「删除」") &&
+            tool_content.contains("\"outcome\":\"action\""),
+        "action 文案: {tool_content}"
+    );
+    assert_eq!(row_status.as_deref(), Some("action"), "行按 outcome 同名关卷");
+    runtime.shutdown();
+}
+
+/// wait 超时：router 按入参 1s 超时 → timeout 文案入历史 + 行 timeout。
+#[test]
+fn notify_wait_timeout() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![
+        notify_call_step(
+            "call-n4",
+            serde_json::json!({
+                "title": "等你确认", "message": "继续吗？", "wait": true, "timeout": 1,
+                "actions": [{"label": "继续"}, {"label": "停止"}]
+            }),
+        ),
+        text_response("用户不在，我按计划继续。"),
+    ]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"确认一下"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    let id = envelope["id"].as_u64().unwrap();
+    // 不 resolve：1s 后 router 超时，工具回填 timeout 文案、回合继续。
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+    let (srt, store) = scratch_store(&paths);
+    let (tool_content, row_status) = srt.block_on(async {
+        let msgs = openslate_store_sqlite::recorder::RunRecorder::load_messages(
+            &store,
+            &runtime.current_run_id().unwrap(),
+        )
+        .await
+        .unwrap();
+        let content = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_ref().map(|i| i.0.as_str()) == Some("call-n4"))
+            .expect("timeout 工具结果入历史")
+            .content
+            .clone();
+        let row = store.get_pending_notification(&id.to_string()).await.unwrap();
+        (content, row.map(|r| r.status))
+    });
+    assert!(
+        tool_content.contains("用户在 1 秒内未回应通知") &&
+            tool_content.contains("\"outcome\":\"timeout\""),
+        "timeout 文案: {tool_content}"
+    );
+    assert_eq!(row_status.as_deref(), Some("timeout"), "行按 timeout 关卷");
+    runtime.shutdown();
+}
+
+/// 竞态（oracle 补充）：timeout 已获胜后的迟到回复 = 原子 UPDATE 0 行
+/// → no-op + notice，不注入新消息、不二次续跑。
+#[test]
+fn notify_wait_timeout_then_late_reply_noop() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![
+        notify_call_step(
+            "call-n5",
+            serde_json::json!({
+                "title": "等你", "message": "回我", "wait": true, "timeout": 1,
+                "actions": [{"label": "好"}]
+            }),
+        ),
+        text_response("超时继续。"),
+    ]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"等回复"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    let id = envelope["id"].as_u64().unwrap();
+    let run_id = runtime.current_run_id().unwrap();
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+    // 迟到回复：在途 resolve 已失效（id 出表）→ 迟到路径 → 行非 pending
+    // → no-op + 定向 notice。
+    assert!(!runtime.resolve_host_call(
+        id,
+        true,
+        r#"{"outcome":"action","label":"好"}"#.to_owned()
+    ), "失效 id resolve 应 no-op");
+    runtime
+        .send(&format!(
+            r#"{{"type":"notification_reply","request_id":"{id}","run_id":"{run_id}","outcome":"action","label":"好"}}"#
+        ))
+        .unwrap();
+    let events = collector.wait_for(&rx, "notice", Duration::from_secs(10));
+    let notice = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "notice")
+        .expect("notice 已发出");
+    assert!(
+        notice["text"].as_str().unwrap().contains("已被应答或已关闭"),
+        "首答者赢语义（timeout 先胜）: {notice}"
+    );
+
+    // 行仍 timeout（迟到回复不改状态、不重开）。
+    let (srt, store) = scratch_store(&paths);
+    let status = srt.block_on(async {
+        store
+            .get_pending_notification(&id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+    });
+    assert_eq!(status, "timeout");
+    runtime.shutdown();
+}
+
+/// App 内停止回合（cancel）：在途 wait 调用被引擎合成 cancelled 结果、
+/// 行收 superseded；之后的迟到 notification_reply 为 no-op。
+#[test]
+fn notify_wait_cancel_superseded() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![notify_call_step(
+        "call-n6",
+        serde_json::json!({
+            "title": "等待确认", "message": "继续？", "wait": true, "timeout": 60,
+            "actions": [{"label": "继续"}, {"label": "停止任务", "behavior": "cancel_turn"}]
+        }),
+    )]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"确认"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    let id = envelope["id"].as_u64().unwrap();
+    let run_id = runtime.current_run_id().unwrap();
+
+    // 用户停止回合。
+    runtime.send(r#"{"type":"cancel"}"#).unwrap();
+    let _ = wait_turn_terminal(&collector, &rx, Duration::from_secs(20));
+
+    // 行被 on_cancel_all 收卷为 superseded（后台异步，轮询 DB）。
+    let (srt, store) = scratch_store(&paths);
+    let status = eventually(
+        || {
+            srt.block_on(async {
+                store
+                    .get_pending_notification(&id.to_string())
+                    .await
+                    .unwrap()
+                    .map(|r| r.status)
+            })
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(status, "superseded", "cancel 后 wait 行关卷 superseded");
+
+    // 迟到 cancelled 上行（边角 2 决策的防御通路：行已关 → no-op）。
+    runtime
+        .send(&format!(
+            r#"{{"type":"notification_reply","request_id":"{id}","run_id":"{run_id}","outcome":"cancelled"}}"#
+        ))
+        .unwrap();
+    let events = collector.wait_for(&rx, "notice", Duration::from_secs(10));
+    let notice = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "notice")
+        .expect("notice 已发出");
+    assert!(
+        notice["text"].as_str().unwrap().contains("已被应答或已关闭"),
+        "行已关卷，迟到 cancelled 为 no-op: {notice}"
+    );
+    runtime.shutdown();
+}
+
+/// wait 划掉通知（dismissed）即时路径。
+#[test]
+fn notify_wait_dismissed() {
+    let (paths, _dir) = temp_paths();
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![
+        notify_call_step(
+            "call-n7",
+            serde_json::json!({
+                "title": "要不要继续", "message": "划掉=默认继续", "wait": true, "timeout": 60,
+                "actions": [{"label": "继续"}, {"label": "停"}]
+            }),
+        ),
+        text_response("用户没选，我按假设继续。"),
+    ]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    runtime.send(r#"{"type":"submit","text":"问一下"}"#).unwrap();
+    let events = collector.wait_for(&rx, "host_call_requested", Duration::from_secs(15));
+    let envelope = events
+        .iter()
+        .find(|e| e["type"] == "host_call_requested")
+        .unwrap();
+    let id = envelope["id"].as_u64().unwrap();
+    assert!(runtime.resolve_host_call(id, true, r#"{"outcome":"dismissed"}"#.to_owned()));
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+    let (srt, store) = scratch_store(&paths);
+    let (tool_content, row_status) = srt.block_on(async {
+        let msgs = openslate_store_sqlite::recorder::RunRecorder::load_messages(
+            &store,
+            &runtime.current_run_id().unwrap(),
+        )
+        .await
+        .unwrap();
+        let content = msgs
+            .iter()
+            .find(|m| m.tool_call_id.as_ref().map(|i| i.0.as_str()) == Some("call-n7"))
+            .expect("dismissed 工具结果入历史")
+            .content
+            .clone();
+        let row = store.get_pending_notification(&id.to_string()).await.unwrap();
+        (content, row.map(|r| r.status))
+    });
+    assert!(
+        tool_content.contains("用户划掉了通知"),
+        "dismissed 文案: {tool_content}"
+    );
+    assert_eq!(row_status.as_deref(), Some("dismissed"));
+    runtime.shutdown();
+}
+
+/// 杀进程恢复 + 首答者赢（dismissed 变体）：预置崩溃现场（悬挂 notify
+/// 调用的 run + pending 行）→ 重启恢复 → notification_reply 迟到补全
+/// 续跑 → turn_ok；重复应答输掉首答者赢。
+#[test]
+fn notify_wait_restart_recovery_dismissed() {
+    let (paths, _dir) = temp_paths();
+    paths.ensure_layout().unwrap();
+
+    let run_id_str = "notify-recover-run";
+    let tool_call_id = "call-notify-9";
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let (srt, store) = scratch_store(&paths);
+        srt.block_on(async {
+            store
+                .insert_run(run_id_str, Some("通知恢复"), "root", "interrupted", "{}", now_ms - 60_000)
+                .await
+                .unwrap();
+            store
+                .insert_execution_node(
+                    &format!("{run_id_str}-persist"),
+                    run_id_str,
+                    "root",
+                    None,
+                    None,
+                    "running",
+                    "{}",
+                    now_ms - 60_000,
+                )
+                .await
+                .unwrap();
+            use openslate_core::types::{Message, MessageRole, ToolCall, ToolCallId};
+            let user_msg = Message {
+                attachments: None,
+                role: MessageRole::User,
+                content: "发个确认通知".into(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+                reasoning_content: None,
+            };
+            let assistant_msg = Message {
+                attachments: None,
+                role: MessageRole::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                name: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: ToolCallId(tool_call_id.into()),
+                    name: "notify".into(),
+                    arguments: serde_json::json!({
+                        "title": "确认", "message": "继续吗", "wait": true,
+                        "actions": [{"label": "继续"}]
+                    }),
+                }]),
+                reasoning_content: None,
+            };
+            store
+                .insert_message(
+                    &format!("msg-{run_id_str}-1"),
+                    run_id_str,
+                    &format!("{run_id_str}-persist"),
+                    Some("root"),
+                    "user",
+                    &openslate_store_sqlite::codec::encode_content(
+                        &serde_json::to_string(&user_msg).unwrap(),
+                    ),
+                    None,
+                    1,
+                    now_ms - 59_000,
+                )
+                .await
+                .unwrap();
+            store
+                .insert_message(
+                    &format!("msg-{run_id_str}-2"),
+                    run_id_str,
+                    &format!("{run_id_str}-persist"),
+                    Some("root"),
+                    "assistant",
+                    &openslate_store_sqlite::codec::encode_content(
+                        &serde_json::to_string(&assistant_msg).unwrap(),
+                    ),
+                    None,
+                    2,
+                    now_ms - 58_000,
+                )
+                .await
+                .unwrap();
+            // 完整信封快照落行（含 v 与 run_id，D2/D9）。
+            store
+                .insert_pending_notification(
+                    "77",
+                    tool_call_id,
+                    run_id_str,
+                    r#"{"v":1,"action":"post","title":"确认","message":"继续吗","wait":true,"timeout":300,"run_id":"notify-recover-run"}"#,
+                    now_ms - 58_000,
+                )
+                .await
+                .unwrap();
+        });
+    }
+
+    let (collector, rx) = Collector::new();
+    let scripted = ScriptedProvider::new(vec![text_response("用户划掉了通知，我按原计划继续。")]);
+    let opts = RuntimeOptions {
+        provider_factory: Some(factory_for(scripted)),
+        ..Default::default()
+    };
+    let runtime = MobileRuntime::create_with(paths.clone(), collector.clone(), opts).unwrap();
+
+    // 迟到 dismissed：notification_reply → 原子关卷 → 补全原 tool result
+    // → resume_from_tool_result 续跑 → turn_ok。
+    runtime
+        .send(&format!(
+            r#"{{"type":"notification_reply","request_id":"77","run_id":"{run_id_str}","outcome":"dismissed"}}"#
+        ))
+        .unwrap();
+    collector.wait_for(&rx, "turn_ok", Duration::from_secs(20));
+
+    // 首答者赢：重复应答 → 定向 notice，不二次续跑。
+    runtime
+        .send(&format!(
+            r#"{{"type":"notification_reply","request_id":"77","run_id":"{run_id_str}","outcome":"action","label":"继续"}}"#
+        ))
+        .unwrap();
+    let events = collector.wait_for(&rx, "notice", Duration::from_secs(10));
+    let notice = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "notice")
+        .expect("notice 已发出");
+    assert!(
+        notice["text"].as_str().unwrap().contains("已被应答或已关闭"),
+        "首答者赢语义: {notice}"
+    );
+
+    // 行 dismissed；消息历史里迟到补全的 tool result 与即时路径同形；
+    // 续跑后的最终回复已入库。
+    let (srt, store) = scratch_store(&paths);
+    let (row_status, msgs) = srt.block_on(async {
+        let row = store
+            .get_pending_notification("77")
+            .await
+            .unwrap()
+            .expect("行存在");
+        let msgs = openslate_store_sqlite::recorder::RunRecorder::load_messages(&store, run_id_str)
+            .await
+            .unwrap();
+        (row.status, msgs)
+    });
+    assert_eq!(row_status, "dismissed");
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m.role == openslate_core::types::MessageRole::Tool
+            && m.tool_call_id.as_ref().map(|i| i.0.as_str()) == Some(tool_call_id))
+        .expect("迟到 dismissed 已补全 tool result");
+    assert!(
+        tool_msg.content.contains("用户划掉了通知")
+            && tool_msg.content.contains("\"outcome\":\"dismissed\""),
+        "与即时路径完全同形（迟到等价不变量）: {}",
+        tool_msg.content
+    );
+    assert!(
+        msgs.iter().any(|m| m.role == openslate_core::types::MessageRole::Assistant
+            && m.content.contains("我按原计划继续")),
+        "续跑后的最终回复已入库"
+    );
     runtime.shutdown();
 }

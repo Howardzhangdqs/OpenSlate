@@ -35,6 +35,7 @@ use openslate_store_sqlite::store::SqliteStore;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::SessionApprovalBridge;
+use crate::notify::NotifyHandler;
 use crate::question::QuestionHandler;
 
 /// 测试接缝：per-turn provider 构造器。生产 = `build_provider_for_model`；
@@ -160,6 +161,11 @@ pub struct SessionCore {
     /// notice）。锁方向遵守模块头不变量：core 锁内只做非阻塞短临界
     /// 区操作（clone Arc），handler 本身由宿主在 core 锁外调用。
     questions: Mutex<Option<Arc<dyn QuestionHandler>>>,
+    /// notify 通知应答通道（见 notify.rs 模块文档：注入点仿 questions，
+    /// mobile 装配层在构造 AppState 之后调用）。`None` = 通道未接入
+    ///（dispatch 收到 notification_reply 时定向 notice）。锁内只
+    /// clone Arc，handler 本身由宿主在 core 锁外调用。
+    notifies: Mutex<Option<Arc<dyn NotifyHandler>>>,
     /// 转写前置冲刷钩子（C1；注入点仿 questions：避免破坏各装配点的
     /// 结构体字面量）。`None` = 未注册（server/cli/tui，行为不变）；
     /// mobile 注册 SyncState 委托（见 mobile transcripts.rs）。锁内只
@@ -172,6 +178,7 @@ impl SessionCore {
         Self {
             inner: Mutex::new(inner),
             questions: Mutex::new(None),
+            notifies: Mutex::new(None),
             transcripts: Mutex::new(None),
         }
     }
@@ -195,6 +202,23 @@ impl SessionCore {
     fn lock_questions(
         m: &Mutex<Option<Arc<dyn QuestionHandler>>>,
     ) -> std::sync::MutexGuard<'_, Option<Arc<dyn QuestionHandler>>> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 注入 notify 通知应答处理器（装配层在构造 AppState 之后调用；
+    /// `set_question_handler` 同款防破坏与防环论证，见 notify.rs）。
+    pub fn set_notify_handler(&self, handler: Arc<dyn NotifyHandler>) {
+        *Self::lock_notifies(&self.notifies) = Some(handler);
+    }
+
+    /// 当前处理器快照（`None` = 通知应答通道未接入）。
+    pub fn notify_handler(&self) -> Option<Arc<dyn NotifyHandler>> {
+        Self::lock_notifies(&self.notifies).clone()
+    }
+
+    fn lock_notifies(
+        m: &Mutex<Option<Arc<dyn NotifyHandler>>>,
+    ) -> std::sync::MutexGuard<'_, Option<Arc<dyn NotifyHandler>>> {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 

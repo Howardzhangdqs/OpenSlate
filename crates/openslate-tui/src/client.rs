@@ -245,6 +245,7 @@ pub fn config_from_view(view: &ConfigViewDto) -> openslate_core::config::OpenSla
         approval: None,
         tui: Default::default(),
         ask_user: Default::default(),
+        notify: Default::default(),
         attachments: Default::default(),
     }
 }

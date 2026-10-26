@@ -25,6 +25,7 @@
 //! | `approval`  | `Option<ApprovalConfig>` | no  | Tool approval gating (legacy `policy`/`tools` + new `default_level`/`tool_levels`/`server_levels`) |
 //! | `tui`       | `TuiConfig`         | no       | TUI frontend (icon overrides)      |
 //! | `ask_user`  | `AskUserConfig`     | no       | ask_user tool behavior (timeout/masking) |
+//! | `notify`    | `NotifyConfig`      | no       | notify tool behavior (default wait timeout, S1b) |
 //! | `attachments` | `AttachmentsConfig` | no     | Multimodal attachment ingest / send limits (multimodal input design §6.6) |
 //!
 //! ## `agents/*.md` (Markdown + YAML frontmatter)
@@ -119,6 +120,11 @@ pub struct OpenSlateConfig {
     /// 手拼 TOML（模块头约定），本 lane 未接写回。
     #[serde(default)]
     pub ask_user: AskUserConfig,
+    /// notify（Agent 主动系统通知）工具行为（`[notify]`，notify 设计
+    /// S1b：wait 模式默认等待时限）。Deserialize-only：写回由 persist.rs
+    /// 手拼 TOML（模块头约定），本 lane 未接写回（文件配置 + 代码默认）。
+    #[serde(default)]
+    pub notify: NotifyConfig,
     /// 附件（多模态输入）限额与实验开关（`[attachments]`，存储 v5 设计
     /// §6.6；图片处理用户可配置：dim/处理后大小双旋钮）。validation
     /// 边界：512 ≤ dim ≤ 6000、1 ≤ max_image_mb ≤ 5、其余 mb ≥ 1。
@@ -619,6 +625,26 @@ impl Default for AskUserConfig {
     }
 }
 
+/// notify（Agent 主动系统通知）工具行为（`[notify]`，notify 设计 S1b；
+/// 本阶段仅文件配置 + 代码默认值，设置页 UI 后补——descope 拍板）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// `wait:true` 模式默认等待时限；工具入参 `timeout` 逐次覆盖
+    /// （`-1` = 永不）。与 ask_user 的 App 内「永不」首装默认不同属
+    /// 有意差异：通知场景用户大概率不在屏幕前，「永不」会让 turn
+    /// 无限挂起（notify 设计 §10 决策 9）。
+    pub default_wait_timeout: AskTimeout,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            default_wait_timeout: AskTimeout::Seconds(300),
+        }
+    }
+}
+
 /// ask_user 等待时限。TOML 写法：`default_timeout = "never"` 或
 /// `default_timeout = { seconds = 300 }`（serde 外部标签枚举）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -935,6 +961,60 @@ model = "m"
         let config = parse_openslate_toml(toml).expect("should parse");
         assert_eq!(config.ask_user.default_timeout, AskTimeout::Never);
         assert!(config.ask_user.mask_secrets);
+    }
+
+    // ── [notify]（notify 设计 S1b）──────────────────────────────────────
+
+    #[test]
+    fn notify_defaults_and_explicit_override() {
+        // 缺省 = 300 秒（与 ask_user 的 Never 首装默认有意不同：通知
+        // 场景用户大概率不在屏幕前，「永不」会让 turn 无限挂起）。
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(
+            config.notify.default_wait_timeout,
+            AskTimeout::Seconds(300)
+        );
+
+        // 显式覆盖（含 -1 语义的 never 形态）。
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[notify]
+default_wait_timeout = { seconds = 60 }
+"#;
+        let config = parse_openslate_toml(toml).expect("should parse");
+        assert_eq!(config.notify.default_wait_timeout, AskTimeout::Seconds(60));
+
+        // deny_unknown_fields 拒拼写错误键。
+        let toml = r#"
+[providers.mock]
+base_url = "http://localhost"
+api_key_env = "MOCK_KEY"
+
+[models.main]
+provider = "mock"
+model = "m"
+
+[notify]
+default_wait_timeout = "never"
+tiemout = 60
+"#;
+        assert!(parse_openslate_toml(toml).is_err(), "deny_unknown_fields 拒拼写错误键");
     }
 
     // ── [attachments]（多模态输入设计 §6.6）─────────────────────────────

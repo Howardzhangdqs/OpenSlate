@@ -20,11 +20,11 @@ use super::OpenSlateConfig;
 ///   entries are kept.
 /// - Every other section (`project`, `database`, `prompts`, `limits`,
 ///   `trace`, `mcp`, `builtin_tools`, `skills`, `ptc`, `approval`, `tui`,
-///   `ask_user`, `attachments`) is taken from local when present, else from
-///   global. For `Option` sections that means `local = None` falls back to
-///   global; non-`Option` sections take the local value verbatim (local
-///   always wins — a local file without the section keeps the section's
-///   defaults).
+///   `ask_user`, `notify`, `attachments`) is taken from local when present,
+///   else from global. For `Option` sections that means `local = None` falls
+///   back to global; non-`Option` sections take the local value verbatim
+///   (local always wins — a local file without the section keeps the
+///   section's defaults).
 pub fn merge_configs(global: &OpenSlateConfig, local: &OpenSlateConfig) -> OpenSlateConfig {
     OpenSlateConfig {
         project: local.project.clone().or_else(|| global.project.clone()),
@@ -43,6 +43,7 @@ pub fn merge_configs(global: &OpenSlateConfig, local: &OpenSlateConfig) -> OpenS
         approval: local.approval.clone().or_else(|| global.approval.clone()),
         tui: local.tui.clone(),
         ask_user: local.ask_user.clone(),
+        notify: local.notify.clone(),
         attachments: local.attachments.clone(),
     }
 }

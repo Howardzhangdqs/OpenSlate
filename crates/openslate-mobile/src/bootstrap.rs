@@ -25,9 +25,33 @@ pub struct MobilePaths {
 }
 
 /// mobile 默认 root agent：显式工具白名单（tools 为空 = 暴露全部注册
-/// 工具，mobile 语义下不可接受）。`output_query`（长输出落盘 C4）加入
-/// 后，存量未定制 root.md 经 [`LEGACY_ROOT_AGENT_MDS`] 自动迁移。
+/// 工具，mobile 语义下不可接受）。`output_query`（长输出落盘 C4）与
+/// `notify`（系统通知 S1）加入后，存量未定制 root.md 经
+/// [`LEGACY_ROOT_AGENT_MDS`] 自动迁移。
 const DEFAULT_ROOT_AGENT_MD: &str = r#"---
+id: root
+name: OpenSlate
+model: main
+tools:
+    - mobile.ping
+    - bash
+    - termux_bash
+    - output_query
+    - notify
+---
+You are a helpful AI assistant.
+"#;
+
+/// 旧版默认（历届自动生成的 Phase 1/2 白名单，历史命名 shell.run /
+/// termux.run；v3 = output_query 加入前的多选命名版；v4 = notify 加入
+/// 前的 output_query 版）。已装机设备的 root.md 与之一致时视为未定制，
+/// 自动迁移到当前默认（bash / termux_bash / output_query / notify）；
+/// 用户改过则保持不动——**不在白名单 ≠ 报错**，只是模型看不到该工具；
+/// 启动迁移对外科式补齐（见 [`ensure_builtin_tool_whitelisted`]）兜底
+/// ——app 私有目录无编辑器可达。
+const LEGACY_ROOT_AGENT_MDS: &[&str] = &[
+    // v4：output_query 版（notify 加入前）。
+    r#"---
 id: root
 name: OpenSlate
 model: main
@@ -38,15 +62,7 @@ tools:
     - output_query
 ---
 You are a helpful AI assistant.
-"#;
-
-/// 旧版默认（历届自动生成的 Phase 1/2 白名单，历史命名 shell.run /
-/// termux.run；v3 = output_query 加入前的多选命名版）。已装机设备的
-/// root.md 与之一致时视为未定制，自动迁移到当前默认（bash / termux_bash
-/// / output_query）；用户改过则保持不动——**不在白名单 ≠ 报错**，只是
-/// 模型看不到该工具；启动迁移对外科式补齐（见
-/// [`ensure_builtin_tool_whitelisted`]）兜底——app 私有目录无编辑器可达。
-const LEGACY_ROOT_AGENT_MDS: &[&str] = &[
+"#,
     // v3：多选命名版（output_query 加入前）。
     r#"---
 id: root
@@ -305,7 +321,7 @@ path = "{db}"
 /// 入口），定制过 root.md 的用户没有手动补的途径——启动时外科式补齐。
 /// 若用户刻意删掉某项，下次启动会再次补上：单用户语义下可接受（有意
 /// 关闭请用工具自身的配置开关而非白名单剔除）。
-const REQUIRED_BUILTIN_TOOLS: &[&str] = &["output_query"];
+const REQUIRED_BUILTIN_TOOLS: &[&str] = &["output_query", "notify"];
 
 /// 定制 root.md 的白名单外科式补齐：`tools:` 块存在、且存在至少一条
 /// 缩进列表项时，把 [`REQUIRED_BUILTIN_TOOLS`] 中缺失的项追加到列表
@@ -361,8 +377,8 @@ mod tests {
         // 定制过的 root.md（含非默认工具项）：外科式追加，其余逐字不动。
         let customized = "---\nid: root\nname: OpenSlate\nmodel: main\ntools:\n    - mobile.ping\n    - bash\n    - termux_bash\n    - termux_read_file\n---\n你好。\n";
         let patched = ensure_builtin_tool_whitelisted(customized)
-            .expect("应补齐 output_query");
-        assert!(patched.contains("- termux_read_file\n    - output_query\n"));
+            .expect("应补齐 output_query + notify");
+        assert!(patched.contains("- termux_read_file\n    - output_query\n    - notify\n"));
         // 头部与正文原样保留。
         assert!(patched.starts_with("---\nid: root\n"));
         assert!(patched.ends_with("你好。\n"));
@@ -371,13 +387,38 @@ mod tests {
     #[test]
     fn builtin_tool_surgery_idempotent_and_bail_forms() {
         // 已包含 → None（幂等）。
-        let has = "tools:\n    - bash\n    - output_query\n";
+        let has = "tools:\n    - bash\n    - output_query\n    - notify\n";
         assert!(ensure_builtin_tool_whitelisted(has).is_none());
         // 内联列表形态 / 无 tools 块 → None（宁可不修）。
         assert!(ensure_builtin_tool_whitelisted("tools: [bash]\n").is_none());
         assert!(ensure_builtin_tool_whitelisted("id: root\n").is_none());
         // 空 tools 块（无列表项可锚定）→ None。
         assert!(ensure_builtin_tool_whitelisted("tools:\n---\n").is_none());
+    }
+
+    /// 旧默认 root.md（notify 加入前的 output_query 版）逐字节匹配 →
+    /// 整体迁移到含 notify 的新默认。
+    #[test]
+    fn legacy_root_agent_md_migrates_to_notify_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = MobilePaths {
+            config_dir: tmp.path().join("config"),
+            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
+            cache_dir: tmp.path().join("cache"),
+        };
+        paths.ensure_layout().unwrap();
+        let root_md = paths.agents_dir().join("root.md");
+        // 手工放回旧默认（v4：output_query 版）。
+        std::fs::write(
+            &root_md,
+            LEGACY_ROOT_AGENT_MDS[0],
+        )
+        .unwrap();
+        paths.ensure_layout().unwrap();
+        let after = std::fs::read_to_string(&root_md).unwrap();
+        assert_eq!(after, DEFAULT_ROOT_AGENT_MD);
+        assert!(after.contains("    - notify\n"), "notify 应进新默认白名单");
     }
 
     #[test]

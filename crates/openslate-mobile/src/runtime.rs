@@ -154,6 +154,10 @@ impl MobileRuntime {
         // wire 注入（Weak 防引用环，见 question.rs 模块文档）。
         let ask_ctx = AskUserContext::new(host_router.clone(), vault.clone());
 
+        // notify 共享上下文（AskUserContext 同款装配时序；wait 模式的
+        // 通知行持久化 + 迟到应答续跑共用）。
+        let notify_ctx = crate::notify::NotifyContext::new(host_router.clone());
+
         // env 注入源（ask_user secret env 形态）：
         // - native bash（本 crate NativeShellTool）经 register_bash_tools
         //   传入，spawn 时取最新值；
@@ -172,6 +176,7 @@ impl MobileRuntime {
         let exec_selection = ExecSelectionCell::new(ExecSelection::default());
         let mut extra_tools = opts.extra_tools;
         extra_tools.push(Box::new(AskUserTool::new(ask_ctx.clone())));
+        extra_tools.push(Box::new(crate::notify::NotifyTool::new(notify_ctx.clone())));
         extra_tools.push(Box::new(HostTool::new(
             "mobile.ping",
             "Ping the OpenSlate mobile host bridge. Returns {'pong': true, 'runtime': 'rust'}. No parameters.",
@@ -247,12 +252,18 @@ impl MobileRuntime {
         // ask_user 接线：上下文注入 store/配置 + QuestionHandler 装配
         // （dispatch 的 question_reply / cancel 由此进 mobile 实现）。
         ask_ctx.wire(&state);
+        // notify 接线：上下文注入 store/配置 + NotifyHandler 装配
+        //（dispatch 的 notification_reply / cancel 由此进 mobile 实现）。
+        notify_ctx.wire(&state);
         // output_query 接线：AppState 弱引用（当前 run 优先 + 输出封顶
         // 生效值；AskUserContext.wire 同款装配后注入）。
         let _ = output_query_state.set(Arc::downgrade(&state));
         state
             .core
             .set_question_handler(Arc::new(MobileQuestionHandler::new(ask_ctx.clone())));
+        state.core.set_notify_handler(Arc::new(
+            crate::notify::MobileNotifyHandler::new(notify_ctx.clone()),
+        ));
         // vault 持久层接线：加载 credentials 镜像（remember 凭据跨会话
         // 可用——env 注入/lookup/脱敏值源全走镜像）。附件字节装载代理
         // 的 store 同步后注（provider 工厂闭包持有 OnceLock）。
@@ -2385,10 +2396,20 @@ async fn assemble_state(
                                 Some(&recorder),
                             )
                             .await;
-                            // 可恢复的 ask_user 悬挂在历史中 → 保留尾部悬挂
-                            // assistant（同批兄弟悬挂由下一 turn 前的
-                            // superseded 修复收口）。
-                            keep_dangling = !recoverable.is_empty();
+                            // notify 启动清扫（D6 同构兄弟函数）：wait 通知
+                            // 行的 expired 合成 / superseded 关卷 / 可恢复
+                            // 保留，语义与问卷清扫一一对应。
+                            let recoverable_notifies = crate::notify::startup_notify_maintenance(
+                                &store,
+                                &mut restored_history,
+                                Some(&recorder),
+                            )
+                            .await;
+                            // 可恢复的 ask_user / notify 悬挂在历史中 →
+                            // 保留尾部悬挂 assistant（同批兄弟悬挂由下一
+                            // turn 前的 superseded 修复收口）。
+                            keep_dangling =
+                                !recoverable.is_empty() || !recoverable_notifies.is_empty();
                             restored_run = Some(openslate_session::state::SessionRun {
                                 run_id: openslate_core::types::RunId(run.id.clone()),
                                 recorder,
@@ -2401,14 +2422,26 @@ async fn assemble_state(
                         // （迟到答案 / TTL 过期合成收尾的补全点，pop 不可
                         // 逆）。查询失败保守保留——多留的悬挂由下一 turn
                         // 前的修复收口，安全；误 pop 则无法挽回。
+                        // pending 集合 = pending_questions ∪ pending_
+                        // notifications 的 tool_call_id 并集（D8：notify
+                        // 行同样守卫尾部悬挂——顺带兜住 fail_all 豁免导致
+                        // 的非 wait 悬挂声明 pop，两决策自洽）。
                         let mut popped_dangling = false;
                         if !keep_dangling {
-                            match store.list_pending_questions().await {
-                                Ok(pending) => {
-                                    let pending_ids: Vec<String> = pending
+                            let pending_guard = async {
+                                let questions = store.list_pending_questions().await;
+                                let notifications = store.list_pending_notifications().await;
+                                match (questions, notifications) {
+                                    (Ok(q), Ok(n)) => Ok(q
                                         .into_iter()
                                         .map(|row| row.tool_call_id)
-                                        .collect();
+                                        .chain(n.into_iter().map(|row| row.tool_call_id))
+                                        .collect::<Vec<_>>()),
+                                    (Err(e), _) | (_, Err(e)) => Err(e),
+                                }
+                            };
+                            match pending_guard.await {
+                                Ok(pending_ids) => {
                                     if may_pop_dangling_tail(&restored_history, &pending_ids) {
                                         restored_history.pop();
                                         popped_dangling = true;
@@ -6396,7 +6429,7 @@ mod tests {
         assert_eq!(t, Some(728), "首次调用值（9999 是后续调用，被忽略）");
 
         // 重发 Hello → 新快照的 User 附件带 tokens。
-        runtime.send(r#"{"type":"hello","proto":5}"#).unwrap();
+        runtime.send(r#"{"type":"hello","proto":6}"#).unwrap();
         collector.wait_for_count(&rx, "snapshot", 2, Duration::from_secs(10));
         let att = snapshot_user_attachment(&collector, &att_id)
             .expect("快照 User 条目应带该附件");
@@ -6450,7 +6483,7 @@ mod tests {
                 "多图 usage 不分图，不回填（{id}）"
             );
         }
-        runtime.send(r#"{"type":"hello","proto":5}"#).unwrap();
+        runtime.send(r#"{"type":"hello","proto":6}"#).unwrap();
         collector.wait_for_count(&rx, "snapshot", 2, Duration::from_secs(10));
         for id in &ids {
             let att =

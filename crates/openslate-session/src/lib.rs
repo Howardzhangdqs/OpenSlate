@@ -25,6 +25,7 @@
 pub mod approval;
 pub mod config_ops;
 pub mod engine;
+pub mod notify;
 pub mod question;
 pub mod session;
 pub mod state;

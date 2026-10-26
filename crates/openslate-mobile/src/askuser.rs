@@ -829,7 +829,8 @@ impl AskUserContext {
     /// `120` 与 `120.0` 这类 int/float 漂移，逐层递归比较（键序无关）。
     /// 让更多悬挂声明能按 tool_call_id 精确对上，减少「无行可恢复」
     /// （args 不匹配且非唯一悬挂时 find_call_id 只能放弃）的路径。
-    fn args_equivalent(a: &Value, b: &Value) -> bool {
+    /// （notify 的 `NotifyContext` 同款复用，故 pub(crate)。）
+    pub(crate) fn args_equivalent(a: &Value, b: &Value) -> bool {
         if a == b {
             return true;
         }
@@ -1335,6 +1336,7 @@ impl MobileQuestionHandler {
         };
 
         let handle = spawn_resume_turn(
+            "ask_user",
             state.clone(),
             manager,
             run_id,
@@ -1433,8 +1435,11 @@ impl QuestionHandler for MobileQuestionHandler {
 /// 回合体包 catch_unwind，panic 拦截后走 engine 的 [`finalize_turn`]
 /// 强制收尾 + `TurnError(kind=other)`——续跑路径同样不能让 running
 /// 卡 true（engine.rs spawn_engine_turn 文档详述动机）。
+///
+/// `via` 为调用方标识（日志用；ask_user / notify 共用本续跑基建）。
 #[allow(clippy::too_many_arguments)]
-fn spawn_resume_turn(
+pub(crate) fn spawn_resume_turn(
+    via: &'static str,
     state: Arc<AppState>,
     manager: RunManager,
     run_id: RunId,
@@ -1451,6 +1456,7 @@ fn spawn_resume_turn(
         let mut manager = manager;
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle.block_on(resume_turn(
+                via,
                 state.clone(),
                 &mut manager,
                 run_id,
@@ -1466,7 +1472,7 @@ fn spawn_resume_turn(
             Err(payload) => {
                 let summary = panic_payload_summary(payload.as_ref());
                 crate::alog!(
-                    "ask_user resume turn panicked ({summary}); forcing finalization"
+                    "{via} resume turn panicked ({summary}); forcing finalization"
                 );
                 TurnTerminal::Error {
                     message: format!("内部错误：回合发生 panic（已恢复，可重试）；{summary}"),
@@ -1484,6 +1490,7 @@ fn spawn_resume_turn(
 /// 重新进入 agent 循环——与正常工具结果后的继续同一条路径）。
 #[allow(clippy::too_many_arguments)]
 async fn resume_turn(
+    via: &'static str,
     state: Arc<AppState>,
     manager: &mut RunManager,
     run_id: RunId,
@@ -1523,7 +1530,7 @@ async fn resume_turn(
                 TurnSummaryDto::from(r)
             };
             crate::alog!(
-                "ask_user resume turn ok: {}s · ↑{} ↓{}",
+                "{via} resume turn ok: {}s · ↑{} ↓{}",
                 started.elapsed().as_secs(),
                 dto.total_input_tokens,
                 dto.total_output_tokens
@@ -1531,14 +1538,14 @@ async fn resume_turn(
             TurnTerminal::Ok(Box::new(dto))
         }
         Err(e) => {
-            // 失败保留 history 现状（engine_turn 同款）。问卷行已关卷——
+            // 失败保留 history 现状（engine_turn 同款）。持久行已关卷——
             // 若失败源于 AlreadyAnswered（被 superseded 修复抢跑），行本
             // 就该关；其他失败路径行状态由快照自愈收口。
             {
                 let mut inner = state.core.lock();
                 flush_stream(&mut inner);
             }
-            crate::alog!("ask_user resume turn error: {e}");
+            crate::alog!("{via} resume turn error: {e}");
             TurnTerminal::Error {
                 message: e.to_string(),
                 kind: None,
@@ -1641,8 +1648,13 @@ pub async fn startup_question_maintenance(
 // 审批豁免（无副作用工具不触发审批）
 // ---------------------------------------------------------------------------
 
-/// 免审工具集（无副作用——提问 / 纯读本会话已脱敏落盘的数据）。
-const APPROVAL_EXEMPT_TOOLS: &[&str] = &[ASK_USER_TOOL, crate::output_query::OUTPUT_QUERY_TOOL];
+/// 免审工具集（无副作用——提问 / 发通知 / 纯读本会话已脱敏落盘的
+/// 数据）。
+const APPROVAL_EXEMPT_TOOLS: &[&str] = &[
+    ASK_USER_TOOL,
+    crate::output_query::OUTPUT_QUERY_TOOL,
+    crate::notify::NOTIFY_TOOL,
+];
 
 /// 审批回调装饰器：命中的无副作用工具直通放行，其余委托内层回调。
 ///
@@ -1650,6 +1662,9 @@ const APPROVAL_EXEMPT_TOOLS: &[&str] = &[ASK_USER_TOOL, crate::output_query::OUT
 ///   问」是体验灾难（ask-user 设计 §0）；
 /// - `output_query`（长输出落盘 C4）：纯读已脱敏落盘的输出，Auto 缺省
 ///   下启发式 Medium 会为每次查询付一次 AI 审查调用——读日志不该过审。
+/// - `notify`（notify 设计 S1）：通知低风险且用户全程可控（系统权限 +
+///   渠道开关 + 可滑删），对齐 ask_user 豁免的同一逻辑——「发个通知
+///   还要先批准」同样是体验灾难。
 ///
 /// 豁免实现点选最小侵入处——装饰 `manager.approval` 的 callback 槽
 /// （mobile 装配层），不动 core 审批逻辑、不动 `AppState.approval`

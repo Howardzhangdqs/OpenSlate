@@ -151,12 +151,52 @@ pub async fn dispatch(state: &Arc<AppState>, conn_id: u64, msg: ClientMsg) {
                 }
             }
         }
+        ClientMsg::NotificationReply {
+            request_id,
+            run_id,
+            outcome,
+            label,
+            value,
+            text,
+        } => {
+            // notify 通知应答转发（notify S1b；QuestionReply 同款双通路：
+            // 桥在 core 锁外调用，首答者赢幂等）。outcome 白名单已在协议
+            // 枚举处机制化（timeout/expired 上行即解析失败），此处收到的
+            // 恒为合法值。
+            let label_outcome = outcome.as_str();
+            match state.core.notify_handler() {
+                Some(handler)
+                    if handler.on_reply(&request_id, &run_id, outcome, label, value, text) =>
+                {
+                    crate::session_event!(
+                        "notification reply: {request_id} ({label_outcome})"
+                    );
+                }
+                Some(_) => {
+                    notice(
+                        state,
+                        conn_id,
+                        "该通知已被应答或已关闭".into(),
+                        NoticeLevel::Info,
+                    );
+                }
+                None => {
+                    notice(state, conn_id, "通知应答通道未接入".into(), NoticeLevel::Warn);
+                }
+            }
+        }
         ClientMsg::Cancel => {
             // ask_user 关卷（best-effort）：先让宿主把悬挂问题按 cancelled
             // 收尾（引擎 select! 对已取消 token 有偏置，真实结果不保证
             // 落地；确定性兜底是下一 turn 前的 superseded 修复，见
             // handle_submit），再取消 token。
             if let Some(handler) = state.core.question_handler() {
+                handler.on_cancel_all();
+            }
+            // notify wait 行同款收卷（notify S1b）：悬挂通知按 superseded
+            // 关卷——引擎已为在途调用合成 cancelled 结果，行留着只会
+            // 等 TTL；迟到上行会被「已关卷」判定挡住。
+            if let Some(handler) = state.core.notify_handler() {
                 handler.on_cancel_all();
             }
             let inner = state.core.lock();

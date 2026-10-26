@@ -51,6 +51,15 @@ pub const HOST_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// 同 crate 内的稳定契约）。
 pub const HOST_CALL_TIMEOUT_ERR_PREFIX: &str = "host call timeout";
 
+/// `fail_all` 豁免工具名集合（拍板 D7：最小改法按名匹配，不引入按
+/// 调用注册的机制）。ask_user = 问卷持久化恢复；notify = wait 通知行
+/// 持久化恢复（非 wait 通知同被豁免属已知良性偏差，见 `fail_all`
+/// 文档）。
+const FAIL_ALL_EXEMPT_TOOLS: &[&str] = &[
+    openslate_core::ask_user::ASK_USER_TOOL,
+    crate::notify::NOTIFY_TOOL,
+];
+
 /// 一条在途 host call 的应答通道 + 发起工具名（`fail_all` 按名豁免）。
 struct Pending {
     tx: tokio::sync::oneshot::Sender<Result<Value, String>>,
@@ -159,19 +168,25 @@ impl HostCallRouter {
 
     /// 关停兜底：让在途调用立刻失败（引擎解栈）。
     ///
-    /// **ask_user 豁免**（ask-user 设计 r5 中断豁免的对接点）：pending
-    /// 的 ask_user 不 fail——工具 future 随 runtime 收束被 drop，问卷行
+    /// **豁免工具集合**（ask_user：ask-user 设计 r5 中断豁免的对接点；
+    /// notify：notify 设计 S1b 同款对接）：pending 的 ask_user / notify
+    /// 不 fail——工具 future 随 runtime 收束被 drop，问卷 / 通知等待行
     /// 留在持久层 pending，重启后经快照回放 + 迟到答案补全恢复；若在
     /// 此处 fail，runner 会把错误结果并入历史、行被迫关卷，迟到答案
     /// 无处补全。其余工具照旧。
+    ///
+    /// 已知良性偏差（拍板 D7，勿「修」）：非 wait 的 notify 调用同样被
+    /// 豁免——它没有落库行无需保护、宿主侧毫秒级完成即 resolve，豁免
+    /// 与否无落地行为差异；ask_user 久有同款行为（按工具名粒度豁免，
+    /// 不引入按调用注册的新机制是最小改法）。
     pub fn fail_all(&self, reason: &str) {
         let drained: Vec<(u64, Pending)> = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             guard.drain().collect()
         };
         for (id, Pending { tx, tool }) in drained {
-            if tool == openslate_core::ask_user::ASK_USER_TOOL {
-                // 放回待答（进程若继续存活，问卷通路不变；随 router
+            if FAIL_ALL_EXEMPT_TOOLS.contains(&tool.as_str()) {
+                // 放回待答（进程若继续存活，应答通路不变；随 router
                 // drop 自然消亡）。
                 self.pending
                     .lock()

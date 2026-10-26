@@ -650,6 +650,204 @@ T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user
 `openslate-mobile/src/runtime.rs`（`tool_output_by_call_id` / `expand_stored_output` /
 `cap_stored_full_text`，C6）。
 
+### 3.5 notify（Agent 主动系统通知，全链路）
+
+Rust 侧工具本体在 `crates/openslate-mobile/src/notify.rs`（`NotifyTool` +
+`NotifyContext` + `MobileNotifyHandler` + `startup_notify_maintenance`；设计
+真相源 `docs/proposals/notify-tool-design.md`（r2），拍板决策 D1-D9 见
+`.slim/deepwork/notify-tool.md`，工具文档见
+[04-tools/notify.md](../04-tools/notify.md)）；Kotlin 侧 = `AgentNotifier`（通知
+执行器）+ `NotificationActionReceiver`（动作接收器）+ RuntimeBridge notify 分支
+（文件角色见 android-app.md §4）。协议 / 存储接缝：protocol v6
+`ClientMsg::notification_reply`（PROTOCOL_VERSION 5→6）、store v9
+`pending_notifications`（见 02-core 文档）；**FFI 零新增面**——下发走既有
+`host_call_requested` 事件、迟到上行走既有 `send`。
+
+三渠道（`AgentNotifier` 幂等创建，渠道 id 挂 `strings.xml`；AgentService 的
+`agent_runtime` FGS 1001 不动）：
+
+| 渠道 id | 用户可见名 | Importance | 用途 |
+|---------|-----------|------------|------|
+| `agent_messages` | Agent 消息 | DEFAULT | normal 通知 / ask_user 伴生唤回 |
+| `agent_important` | Agent 重要提醒 | HIGH | important / wait 确认（heads-up 资格**由系统决定**） |
+| `agent_progress` | Agent 任务进度 | LOW | progress（配 `setOnlyAlertOnce` 更新不响铃） |
+
+发起链（post / update / cancel 共用；非 wait = fire-and-forget，不落库）：
+
+```text
+模型 tool call notify
+  → NotifyTool::execute（notify.rs:776）                         [Rust]
+      归一化（缺省/越界钳制/UTF-8 字符边界截断/组合校验，全部业务校验在
+      发信封前完成——Kotlin 收到即合法）+ 限额闸：新 id 非 wait post
+      12 条/分钟（同 id 更新、wait、cancel 豁免；超限 Ok(Error) 文案
+      回喂模型。活跃上限 16 的淘汰在**宿主侧 AgentNotifier** 实施：登记满
+      16 时按插入序淘汰首个非 ongoing 且非 waitPending 条目；全不可淘汰
+      时放行，由本 12 条/分钟限流兜底）
+  → run_id 取当前 session_run（非 wait 也带，Kotlin 路由用；无会话省键）
+  → host_envelope（notify.rs:362）：v:1 + 归一化字段 + **run_id 内嵌
+      args**（拍板 D9：信封顶层保持 {type,id,tool,args} 不改
+      HostCallRouter；非 cancel_turn 按钮的 value 缺省在 Rust 侧补齐
+      「用户在通知上点了「label」」）
+  → HostCallRouter::call（默认 120s 超时，Kotlin 毫秒级绰绰有余）
+  → emit {"type":"host_call_requested","id":42,"tool":"notify",
+          "args":{"v":1,…,"run_id":"r-…"}}
+  → （经 §2 下行链路）RuntimeBridge.handleHostCall（:3049）
+      → handleNotify（:2728）：args → NotificationSpec（防御性再截/再滤，
+        异常兜 posted:false invalid_args；一切业务结果 ok=true 对齐 ask_user）
+      ├ post/update → AgentNotifier.post（AgentNotifier.kt:198）
+      │    权限检查（API 33 POST_NOTIFICATIONS 运行时授予 + 系统总开关
+      │    areNotificationsEnabled → permission_denied）→ 渠道检查
+      │    （IMPORTANCE_NONE → channel_disabled）→ 寻址 tag="an-"+
+      │    sanitize(agentId)、id=stableHash32(agentId) **纯函数稳定派生**
+      │    （重启后同 id 仍命中）→ notify(tag,id)（同 id 原生覆盖=update）
+      │    → 登记表登记（RegisteredEntry：ongoing / waitPending 快照）；
+      │    contentIntent → MainActivity（带 run_id）；wait 另挂 deleteIntent
+      └ cancel → cancelRegistered / cancelAllRegistered（**只枚举本进程
+           登记表，禁 NotificationManager.cancelAll()——会连 AgentService
+           FGS 常驻 1001 一起取消**）；命中 wait 挂起条目 → 防御收口（下）
+  → resolveHostCall(id, true, {"posted":true,"id","kind","channel"} /
+      {"posted":false,"reason":…} / cancel → {"cancelled":…,"not_found":…})
+  → Rust oneshot 唤醒 → format_post_result（自然语言 + JSON 双写；文案
+      恒「已提交系统」不虚报送达）→ 工具结果带上下一请求
+```
+
+wait 链（`wait:true` 阻塞模式，S1b；归一化强制 ≥1 action）：
+
+```text
+NotifyTool::execute（wait 分支）
+  → find_call_site（notify.rs:595）：读当前 run 持久化消息定位悬挂
+      tool_call_id（AskUserContext::find_call_id 同款——inner.history 是
+      回合前旧副本不可用；PTC 沙箱 bridge 调用找不到 → 不落库仅内存通路）
+  → **先落库** pending_notifications（store v9）：request_id=host call id /
+      tool_call_id / run_id（D2：纵深防御 + SQL 可查，非迟到补全必需）/
+      args_json=完整信封快照（含 v 与 run_id）/ status=pending——
+      崩溃窗口内通知已可见则行必在
+  → allocate_id + call_with_id（自定义超时：入参 timeout > [notify]
+      default_wait_timeout 缺省 300s；-1 永不 ≈ 365d，askuser 同款约定）
+  → Kotlin handleNotify → post（wait 通知的 deleteIntent=dismissed、
+      动作 PendingIntent 挂 request_id/run_id/wait extras）→ **立即 resolve
+      posted:true**（挂起等待从这之后开始，通知本身早已可见）
+  → 用户在通知上动作 → NotificationActionReceiver（exported=false）：
+      ├ 按钮/回复（wait）→ RuntimeBridge.resolveNotificationOutcome（:2852）
+      │    先 resolveHostCall(request_id, {outcome:"action|replied",label,
+      │    value,text})（true=在途已投递）；失效 id（超时已清/已答/重启后
+      │    id 复位撞不上）→ 迟到上行 sendLateNotificationReply（:2885）：
+      │    openSession(run_id) 对齐（失败不阻断——send 与会话无关）→
+      │    sendJson {"type":"notification_reply","request_id","run_id",
+      │    "outcome","label"?,"value"?,"text"?}（D5：PROTOCOL_VERSION 6；
+      │    **outcome 上行白名单 action/replied/dismissed/cancelled——
+      │    协议枚举即白名单**，timeout/expired 仅 Rust 侧合成、wire 不可
+      │    表达，Kotlin 恒不发送）
+      ├ 划掉通知（仅 wait 挂 deleteIntent）→ outcome="dismissed" 同分流；
+      │    通知本体已被用户移除，仅从登记表除名（unregister 不重复 cancel）
+      ├ cancel_turn 按钮 → notificationCancelTurn（:2915）：wait 先
+      │    resolve/迟到上行 cancelled，随后 cancel() 停止整个回合（非
+      │    wait 直接 cancel() 即时生效）
+      └ 动作点击/内联回复消费后**撤下通知**（cancelRegistered——防重复
+           点击双发；同 id 再 post 可重建）
+  → Rust 双通路（MobileNotifyHandler::on_reply，notify.rs:1120）：
+      在途 → oneshot 唤醒 → format_wait_result → 行按 outcome 关卷
+        （posted:false / 异形 payload → superseded，等待未成立）
+      迟到 → session dispatch NotificationReply → SessionCore::
+        notify_handler()（桥在 core 锁外调用）→ late_reply_async（:961）：
+        行 status=pending 前置校验（timeout/已关卷 → no-op + log，不注入
+        新消息）→ run_id 错配拒绝（D2 落点：行保持 pending 等正确路由）→
+        悬挂前置校验（结果已落地 → superseded 关卷，防 resume 撞
+        AlreadyAnswered）→ busy 守卫 + 引擎占用（同锁内置 running）→
+        **原子关卷首答者赢**（UPDATE … WHERE status='pending' 且
+        rows=1；输掉竞态 → 回收引擎占用 + no-op）→ reply_payload →
+        format_wait_result（与即时路径同一函数 = 迟到等价不变量）→
+        spawn_resume_turn（resume_from_tool_result 补全原 tool result
+        并续跑）；provider 构建失败 → 回收 + 行重开 pending + notice
+  → 超时（router per-call timeout）→ execute Err(TIMEOUT 前缀) → 行关卷
+      timeout + 合成 timeout 文案（Ok(Success)——「用户 N 秒内未回应，
+      自行判断继续」是业务结果）；此后迟到上行原子 UPDATE 0 行 → no-op
+      + log（timeout-竞态安全，不注入新消息）
+```
+
+cancel 对 wait 挂起通知的防御收口（边角 2 拍板）：`action:"cancel"` 命中
+登记表里 waitPending 条目 → `closeWaitEntryOnCancel` →
+`resolveNotificationOutcome(requestId, cancelled)`（在途 resolve 失效 id 无害
+→ 迟到上行 outcome=cancelled）→ Rust handler 原子关卷 `status='cancelled'` +
+以 cancelled 结果（文案对齐 dismissed 语义）续跑。顺序工具执行下该路径通常
+不可达（wait 阻塞整个 turn），仅 PTC 沙箱并发工具可触达——防御实现。
+
+回流链（非 wait 动作 / 内联回复 → **新用户消息开新 turn**，与 wait 的
+「回填原 tool call」分工）：
+
+```text
+receiver 按钮（非 wait）/ 回复文本
+  → RuntimeBridge.submitFromNotification（:2929）
+      回合进行中 → pendingSubmits 排队（记 originRunId）；turn 终态
+        （turn_ok / turn_error，:2088/:2103）**冲刷一条**——submit 后
+        running 翻转走事件流是异步的，连发会撞 Rust session busy 拒绝
+        （handle_submit busy 直接拒、无排队），故每终态一条**链式消化**
+        （flushOnePendingSubmit :2951；多条排队 = 逐 turn 递进提交）
+      回合空闲 → submitAligned（:2941）：currentRunId() ≠ originRunId →
+        openSession(originRunId)（失败/已被删回退当前会话 + log）→
+        submit(text)（既有 ClientMsg::submit 通路）
+  → 新 turn：回复文本原文注入（模型上下文零噪音；「来自通知」UI 标记 S2）
+```
+
+turn 终态收敛与冲刷顺序：turn_ok / turn_error 处理器在转写落盘
+（persistTranscriptAsync）**之后**先 `settleNotifyOnTurnEnd`（:2958）→
+`AgentNotifier.settleOngoing`（AgentNotifier.kt:333）：把登记的 ongoing 通知
+重建为非常驻（去 setOngoing、恢复 autoCancel，内容不变）——防模型忘记
+`completed`/`cancel` 的僵尸常驻；**wait 挂起中的通知不参与**（其 ongoing 属
+等待语义，由 outcome 收口）。随后 `flushOnePendingSubmit`（置后于落盘：submit
+会立即追加 User 条目，先落盘防新条目混入上一 run 的镜像）。
+
+伴生唤回链（ask_user 问卷久未答 → 通知唤回；宿主行为，不经模型工具调用）：
+
+```text
+RuntimeBridge.start → AgentNotifier.init（:725，Activity 生命周期计数跟踪
+  前后台 → StateFlow，幂等注册）+ startCompanionNudgeWatcher（:3000）
+  → pendingQuestion（live 卡 / 重启恢复卡同源）以 (requestId, phase,
+      createdAtMs) 去抖 + 前台态 combine → collectLatest：
+      挂起超 60s（ASK_USER_COMPANION_NOTIFY_SECONDS 常量；[ask_user]
+      companion_notify_seconds 配置键 descope 未接设置页）且 App 不在
+      前台 → AgentNotifier.postAskUserCompanion（:355）：agent_messages
+      渠道、固定 id "ask-user-nudge"（同问卷覆写复用，**不入工具登记
+      表**）、正文=首题摘要；动作：
+      「去回答」= contentIntent 同源深链（EXTRA_OPEN_ASK_USER →
+        MainActivity.handleNotificationIntent（:125）→ pendingDeepLinkRoute
+        → AppNavHost 导航 question-fullscreen，onCreate/onNewIntent 双入口）
+      「不回答」= receiver → RuntimeBridge.declineQuestionCard（live →
+        resolve declined；恢复卡 → question_reply decline，函数内双通路；
+        卡不在 pending 相位时 no-op）
+      卡清除 / 离开 pending 相位 / App 回前台 → 撤通知
+      （cancelCompanionNudge）+ 停计时；重启回放恢复卡经同一 state 流
+      自动重新武装
+```
+
+冷启动（进程被杀后点通知动作，提案 §4.7）：
+
+```text
+receiver.onReceive → RuntimeBridge.runOrDeferNotificationAction（:2969）
+  runtime 就绪（含 runtimeRef 在位）→ 立即执行（wait 分流 / 回流同上）
+  未就绪 → 动作入 pendingNotificationActions（cap 32，超出丢弃 + log）→
+    返回 false → receiver 上下文 AgentService.start(ctx) 拉起 FGS →
+    RuntimeBridge.start 完成 → notifyFlushJob 等 state.ready（15s 上限，
+    start :789-793）→ flushDeferredNotificationActions 逐条执行；
+    runtime 起不来（CreateFailed）→ 队列丢弃 + log（尽力而为语义）
+```
+
+**重启恢复（迟到等价）**：shutdown 的 `fail_all` 对豁免集合
+**`[ask_user, notify]`** 放行（hostcall.rs `FAIL_ALL_EXEMPT_TOOLS`——wait 行
+留持久层等待迟到补全；非 wait 调用同被豁免属**已知良性偏差**：无落库行、
+宿主毫秒级完成，注释已标注防误修）。重启后 `assemble_state` →
+`startup_notify_maintenance`（notify.rs:1194，`startup_question_maintenance`
+同构兄弟）：TTL 24h（`NOTIFICATION_TTL_MS`）过期 → 合成 expired 结果补全 +
+行 expired（声明不在本 history 的过期行同样关卷，TTL 兜底）；已解决（恢复
+history 确有该 tool_call_id 的结果消息）→ superseded 关卷；其余 pending
+保留（**含属于其它 run 的行**——查无调用不构成「被取代」证据，迟到应答
+补全或 TTL 兜底）。悬挂尾守卫 `may_pop_dangling_tail` 的 pending 集合 =
+pending_questions ∪ pending_notifications 的 tool_call_id **并集**（拍板 D8：
+notify 行同样守卫尾部悬挂，顺带兜住豁免导致的非 wait 悬挂声明 pop）。
+用户显式取消回合（ClientMsg::Cancel）→ `NotifyHandler::on_cancel_all`：
+悬挂 wait 行按 superseded 关卷（引擎 select! 已为在途调用合成 cancelled
+结果，历史侧自洽；cancelled 是 outcome 词表、行状态机折叠为 superseded）。
+
 ## 4. 生命周期
 
 ### 4.1 启动
@@ -658,7 +856,8 @@ T2 落盘分叉（[limits].output_store_threshold 默认 16KB；0=关；ask_user
 MainActivity.onCreate
   → AgentService.start(ctx)（startForegroundService）
   → AgentService.onCreate
-      startForegroundWithNotification（API 34+ 走 SPECIAL_USE 重载）
+      startForegroundWithNotification（单函数 SDK_INT 分支：API 34+ 传
+      FOREGROUND_SERVICE_TYPE_SPECIAL_USE，其余走无类型调用）
       createTurnLocks（PARTIAL_WAKE_LOCK + WifiLock，只创建不获取）
       lifecycleScope.launch { RuntimeBridge.start(this@AgentService) }
       lifecycleScope.launch { RuntimeBridge.state.collect { running ?持锁 : 释放 } }
@@ -697,8 +896,10 @@ AgentService.onDestroy
       【宁可短暂阻塞主线程也要同步等——lifecycleScope 协程会被 DESTROYED
         竞态截断，Rust 收尾做一半 = run 僵尸 + SQLite 撕裂】
   → OpenSlateRuntime.shutdown() → MobileRuntime::shutdown（幂等）
-      1. host_router.fail_all（在途 host call 全失败；**ask_user 豁免**——
-         在途问卷不 fail，留给持久化恢复，重启后经 question_reply 迟到补全）
+      1. host_router.fail_all（在途 host call 全失败；豁免集合
+         **[ask_user, notify]**——在途问卷 / wait 通知不 fail，留给持久化
+         恢复，重启后经 question_reply / notification_reply 迟到补全；非
+         wait notify 同被豁免属已知良性偏差——无落库行、宿主毫秒级完成）
       2. approval.deny_all（审批全拒）
       3. sink.close_all（丢 sender；泵线程 drain 完余量退出，已入队事件仍送达）
       4. run.recorder.finish("interrupted", None, cost)   【先于 runtime 收束落库】

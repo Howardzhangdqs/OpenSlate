@@ -10,6 +10,7 @@
 | `engine.rs`（530 行） | 引擎回合任务 | `SessionProgressBridge`/`spawn_engine_turn`/`engine_turn`/`finalize_turn`+`TurnTerminal`（panic 防线共用收尾）/`run_auto_compact`/`generate_title` |
 | `approval.rs`（436 行） | 会话审批桥（双作用域集合 + rules 共享 cell） | `SessionApprovalBridge`/`session_allows`/`clear_session_scopes`/`rules_handle` |
 | `question.rs` | ask_user 应答接缝 | `QuestionHandler` |
+| `notify.rs` | notify 通知应答接缝（S1b，QuestionHandler 同构） | `NotifyHandler` |
 | `config_ops.rs`（1312 行） | 配置 CRUD 写回链 | `ConfigChange`/`apply_config_change`/`apply_approval_rules`/`apply_set_api_key` |
 | `session.rs`（895 行） | ClientMsg 派发 | `dispatch`/`handle_submit`/`open_session_run`/`generate_session_title` |
 
@@ -123,6 +124,13 @@ pre-turn 摘要。history 整体搬出（std Mutex 守卫不能跨 await）→ `
 - **注入点**：`SessionCore::set_question_handler`（私有 `questions: Mutex<Option<Arc<dyn QuestionHandler>>>` 槽，`new()` 初始化）——刻意**不加 AppState/CoreInner 字段**（server/mobile 侧结构体字面量装配会破），`SessionCore` 仅经 `new` 构造零破坏；宿主实现持 `Weak<AppState>` 防引用环。
 - 快照 `pending_questions` 由宿主持久层回填（server 投影恒空，见 state.rs `build_snapshot`）。
 
+## 3.6 notify.rs —— notify 通知应答接缝（notify S1b，3.5 同构）
+
+- `NotifyHandler` trait（宿主注入，默认未注入 = 通道关闭）：
+  - `on_reply(request_id, run_id, outcome, label?, value?, text?) -> bool`：转发 `ClientMsg::NotificationReply`（协议 v6）；`true` = 首答生效。宿主（mobile）职责：在途 host call 先 `resolve`；否则原子关卷 `pending_notifications` 行（首答者赢）→ 补全原 tool result → `resume_from_tool_result` 续跑。`outcome` 白名单在协议枚举处机制化（timeout/expired 上行即解析失败），trait 收到的恒为合法值。
+  - `on_cancel_all()`（默认 no-op）：用户显式取消时把悬挂 wait 通知行按 superseded 关卷（引擎已为在途调用合成 cancelled 结果）。
+- **注入点**：`SessionCore::set_notify_handler`（`notifies: Mutex<Option<Arc<dyn NotifyHandler>>>` 槽，set_question_handler 同款防破坏论证）。dispatch 的 `Cancel` 分支同时触发两个 handler 的 `on_cancel_all`。
+
 ## 3. approval.rs —— SessionApprovalBridge
 
 （审批链完整时序见 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1。）
@@ -169,7 +177,7 @@ pub struct SessionApprovalBridge {
 
 ## 5. session.rs —— dispatch
 
-- `dispatch(state, conn_id, msg)`（:18）：WS 读任务与 mobile FFI `send()` 共用的同一状态机。分支：重复 Hello 忽略 / Submit → `handle_submit` / **ApprovalAnswer（先 bridge 后 core，锁序）：`respond` 首答生效 → 推转写 `EntryDto::Approval`（decision = approved/denied/approve-all/always-tool/session-mcp/always-mcp 六值）+ 广播 `ApprovalResolved`（choice 连字符拼写）→ (b)/(d) `always_tool`/`always_mcp` 取 `rules_snapshot()` 构造规则增量（tools[tool]=Allow / servers[server]=Allow）经 `apply_approval_rules` 落盘 + 热更（失败仅 warn——本次调用已放行，新规则作用于下一次 check；always_mcp 遇 server 缺失的请求定向 warn「仅本次生效」）** / **QuestionReply → `SessionCore::question_handler()` 转发**（桥在 core 锁外调用；首答者赢，迟到/未知 → 定向 notice；未注入 handler → 定向 notice「提问通道未接入」）/ Cancel（**先 `QuestionHandler::on_cancel_all`（ask_user 关卷 best-effort）再有 token 则 cancel**，否则 notice）/ **NewSession（busy 守卫 → 【C1 前置冲刷】`core.transcript_flusher()` 已注入则先 `flush(state).await`（best-effort，失败在实现内 log）→ 锁段开头二次 busy 守卫（flush 窗口内 submit 可能已起回合 → 拒绝，转写清空留给下一次）→ 清空 → **终态聚合快照（cost/tokens，先于 stats 重置读取，见 §5.1）** → `state.approval.clear_session_scopes()` 清会话作用域审批集合（core 锁外调 bridge——锁序红线；持久化规则不随会话重置）→ 异步关旧 run 行 `finish_with(RunFinal{completed})` → 广播 reset → 逐连接补 snapshot）** / SetModel（可解析性校验 → 广播）/ SetApiKey / 其余 → ConfigChange 家族（含 SetApprovalConfig）。
+- `dispatch(state, conn_id, msg)`（:18）：WS 读任务与 mobile FFI `send()` 共用的同一状态机。分支：重复 Hello 忽略 / Submit → `handle_submit` / **ApprovalAnswer（先 bridge 后 core，锁序）：`respond` 首答生效 → 推转写 `EntryDto::Approval`（decision = approved/denied/approve-all/always-tool/session-mcp/always-mcp 六值）+ 广播 `ApprovalResolved`（choice 连字符拼写）→ (b)/(d) `always_tool`/`always_mcp` 取 `rules_snapshot()` 构造规则增量（tools[tool]=Allow / servers[server]=Allow）经 `apply_approval_rules` 落盘 + 热更（失败仅 warn——本次调用已放行，新规则作用于下一次 check；always_mcp 遇 server 缺失的请求定向 warn「仅本次生效」）** / **QuestionReply → `SessionCore::question_handler()` 转发**（桥在 core 锁外调用；首答者赢，迟到/未知 → 定向 notice；未注入 handler → 定向 notice「提问通道未接入」）/ **NotificationReply（v6，notify S1b）→ `SessionCore::notify_handler()` 转发**（同 QuestionReply 双通路语义；迟到/已关卷 → 定向 notice「该通知已被应答或已关闭」；未注入 → 定向 notice「通知应答通道未接入」）/ Cancel（**先 `QuestionHandler::on_cancel_all` + `NotifyHandler::on_cancel_all`（问卷/通知行关卷 best-effort）再有 token 则 cancel**，否则 notice）/ **NewSession（busy 守卫 → 【C1 前置冲刷】`core.transcript_flusher()` 已注入则先 `flush(state).await`（best-effort，失败在实现内 log）→ 锁段开头二次 busy 守卫（flush 窗口内 submit 可能已起回合 → 拒绝，转写清空留给下一次）→ 清空 → **终态聚合快照（cost/tokens，先于 stats 重置读取，见 §5.1）** → `state.approval.clear_session_scopes()` 清会话作用域审批集合（core 锁外调 bridge——锁序红线；持久化规则不随会话重置）→ 异步关旧 run 行 `finish_with(RunFinal{completed})` → 广播 reset → 逐连接补 snapshot）** / SetModel（可解析性校验 → 广播）/ SetApiKey / 其余 → ConfigChange 家族（含 SetApprovalConfig）。
 - `handle_submit`（:165）：九步全流程（逐步注释见 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §1）。step 1 起（用户消息入 history 之前）先做 **ask_user 悬挂修复**（`ask_user::repair_dangling_tool_calls`，superseded）——新 turn 前为所有悬挂 tool call 合成结果保证消息序合法；合成消息在 step 3 先于用户消息经 recorder 落库。
 - `open_session_run`（:326）：lazy 建 run；title_hint（prompt 40 字符摘要）作占位标题落库（历史列表免 N+1）；begin 失败 → None（本会话不落库照常对话）。
 - `generate_session_title`（:384）：capability=title 计划（alias → resolve → factory）任一步失败静默返回（占位已就位，**降级可用永不报错**）；成功 → `update_run_title` + 广播 RunTitle；usage 计入会话累计；run 可能已被删（UPDATE 零行也成功，广播无目标自然丢弃）。

@@ -38,6 +38,7 @@
 | [mcp-host.md](04-tools/mcp-host.md) | Termux 聚合宿主：连接管理、token 鉴权、重连策略 |
 | [mcp-builtin.md](04-tools/mcp-builtin.md) | 内置工具 server（fs/shell/edit/skill）与各限额 |
 | [ask-user.md](04-tools/ask-user.md) | ask_user 提问工具：schema/下发契约、问卷持久化与 TTL、迟到答案等价不变量、secret 凭据接缝 |
+| [notify.md](04-tools/notify.md) | notify 系统通知工具：双模式（非阻塞 / wait 阻塞）、下发契约（run_id 内嵌 args）、pending_notifications 持久化与迟到等价、`[notify]` 配置 |
 | [ptc.md](04-tools/ptc.md) | QuickJS 沙箱、ToolCallMode/Disclosure、PtcLimits、安全模型 |
 | [adding-a-tool.md](04-tools/adding-a-tool.md) | 手把手新增内置工具（含测试模板与检查清单） |
 
@@ -54,10 +55,10 @@
 
 | 文件 | 内容 |
 |------|------|
-| [openslate-mobile.md](06-mobile/openslate-mobile.md) | Rust 组合层八模块详解 |
+| [openslate-mobile.md](06-mobile/openslate-mobile.md) | Rust 组合层各模块详解（含 notify.rs 通知工具全链路） |
 | [mobile-ffi.md](06-mobile/mobile-ffi.md) | UniFFI 完整暴露面、类型映射、panic 防线、再生成流程 |
-| [android-app.md](06-mobile/android-app.md) | android/ 工程：gradle、Manifest、Kotlin 文件角色表 |
-| [call-chains.md](06-mobile/call-chains.md) | 四条调用链时序、分层超时表、MCP host 子链 |
+| [android-app.md](06-mobile/android-app.md) | android/ 工程：gradle、Manifest、Kotlin 文件角色表（含 AgentNotifier / NotificationActionReceiver） |
+| [call-chains.md](06-mobile/call-chains.md) | 四条调用链时序、notify 通知全链路、分层超时表、MCP host 子链 |
 
 ### 07-build-dev/ — 构建与开发
 

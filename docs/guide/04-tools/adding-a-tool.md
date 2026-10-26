@@ -156,9 +156,10 @@ if cfg.enabled && cfg.net {
 
 宿主直连 `Tool`（`extra_tools` 注入，`AskUserTool` / `HostTool` 同款形态）与 §1-§5 的
 mcp-builtin 路线是两条不同的注册通路：没有 `[builtin_tools]` 开关、没有 server 概念、
-审批按 mobile 装配链（`SideEffectFreeApproval` / AI 审查）走。现有三个先例：
+审批按 mobile 装配链（`SideEffectFreeApproval` / AI 审查）走。现有四个先例：
 `ask_user`（askuser.rs）、`mobile.ping`（hostcall.rs）、`output_query`（output_query.rs，
-查落盘输出，2026-10 C4）。以 `output_query` 为参照的改动点：
+查落盘输出，2026-10 C4）、`notify`（notify.rs，系统通知，2026-10 S1/S1b）。以
+`output_query` 为参照的改动点：
 
 - **本体**：`crates/openslate-mobile/src/` 新模块实现 `Tool`（name/description/
   parameters_schema/execute）；`lib.rs` 模块表注册。

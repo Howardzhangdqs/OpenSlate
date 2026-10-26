@@ -1,14 +1,15 @@
 # 02-2 · openslate-protocol
 
-> **单一文件 crate**（`crates/openslate-protocol/src/lib.rs`，862 行）：server 与 client（TUI/mobile）两侧共用的唯一协议真相源——`ClientMsg`/`ServerMsg` + 全部 DTO。纯数据层，**不依赖 tokio/axum**（Cargo.toml 只有 serde/serde_json/openslate-core），server 与 client 各自装配传输。
+> **单一文件 crate**（`crates/openslate-protocol/src/lib.rs`，约 1165 行）：server 与 client（TUI/mobile）两侧共用的唯一协议真相源——`ClientMsg`/`ServerMsg` + 全部 DTO。纯数据层，**不依赖 tokio/axum**（Cargo.toml 只有 serde/serde_json/openslate-core），server 与 client 各自装配传输。
 
 ## 1. 版本与线格式
 
 ```rust
 // lib.rs
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 ```
 
+- **v6**（notify S1b）：新增 `ClientMsg::NotificationReply`（notify 工具 `wait:true` 模式的通知应答，即时或迟到，语义同 `question_reply`）+ `NotificationOutcome` 枚举。`outcome` **上行白名单 = action / replied / dismissed / cancelled**——枚举即白名单（机制化）：timeout / expired 仅 Rust 侧合成（host call router 超时 / TTL 启动清扫），wire 上不可表达，上行携带在反序列化处直接失败被拒（D5）。`label` / `value` / `text` 全 Option + None 跳键。
 - **v5**（附件 token 响应侧回填）：`AttachmentDto` 新增 `tokens: Option<u64>`（serde default + None 跳键，旧 payload 双向容忍）。值 = **真实模型响应**顺带携带的 image input tokens（OpenAI 系 chat usage `prompt_tokens_details.image_tokens`；provider 不分模态则恒无——智谱 chat usage 天然无此字段）。仅出现在 `EntryDto::User.attachments[]`（transcript 快照 / 持久化条目）；`ClientMsg::Submit` 方向忽略该字段。语义（首次调用口径 / 单图限定 / 智谱恒回退）与回填链路见 `06-mobile/openslate-mobile.md` §12.5——**导入侧绝不预估**（发起 API 请求之前附件数据不上行任何服务器）。
 - **v4**（多模态输入，存储 v5）：新增 `AttachmentDto`（附件引用：`{id, mime, filename?}`，与 core `Attachment` 的持久化形状逐字段一致、From/Into 互转，`data` 永不过 wire）；`ClientMsg::Submit` 与 `EntryDto::User` 新增 `attachments: Option<Vec<AttachmentDto>>`（`serde(default)` + None 跳键——旧客户端 / 旧 payload 双向容忍，既有样例字节不变，快照内嵌 `proto` 除外）；`SessionListItemDto` 新增 `input_tokens`/`output_tokens`（v5 runs 聚合列）。图/视频混发等约束由 mobile dispatch 门控（notice 通道），协议层不表达。
 - **v3**（tool-approval）：`ApprovalAnswerChoice` 扩为六值（新增 `always_tool`/`session_mcp`/`always_mcp`）；`ApprovalSummaryDto` 新增 `server`/`trigger`/`note`（全 Option + None 跳键，旧 payload 双向容忍）；新增 `ClientMsg::SetApprovalConfig` 与 `ConfigViewDto.approval`（生效规则视图）；`EntryDto::Approval.decision` / `ApprovalResolved.choice` 值域扩展（新增 "always-tool"/"session-mcp"/"always-mcp"）。
@@ -41,7 +42,7 @@ pub struct AttachmentDto {
 - core 已有 serde derive 的类型（`Message`/`Usage`/`RunId`/`RunStatus`）→ **直接嵌入**协议。
 - core 仅 Deserialize 的 config 类型（`ProviderConfig`/`ModelConfig`）→ 协议侧定义**镜像 DTO + `From` 双向转换**——避免给 core 加 Serialize 耦合。
 
-## 3. 上行 ClientMsg（18 变体，lib.rs:651-752）
+## 3. 上行 ClientMsg（19 变体，lib.rs:651-752）
 
 | 变体 | 字段 | 语义/约束 |
 |------|------|-----------|
@@ -63,6 +64,7 @@ pub struct AttachmentDto {
 | `RemoveMcpServer` | `name` | 不存在静默成功（幂等） |
 | `SetApiKey` | `provider`, `value` | 派生 `<NAME>_API_KEY` 写 `.env`（0600），不回显不广播。**mobile 上不走此路径**（FFI `set_api_key` 内存注入 + Keystore，PLAN §18） |
 | `QuestionReply` | `request_id`, `action: QuestionReplyAction`, `answers: serde_json::Value` | ask_user 问卷应答（即时/迟到，首答者赢同 approval_answer）。`action` ∈ accept/decline（对齐 MCP Elicitation）；`answers` 结构由 mobile 层定义、协议透传 |
+| `NotificationReply` | `request_id`, `run_id`, `outcome: NotificationOutcome`, `label?`, `value?`, `text?` | notify 通知应答（v6，notify S1b；即时/迟到，首答者赢同 question_reply）。即时路径 `request_id` = 在途 host call id（`resolve` 唤醒工具）；迟到路径按 `request_id` 原子关卷 `pending_notifications` 行并补全原 tool result 续跑。`run_id` 供 Kotlin 会话路由 + mobile 侧错配检测（纵深防御）。**outcome 白名单机制化**：枚举四值 action/replied/dismissed/cancelled——timeout/expired 仅 Rust 侧合成、wire 不可表达，上行携带即解析失败被拒 |
 
 `ApprovalAnswerChoice`（:122）**六值**（snake_case，v3 扩展）：`approve`（单次放行，TUI y / 兜底保留）/ `deny`（禁止执行，选项 (e)）/ `approve_all`（选项 (a) 本会话允许该工具——写会话级工具集合）/ `always_tool`（(b) 一直允许该工具——持久化 `tool_levels=allow`）/ `session_mcp`（(c) 本会话允许该 MCP server——写会话级 server 集合）/ `always_mcp`（(d) 一直允许该 MCP——持久化 `server_levels=allow`）。mobile UI 只出后五项语义化入口；会话侧各 choice 落点见 [openslate-session.md](openslate-session.md) §3/§5。
 
@@ -151,6 +153,7 @@ hello 成功后定向发送的全量快照：`proto`/`session_id`/`session_label
 ### ask_user 问卷 DTO（v2，ask-user r4/r5）
 
 - `QuestionReplyAction`（snake_case）：`accept` / `decline`（cancel 不在此表达——用户打断走回合取消通道）。
+- `NotificationOutcome`（snake_case，v6）：`action` / `replied` / `dismissed` / `cancelled`——**上行白名单本体**。`timeout` / `expired` 仅 Rust 侧合成（router 超时路径 / TTL 清扫），不是枚举成员、wire 不可表达；上行携带会在 ClientMsg 反序列化处失败被拒（枚举即白名单，handler 无需二次校验）。
 - `QuestionStatus`（snake_case）：`pending` / `answered` / `declined` / `superseded` / `expired`（cancelled 随 Tool 消息折叠，不进枚举）。
 - `PendingQuestionDto`：`request_id`（幂等主键，host call id）/ `tool_call_id`（关联悬挂 tool call——迟到答案按 r5 补全其 tool result 并续跑，**不注入新用户消息**）/ `questions: serde_json::Value`（透传）/ `status` / `version`（防回答已撤销/已改的问题）。
 

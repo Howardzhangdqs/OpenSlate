@@ -21,16 +21,17 @@ Kotlin (UniFFI callback)◄──EventSink(单队列+泵线程)──┐
 MobileRuntime::send ──► session::dispatch ──► 引擎(RunManager) ──► LLM
 ```
 
-## 2. 模块一览（17 个模块 + lib.rs）
+## 2. 模块一览（19 个模块 + lib.rs）
 
 | 模块 | 行数 | 关键导出 | 职责 |
 |------|------|---------|------|
 | `src/runtime.rs` | 3371 | `MobileRuntime`、`RuntimeOptions` | FFI 边界的组合根；create/send/shutdown/会话管理/registry 查询全部入口 |
 | `src/bootstrap.rs` | 396 | `MobilePaths` | 宿主注入的 4 个路径；首启目录脚手架 + 默认配置；DB 路径归位 |
 | `src/events.rs` | 111 | `EventSink`、`EventCallback`、`MOBILE_CONN_ID` | 事件出口：单条 std mpsc + 专用泵线程 |
-| `src/hostcall.rs` | 447 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`call_with_id`（自定义超时，ask_user 先例）；`HostTool::with_timeout`（超时覆盖 builder——termux 壳用，见 exec.rs）；`fail_all` 对 ask_user 豁免（持久化恢复） |
+| `src/hostcall.rs` | 464 | `HostCallRouter`、`HostTool`、`HOST_CALL_TIMEOUT` | host call 信封路由：request/resolve + oneshot 超时兜底；`call_with_id`（自定义超时，ask_user 先例）；`HostTool::with_timeout`（超时覆盖 builder——termux 壳用，见 exec.rs）；`fail_all` 豁免集合 `[ask_user, notify]`（wait 调用放回 pending 留给持久化恢复，见 notify.rs） |
 | `src/mcp_recovery.rs` | — | `RecoveringMcpTool`、`RecoveryCtx`、`MCP_RECOVER_HOST_TOOL`、`is_mcp_connection_failure` | MCP host 死亡自愈：外部 MCP 工具的恢复装饰器（连接失败签名 → 单飞恢复 host call `mcp.recover_host` → 注册表同名重发一次）；`RecoveryCtx` = 单飞闩 + 完成代数 + 冷却窗口（10s）+ 注册表弱引用；重试预算 = 1（task-local 重入标记）；包装点两处（create_with 装配期 `wrap_mcp_tools` / reload_mcp scratch 迁移期），见 call-chains.md §3.1.2 |
 | `src/askuser.rs` | — | `AskUserTool`、`AskUserContext`、`MobileQuestionHandler`、`SideEffectFreeApproval`、`AskUserSecretVault` | ask_user 提问工具全链路：参数归一化/下发契约、问卷持久化、迟到答案续跑、secret 凭据 trait 接缝、无副作用工具免审装饰器（原 `AskUserExemptApproval`，C4 起覆盖 ask_user + output_query，见 [04-tools/ask-user.md](../04-tools/ask-user.md)） |
+| `src/notify.rs` | 1649 | `NotifyTool`、`NotifyContext`、`MobileNotifyHandler`、`startup_notify_maintenance`、`NOTIFY_TOOL` | notify 主动系统通知工具全链路（S1+S1b，`AskUserTool` 同款宿主直连模式，不进 mcp-builtin）：参数归一化 / 限额（新 id 非 wait post 12 条/分钟；同 id 更新、wait、cancel 豁免）→ v:1 信封（**run_id 内嵌 args**，拍板 D9——不改 HostCallRouter 信封结构）→ 非 wait fire-and-forget / wait **先落库** store v9 `pending_notifications` 再 `call_with_id`（自定义超时：入参 > `[notify] default_wait_timeout` 缺省 300s，-1 永不）；`MobileNotifyHandler` = `ClientMsg::notification_reply` 双通路（在途 resolve / 原子关卷首答者赢 + `resume_from_tool_result` 续跑——迟到等价不变量；cancel 关 wait 行走防御收口 status='cancelled'）；启动清扫 TTL 24h（expired 合成 / superseded 关卷 / 可恢复保留，D6）；`NOTIFY_TOOL` 同时进 `FAIL_ALL_EXEMPT_TOOLS`（hostcall.rs）与 `APPROVAL_EXEMPT_TOOLS`（askuser.rs）；装配点 `create_with`（notify_ctx :159 / 注册 :179 / wire+handler :255-265）、`may_pop_dangling_tail` 并集（D8）；全链路见 call-chains.md §3.5 与 [04-tools/notify.md](../04-tools/notify.md) |
 | `src/approval_review.rs` | 502 | `AiReviewApproval`、`DEFAULT_REVIEW_TIMEOUT` | 审批 AI 审查装饰器（mobile-only，tool-approval）：AutoRisk 请求先付一次小额 LLM 审查——safe 静默放行 / risky 弹人（note 带审查理由）/ 失败超时 fail-safe 弹人；verdict 缓存（(tool, args hash)→结论，容量 128）；审查模型 = `[capabilities].review` 未绑定继承会话模型；P0 红线全落实（见 [call-chains.md](call-chains.md) §3.3 与 [../01-architecture/dataflow.md](../01-architecture/dataflow.md) §4.1） |
 | `src/secrets.rs` | — | `PersistentSecretVault`、`env_source`、`mask_with_known_values` | ask_user secret 子系统：会话内存 + store v4 `credentials` 持久镜像两级凭据库、env 注入源、file 写入（0600）、脱敏值源（见 [04-tools/ask-user.md §8](../04-tools/ask-user.md)） |
 | `src/exec.rs` | 940 | `ExecSelection`、`ExecSelectionCell`、`NativeShellTool`、`EnvSource`、`register_bash_tools`、`mcp_owned_bash_names` | bash 工具后端多选（native / termux）+ 进程内 shell 工具（env 注入：脱敏后应用 vault env 形态凭据）+ MCP 接管判定（见 §7.1）；termux HostTool 壳专用超时 `TERMUX_HOST_CALL_TIMEOUT` = **900s**（停滞期间 Kotlin 侧等待连接 + 重发续跑，见 android-app.md / call-chains.md §3.1.1；配套 Kotlin `HARD_WAIT_TIMEOUT_MS` = 880s） |
@@ -245,7 +246,7 @@ Tool::execute ─► HostCallRouter::call(tool, args)
 - `call()`：oneshot 注册 → 信封经 `sink.emit_raw`（与 ServerMsg 同一条事件流，全局保序）→ `tokio::time::timeout` 等应答；三种结局：应答 / 发送端 drop（fail_all 或关停 → `"host call aborted (runtime shutting down)"`）/ 超时（移除 pending，报 `"host call timeout after {}ms (host did not resolve)"`）。
 - `allocate_id()` + `call_with_id(id, tool, args, timeout)`：ask_user 用——id 预取（问卷行要在发信封前落库，request_id = id）+ 每调用自定义超时（永不超时配置取近似无限的极长时长）。
 - `resolve(id, ok, payload)`：`ok=true` 时 payload 必须是合法 JSON 文本（解析失败转为 Err）；`ok=false` 时 payload 是错误说明；false = 无此在途调用（超时/已答/关停）——**对失效 id 无害 no-op**。
-- `fail_all(reason)`：关停兜底，drain 全部 pending 立刻失败（引擎解栈）；**ask_user 豁免**（放回待答，问卷留给持久化恢复——若 fail 会把错误结果并入历史、行被迫关卷，迟到答案无处补全）。
+- `fail_all(reason)`：关停兜底，drain 全部 pending 立刻失败（引擎解栈）；**豁免集合 `[ask_user, notify]`**（放回待答，问卷 / wait 通知留给持久化恢复——若 fail 会把错误结果并入历史、行被迫关卷，迟到应答无处补全；非 wait notify 同被豁免属已知良性偏差，hostcall.rs `FAIL_ALL_EXEMPT_TOOLS` 注释已标注）。
 - `HostTool`（hostcall.rs:139-196）：由宿主执行的 `Tool` 壳——name/description/schema 进注册表，execute 转发 router；Err 也返回 `Ok(ToolOutput{status: Error})`（工具失败，不炸回合）。
 
 ## 7. `exec.rs` 详解（bash 后端注册 × MCP 接管）

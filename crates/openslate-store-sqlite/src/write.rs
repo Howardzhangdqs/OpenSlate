@@ -1003,6 +1003,58 @@ impl SqliteStore {
         Ok(result.rows_affected() == 1)
     }
 
+    // ── notify 通知等待持久化（v9；notify 设计 S1b，拍板 D1-D3）──────
+
+    /// 插入一条 pending 通知等待行（request_id = host call id，幂等主键；
+    /// 工具在发出信封**之前**调用——崩溃窗口内通知已可见则行必在）。
+    /// 重复插入（同 request_id 重放）按主键冲突报错，由调用方决定语义。
+    /// `args_json` 为完整信封快照（含 `v` 与 `run_id`，D2/D9）。
+    pub async fn insert_pending_notification(
+        &self,
+        request_id: &str,
+        tool_call_id: &str,
+        run_id: &str,
+        args_json: &str,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        query(
+            "INSERT INTO pending_notifications \
+             (request_id, tool_call_id, run_id, args_json, status, created_at) \
+             VALUES (?, ?, ?, ?, 'pending', ?)",
+        )
+        .bind(request_id)
+        .bind(tool_call_id)
+        .bind(run_id)
+        .bind(args_json)
+        .bind(created_at)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(())
+    }
+
+    /// 原子状态迁移（幂等首答者赢，`transition_pending_question` 同款）：
+    /// 单条 `UPDATE … SET status = ? WHERE request_id = ? AND status = ?`，
+    /// `rows_affected == 1` 即本次迁移生效；`false` = 状态不匹配（已被
+    /// 首答者赢 / 不存在——timeout 关卷后的迟到上行在此原子落空）。
+    pub async fn transition_pending_notification(
+        &self,
+        request_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<bool, StoreError> {
+        let result = query(
+            "UPDATE pending_notifications SET status = ? WHERE request_id = ? AND status = ?",
+        )
+        .bind(to)
+        .bind(request_id)
+        .bind(from)
+        .execute(self.pool())
+        .await
+        .map_err(werr)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     // ── ask_user 持久凭据（v4）────────────────────────────────────────
 
     /// 写入/覆盖一条持久凭据（name 主键 upsert；`remember = true` 的

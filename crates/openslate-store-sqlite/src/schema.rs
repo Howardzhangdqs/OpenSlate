@@ -1,10 +1,10 @@
 //! OpenSlate SQLite 存储的 schema 定义与版本化迁移。
 //!
-//! 全部 12 张表：`runs`、`execution_nodes`、`steps`、`messages`、
+//! 全部 13 张表：`runs`、`execution_nodes`、`steps`、`messages`、
 //! `prompt_snapshots`、`audit_log`、`trace_events`、`pending_questions`
 //! （v3）、`credentials`（v4）、`attachments`（v5）、`transcript_entries`
 //! （v5）、`tool_outputs`（v6；v7 加 `ref` 列 + 唯一索引；v8 加
-//! `frame_index` BLOB 列）。
+//! `frame_index` BLOB 列）、`pending_notifications`（v9）。
 //!
 //! 迁移机制（见 [`crate::store::SqliteStore::run_migrations`]）：
 //! - 以 `PRAGMA user_version` 记录当前 schema 版本，目标版本为
@@ -58,7 +58,10 @@ use sqlx::{query, query_scalar, SqliteConnection};
 ///   [`DDL_TOOL_OUTPUTS`] 的 kdoc。**破坏性**（开发期拍板 2026-10-22）：
 ///   照 v7 先例 DROP 整表重建——v7 存量行是普通单帧 zstd 文件（无帧
 ///   索引可回填），随 DROP 消失后由写入路径按 seekable 格式重落盘。
-pub const SCHEMA_VERSION: i64 = 8;
+/// - `9`：新增 `pending_notifications` 表（notify 工具 `wait:true` 模式
+///   的通知等待持久化，notify 设计 S1b / D1-D3）：纯新增、无数据搬移，
+///   全部 `IF NOT EXISTS` 幂等（照 v3 `pending_questions` 先例）。
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 基线建表 DDL（v0 → v1 执行；全新库直接建成最终形态）。
 ///
@@ -231,6 +234,42 @@ CREATE TABLE IF NOT EXISTS pending_questions (
     questions_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending','answered','declined','superseded','expired')),
     version INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+"#;
+
+/// notify 通知等待持久化（v9；notify 设计 S1b，拍板 D1-D3）。
+///
+/// 行来源：`notify` 工具 `wait:true` 路径在发出 host call 信封**之前**
+/// 落库（request_id = host call id，幂等主键）；TTL 24h 清扫在 mobile
+/// 层启动路径（store 无 TTL / 无 DELETE，关卷走 UPDATE status）。
+///
+/// 与先例 `pending_questions` 的差异：
+/// - **不设 `version` 列**（拍板 D2）：`args_json` 存完整信封快照
+///   （含 `v` 字段），版本信息随快照携带，无独立消费者；
+/// - **新增 `run_id` 列**（拍板 D2）：通知动作必须路由回发起会话
+///   （notify 设计 §4.5 runId 对齐）。该列**不是迟到补全的必需**
+///   （ask_user 无此列照样迟到补全，靠 session_run + Kotlin
+///   openSession 对齐）——价值在纵深防御（openSession 失败回退当前
+///   会话时检测 reply.run_id ≠ 行 run_id 错配，mobile handler 拒绝
+///   错配应答）+ SQL 可查性（按 run 排查通知现场）。
+/// - `status` 载荷两分（拍板 D3）：状态落行、outcome 载荷
+///   （label/value/text）不落行（即时路径经 resolve payload 原样进
+///   tool result，迟到路径由上行 notification_reply 携带，行只做
+///   首答者赢的原子关卷）。CHECK 集合写死 8 值：timeout = router
+///   超时（Rust 侧合成）；expired = TTL 清扫（Rust 侧合成）；上行
+///   outcome 白名单 {action, replied, dismissed, cancelled} 之外
+///   的值到不了这里（协议枚举即白名单）。
+///
+/// 无意 FK 到 `runs`：同 `pending_questions`（行按 request_id 寻址且
+/// 随 TTL 过期，孤儿行无害）。
+const DDL_PENDING_NOTIFICATIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS pending_notifications (
+    request_id TEXT PRIMARY KEY,
+    tool_call_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','action','replied','dismissed','timeout','cancelled','superseded','expired')),
     created_at INTEGER NOT NULL
 );
 "#;
@@ -437,6 +476,11 @@ const IDX_AUDIT_LOG_RUN_ID: &str =
 const IDX_PENDING_QUESTIONS_STATUS: &str =
     "CREATE INDEX IF NOT EXISTS idx_pending_questions_status ON pending_questions(status)";
 
+/// 通知等待行按状态过滤（启动清扫扫描；v9 步进创建，同问卷状态索引
+/// 先例：不进基线索引集，全新库经 v8→v9 步进获得）。
+const IDX_PENDING_NOTIFICATIONS_STATUS: &str =
+    "CREATE INDEX IF NOT EXISTS idx_pending_notifications_status ON pending_notifications(status)";
+
 /// 附件按内容寻址定位（v5）：`delete_run` / 启动 GC 的孤儿文件判定做
 /// 行级 `SELECT 1 FROM attachments WHERE sha256 = ?`，走本索引。
 const IDX_ATTACHMENTS_SHA256: &str =
@@ -466,7 +510,7 @@ const IDX_TOOL_OUTPUTS_RUN_REF: &str =
 
 /// 期望的表名（建表顺序）。含 v3 的 `pending_questions`、v4 的
 /// `credentials`、v5 的 `attachments` 与 `transcript_entries`、v6 的
-/// `tool_outputs`。
+/// `tool_outputs`、v9 的 `pending_notifications`。
 pub const TABLE_NAMES: &[&str] = &[
     "runs",
     "execution_nodes",
@@ -480,11 +524,13 @@ pub const TABLE_NAMES: &[&str] = &[
     "attachments",
     "transcript_entries",
     "tool_outputs",
+    "pending_notifications",
 ];
 
 /// 期望的索引名（测试校验用）。含 v2 的唯一索引、v3 的问卷状态索引、
-/// v5 的两个新索引、v6 的 sha256 索引、v7 的 run+ref 唯一索引；**不含**
-/// `idx_messages_run_seq`（v5 起随表重建消亡，uq 最左前缀覆盖）。
+/// v5 的两个新索引、v6 的 sha256 索引、v7 的 run+ref 唯一索引、v9 的
+/// 通知状态索引；**不含** `idx_messages_run_seq`（v5 起随表重建消亡，
+/// uq 最左前缀覆盖）。
 pub const INDEX_NAMES: &[&str] = &[
     "idx_runs_status",
     "idx_runs_started_at",
@@ -498,6 +544,7 @@ pub const INDEX_NAMES: &[&str] = &[
     "idx_transcript_run_seq",
     "idx_tool_outputs_sha256",
     "idx_tool_outputs_run_ref",
+    "idx_pending_notifications_status",
 ];
 
 // ---------------------------------------------------------------------------
@@ -795,6 +842,22 @@ pub(crate) async fn migrate_v7_to_v8(conn: &mut SqliteConnection) -> Result<(), 
     Ok(())
 }
 
+/// v8 → v9：`pending_notifications` 表 + 状态索引（notify 设计 S1b；
+/// 全部 `IF NOT EXISTS`，全新库与存量库同一路径，天然幂等——照
+/// `migrate_v2_to_v3` 先例）。纯新增、无数据搬移。
+pub(crate) async fn migrate_v8_to_v9(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let merr = |e: sqlx::Error| StoreError::MigrationError(e.to_string());
+    query(DDL_PENDING_NOTIFICATIONS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    query(IDX_PENDING_NOTIFICATIONS_STATUS)
+        .execute(&mut *conn)
+        .await
+        .map_err(merr)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,6 +868,9 @@ mod tests {
         "CHECK (status IN ('running','completed','interrupted','error','failed','cancelled'))";
     const MESSAGE_ROLE_CHECK: &str = "CHECK (role IN ('system','user','assistant','tool'))";
     const CREDENTIAL_KIND_CHECK: &str = "CHECK (kind IN ('env','file'))";
+    /// notify 等待行状态全集（拍板 D3 写死 8 值：上行白名单 4 值 +
+    /// timeout / superseded / expired Rust 侧合成 + pending 初始态）。
+    const PENDING_NOTIFICATION_STATUS_CHECK: &str = "CHECK (status IN ('pending','action','replied','dismissed','timeout','cancelled','superseded','expired'))";
 
     /// CHECK 约束常量与 DDL 内联文本保持一致（防止两处漂移）。
     #[test]
@@ -812,6 +878,10 @@ mod tests {
         assert!(DDL_RUNS.contains(RUN_STATUS_CHECK));
         assert!(DDL_MESSAGES.contains(MESSAGE_ROLE_CHECK));
         assert!(DDL_CREDENTIALS.contains(CREDENTIAL_KIND_CHECK));
+        assert!(
+            DDL_PENDING_NOTIFICATIONS.contains(PENDING_NOTIFICATION_STATUS_CHECK),
+            "pending_notifications 的 8 值状态 CHECK 防漂移"
+        );
         assert!(!DDL_RUNS.contains("cwd"), "基线 DDL 不应再包含 cwd 死列");
         assert!(!index_statements()
             .iter()

@@ -271,6 +271,114 @@ fn client_question_reply() {
     );
 }
 
+/// v6（notify S1b）：notification_reply 逐字节样例 + outcome 上行白名单。
+#[test]
+fn client_notification_reply() {
+    // action 全形（label + value）。
+    assert_wire(
+        ClientMsg::NotificationReply {
+            request_id: "n-42".into(),
+            run_id: "run-9".into(),
+            outcome: NotificationOutcome::Action,
+            label: Some("删除".into()),
+            value: Some("用户在通知上点了「删除」".into()),
+            text: None,
+        },
+        r#"{"type":"notification_reply","request_id":"n-42","run_id":"run-9","outcome":"action","label":"删除","value":"用户在通知上点了「删除」"}"#,
+    );
+    // replied（text）。
+    assert_wire(
+        ClientMsg::NotificationReply {
+            request_id: "n-43".into(),
+            run_id: "run-9".into(),
+            outcome: NotificationOutcome::Replied,
+            label: None,
+            value: None,
+            text: Some("改成室内活动".into()),
+        },
+        r#"{"type":"notification_reply","request_id":"n-43","run_id":"run-9","outcome":"replied","text":"改成室内活动"}"#,
+    );
+    // dismissed 最小形（可选键全部缺席）。
+    assert_wire(
+        ClientMsg::NotificationReply {
+            request_id: "n-44".into(),
+            run_id: "run-9".into(),
+            outcome: NotificationOutcome::Dismissed,
+            label: None,
+            value: None,
+            text: None,
+        },
+        r#"{"type":"notification_reply","request_id":"n-44","run_id":"run-9","outcome":"dismissed"}"#,
+    );
+    // cancelled（cancel_turn 按钮 / 停止回合的迟到上行）。
+    assert_wire(
+        ClientMsg::NotificationReply {
+            request_id: "n-45".into(),
+            run_id: "run-9".into(),
+            outcome: NotificationOutcome::Cancelled,
+            label: None,
+            value: None,
+            text: None,
+        },
+        r#"{"type":"notification_reply","request_id":"n-45","run_id":"run-9","outcome":"cancelled"}"#,
+    );
+    // run_id 缺键（serde default = 空串，与 label/value/text 的 Option
+    // 缺省互补）：客户端非空才带键的惯例下，缺键不得整条拒绝——空串
+    // 语义 = mobile 侧跳过错配检测。
+    let de: ClientMsg = serde_json::from_str(
+        r#"{"type":"notification_reply","request_id":"n-46","outcome":"dismissed"}"#,
+    )
+    .unwrap();
+    match de {
+        ClientMsg::NotificationReply {
+            request_id,
+            run_id,
+            outcome,
+            label,
+            value,
+            text,
+        } => {
+            assert_eq!(request_id, "n-46");
+            assert_eq!(run_id, "", "缺键解析为空串而非 Err");
+            assert_eq!(outcome, NotificationOutcome::Dismissed);
+            assert_eq!((label, value, text), (None, None, None));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// D5 白名单机制化：timeout / expired 仅 Rust 侧合成，wire 不可表达——
+/// 上行携带即反序列化失败被拒（枚举即白名单，handler 无需再校验）。
+#[test]
+fn client_notification_reply_outcome_whitelist_rejects_synthetic_values() {
+    for bad in ["timeout", "expired", "superseded", "bogus"] {
+        let json = format!(
+            r#"{{"type":"notification_reply","request_id":"n-1","run_id":"run-9","outcome":"{bad}"}}"#
+        );
+        let err = serde_json::from_str::<ClientMsg>(&json)
+            .err()
+            .unwrap_or_else(|| panic!("outcome={bad} 必须被白名单拒绝"));
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+    // 合法值逐一可解。
+    for (lit, expect) in [
+        ("action", NotificationOutcome::Action),
+        ("replied", NotificationOutcome::Replied),
+        ("dismissed", NotificationOutcome::Dismissed),
+        ("cancelled", NotificationOutcome::Cancelled),
+    ] {
+        let json = format!(
+            r#"{{"type":"notification_reply","request_id":"n-1","run_id":"run-9","outcome":"{lit}"}}"#
+        );
+        let de: ClientMsg = serde_json::from_str(&json).unwrap();
+        match de {
+            ClientMsg::NotificationReply { outcome, .. } => assert_eq!(outcome, expect),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(expect.as_str(), lit);
+    }
+}
+
 #[test]
 fn client_unit_variants() {
     assert_wire(ClientMsg::Cancel, r#"{"type":"cancel"}"#);
@@ -586,7 +694,7 @@ fn server_snapshot() {
         ServerMsg::Snapshot {
             session: Box::new(snap),
         },
-        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
+        r#"{"type":"snapshot","session":{"proto":6,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[{"kind":"user","text":"hi"},{"kind":"assistant","text":"hello"}],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":{"id":3,"summary":{"tool_name":"bash","arguments":"{\"command\":\"cargo test\"}","agent_id":"root","risk_level":"high"}},"pending_questions":[],"config":{"providers":{"p1":{"base_url":"https://api.example.com/v1","api_key_env":"EXAMPLE_KEY","adapter":"openai","max_attempts":3,"retry_base_ms":500}},"models":{"main":{"provider":"p1","model":"glm-4","max_context_tokens":128000,"max_output_tokens":4096,"supports_tool_call":true,"supports_vision":false,"supports_reasoning":true,"input_price_per_mtok":0.5,"output_price_per_mtok":2.0}},"levels":{"fast":"main"},"capabilities":{"compact":"fast","main":"main","title":"fast"},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":300000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[{"id":"researcher","name":"Researcher","model":"fast","children":[]}]},"skills":[{"name":"rust-testing","description":"Rust 测试技巧"}],"active_config":"/home/u/p/.openslate/openslate.toml","global_config":"/home/u/.config/openslate/openslate.toml","local_config":"/home/u/p/.openslate/openslate.toml"},"session_stats":{"turns":2,"total_input_tokens":1000,"total_output_tokens":200,"total_cost_usd":0.02}}}"#,
     );
 }
 
@@ -610,7 +718,7 @@ fn server_snapshot_pending_questions() {
         ServerMsg::Snapshot {
             session: Box::new(snap.clone()),
         },
-        r#"{"type":"snapshot","session":{"proto":5,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
+        r#"{"type":"snapshot","session":{"proto":6,"session_id":"s-a1b2c3d4","session_label":"openslate 会话","transcript":[],"running":false,"depth_cur":0,"agents_running":0,"tool_calls_cur":0,"model_alias":"main","pending_approval":null,"pending_questions":[{"request_id":"q-42","tool_call_id":"tc-9","questions":{"questions":[{"header":"数据库","id":"db_choice","question":"SQLite 还是 sled？","type":"choice"}]},"status":"pending","version":1}],"config":{"providers":{},"models":{},"levels":{},"capabilities":{},"limits":{"max_steps":0,"max_depth":4,"max_tool_calls":20,"max_child_agent_calls":8,"timeout_ms":60000,"max_context_messages":16,"max_context_bytes":64000,"max_output_bytes":65536,"output_store_threshold":16384,"auto_compact":true,"parallel_tool_calls":true},"agents":{"id":"root","name":"Root","model":"main","children":[]},"skills":[],"active_config":"/dev/null","global_config":null,"local_config":null},"session_stats":{"turns":0,"total_input_tokens":0,"total_output_tokens":0,"total_cost_usd":0.0}}}"#,
     );
     // status 全集（生命周期 pending → answered | declined | superseded | expired）。
     for (status, lit) in [
@@ -1144,7 +1252,8 @@ fn protocol_version_pinned() {
     // v4：多模态输入（AttachmentDto + Submit/User attachments 字段；
     // 样例字节对旧 payload 逐字节不变——快照内嵌 proto 除外，随版本走）。
     // v5：AttachmentDto.tokens（响应侧 image tokens 回填；导入侧不预估）。
-    assert_eq!(PROTOCOL_VERSION, 5);
+    // v6：notify S1b（NotificationReply + outcome 上行白名单）。
+    assert_eq!(PROTOCOL_VERSION, 6);
 }
 
 #[test]

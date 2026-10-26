@@ -52,7 +52,16 @@ use openslate_core::types::{Attachment, Message, MessageRole, RunId, RunStatus, 
 /// `EntryDto::User.attachments[]`（transcript 快照 / 持久化条目），
 /// `ClientMsg::Submit` 方向忽略该字段。`serde(default)` + None 跳键，
 /// 旧 payload 双向容忍。
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6（notify S1b）：新增 [`ClientMsg::NotificationReply`]（notify 工具
+/// `wait:true` 模式的通知应答，即时或迟到，语义同 `question_reply`）。
+/// `outcome` 上行白名单 = action / replied / dismissed / cancelled
+/// （[`NotificationOutcome`] 枚举即白名单——timeout / expired 仅 Rust
+/// 侧合成：router 超时 / TTL 清扫，wire 上不可表达，上行发送即解析
+/// 失败被拒）。`label` / `value` / `text` 全 Option + None 跳键；
+/// `run_id` 带 `serde(default)`（缺键 = 空串 = 跳过错配检测，与 Option
+/// 字段缺省行为互补——收紧兼容性，不升版本）。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 附件引用（存储 v5 多模态输入，设计 §3/§7）。
 ///
@@ -239,6 +248,37 @@ pub enum QuestionStatus {
     Superseded,
     /// TTL 过期（默认 24h，mobile 持久层判定）。
     Expired,
+}
+
+/// notify 通知应答的 outcome（v6，notify 设计 S1b；上行白名单本体）。
+///
+/// **枚举即白名单**：`timeout` / `expired` 仅 Rust 侧合成（host call
+/// router 超时路径 / TTL 启动清扫），wire 上不可表达——客户端上行携带
+/// 会在反序列化处直接失败被拒（D5），不进入 handler。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationOutcome {
+    /// 用户点了通知上的动作按钮（`label` + 可选 `value`）。
+    Action,
+    /// 用户内联回复了文本（`text`）。
+    Replied,
+    /// 用户划掉通知未作选择（`deleteIntent` 通路）。
+    Dismissed,
+    /// 通知等待被撤销（`cancel_turn` 按钮 / 停止回合；迟到上行时关闭
+    /// wait 行并按 cancelled 语义续跑——通知工具边角决策）。
+    Cancelled,
+}
+
+impl NotificationOutcome {
+    /// wire 字面量（snake_case，与 serde rename 一致；日志/文案用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Action => "action",
+            Self::Replied => "replied",
+            Self::Dismissed => "dismissed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// 待答问卷条目（snapshot 内嵌；重启恢复回放用）。`tool_call_id` 关联
@@ -911,6 +951,31 @@ pub enum ClientMsg {
         request_id: String,
         action: QuestionReplyAction,
         answers: serde_json::Value,
+    },
+    /// notify 通知应答（v6，notify S1b；即时或迟到，首答者赢——语义
+    /// 同 `question_reply`）。即时路径：`request_id` = 在途 host call
+    /// id，`resolve` 唤醒工具；迟到路径（进程重启后点通知动作）：
+    /// 按 `request_id` 原子关卷 `pending_notifications` 行并以
+    /// cancelled/action/… 语义补全原 tool result 续跑。`run_id` 用于
+    /// 路由对齐（Kotlin openSession）与错配检测（mobile 侧纵深防御；
+    /// 空串 = 跳过错配检测）。`#[serde(default)]`：客户端非空才带键
+    /// （Kotlin 惯例），缺键解析为空串而非整条拒绝——收紧兼容性，
+    /// 不升版本。
+    NotificationReply {
+        request_id: String,
+        #[serde(default)]
+        run_id: String,
+        outcome: NotificationOutcome,
+        /// action 的按钮 label。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// action 的按钮 value（缺省 = 「用户在通知上点了「label」」，
+        /// 由 Kotlin 侧补齐后上行）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// replied 的回复文本。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     /// 取消当前回合（复用 TUI Ctrl-C 语义：引擎侧 cancel）。
     Cancel,

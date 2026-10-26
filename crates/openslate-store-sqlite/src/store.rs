@@ -195,6 +195,7 @@ impl SqliteStore {
                 5 => schema::migrate_v5_to_v6(&mut tx).await?,
                 6 => schema::migrate_v6_to_v7(&mut tx).await?,
                 7 => schema::migrate_v7_to_v8(&mut tx).await?,
+                8 => schema::migrate_v8_to_v9(&mut tx).await?,
                 v => {
                     return Err(StoreError::MigrationError(format!(
                         "未知的 schema 版本步进起点: v{v}"
@@ -1275,10 +1276,11 @@ mod tests {
         store.run_migrations().await.expect("idempotent rerun");
     }
 
-    /// v5 → v6 → v7 → v8 步进：建 `tool_outputs` 表 + 索引；步进重跑幂等
-    ///（把 user_version 手工拨回 5 模拟「步进事务提交前崩溃重放」）。
+    /// v5 → v6 → v7 → v8 → v9 步进：建 `tool_outputs` 表 + 索引 + v9
+    /// `pending_notifications` 表；步进重跑幂等（把 user_version 手工拨回 5
+    /// 模拟「步进事务提交前崩溃重放」）。
     #[tokio::test]
-    async fn test_v5_db_migrates_to_v8_and_step_rerun_idempotent() {
+    async fn test_v5_db_migrates_to_v9_and_step_rerun_idempotent() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("v5_to_v6.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
@@ -1299,9 +1301,9 @@ mod tests {
         }
 
         let store = SqliteStore::new(path_str).await.expect("reopen");
-        store.run_migrations().await.expect("v5 → v8 (rerun steps)");
+        store.run_migrations().await.expect("v5 → v9 (rerun steps)");
 
-        assert_eq!(store.user_version().await.expect("version"), 8);
+        assert_eq!(store.user_version().await.expect("version"), 9);
 
         // 表就位且数据完好
         let tables: Vec<String> = query_scalar(
@@ -1344,11 +1346,11 @@ mod tests {
         store.run_migrations().await.expect("idempotent rerun");
     }
 
-    /// v6 → v8 连续步进（破坏性，开发期拍板）：`tool_outputs` 整表重建为
+    /// v6 → v9 连续步进（破坏性，开发期拍板）：`tool_outputs` 整表重建为
     /// 最终形态（v7 加 `ref` 列、v8 加 `frame_index` 列）——存量行随
     /// DROP 消失（缓存可弃，降级路径兜底），步进重跑幂等。
     #[tokio::test]
-    async fn test_v6_db_migrates_to_v8_rebuilds_tool_outputs() {
+    async fn test_v6_db_migrates_to_v9_rebuilds_tool_outputs() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("v6_to_v7.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
@@ -1392,9 +1394,9 @@ mod tests {
         }
 
         let store = SqliteStore::new(path_str).await.expect("reopen");
-        store.run_migrations().await.expect("v6 → v8");
+        store.run_migrations().await.expect("v6 → v9");
 
-        assert_eq!(store.user_version().await.expect("version"), 8);
+        assert_eq!(store.user_version().await.expect("version"), 9);
 
         // 存量行已随 DROP 消失（破坏性拍板，不回填）
         let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
@@ -1434,12 +1436,12 @@ mod tests {
         store.run_migrations().await.expect("idempotent rerun");
     }
 
-    /// v7 → v8 步进（破坏性，开发期拍板）：`tool_outputs` 重建为带
+    /// v7 → v9 步进（破坏性，开发期拍板）：`tool_outputs` 重建为带
     /// `frame_index BLOB NOT NULL DEFAULT x''` 列形态——v7 存量行随 DROP
     /// 消失（单帧 zstd 无帧索引可回填）；裸 INSERT 可省略 frame_index
     /// （落缺省空 BLOB = legacy 单帧文件）；步进重跑幂等。
     #[tokio::test]
-    async fn test_v7_db_migrates_to_v8_adds_frame_index() {
+    async fn test_v7_db_migrates_to_v9_adds_frame_index() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("v7_to_v8.sqlite");
         let path_str = path.to_str().expect("valid utf-8 path");
@@ -1482,9 +1484,9 @@ mod tests {
         }
 
         let store = SqliteStore::new(path_str).await.expect("reopen");
-        store.run_migrations().await.expect("v7 → v8");
+        store.run_migrations().await.expect("v7 → v9");
 
-        assert_eq!(store.user_version().await.expect("version"), 8);
+        assert_eq!(store.user_version().await.expect("version"), 9);
 
         // 存量行已随 DROP 消失（破坏性拍板，无帧索引可回填）
         let rows: i64 = query_scalar::<_, i64>("SELECT COUNT(*) FROM tool_outputs")
@@ -1522,6 +1524,104 @@ mod tests {
 
         // 幂等重跑
         store.run_migrations().await.expect("idempotent rerun");
+    }
+
+    /// v8 → v9 步进：建 `pending_notifications` 表 + 状态索引（纯新增，
+    /// notify 设计 S1b / D1-D3）；步进重跑幂等（拨回 8 模拟「步进事务
+    /// 提交前崩溃重放」）；CHECK 约束 + 原子关卷（首答者赢）在位。
+    #[tokio::test]
+    async fn test_v8_db_migrates_to_v9_pending_notifications() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("v8_to_v9.sqlite");
+        let path_str = path.to_str().expect("valid utf-8 path");
+
+        {
+            let store = SqliteStore::new(path_str).await.expect("store");
+            store.run_migrations().await.expect("migrate to latest first");
+            // 塞一行 v8 时代数据 + 拨回版本 8，模拟 v8 存量库（v9 步进
+            // DDL 全 IF NOT EXISTS，已建的表/索引就是重放结果）。
+            store
+                .insert_run("v8-run", None, "root", "completed", "{}", 1000)
+                .await
+                .expect("seed run");
+            query("PRAGMA user_version = 8")
+                .execute(store.pool())
+                .await
+                .expect("stamp v8");
+        }
+
+        let store = SqliteStore::new(path_str).await.expect("reopen");
+        store.run_migrations().await.expect("v8 → v9");
+
+        assert_eq!(store.user_version().await.expect("version"), 9);
+
+        // 表就位且存量数据完好。
+        let tables: Vec<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("tables");
+        let mut expected: Vec<&str> = schema::TABLE_NAMES.to_vec();
+        expected.sort();
+        let mut actual = tables;
+        actual.sort();
+        assert_eq!(actual, expected, "pending_notifications 表应就位");
+
+        let run = store.get_run("v8-run").await.expect("get").expect("kept");
+        assert_eq!(run.status, "completed", "存量数据不受纯新增迁移影响");
+
+        // 索引就位。
+        let idx: Option<String> = query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_pending_notifications_status'",
+        )
+        .fetch_optional(store.pool())
+        .await
+        .expect("idx check");
+        assert!(idx.is_some(), "idx_pending_notifications_status 应存在");
+
+        // 新表可写：API 插入 + 原子关卷（首答者赢，D3）。
+        store
+            .insert_pending_notification("n-1", "call-1", "run-1", r#"{"v":1,"wait":true}"#, 1000)
+            .await
+            .expect("insert pending notification");
+        store
+            .insert_pending_notification("n-2", "call-2", "run-1", r#"{"v":1,"wait":true}"#, 1001)
+            .await
+            .expect("insert second");
+        let pending = store.list_pending_notifications().await.expect("list");
+        assert_eq!(pending.len(), 2, "pending 清单按 created_at 升序");
+        assert_eq!(pending[0].request_id, "n-1");
+        assert_eq!(pending[0].run_id, "run-1");
+        // 首答者赢：pending → action 只有第一次生效。
+        assert!(store
+            .transition_pending_notification("n-1", "pending", "action")
+            .await
+            .expect("first transition"));
+        assert!(!store
+            .transition_pending_notification("n-1", "pending", "replied")
+            .await
+            .expect("second transition"),
+            "首答者赢：pending 已被迁走，第二次 UPDATE 0 行");
+        let row = store
+            .get_pending_notification("n-1")
+            .await
+            .expect("get")
+            .expect("row exists");
+        assert_eq!(row.status, "action");
+
+        // CHECK 约束拒绝 8 值之外的状态（裸 SQL 直插验证）。
+        let bad = query(
+            "INSERT INTO pending_notifications (request_id, tool_call_id, run_id, args_json, status, created_at) \
+             VALUES ('n-bad', 'c', 'r', '{}', 'bogus', 1)",
+        )
+        .execute(store.pool())
+        .await;
+        assert!(bad.is_err(), "status CHECK 应拒绝枚举外的值");
+
+        // 幂等重跑。
+        store.run_migrations().await.expect("idempotent rerun");
+        assert_eq!(store.user_version().await.expect("version"), 9);
     }
 
     /// 高于支持版本的库必须拒绝迁移。

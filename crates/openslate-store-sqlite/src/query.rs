@@ -197,6 +197,27 @@ pub struct PendingQuestionRecord {
     pub created_at: i64,
 }
 
+/// A notify pending-notification record（v9；notify 设计 S1b）。
+/// `status` 用小写词表（pending/action/replied/dismissed/timeout/
+/// cancelled/superseded/expired——上行白名单 4 值 + Rust 侧合成 3 值 +
+/// 初始态），与协议无直接映射（上行 `NotificationOutcome` 只覆盖其中
+/// 4 值）。outcome 载荷（label/value/text）不落行（D3）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingNotificationRecord {
+    /// 幂等主键（host call id）。
+    pub request_id: String,
+    /// 关联消息历史中的悬挂 tool call（assistant `tool_calls[].id`）。
+    pub tool_call_id: String,
+    /// 发起时的活动 run（D2：纵深防御错配检测 + SQL 可查性，非迟到
+    /// 补全必需——补全靠 session_run + Kotlin openSession 对齐）。
+    pub run_id: String,
+    /// 完整信封快照（含 `v` 与 `run_id`；版本信息随快照携带，无独立
+    /// version 列）。
+    pub args_json: String,
+    pub status: String,
+    pub created_at: i64,
+}
+
 /// ask_user 持久凭据行（设置页列表 / vault 镜像管理的**无明文**视图）。
 ///
 /// 刻意不含 `value`：列表/管理路径只走元数据，明文只在 vault 取值时经
@@ -311,6 +332,15 @@ type PendingQuestionRow = (
     String, // questions_json
     String, // status
     i64,    // version
+    i64,    // created_at
+);
+
+type PendingNotificationRow = (
+    String, // request_id
+    String, // tool_call_id
+    String, // run_id
+    String, // args_json
+    String, // status
     i64,    // created_at
 );
 
@@ -511,6 +541,17 @@ fn row_to_pending_question(row: PendingQuestionRow) -> PendingQuestionRecord {
         questions_json: row.2,
         status: row.3,
         version: row.4,
+        created_at: row.5,
+    }
+}
+
+fn row_to_pending_notification(row: PendingNotificationRow) -> PendingNotificationRecord {
+    PendingNotificationRecord {
+        request_id: row.0,
+        tool_call_id: row.1,
+        run_id: row.2,
+        args_json: row.3,
+        status: row.4,
         created_at: row.5,
     }
 }
@@ -829,6 +870,45 @@ impl SqliteStore {
         .map_err(qerr)?;
 
         Ok(row.map(row_to_pending_question))
+    }
+
+    // ── notify 通知等待持久化（v9；notify 设计 S1b）──────────────────
+
+    /// List pending notify waits（启动清扫 / 迟到应答校验的数据源），
+    /// 按 `created_at` 升序（与 `list_pending_questions` 同序约定）。
+    pub async fn list_pending_notifications(
+        &self,
+    ) -> Result<Vec<PendingNotificationRecord>, StoreError> {
+        let pool = self.pool();
+        let rows: Vec<PendingNotificationRow> = query_as(
+            "SELECT request_id, tool_call_id, run_id, args_json, status, created_at \
+             FROM pending_notifications WHERE status = 'pending' ORDER BY created_at",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(rows.into_iter().map(row_to_pending_notification).collect())
+    }
+
+    /// 取单条通知等待行（任意状态；迟到应答路径做 pending 前置校验——
+    /// timeout 关卷后的迟到上行在此被识别为 no-op，真正的首答者赢由
+    /// [`crate::write::SqliteStore::transition_pending_notification`] 原子保证）。
+    pub async fn get_pending_notification(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingNotificationRecord>, StoreError> {
+        let pool = self.pool();
+        let row: Option<PendingNotificationRow> = query_as(
+            "SELECT request_id, tool_call_id, run_id, args_json, status, created_at \
+             FROM pending_notifications WHERE request_id = ?",
+        )
+        .bind(request_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(qerr)?;
+
+        Ok(row.map(row_to_pending_notification))
     }
 
     // ── ask_user 持久凭据（v4）────────────────────────────────────────

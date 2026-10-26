@@ -178,7 +178,7 @@ User answered your questions:
 ### S2（可靠性增强 —— 持久化三件套已提前进 S1）
 
 - timeout → pending（超时不终止问卷：题仍可答，迟到答案按 r5 语义补全原 tool call 结果，deepseek 模式）。
-- 待答收件箱 + 推送通知 + 深链定位（用户不在 App 内时唤回）。
+- 待答收件箱 + 深链定位（用户不在 App 内时唤回）。「推送通知」唤回**已由 notify 提案提前至 S1 实施**（见 `docs/proposals/notify-tool-design.md` §4.8 ask_user 伴生唤回通知）。
 - 新用户消息 supersession（问题被取代时明确告知模型）。
 - 超时自动采纳推荐项（`requiresExplicitResponse` 可禁）。
 - 多端竞答 first-response-wins（复用 session dispatch 首答者赢语义）。

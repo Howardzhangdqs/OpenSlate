@@ -1053,6 +1053,8 @@ android.notification.reply
 }
 ```
 
+注：本节是「读通知」（把第三方 App 的通知内容取给 Agent）。Agent 主动「发通知」（`notify` 工具：向系统通知栏投递并接收回应）是反方向能力，见 `docs/proposals/notify-tool-design.md`。
+
 ---
 
 # 18. Secret / API Key 改造

@@ -1,9 +1,11 @@
 # 设计提案：Agent 主动通知工具（`notify`）
 
 > 状态：已评审拍板（design-only，未实施；决策记录见 §10，2026-10-20 用户拍板 8 项）
-> 依据：《Android Agent 消息与系统通知接口技术调研》（用户提供的调研报告，2026-10）、本项目现状摸底（host call 通道、`ask_user` 先例、AgentService FGS 通知、Manifest 权限）。
+> 依据：《Android Agent 消息与系统通知接口技术调研》（用户提供的调研报告，2026-10）、本项目现状摸底（host call 通道、`ask_user` 先例、AgentService FGS 通知、Manifest 权限）。注记：该外部调研报告为**用户提供的未入库材料**，仓库内无法溯源核对；本文以「报告/调研报告结论」指称，引用结论尽可能以官方公开 API 文档与真机行为交叉验证。
 > 约束（用户拍板）：**现阶段只实现 Android 通用通知类型**（NotificationCompat 公开 API），**不做厂商适配**（小米超级岛 / OPPO 流体云 / vivo 原子通知另行立项）；兼容 API 26～37；**移动端优先**。
 > 姊妹先例：`docs/proposals/ask-user-tool-design.md`（宿主直连 Tool + host call 模式的第一个完整实现；本设计大量复用其机制）。
+> 修订：r2（2026-10-26）依代码核对修正——store 落位 v5→v9（现网 `SCHEMA_VERSION=8`，v5 已被 multimodal 版本占用）；白名单先例更正为 `output_query` 全套（DEFAULT + LEGACY + `REQUIRED_BUILTIN_TOOLS`，bootstrap.rs:30-85/:308），注明 `ask_user` 不在任何白名单；`pending_notifications` 字段拍板（`run_id` 为新增列、不设 `version` 列）；TTL 清扫明确在 mobile 层启动路径（store 无 TTL / 无 DELETE）；`fail_all` 豁免改为工具名集合 `[ask_user, notify]`（不引入按调用注册）；刷新行号（`handleHostCall` :2648、信封分发 :2086、submit :766、mobile.ping 注册 :175-184、`DEFAULT_ROOT_AGENT_MD` :30-41）；AgentService 前台化描述更正为单函数 `SDK_INT` 分支（AgentService.kt:129-155）；注明外部调研报告未入库；新增与 PLAN-phase1 §17（读通知）的互指消歧（§0）。
+> 修订 r2 delta（同日，实施计划评审后）：下行信封 `run_id` 改**内嵌 args**（§3 示例同步；信封顶层保持 `{type,id,tool,args}` 不改 HostCallRouter）；`run_id` 列理由修正为纵深防御 + SQL 可查性（迟到补全不依赖它，§4.2 表后注）；§4.3「cancel 关闭 wait 行」补定防御性机制（关卷 `cancelled`）；测试矩阵补 timeout-竞态 no-op / cancel 防御 / restart-dismissed 三条（§8.1）；`[notify] default_wait_timeout`、`[ask_user] companion_notify_seconds` 设置页 UI descope（S1 仅文件配置 + 默认值）；§7.2 mask_secrets S1 仅文档化不接线。
 
 ---
 
@@ -24,6 +26,7 @@
   - 通知声音/振动自定义——跟渠道走，由用户系统设置控制；
   - 替用户向第三方应用发送内容（`ACTION_SEND` 分享、短信预填）——语义是「发送」不是「通知」，属另一个未来工具（如 `share_content`），不复用本工具；
   - 前台服务常驻通知（AgentService 1001）的改造——不动。
+- **与 PLAN-phase1 §17 的分工（消歧）**：该节的 `android.notification.*`（`NotificationListenerService`）是**读通知**——把第三方 App 的通知内容取给 Agent；本提案是**发通知**——Agent 主动向系统通知栏投递并接收回应。方向相反、互不覆盖；读通知不在本提案范围（PLAN-phase1 §17 已互指至此）。
 
 ## 1. 通知类型覆盖矩阵
 
@@ -54,7 +57,7 @@
 
 ## 2. 工具 Schema
 
-工具名 **`notify`**（已拍板）。宿主直连 `Tool` trait 实现（`ask_user` 同款模式，**不进 mcp-builtin**）：`crates/openslate-mobile/src/notify.rs` 新模块 `NotifyTool`，内部持 `Arc<HostCallRouter>`，装配期在 `runtime.rs` `create_with` 第 6 步与 `mobile.ping` 同位点注册（`crates/openslate-mobile/src/runtime.rs:154-163` 先例）。
+工具名 **`notify`**（已拍板）。宿主直连 `Tool` trait 实现（`ask_user` 同款模式，**不进 mcp-builtin**）：`crates/openslate-mobile/src/notify.rs` 新模块 `NotifyTool`，内部持 `Arc<HostCallRouter>`，装配期在 `runtime.rs` `create_with` 第 6 步与 `mobile.ping` 同位点注册（`crates/openslate-mobile/src/runtime.rs:175-184` 先例）。
 
 ### 输入（模型侧，手写 JSON Schema，`additionalProperties:false`）
 
@@ -140,12 +143,14 @@ Rust 归一化/校验**全部在发信封前完成**，Kotlin 收到即合法（
 ```jsonc
 // 下行（emit_raw，与 ServerMsg 同一事件流）
 {"type":"host_call_requested","id":42,"tool":"notify",
- "args":{"v":1,"action":"post","wait":true,"timeout":300,
+ "args":{"v":1,"run_id":"r-20261020-…",   // r2(D9)：发起时活动 run 内嵌 args——信封顶层保持
+                                          // {type,id,tool,args} 不改 HostCallRouter；Kotlin 从
+                                          // args.run_id 读（路由用，§4.5）
+   "action":"post","wait":true,"timeout":300,
    "id":"confirm-delete","title":"确认删除","message":"要删除 3 个旧导出文件吗？",
    "kind":"important","public":false,
    "actions":[{"label":"删除","style":"positive"},{"label":"取消","style":"destructive"},
-              {"label":"回复","reply":true}]},
-   "run_id":"r-20261020-…"}          // Rust 侧附带发起时活动 run（Kotlin 路由用，§4.5）
+              {"label":"回复","reply":true}]}}
 
 // 上行 resolveHostCall(id, true, payload)——posted:false / 各 outcome 也是 ok=true
 {"posted":true,"id":"confirm-delete","kind":"important","channel":"agent_important"}
@@ -153,6 +158,7 @@ Rust 归一化/校验**全部在发信封前完成**，Kotlin 收到即合法（
 ```
 
 - `v:1` 版本化（ask_user 先例），Kotlin 对未知字段向前兼容。
+- **run_id 内嵌 args**（r2 D9）：`HostCallRouter` 信封结构不动（`{type,id,tool,args}`，hostcall.rs:111-116）；Rust 侧 `NotifyTool` 经 session_run 句柄取当前 run 写入 args（照 `AskUserContext::find_call_id` 先例，askuser.rs:864-870）——`Tool::execute` 本身无 run 上下文（core/tool.rs:37）。wait 行 `args_json` 快照天然含 run_id，与 §4.2 run_id 列冗余互证。
 - 非 wait：默认 `HOST_CALL_TIMEOUT`（120s）足够（Kotlin 权限查询 + post 毫秒级）。
 - wait：`allocate_id + call_with_id`（ask_user 先例，runtime 侧先落库再发信封，§4.2）；超时取入参/配置（近似无限 = 永不）。
 - 幂等：resolve 对失效 id 无害 no-op（既有 `HostCallRouter::resolve` 语义）。
@@ -170,7 +176,7 @@ Rust 归一化/校验**全部在发信封前完成**，Kotlin 收到即合法（
 
 | 事件 | 路径 | 模型看到 |
 |------|------|----------|
-| 工具发起 | **先落库**（store v5 `pending_notifications`：request_id=host call id、tool_call_id=悬挂声明、run_id、args 快照、status=pending、TTL 24h）→ 发信封 → 自定义超时等待 | （挂起） |
+| 工具发起 | **先落库**（store v9 `pending_notifications`：request_id=host call id、tool_call_id=悬挂声明、run_id（新增列，见表后字段注）、args 快照、status=pending；TTL 24h——清扫在 mobile 层启动路径，store 无 TTL / 无 DELETE）→ 发信封 → 自定义超时等待 | （挂起） |
 | 用户点动作按钮（在途） | `resolveHostCall(id, true, {outcome:"action",…})` → oneshot 唤醒 | action 输出 |
 | 用户内联回复（在途） | 同上 `{outcome:"replied","text":…}` | replied 输出 |
 | 用户划掉通知 | `setDeleteIntent` PendingIntent → receiver → resolve `{outcome:"dismissed"}` | dismissed 文案，**继续干活** |
@@ -178,8 +184,15 @@ Rust 归一化/校验**全部在发信封前完成**，Kotlin 收到即合法（
 | 超时 | router 按 per-call timeout resolve `{outcome:"timeout"}` | timeout 文案 |
 | App 内停止回合 | 现有 `ClientMsg::Cancel` → select! drop 工具 future → 合成 cancelled；行收 superseded | cancelled（零改动） |
 | 新 turn 抢答 | 对齐 ask_user 的悬挂修复：新 turn 开始前对未决行以合成结果关卷（superseded） | superseded |
-| 进程被杀 | `fail_all` 对 **wait 模式 notify 豁免**（行留持久层；通知由系统持有继续可点）；重启后 `assemble_state` keep-dangling + 启动清扫（TTL 过期→合成 expired 补全；已解决→关卷；其余保留） | 该工具调用得到迟到结果，循环续跑 |
+| 进程被杀 | `fail_all` 豁免集合含 `notify`（§6；行留持久层，通知由系统持有继续可点）；重启后 `assemble_state` keep-dangling + 启动清扫（mobile 层启动路径，对齐 `startup_question_maintenance`：TTL 过期→合成 expired 补全；已解决→关卷；其余保留） | 该工具调用得到迟到结果，循环续跑 |
 | 重启后用户点按钮 | 迟到路径：`ClientMsg::notification_reply`（§5.1）→ `MobileNotifyHandler`：在途先 resolve（即时路径）；否则原子关卷（**首答者赢**）→ 与即时路径**同一格式化函数** → `RunManager::resume_from_tool_result` 补全原 tool result 并续跑 | 迟到等价：模型无法区分即时/迟到 |
+
+**表字段与落位决策**（r2，与先例 `pending_questions` 的差异）：
+
+- store 落位 **v9**：现网 `SCHEMA_VERSION=8`（schema.rs:61），v5 已被 multimodal 版本占用——新表随 `migrate_v8_to_v9`（幂等 IF NOT EXISTS）进入。
+- `run_id` 为**新增列**：先例 `pending_questions` 故意不设 run_id（schema.rs:224-226 注释明示不 FK runs 表）。迟到补全本身**不依赖**该列（ask_user 无它照样迟到补全——靠 session_run + Kotlin `openSession` 对齐）；notify 落它的实际价值是**纵深防御**（`openSession` 失败回退当前会话时——§4.5 允许——可检测 `message.run_id ≠ session_run` 错配）与 TTL 清扫/诊断的 SQL 可查性。DDL 注释按此表述。
+- **不设 `version` 列**（已拍板）：`args_json` 存完整信封快照（含 `v` 字段），版本信息随快照携带；开发期不做多余兼容列。
+- TTL（24h）常量与清扫逻辑在 **mobile 层启动路径**（对齐 `startup_question_maintenance`，askuser.rs:56 / :1570-1625）；store 层无 TTL 任务、无 DELETE 语句（关卷走 UPDATE status）。
 
 **迟到等价不变量**（同 ask_user r5）：动作/回复无论即时返回还是迟到补全，消息历史与工具结果完全一致；迟到的时间信息只进 UI 转写，不进模型上下文。悬挂修复与 `may_pop_dangling_tail` 的 store 权威守卫对 `pending_notifications` 行同样适用（尾部声明仍被 pending 行引用时不 pop）。
 
@@ -190,7 +203,7 @@ Rust 归一化/校验**全部在发信封前完成**，Kotlin 收到即合法（
 | post（新 id） | Rust 归一化/限额 → host call → Kotlin 建渠道（幂等）→ 权限检查 → `notify(tag,id)` → resolve | posted / posted:false 原因 |
 | update（同 id） | 同 post；Android 同 tag+id 原生替换，不产生新条目、不重复响铃（`setOnlyAlertOnce`） | posted |
 | kind 变化（progress → normal） | 同 id 重发时渠道跟随 kind 切换（Android 支持渠道迁移） | posted（channel 字段反映新渠道） |
-| cancel(id) | Kotlin 按登记表逐条 `cancel(tag,id)`；**wait 模式 pending 通知被 cancel → 行关卷 superseded**（工具结果即时回填） | cancelled / not_found |
+| cancel(id) | Kotlin 按登记表逐条 `cancel(tag,id)`；**wait 模式 pending 通知被 cancel → 防御性收口**（r2 补定机制：先试在途 `resolveHostCall(request_id, {outcome:"cancelled"})`——失效 id 无害 no-op；迟到则上行 `notification_reply` outcome=cancelled）→ Rust 原子关卷 `status='cancelled'` + 以 cancelled 结果回填续跑。顺序工具执行下该路径通常不可达（wait 阻塞整个 turn），仅 PTC 沙箱并发工具可触达，故为防御实现 | cancelled / not_found |
 | cancel(all) | **枚举本进程登记的 agent 通知逐条 cancel**（§5.5） | cancelled:N |
 
 ### 4.4 通知动作分流（receiver 内分发）
@@ -215,7 +228,7 @@ NotificationActionReceiver.onReceive（PendingIntent extras：agent_id / run_id 
       1. 目标会话对齐（已拍板 S1 就做）：currentRunId() != originRunId
          → 回合空闲：FFI openSession(originRunId)（失败/已被删 → 回退当前会话 + notice + log）
          → 回合进行中：入 pendingSubmits 队列（记 originRunId），turn 终态 flush 时先切会话再 submit
-      2. 回合空闲 → submit(text)（既有 ClientMsg::submit 通路，RuntimeBridge.kt:669）
+      2. 回合空闲 → submit(text)（既有 ClientMsg::submit 通路，RuntimeBridge.kt:766）
       3. 回合进行中（同会话）→ 入 pendingSubmits 队列，turn_ok/turn_error 逐条 flush
          （session handle_submit busy 直接拒绝、无排队——session.rs:199-241，故必须在 Kotlin 侧等 turn 终态）
   → 新 turn 开始，模型收到该文本作为用户消息
@@ -242,9 +255,11 @@ receiver.onReceive → RuntimeBridge 未 started
   → runtime 起不来（CreateFailed）→ 队列丢弃 + log（尽力而为语义）
 ```
 
+前台化不新增入口：AgentService 既有 `startForegroundWithNotification` **单函数内 `SDK_INT` 分支**（API 34+ 传 `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`，其余走无类型调用；AgentService.kt:129-155，FGS 通知 1001 见 :158）——notify 只复用 `startForegroundService` 拉起路径，不改前台化机制、不新增 FGS 类型。
+
 ### 4.8 ask_user 伴生唤回通知（S1，宿主行为）
 
-- 触发：`UiState.pendingQuestion` 持续超过 `[ask_user] companion_notify_seconds`（建议默认 60，0 = 关）且 App 不在前台——RuntimeBridge 协程 timer 驱动，**不经模型工具调用、不占模型限额**。
+- 触发：`UiState.pendingQuestion` 持续超过 `[ask_user] companion_notify_seconds`（建议默认 60，0 = 关；S1 以文件配置 + 代码默认常量生效，设置页 UI 后补）且 App 不在前台——RuntimeBridge 协程 timer 驱动，**不经模型工具调用、不占模型限额**。
 - 通知形态：`agent_messages` 渠道、固定 id `"ask-user-nudge"`（同问卷覆写复用）、title「Agent 在等你回答」、message = 首题摘要；动作：
   - 「去回答」：打开 MainActivity + 导航 `question-fullscreen`（intent extra）；
   - 「不回答」：走现有 decline 路径（在途 → `resolveHostCall(declined)`；恢复卡 → `question_reply decline`）。
@@ -258,11 +273,11 @@ receiver.onReceive → RuntimeBridge 未 started
 |------|------|
 | `bridge/AgentNotifier.kt` | object 单例：渠道注册（幂等）、`areNotificationsEnabled` + API 33 `POST_NOTIFICATIONS` 检查、post/update/cancel/settleOngoing、agent-tag↔(tag,id) 登记表、渠道禁用检测（`getNotificationChannel().importance == IMPORTANCE_NONE`）、伴生通知入口 |
 | `bridge/NotificationActionReceiver.kt` | 动作/回复/划掉接收器（Manifest 注册 `exported=false`）：RemoteInput 取文本、wait 分流、冷启动排队、cancel_turn 分发 |
-| `RuntimeBridge.kt`（改） | `handleHostCall`（:2452）加 `"notify"` 分支；`submitFromNotification` + `pendingSubmits`（带 runId）+ turn 终态 flush/settleOngoing 钩子；伴生 timer；`notification_reply` 迟到上行 |
+| `RuntimeBridge.kt`（改） | `handleHostCall`（:2648；`host_call_requested` 信封分发在 :2086）加 `"notify"` 分支；`submitFromNotification` + `pendingSubmits`（带 runId）+ turn 终态 flush/settleOngoing 钩子；伴生 timer；`notification_reply` 迟到上行 |
 | `MainActivity.kt`（改） | API 33+ 首启请求 `POST_NOTIFICATIONS`（拒绝后记 prefs 不再自动弹）；runId intent 路由；「去回答」深链导航 |
 | `AndroidManifest.xml`（改） | 注册 receiver；权限**已声明**（xml:4-11），无需新增 |
 
-协议扩展（S1b，对齐 ask_user r4 先例）：`ClientMsg::notification_reply {request_id, run_id, outcome, label?, value?, text?}` + store v5 `pending_notifications` 表 + `PROTOCOL_VERSION` 升级 + 契约测试。
+协议扩展（S1b，对齐 ask_user r4 先例）：`ClientMsg::notification_reply {request_id, run_id, outcome, label?, value?, text?}`（outcome **上行白名单** `action|replied|dismissed|cancelled`；`timeout`/`expired` 仅 Rust 侧合成——router 超时 / TTL 清扫——上行收到白名单外值拒绝/忽略）+ store v9 `pending_notifications` 表（落位与字段决策见 §4.2 表后注）+ `PROTOCOL_VERSION` 升级 + 契约测试。
 
 ### 5.2 渠道设计（与 AgentService 既有渠道并存，不碰 1001）
 
@@ -302,10 +317,14 @@ receiver.onReceive → RuntimeBridge 未 started
 ## 6. Rust 侧设计（`crates/openslate-mobile/src/notify.rs`）
 
 - `NotifyTool`：`impl Tool`（`crates/openslate-core/src/tool.rs:17-47` trait：name/description/手写 `parameters_schema`/async execute）。execute = 归一化校验 → 限额闸 → 非 wait `HostCallRouter::call("notify", args)` / wait `allocate_id + call_with_id`（先落库，ask_user 先例）→ 结果格式化（自然语言 + JSON 双写）。错误恒 `Ok(ToolOutput{status:Error})`，回合不中断。
-- `MobileNotifyHandler`（对齐 `MobileQuestionHandler`）：`notification_reply` 上行的双通路处理（在途 resolve / 迟到原子关卷 + `resume_from_tool_result` 续跑）+ 启动清扫（TTL expired / 已解决关卷 / 可恢复保留）。
+- `MobileNotifyHandler`（对齐 `MobileQuestionHandler`）：`notification_reply` 上行的双通路处理（在途 resolve / 迟到原子关卷 + `resume_from_tool_result` 续跑）+ 启动清扫（TTL expired / 已解决关卷 / 可恢复保留——清扫在 **mobile 层启动路径**，对齐 `startup_question_maintenance`；store 无 TTL / 无 DELETE）。
 - 注册：`runtime.rs` `create_with` 第 6 步工具集组装处加入（`mobile.ping` 同位点）。
-- **可见性白名单**：`bootstrap.rs` `DEFAULT_ROOT_AGENT_MD`（:29-39）`tools:` 追加 `notify`；旧默认 root.md 经 `LEGACY_ROOT_AGENT_MDS` 追加机制自动迁移（仅逐字节等于旧默认的文件；用户定制过的不动——工具管理页手动开启兜底，`setAgentToolVisibility` 既有机制）。
-- **hostcall.rs 调整**：`fail_all` 豁免从「按工具名（ask_user）」泛化为**按调用注册**（`call_with_id` 带 `exempt_from_fail_all: bool`；wait 模式 true，非 wait false；ask_user 迁移到同机制，行为不变）。
+- **可见性白名单**（全套先例 = `output_query`，走 DEFAULT + LEGACY + REQUIRED 三件；注意 `ask_user` **不在任何白名单**，不能当本项先例引用）。三步必做：
+  1. `bootstrap.rs` `DEFAULT_ROOT_AGENT_MD`（:30-41）`tools:` 追加 `notify`——新装设备默认可见；
+  2. 旧默认 root.md 经 `LEGACY_ROOT_AGENT_MDS` 逐字节匹配迁移（bootstrap.rs:30-85，仅逐字节等于旧默认的文件）；
+  3. `REQUIRED_BUILTIN_TOOLS`（bootstrap.rs:308）补 `notify`——定制过 root.md 的存量设备启动时**外科式补齐**（app 私有目录无编辑器可达、设置页无该文件编辑入口，用户没有手动补的途径；刻意关闭请用工具自身配置开关而非白名单剔除，见 bootstrap.rs:303-308 注释）。
+  `output_query` 是唯一走齐全套的先例；工具管理页手动开启（`setAgentToolVisibility`）仍可作为兜底说明文档保留。
+- **hostcall.rs 调整**：现状为硬编码 `tool == ASK_USER_TOOL`（hostcall.rs:173-180）；实施改为**豁免工具名集合 `[ask_user, notify]`**（最小改法，不引入按调用注册新机制）——`fail_all` 对集合内工具的在途调用放回 pending 而非合成失败：wait 模式 notify 行留持久层等待迟到补全（§4.2）；非 wait 调用无持久行，future 随 runtime 收束被 drop，豁免与否无落地行为差异；ask_user 行为不变。
 - **限额常量**（模块顶部 `const`，对齐 shell.rs `MAX_OUTPUT_BYTES` 风格；**宽松档已拍板**）：
 
 | 常量 | 值 | 语义 |
@@ -316,13 +335,13 @@ receiver.onReceive → RuntimeBridge 未 started
 | `MAX_ACTIVE_NOTIFICATIONS` | 16 | 活跃 agent 通知上限，超出自动 cancel 最早的非 ongoing 条目 |
 | `RATE_LIMIT_PER_MINUTE` | 12 | **新 id** post 频率；同 id 更新豁免（进度更新合法高频）；wait 模式通知豁免（一等待一条） |
 
-- 配置：`[notify] default_wait_timeout`（wait 模式缺省秒数；建议默认 **300**，`-1` 永不；设置页「内置工具行为」可调——对齐 `[ask_user] default_timeout` 模式）；`[ask_user] companion_notify_seconds`（§4.8，默认 60，0 = 关）。两值随装配快照固定、重启生效（对齐 AskUserContext 现状）。
+- 配置：`[notify] default_wait_timeout`（wait 模式缺省秒数；建议默认 **300**，`-1` 永不）；`[ask_user] companion_notify_seconds`（§4.8，默认 60，0 = 关）。两值随装配快照固定、重启生效（对齐 AskUserContext 现状）。**S1 descope**：两键仅走文件配置 + 代码默认值；设置页「内置工具行为」调节 UI（对齐 `[ask_user] default_timeout` 的设置页模式）后补，不随 S1 交付。
 - 审计：走既有 `ToolAuditRecord`（所有 Tool 调用自动覆盖），无特殊处理。
 
 ## 7. 安全、隐私与滥用防护
 
 1. **锁屏默认隐藏内容**，`public:true` 显式 opt-in（description 明令公开内容不得含敏感信息——锁屏明文 + 可能被朗读/投屏/穿戴设备显示）。
-2. **通知内容约束**：不得放密钥/敏感明文；Rust 侧可复用 `mask_secrets` 已知值打码管道（ask-user.md §8.4 的 masker 注册点同样作用于 notify 正文——实施时接线，S1 至少文档化）。
+2. **通知内容约束**：不得放密钥/敏感明文；Rust 侧可复用 `mask_secrets` 已知值打码管道（ask-user.md §8.4 的 masker 注册点同样作用于 notify 正文）。**S1 descope：不接线，仅本文档化**（接线随后续版本）。
 3. **滥用防线**：频率限额（宽松档）+ 活跃上限 + important 渠道用户可系统级关闭（关了如实回 `channel_disabled`）。
 4. **PendingIntent 安全**：全部显式组件；`FLAG_MUTABLE` 仅 RemoteInput/deleteIntent 动作使用。
 5. **Receiver `exported=false`**：外部应用无法伪造通知动作注入用户消息/伪造 resolve。
@@ -333,10 +352,10 @@ receiver.onReceive → RuntimeBridge 未 started
 
 ### 8.1 Desktop（`cargo test -p openslate-mobile` 等，无 Android 依赖）
 
-- `notify.rs` 单测：归一化矩阵（缺省/越界钳制/截断字符边界/非法 kind/progress 边界 0·100·101·-1/互斥字段/action 分支/wait 组合校验/cancel_turn 带 value 拒绝）、信封逐字段契约、结果格式化（posted / 各 posted:false 原因 / wait 全 outcome）、限额（新 id 计数、同 id 豁免、活跃上限淘汰、限流文案）、超时路径、`fail_all` 豁免矩阵（wait 豁免 / 非 wait 不豁免）。
-- `runtime_flow.rs` 集成：`notify_roundtrip`（信封 → resolve posted → ToolOutput 入历史）、`notify_permission_denied_roundtrip`、`notify_wait_immediate_path_roundtrip`（wait → 点按钮 resolve → outcome 入历史）、`notify_wait_timeout`、`notify_wait_restart_recovery_and_first_answer_wins`（预置崩溃现场 → 恢复 → notification_reply 续跑 → 重复应答首答者赢）、`notify_wait_dismissed`。
-- store crate：`pending_notifications` 行 insert / 原子迁移 / CHECK 约束 / pending 清单 / TTL。
-- protocol：`notification_reply` 契约测试 + `PROTOCOL_VERSION` 升级同步。
+- `notify.rs` 单测：归一化矩阵（缺省/越界钳制/截断字符边界/非法 kind/progress 边界 0·100·101·-1/互斥字段/action 分支/wait 组合校验/cancel_turn 带 value 拒绝）、信封逐字段契约、结果格式化（posted / 各 posted:false 原因 / wait 全 outcome）、限额（新 id 计数、同 id 豁免、活跃上限淘汰、限流文案）、超时路径、`fail_all` 豁免集合矩阵（`[ask_user, notify]` 放回 pending 不合成失败；其余工具照旧；ask_user 行为回归不变）。
+- `runtime_flow.rs` 集成：`notify_roundtrip`（信封 → resolve posted → ToolOutput 入历史）、`notify_permission_denied_roundtrip`、`notify_wait_immediate_path_roundtrip`（wait → 点按钮 resolve → outcome 入历史）、`notify_wait_timeout`、`notify_wait_restart_recovery_and_first_answer_wins`（预置崩溃现场 → 恢复 → notification_reply 续跑 → 重复应答首答者赢）、`notify_wait_dismissed`、`notify_wait_timeout_then_late_reply_noop`（r2 补：timeout 已获胜后迟到回复 → 原子 UPDATE 0 行 → no-op + log，不得注入新消息）、`notify_wait_cancel_superseded`（r2 补：cancel 防御收口路径，§4.3）、`notify_wait_restart_recovery_dismissed`（r2 补：重启恢复 dismissed 变体，验证迟到上行通路等价）。
+- store crate：`pending_notifications` 行 insert / 原子迁移（v8→v9）/ CHECK 约束 / pending 清单（store 无 TTL / 无 DELETE；TTL 清扫逻辑归 mobile 层启动路径测试）。
+- protocol：`notification_reply` 契约测试（含 uplink outcome 白名单 `action|replied|dismissed|cancelled` 之外的拒绝）+ `PROTOCOL_VERSION` 升级同步。
 
 ### 8.2 真机验证（release 包，用户执行，agent 不驱动 UI）
 
@@ -350,7 +369,7 @@ receiver.onReceive → RuntimeBridge 未 started
 
 ### S1a（首版核心：非阻塞全类型 + 路由 + 伴生）
 
-- Rust：`notify.rs`（NotifyTool：归一化 + 限额 + 非 wait 全格式化）；`runtime.rs` 注册；`bootstrap.rs` 白名单 + legacy 迁移；`hostcall.rs` 豁免机制泛化（notify 非 wait 不豁免，行为不变）。
+- Rust：`notify.rs`（NotifyTool：归一化 + 限额 + 非 wait 全格式化）；`runtime.rs` 注册；`bootstrap.rs` 白名单三件套（DEFAULT + LEGACY + REQUIRED，§6）；`hostcall.rs` 豁免泛化为集合 `[ask_user, notify]`（§6）。
 - Kotlin：`AgentNotifier.kt`、`NotificationActionReceiver.kt`（+ Manifest）、`RuntimeBridge` notify 分支 / submitFromNotification（含 runId 对齐 + busy 排队）/ settleOngoing / 伴生 timer、MainActivity 首启权限 + runId 路由 + 「去回答」深链。
 - 零协议变更、零 FFI 面变更（host call 信封既有机制，无需重跑 uniffi-gen）。
 
@@ -358,7 +377,7 @@ receiver.onReceive → RuntimeBridge 未 started
 
 - Rust：wait 路径（落库 + call_with_id + outcome 格式化）、`MobileNotifyHandler`（迟到双通路 + 启动清扫 + resume_from_tool_result）、`fail_all` 豁免接线。
 - 协议：`ClientMsg::notification_reply` + `PROTOCOL_VERSION` 升级 + 契约测试。
-- store：v5 `pending_notifications`（迁移 + TTL 24h）。
+- store：v9 `pending_notifications` 迁移（现网 `SCHEMA_VERSION=8`，v5 已被 multimodal 占用，见 §4.2 表后注；TTL 清扫在 mobile 层，store 无 TTL / 无 DELETE）。
 - Kotlin：receiver 的 wait 分流（在途 resolve / 迟到 notification_reply）+ 冷启动缓冲。
 - FFI：无新面（reply 走既有 `send`）。
 

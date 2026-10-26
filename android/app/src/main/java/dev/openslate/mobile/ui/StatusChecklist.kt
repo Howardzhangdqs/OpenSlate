@@ -25,12 +25,14 @@ import androidx.compose.ui.unit.dp
  * 状态图标 + 标题（+可选摘要副文本 + 可选操作按钮），整列按行状态呈现
  * 「检查记录」的观感（完成绿勾 / 进行中 spinner / 失败红叉 / 未开始空点）。
  *
- * 视觉规格照搬提炼源（SettingsScreen McpStatusLine + 「当前步骤」行）：
- * - Done/Failed：14×14dp `CheckCircle`（[successGreen]）/ `Cancel`（error
+ * 视觉规格源：SettingsScreen McpStatusLine + 「当前步骤」行——四态图标
+ * 2026-10-26 统一 16×16dp（原勾/叉/空心圆 14dp、spinner 16dp 不一致，
+ * 用户拍板全 16dp）：
+ * - Done/Failed：16×16dp `CheckCircle`（[successGreen]）/ `Cancel`（error
  *   色）+ 「␣␣标题」（labelMedium，两空格前缀与源逐字一致）；
  * - InProgress：16×16dp spinner（stroke 2dp）+ primary 色标题（对齐
  *   McpSection「当前步骤」行的进行中语言）；
- * - Pending：14×14dp 空心圆（outline 色，未开始不抢注意力）；
+ * - Pending：16×16dp 空心圆（outline 色，未开始不抢注意力）；
  * - 行间距 8dp = 设置页 [Section] 内容列的 spacedBy——把整列作为 Section
  *   直接子项放入，行距/顺序与原逐行渲染像素级一致；
  * - 空清单**不组合**（零尺寸子项也会在父 spacedBy 列里引入额外间距，
@@ -85,13 +87,13 @@ fun StatusChecklist(
                         imageVector = Icons.Filled.CheckCircle,
                         contentDescription = "已就绪",
                         tint = successGreen(),
-                        modifier = Modifier.height(14.dp).width(14.dp),
+                        modifier = Modifier.height(16.dp).width(16.dp),
                     )
                     StatusCheckState.Failed -> Icon(
                         imageVector = Icons.Filled.Cancel,
                         contentDescription = "未就绪",
                         tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.height(14.dp).width(14.dp),
+                        modifier = Modifier.height(16.dp).width(16.dp),
                     )
                     StatusCheckState.InProgress -> CircularProgressIndicator(
                         modifier = Modifier.height(16.dp).width(16.dp),
@@ -101,7 +103,7 @@ fun StatusChecklist(
                         imageVector = Icons.Outlined.Circle,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.outline,
-                        modifier = Modifier.height(14.dp).width(14.dp),
+                        modifier = Modifier.height(16.dp).width(16.dp),
                     )
                 }
                 // 标题色：进行中 = primary（对齐 McpSection「当前步骤」行）；

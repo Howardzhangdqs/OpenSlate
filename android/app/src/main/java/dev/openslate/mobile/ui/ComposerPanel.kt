@@ -209,9 +209,10 @@ internal fun ComposerFocusPanel(
                     // 哪一步，免手动点击；随后恢复运行（hostAlive 终态）时
                     // 自动收起，回归常态首行——「Termux 运行中」+ MCP/tools
                     // 计数与 server 名单。仅限自动路径（用户手动切换过则不
-                    // 再干预）。展开即触发下方既有的 gateRefresh（含自动拉
-                    // 起 host），与手动展开同一条路；以两个布尔为 key——
-                    // 状态不翻转不重跑，手动收起后不会被自动顶开。
+                    // 再干预）。自动展开只渲染缓存快照、不重探（重检入口 =
+                    // 手动展开点击处理器直调 gateRefresh + ChatScreen 首载/
+                    // ON_RESUME）；以两个布尔为 key——状态不翻转不重跑，
+                    // 手动收起后不会被自动顶开。
                     LaunchedEffect(lightsBlocked, lightsRunning) {
                         when {
                             lightsBlocked && !lightsUserToggled && !lightsAutoExpanded -> {
@@ -248,6 +249,13 @@ internal fun ComposerFocusPanel(
                                 .clickable {
                                     lightsUserToggled = true
                                     termuxExpanded = !termuxExpanded
+                                    // 重检只在手动展开时触发（用户显式要新
+                                    // 数据，与设置页同款智能门控）；自动展开
+                                    // 只渲染缓存快照——启动/ON_RESUME 的
+                                    // gateRefresh 已保证快照新鲜，聚焦再全量
+                                    // 重探会被看成「点输入框就重新检测一遍」
+                                    // （用户反馈 2026-10-26）。
+                                    if (termuxExpanded) McpLightsTracker.gateRefresh(context)
                                 }
                                 .padding(vertical = 6.dp),
                         ) {
@@ -330,18 +338,19 @@ internal fun ComposerFocusPanel(
                     // 对齐 ToolNameTemplateSection（expandVertically +
                     // 200ms 淡入淡出）。数据 = McpLightsTracker（与设置页 MCP
                     // 区同一探测管线 probeMcpLights、同一五灯映射 mcpLightRow
-                    // ——五项独立判定成败）；展开时走 gateRefresh（无快照/非
-                    // 全绿→全量重检含自动拉起 host、全绿→廉价 hostAlive 比对，
-                    // 与设置页同款门控）；ON_RESUME 门控已上移 ChatScreen 全局
-                    // 观察（从 Termux 切回即触发，不再要求面板展开）。不再触发
-                    // TermuxStallTracker（onTermuxConnectionRestored 回归停滞
-                    // 面板专属语义）。五行全显（checked→终态、当前步骤→进行
-                    // 中、其余→待检测；hostAlive 拉起窗口显示「MCP host 启动
-                    // 中…」过渡态），高度有界，小屏与 IME 共存无需滚动。
+                    // ——五项独立判定成败）；重检入口 = 手动展开（点击处理
+                    // 器直调 gateRefresh：无快照/非全绿→全量重检含自动拉起
+                    // host、全绿→廉价 hostAlive 比对，与设置页同款门控），
+                    // 自动展开只渲染缓存快照不重探；ON_RESUME 门控已上移
+                    // ChatScreen 全局观察（从 Termux 切回即触发，不再要求
+                    // 面板展开）。不再触发 TermuxStallTracker
+                    // （onTermuxConnectionRestored 回归停滞面板专属语义）。
+                    // 清单显示到首个 Failed 行（含引导摘要/按钮）为止——
+                    // 阶梯短路，后续步骤未执行到不铺提示；检测中/全绿不
+                    // 截断（checked→终态、当前步骤→进行中、其余→待检测；
+                    // hostAlive 拉起窗口显示「MCP host 启动中…」过渡态），
+                    // 高度有界，小屏与 IME 共存无需滚动。
                     val mcpActions = remember(context) { standardMcpLightActions(context) }
-                    LaunchedEffect(termuxExpanded) {
-                        if (termuxExpanded) McpLightsTracker.gateRefresh(context)
-                    }
                     AnimatedVisibility(
                         visible = termuxExpanded,
                         enter = expandVertically() + fadeIn(tween(200)),
@@ -350,12 +359,19 @@ internal fun ComposerFocusPanel(
                         StatusChecklist(
                             buildList {
                                 for (key in MCP_LIGHT_KEYS) {
-                                    mcpLightRow(
+                                    val row = mcpLightRow(
                                         key = key,
                                         result = lights.result ?: McpLightsResult(),
                                         displayDetails = true,
                                         actions = mcpActions,
-                                    )?.let { add(it) }
+                                    ) ?: continue
+                                    add(row)
+                                    // 阶梯短路语义：首个 Failed 之后的步骤根本
+                                    // 没执行到——清单只显示到第一个错误（含其
+                                    // 引导摘要/按钮）为止，后续步骤的提示不再
+                                    // 全部铺出（用户拍板 2026-10-26）。检测中
+                                    // /全绿不受影响（无 Failed 不截断）。
+                                    if (row.state == StatusCheckState.Failed) break
                                 }
                             },
                             modifier = Modifier.padding(top = 6.dp),

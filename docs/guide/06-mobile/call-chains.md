@@ -257,7 +257,10 @@ Termux 未启动/被冻结/停止态时，RUN_COMMAND 的结果 PendingIntent �
   收起面板后重探继续到 stall 清零，重发后再 stall 能被重新捕获）；composer
   聚焦面板五灯独立探测（McpLightsTracker：McpLightsUiState(result, probing)
   快照 + CAS 单飞；驱动 = ChatScreen 初载/ON_RESUME 的 gateRefresh 与子面板
-  展开时 gateRefresh，均为与设置页 McpSection 同款智能门控——无快照/非全绿
+  手动展开时 gateRefresh（自动展开只读缓存快照不重探——启动/ON_RESUME 已
+  保证快照新鲜，聚焦重跑会被看成「点输入框就重新检测一遍」；清单显示到
+  首个 Failed 行为止，后续步骤不铺提示），均为与设置页 McpSection
+  同款智能门控——无快照/非全绿
   （checked 未齐或五布尔任一 false）→ 全量重检含步骤 ⑦ 自动拉起 host（从
   Termux 切回即自动确认恢复）、全绿→廉价 hostAliveDetail 比对翻转才重检、
   在途不叠加；autoRestartHost=true 顺手拉起 host，不经本 tracker）；聚焦面板

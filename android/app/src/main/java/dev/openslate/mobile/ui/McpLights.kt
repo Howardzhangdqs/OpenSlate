@@ -250,8 +250,10 @@ internal object McpLightsTracker {
 
     private val _state = MutableStateFlow(McpLightsUiState())
 
-    /** 最新 UI 状态；result=null = 尚未探测过（子面板展开即触发首轮，
-     *  期间按 checked 空集渲染「正在检测…/待检测」渐进行）。 */
+    /** 最新 UI 状态；result=null = 尚未探测过（首轮由 ChatScreen 初载/
+     *  ON_RESUME 的 gateRefresh 触发；子面板手动展开亦经 gateRefresh，
+     *  自动展开只读快照不重检），期间按 checked 空集渲染「正在检测…/
+     *  待检测」渐进行）。 */
     val state: StateFlow<McpLightsUiState> = _state.asStateFlow()
 
     private val probing = AtomicBoolean(false)

@@ -23,6 +23,12 @@ import kotlinx.coroutines.launch
  * - runtime 在 onCreate 起后台协程里创建（磁盘 bootstrap 首启稍慢）。
  * - onStartCommand 幂等；主界面通过 [RuntimeBridge] 单例共享状态。
  * - onDestroy 优雅关停 runtime（host call fail-all + 审批全拒）。
+ * - FGS 通知（1001）**仅后台显示**：onCreate 仍先 startForeground
+ *   （startForegroundService 5s 契约），随后收集 AgentNotifier.inForeground
+ *   ——App 在前台 → stopForeground(STOP_FOREGROUND_REMOVE) 撤下 1001（进程
+ *   优先级由可见 Activity 保证，不怕杀）；退到后台 → 幂等 promote 恢复
+ *   （此时用户不在 App，1001 即「runtime 仍在运行」的凭据）。跟踪器未就绪
+ *   （状态未知）时保守保持前台化，等首个确定状态再切。
  * - 回合期唤醒锁（wakeLock/wifiLock）：running 期间持 CPU + Wi-Fi 锁，见字段注释。
  */
 class AgentService : LifecycleService() {
@@ -30,11 +36,12 @@ class AgentService : LifecycleService() {
     /**
      * 回合期唤醒锁（PARTIAL_WAKE_LOCK + WifiLock，tag 均 "openslate:turn"）。
      *
-     * 为什么需要：前台服务只保**进程**不被杀，**不保 CPU 不休眠、不保网卡
-     * 不断连**——App 切后台后系统照常进 doze/省电，模型流式连接被掐断
-     * （"error decoding response body"）。因此由**回合运行态**驱动：
-     * 收集 [RuntimeBridge.state] 的 `running` 字段，true → acquire（回合期
-     * 持锁），false → release（回合结束即还，空闲不长持耗电）。
+     * 为什么需要：前台化只保**进程**不被杀（App 在前台时由可见 Activity
+     * 保证、FGS 通知已撤下；退后台由 FGS 常驻通知接管），但**不保 CPU
+     * 不休眠、不保网卡不断连**——App 切后台后系统照常进 doze/省电，模型
+     * 流式连接被掐断（"error decoding response body"）。因此由**回合运行态**
+     * 驱动：收集 [RuntimeBridge.state] 的 `running` 字段，true → acquire
+     * （回合期持锁），false → release（回合结束即还，空闲不长持耗电）。
      *
      * - PARTIAL_WAKE_LOCK：与屏幕无关，灭屏也保持 CPU 运行；
      * - WifiLock(WIFI_MODE_FULL_HIGH_PERF)：抑制 Wi-Fi 省电模式休眠断连
@@ -56,10 +63,23 @@ class AgentService : LifecycleService() {
     override fun onCreate() {
         super.onCreate()
         android.util.Log.i("OpenSlateBridge", "AgentService: onCreate")
+        // 5s 契约：startForegroundService 拉起后必须先 startForeground，
+        // 前台撤下的判定在其后（见下方 inForeground 收集器）。
         startForegroundWithNotification()
         createTurnLocks()
         lifecycleScope.launch {
             RuntimeBridge.start(this@AgentService)
+        }
+        // FGS 通知仅后台显示：前台 → 撤下 1001（进程由可见 Activity 保），
+        // 退后台 → 幂等 promote 恢复（1001 = 「runtime 仍在运行」凭据）。
+        // 跟踪器已在 Application.onCreate 幂等 init；StateFlow 首射为 false
+        // （init 前未知/后台）时保守保持前台化（promote 幂等），等首个确定
+        // 状态再切。collect 挂 lifecycleScope（Main），stopForeground /
+        // startForeground 均主线程安全。
+        lifecycleScope.launch {
+            dev.openslate.mobile.bridge.AgentNotifier.inForeground.collect { fg ->
+                if (fg) demoteForegroundNotification() else startForegroundWithNotification()
+            }
         }
         // 回合运行态驱动锁的获取/释放：running=true 持锁（后台保网络/CPU），
         // false 立即释放（空闲不耗电）。collect 挂 lifecycleScope，服务销毁
@@ -124,6 +144,12 @@ class AgentService : LifecycleService() {
         if (wifiLock?.isHeld == true) {
             wifiLock?.release()
         }
+    }
+
+    /** App 在前台：撤前台化并移除 1001。幂等（对未前台化的服务 no-op）；进程优先级由可见 Activity 保证，不怕杀。 */
+    private fun demoteForegroundNotification() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        android.util.Log.i("OpenSlateBridge", "AgentService: FGS demoted (app foreground)")
     }
 
     private fun startForegroundWithNotification() {

@@ -860,8 +860,11 @@ MainActivity.onCreate
       FOREGROUND_SERVICE_TYPE_SPECIAL_USE，其余走无类型调用）
       createTurnLocks（PARTIAL_WAKE_LOCK + WifiLock，只创建不获取）
       lifecycleScope.launch { RuntimeBridge.start(this@AgentService) }
+      lifecycleScope.launch { AgentNotifier.inForeground.collect {
+        前台 ? 撤 1001（stopForeground REMOVE） : 幂等 promote } }
+        【FGS 通知仅后台显示，见 §4.2】
       lifecycleScope.launch { RuntimeBridge.state.collect { running ?持锁 : 释放 } }
-        【回合期唤醒锁：FGS 只保进程不保网络/CPU，见 §4.2】
+        【回合期唤醒锁：前台化只保进程不保网络/CPU，见 §4.2】
   → RuntimeBridge.start（startMutex 防重入；Dispatchers.IO——装配可能阻塞数秒）
       1. 组 MobilePathsDto：filesDir/openslate | filesDir/workspace | filesDir/data | cacheDir/openslate
       2. McpHostManager.token(ctx) → uniffi setMcpHostToken(token)   【必须在 create 前】
@@ -885,7 +888,9 @@ MainActivity.onCreate
 
 App 退到后台：前台服务存活，runtime 与事件流不受影响（POST_NOTIFICATIONS + FOREGROUND_SERVICE_SPECIAL_USE）。
 
-后台保网络机制：FGS 只保**进程**不保网络/CPU——切后台后系统照常进 doze/省电，会掐断模型流式连接（"error decoding response body"）。AgentService 由回合运行态驱动持锁：收集 `RuntimeBridge.state` 的 `running` 字段，true → `acquire`（`PARTIAL_WAKE_LOCK`（tag `openslate:turn`，灭屏保 CPU）+ `WifiLock(WIFI_MODE_FULL_HIGH_PERF)`（抑制 Wi-Fi 省电断连）），false → 立即释放（空闲不长持耗电）；onDestroy 强制释放兜底。MIUI 类激进省电不保证 100% 拦截，回合级重试是另一轨的兜底。
+**FGS 通知（1001）仅后台显示（2026-10）**：AgentService.onCreate 先 startForeground（startForegroundService 5s 契约），随后收集 `AgentNotifier.inForeground`（跟踪器 init 已提前到 OpenSlateApp.onCreate）——App 在前台 → `stopForeground(STOP_FOREGROUND_REMOVE)` 撤下 1001（进程优先级由可见 Activity 保证）；退到后台 → 幂等 promote（`startForegroundWithNotification()`）恢复，1001 即「runtime 仍在运行」的用户凭据。跟踪器未知态（init 前）保守保持前台化（StateFlow 初值 false → promote 幂等）。冷启动经 NotificationActionReceiver 拉起时 App 不在前台 → 首射 false → 保持前台化。
+
+后台保网络机制：前台化只保**进程**不被杀（前台由可见 Activity 保、退后台由 FGS 常驻通知接管），且不保网络/CPU——切后台后系统照常进 doze/省电，会掐断模型流式连接（"error decoding response body"）。AgentService 由回合运行态驱动持锁：收集 `RuntimeBridge.state` 的 `running` 字段，true → `acquire`（`PARTIAL_WAKE_LOCK`（tag `openslate:turn`，灭屏保 CPU）+ `WifiLock(WIFI_MODE_FULL_HIGH_PERF)`（抑制 Wi-Fi 省电断连）），false → 立即释放（空闲不长持耗电）；onDestroy 强制释放兜底。MIUI 类激进省电不保证 100% 拦截，回合级重试是另一轨的兜底。
 
 ### 4.3 关停
 

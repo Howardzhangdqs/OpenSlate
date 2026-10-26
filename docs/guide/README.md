@@ -69,6 +69,7 @@
 | [troubleshooting.md](07-build-dev/troubleshooting.md) | 19 条构建/运行问题：症状/原因/解法 |
 | [reference-repos.md](07-build-dev/reference-repos.md) | `.ref/` 参考项目源码：浅克隆、更新脚本、不入库 |
 | [code-locate.md](07-build-dev/code-locate.md) | 代码快速定位：symbol_brief 符号大纲（Rust LSP / Kotlin ast-grep）、AST 模式搜索 |
+| [multi-machine-sync.md](07-build-dev/multi-machine-sync.md) | 多机工作区同步：sync-remote.sh（dev ↔ lenovo-legion，rsync over Tailscale，双向 push/pull） |
 
 ### 08-conventions/ — 代码与协作约定（改动前必读）
 

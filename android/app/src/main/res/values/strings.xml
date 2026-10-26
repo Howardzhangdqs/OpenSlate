@@ -4,4 +4,7 @@
     <string name="agent_service_notification_title">OpenSlate Agent</string>
     <string name="agent_service_notification_text">Agent 运行时已就绪</string>
     <string name="agent_service_channel">agent_runtime</string>
+    <string name="agent_channel_messages">agent_messages</string>
+    <string name="agent_channel_important">agent_important</string>
+    <string name="agent_channel_progress">agent_progress</string>
 </resources>

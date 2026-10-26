@@ -55,6 +55,14 @@
             android:name=".bridge.TermuxResultReceiver"
             android:exported="false" />
 
+        <!-- notify 工具通知动作/回复/划掉/ask_user 伴生唤回「不回答」的接收器
+            （PendingIntent 全部显式组件指向这里；exported=false：外部应用无法
+             伪造通知动作注入用户消息/伪造 resolve）。冷启动：进程被杀后
+             PendingIntent 仍可拉起本进程 → receiver → AgentService（FGS）。 -->
+        <receiver
+            android:name=".bridge.NotificationActionReceiver"
+            android:exported="false" />
+
         <!-- Shizuku（设置页一键 pm grant 授权 RUN_COMMAND；仅首次配置用，
              日常执行不经过它）。 -->
         <provider

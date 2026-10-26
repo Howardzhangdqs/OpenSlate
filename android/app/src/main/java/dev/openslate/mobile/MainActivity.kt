@@ -1,8 +1,15 @@
 package dev.openslate.mobile
 
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -28,7 +35,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -36,8 +45,13 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import dev.openslate.mobile.service.AgentService
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.runtime.CompositionLocalProvider
+import dev.openslate.mobile.bridge.AgentNotifier
+import dev.openslate.mobile.bridge.AppPrefs
+import dev.openslate.mobile.bridge.RuntimeBridge
 import dev.openslate.mobile.ui.LocalDarkTheme
 import dev.openslate.mobile.ui.AccentPalette
 import dev.openslate.mobile.ui.accentOf
@@ -51,7 +65,14 @@ import dev.openslate.mobile.ui.QuestionFullScreen
 import dev.openslate.mobile.ui.QuestionReviewScreen
 import dev.openslate.mobile.ui.SettingsScreen
 
+/** POST_NOTIFICATIONS 首启请求只弹一次的 prefs 键（拒绝后不追弹，§5.1）。 */
+private const val PREF_NOTIF_PERMISSION_ASKED = "notif_permission_asked"
+
 class MainActivity : ComponentActivity() {
+
+    /** 通知深链挂起路由（「去回答」→ question-fullscreen）；AppNavHost 内消费。 */
+    private val pendingDeepLinkRoute = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AgentService.start(this)
@@ -59,10 +80,14 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             runCatching { dev.openslate.mobile.bridge.McpHostManager.prewarm(this@MainActivity) }
         }
+        // notify：通知 intent 路由（run_id 对齐 + 「去回答」深链）。
+        handleNotificationIntent(intent)
         setContent {
             val ctx = applicationContext
             var themeMode by remember { mutableStateOf(ThemePrefs.read(ctx)) }
             var accentColor by remember { mutableStateOf(ThemePrefs.readAccent(ctx)) }
+            // notify：API 33+ 首启请求 POST_NOTIFICATIONS（拒绝后记 prefs 不再自动弹）。
+            RequestNotificationPermissionOnce()
             OpenSlateTheme(mode = themeMode, accent = accentColor) {
                 Surface {
                     AppNavHost(
@@ -76,10 +101,62 @@ class MainActivity : ComponentActivity() {
                             accentColor = id
                             ThemePrefs.writeAccent(ctx, id)
                         },
+                        pendingRoute = pendingDeepLinkRoute,
                     )
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    /**
+     * notify 通知 intent 路由（§4.5）：
+     * - run_id extra → openSession(runId) 对齐发起会话（空闲时；busy 由 Rust
+     *   侧 busy 守卫兜底拒绝，打开 App 看上下文是主诉求）——等 runtime 就绪
+     *   （首启创建需数秒，15s 上限尽力而为）；
+     * - EXTRA_OPEN_ASK_USER（伴生唤回「去回答」）→ 标记挂起路由，由
+     *   AppNavHost 导航 question-fullscreen（onCreate / onNewIntent 双入口）。
+     */
+    private fun handleNotificationIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.getBooleanExtra(AgentNotifier.EXTRA_OPEN_ASK_USER, false)) {
+            pendingDeepLinkRoute.value = "question-fullscreen"
+        }
+        val runId = intent.getStringExtra(AgentNotifier.EXTRA_RUN_ID)?.takeIf { it.isNotEmpty() } ?: return
+        lifecycleScope.launch {
+            withTimeoutOrNull(15_000) { RuntimeBridge.state.first { it.ready } }
+            if (RuntimeBridge.currentRunId() != runId) {
+                RuntimeBridge.openSession(runId)
+            }
+        }
+    }
+}
+
+/** API 33+ 首启请求 POST_NOTIFICATIONS；已授予/已问过不再弹（§5.1 决策 5）。 */
+@Composable
+private fun RequestNotificationPermissionOnce() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    val ctx = LocalContext.current
+    val prefs = remember(ctx) {
+        ctx.getSharedPreferences(AppPrefs.FILE_MAIN, Context.MODE_PRIVATE)
+    }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        prefs.edit().putBoolean(PREF_NOTIF_PERMISSION_ASKED, true).apply()
+    }
+    LaunchedEffect(Unit) {
+        if (prefs.getBoolean(PREF_NOTIF_PERMISSION_ASKED, false)) return@LaunchedEffect
+        if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            prefs.edit().putBoolean(PREF_NOTIF_PERMISSION_ASKED, true).apply()
+            return@LaunchedEffect
+        }
+        launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }
 
@@ -90,9 +167,17 @@ private fun AppNavHost(
     onThemeModeChange: (ThemeMode) -> Unit,
     accent: String,
     onAccentChange: (String) -> Unit,
+    pendingRoute: androidx.compose.runtime.MutableState<String?>,
 ) {
     val nav = rememberNavController()
     WarmUpSecondaryScreens()
+    // 通知深链（伴生唤回「去回答」）：intent 到达（onCreate/onNewIntent）→
+    // 标记挂起路由 → 此处导航；消费后清标记（launchSingleTop 防重复入栈）。
+    LaunchedEffect(pendingRoute.value) {
+        val route = pendingRoute.value ?: return@LaunchedEffect
+        pendingRoute.value = null
+        nav.navigate(route) { launchSingleTop = true }
+    }
     NavHost(navController = nav, startDestination = "chat") {
         composable("chat") {
             ChatScreen(

@@ -12,6 +12,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -596,6 +601,37 @@ object RuntimeBridge {
     /** 当前步起始时间戳（usage 事件计算步耗时用）。 */
     private var stepStartTs: Long? = null
 
+    // ── notify（Agent 主动系统通知，S1+S1b）──────────────────────────────
+
+    /** [ask_user] companion_notify_seconds 的本阶段缺省（具名常量；配置键
+     *  尚未接设置页——真值随 openslate.toml 接线后再启用）。 */
+    private const val ASK_USER_COMPANION_NOTIFY_SECONDS = 60L
+
+    /** 冷启动缓冲 flush 等待 runtime 就绪的上限（§4.7 尽力而为）。 */
+    private const val NOTIFY_COLD_START_FLUSH_TIMEOUT_MS = 15_000L
+
+    /** 冷启动缓冲队列上限（防堆积；超出丢弃新动作并 log）。 */
+    private const val NOTIFY_DEFERRED_QUEUE_CAP = 32
+
+    /** D5：notification_reply 上行 outcome 白名单（timeout/expired 仅 Rust 侧
+     *  合成，Kotlin 恒不发送）。 */
+    private val NOTIFICATION_REPLY_OUTCOMES = setOf("action", "replied", "dismissed", "cancelled")
+
+    /** 通知动作冷启动缓冲（§4.7）：runtime 未就绪时排队，就绪后 flush。 */
+    private val pendingNotificationActions = java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>()
+
+    /** busy 期通知回流（§4.5）：turn 终态逐条 flush（每终态提交一条——submit
+     *  后 running 翻转走事件流是异步的，连发会撞 Rust 侧 busy 拒绝）。 */
+    private class PendingSubmitFromNotification(val text: String, val originRunId: String?)
+
+    private val pendingSubmits = java.util.concurrent.ConcurrentLinkedQueue<PendingSubmitFromNotification>()
+
+    /** ask_user 伴生唤回 watcher（§4.8）；随 start/shutdown 起停。 */
+    private var companionNudgeJob: Job? = null
+
+    /** 冷启动缓冲 flush 协程（等待 state.ready 即首个 snapshot）。 */
+    private var notifyFlushJob: Job? = null
+
     /** 工具名 → 待消费输出队列（同名工具并发时按序配对）。 */
     private val pendingToolOutputs =
         java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<String>>()
@@ -685,6 +721,8 @@ object RuntimeBridge {
                     runtimeRef.set(runtime)
                     this@RuntimeBridge.appContext = appContext
                     Log.i(TAG, "start: runtime created ✓ (native=${runtime.uniffiIsDestroyed.not()})")
+                    // notify：前台跟踪注册（幂等；ask_user 伴生唤回 timer 门控用）。
+                    AgentNotifier.init(appContext)
                     // 重注入持久化密钥（Keystore → FFI 内存）；解密失败的
                     // provider 显式告警（UI 侧密钥管理页会显示"解密失败，
                     // 请重新录入"，此处不静默混作未配置）。
@@ -716,6 +754,10 @@ object RuntimeBridge {
                     Log.e(TAG, "start: runtime create FAILED", e)
                     _state.value = _state.value.copy(ready = false, lastError = e.message ?: e.javaClass.simpleName)
                     started = false
+                    // notify 冷启动缓冲：runtime 起不来 → 队列丢弃 + log（§4.7）。
+                    pendingNotificationActions.clear()
+                    pendingSubmits.clear()
+                    Log.w(TAG, "notify: deferred queues dropped (runtime create failed)")
                     return@withContext
                 }
                 // 事件消费协程（start 后常驻）。先取消旧泵：同进程
@@ -742,6 +784,15 @@ object RuntimeBridge {
                     }
                     Log.w(TAG, "event pump: channel closed")
                 }
+                // notify 冷启动缓冲（§4.7）：就绪（首个 snapshot）后冲刷排队动作；
+                // runtime 起不来由下方 catch 丢弃队列（尽力而为语义）。
+                notifyFlushJob?.cancel()
+                notifyFlushJob = scope.launch {
+                    withTimeoutOrNull(NOTIFY_COLD_START_FLUSH_TIMEOUT_MS) { state.first { it.ready } }
+                    flushDeferredNotificationActions()
+                }
+                // ask_user 伴生唤回 watcher（§4.8）。
+                startCompanionNudgeWatcher()
             }
             Unit
         }
@@ -1875,6 +1926,13 @@ object RuntimeBridge {
             // 关停时取消事件泵（下次 start 会重建），防旧泵滞留消费。
             pumpJob?.cancel()
             pumpJob = null
+            // notify：watcher/flush 协程随停；冷启动缓冲与排队回流失去落点，丢弃。
+            companionNudgeJob?.cancel()
+            companionNudgeJob = null
+            notifyFlushJob?.cancel()
+            notifyFlushJob = null
+            pendingNotificationActions.clear()
+            pendingSubmits.clear()
             // 在途附件提交失去落点：终结等待（composer 草稿保留）。
             dropPendingEcho()
             TermuxExec.cancelAll()
@@ -2024,6 +2082,11 @@ object RuntimeBridge {
                 // optStringOrNull：optString 对 JSON null 返回字面量 "null"
                 // （org.json 陷阱）——曾致镜像写入 transcripts/null.json 僵尸文件。
                 persistTranscriptAsync(obj.optJSONObject("summary")?.optStringOrNull("run_id"))
+                // notify：turn 终态收敛（§4.6，wait 挂起除外）+ busy 排队回流
+                // 冲刷一条（§4.5；置后于落盘——submit 会立刻追加 User 条目，
+                // 先落盘防新条目混入上一 run 的镜像）。
+                settleNotifyOnTurnEnd()
+                flushOnePendingSubmit()
             }
             "turn_error" -> mutate {
                 copy(
@@ -2036,6 +2099,9 @@ object RuntimeBridge {
                 // turn_error 无 summary：兜底最近快照的 run_id（泵协程内，
                 // FIFO 保证它仍是本 run——见 persistTranscriptAsync 注释）。
                 persistTranscriptAsync(lastKnownRunId)
+                // notify：同 turn_ok——终态收敛 + 排队回流冲刷（顺序同理）。
+                settleNotifyOnTurnEnd()
+                flushOnePendingSubmit()
             }
             "notice" -> {
                 val level = obj.optString("level", "info")
@@ -2636,6 +2702,344 @@ object RuntimeBridge {
         }
     }
 
+    // ── notify：Agent 主动系统通知（提案 notify-tool-design.md S1+S1b）──
+    //
+    // 契约（供 Rust 侧对齐；D9：run_id 内嵌 args，信封顶层只有 {type,id,tool,args}）：
+    // - 下发：host_call_requested {"type":"host_call_requested","id":<Long>,
+    //   "tool":"notify","args":{"v":1,"action":"post|cancel","id":…,"title":…,
+    //   "message":…,"kind":"normal|important|progress","progress":0..100,
+    //   "progress_indeterminate":bool,"ongoing":bool,"completed":bool,
+    //   "auto_cancel":bool,"public":bool,"wait":bool,"cancel_scope":"id|all",
+    //   "actions":[{label,value?,style?,behavior?,reply?,placeholder?}],
+    //   "run_id":"r-…"}}（args.run_id = 发起时活动 run，Kotlin 路由用）。
+    // - 提交：resolveHostCall(id, true, {"posted":true,"id","kind","channel"})；
+    //   失败 {"posted":false,"reason":"permission_denied|channel_disabled|
+    //   invalid_args"[,"channel":…]}；cancel → {"cancelled":[…],"not_found":[…]}
+    //   或 {"cancelled":N}（all）。一切业务结果 ok=true（对齐 ask_user）。
+    // - wait 模式：post 立即 resolve posted；后续 outcome 由通知动作回填——
+    //   在途先 resolveHostCall(request_id, {outcome:…})（返回 false = 失效 id
+    //   无害 no-op）→ 迟到上行 notification_reply（D5 wire）。
+
+    /**
+     * notify host call：args（v:1 信封）→ AgentNotifier 执行 → resolve。
+     * 防御性兜底（§5.6）：Rust 侧已做全部业务校验，本层长度再截/枚举再滤，
+     * 异常兜 posted:false invalid_args（回合不中断）。
+     */
+    private fun handleNotify(id: Long, obj: JSONObject) {
+        val runtime = runtimeRef.get() ?: return
+        val ctx = appContext ?: run {
+            runtime.resolveHostCall(id.toULong(), false, "notify: no app context")
+            return
+        }
+        val args = obj.optJSONObject("args") ?: JSONObject()
+        scope.launch(Dispatchers.Default) {
+            val payload = try {
+                executeNotify(ctx, id, args)
+            } catch (t: Throwable) {
+                Log.e(TAG, "notify: host call failed", t)
+                postedFalse("invalid_args")
+            }
+            runtime.resolveHostCall(id.toULong(), true, payload)
+        }
+    }
+
+    private fun executeNotify(ctx: Context, hostCallId: Long, args: JSONObject): String {
+        if (args.optInt("v", 0) != 1) return postedFalse("invalid_args")
+        val action = args.optString("action").ifBlank { "post" }
+        return if (action == "cancel") executeNotifyCancel(ctx, args) else executeNotifyPost(ctx, hostCallId, args)
+    }
+
+    private fun executeNotifyPost(ctx: Context, hostCallId: Long, args: JSONObject): String {
+        val title = args.optString("title").trim().take(120)
+        val message = args.optString("message").trim().take(4000)
+        if (title.isEmpty() || message.isEmpty()) return postedFalse("invalid_args")
+        val kind = args.optString("kind").ifBlank { "normal" }
+        if (kind !in setOf("normal", "important", "progress")) return postedFalse("invalid_args")
+        val spec = AgentNotifier.NotificationSpec(
+            agentId = args.optString("id").trim().ifEmpty { AgentNotifier.nextAutoId() },
+            title = title,
+            message = message,
+            kind = kind,
+            progress = if (args.has("progress") && !args.isNull("progress")) {
+                args.optLong("progress", 0L).toInt().coerceIn(0, 100)
+            } else {
+                null
+            },
+            progressIndeterminate = args.optBoolean("progress_indeterminate", false),
+            ongoing = args.optBoolean("ongoing", false),
+            completed = args.optBoolean("completed", false),
+            autoCancel = args.optBoolean("auto_cancel", true),
+            publicVisible = args.optBoolean("public", false),
+            wait = args.optBoolean("wait", false),
+            requestId = hostCallId,
+            runId = args.optStringOrNull("run_id"), // D9：args.run_id
+            actions = parseNotifyActions(args.optJSONArray("actions")),
+        )
+        return when (val r = AgentNotifier.post(ctx, spec)) {
+            is AgentNotifier.PostResult.Posted ->
+                JSONObject()
+                    .put("posted", true)
+                    .put("id", spec.agentId)
+                    .put("kind", kind)
+                    .put("channel", r.channel)
+                    .toString()
+            AgentNotifier.PostResult.PermissionDenied -> postedFalse("permission_denied")
+            is AgentNotifier.PostResult.ChannelDisabled -> postedFalse("channel_disabled", r.channel)
+        }
+    }
+
+    private fun parseNotifyActions(arr: JSONArray?): List<AgentNotifier.ActionSpec> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<AgentNotifier.ActionSpec>(arr.length())
+        for (i in 0 until arr.length()) {
+            if (out.size >= 3) break // Android 上限 3（Rust 已限，防御）
+            val o = arr.optJSONObject(i) ?: continue
+            val label = o.optString("label").trim().take(24)
+            if (label.isEmpty()) continue
+            out.add(
+                AgentNotifier.ActionSpec(
+                    label = label,
+                    value = o.optStringOrNull("value")?.take(500),
+                    style = o.optString("style").ifBlank { "default" },
+                    behavior = o.optStringOrNull("behavior"),
+                    reply = o.optBoolean("reply", false),
+                    placeholder = o.optStringOrNull("placeholder")?.take(40),
+                ),
+            )
+        }
+        return out
+    }
+
+    private fun executeNotifyCancel(ctx: Context, args: JSONObject): String {
+        return if (args.optString("cancel_scope", "id") == "all") {
+            val entries = AgentNotifier.cancelAllRegistered(ctx)
+            entries.forEach { closeWaitEntryOnCancel(it) }
+            JSONObject().put("cancelled", entries.size).toString()
+        } else {
+            val agentId = args.optString("id").trim()
+            val entry = if (agentId.isEmpty()) null else AgentNotifier.cancelRegistered(ctx, agentId)
+            if (entry == null) {
+                JSONObject()
+                    .put("cancelled", JSONArray())
+                    .put("not_found", JSONArray().put(agentId))
+                    .toString()
+            } else {
+                closeWaitEntryOnCancel(entry)
+                JSONObject().put("cancelled", JSONArray().put(agentId)).toString()
+            }
+        }
+    }
+
+    /**
+     * cancel 命中 wait 挂起通知（边角 2 决策）：先试在途 resolve
+     * （outcome=cancelled，失效 id 无害），失败上行迟到 notification_reply；
+     * Rust handler 原子关卷 status='cancelled' + 以 cancelled tool result 续跑。
+     */
+    private fun closeWaitEntryOnCancel(e: AgentNotifier.CancelledEntry) {
+        val requestId = e.requestId ?: return
+        resolveNotificationOutcome(requestId, e.runId, "cancelled")
+    }
+
+    private fun postedFalse(reason: String, channel: String? = null): String =
+        JSONObject().put("posted", false).put("reason", reason).apply {
+            channel?.let { put("channel", it) }
+        }.toString()
+
+    /**
+     * 通知回应用答（wait）：先试在途 resolve（true = 已投递）；false = 失效
+     * id（超时/已答/关停/重启）→ 迟到上行 notification_reply（D5 wire）。
+     */
+    fun resolveNotificationOutcome(
+        requestId: Long,
+        runId: String?,
+        outcome: String,
+        label: String? = null,
+        value: String? = null,
+        text: String? = null,
+    ) {
+        if (requestId < 0 || outcome !in NOTIFICATION_REPLY_OUTCOMES) return
+        val runtime = runtimeRef.get()
+        if (runtime != null) {
+            val payload = JSONObject().put("outcome", outcome).apply {
+                label?.let { put("label", it) }
+                value?.let { put("value", it) }
+                text?.let { put("text", it) }
+            }
+            val resolved = runCatching {
+                runtime.resolveHostCall(requestId.toULong(), true, payload.toString())
+            }.getOrDefault(false)
+            if (resolved) {
+                Log.i(TAG, "notify: in-flight resolve ok (id=$requestId, outcome=$outcome)")
+                return
+            }
+        }
+        sendLateNotificationReply(requestId, runId, outcome, label, value, text)
+    }
+
+    /**
+     * 迟到 notification_reply 上行（D5，经既有 client send 通道）：
+     * `{"type":"notification_reply","request_id","run_id","outcome",
+     * "label"?,"value"?,"text"?}`（可选字段仅在非空时携带）。上行前先对齐
+     * 会话（§4.5：openSession 失败不阻断上行——send 与会话无关）。
+     */
+    private fun sendLateNotificationReply(
+        requestId: Long,
+        runId: String?,
+        outcome: String,
+        label: String?,
+        value: String?,
+        text: String?,
+    ) {
+        if (outcome !in NOTIFICATION_REPLY_OUTCOMES) return
+        if (!runId.isNullOrEmpty() && currentRunId() != runId) {
+            val aligned = runCatching { openSession(runId) }.getOrDefault(false)
+            if (aligned) Log.i(TAG, "notify: session aligned to $runId for late reply")
+            else Log.w(TAG, "notify: openSession($runId) failed before late reply (sending anyway)")
+        }
+        val json = JSONObject()
+            .put("type", "notification_reply")
+            .put("request_id", requestId.toString())
+            .put("outcome", outcome)
+        runId?.takeIf { it.isNotEmpty() }?.let { json.put("run_id", it) }
+        label?.let { json.put("label", it) }
+        value?.let { json.put("value", it) }
+        text?.let { json.put("text", it) }
+        val ok = sendJson(json.toString())
+        Log.i(TAG, "notify: late notification_reply sent (id=$requestId, outcome=$outcome, ok=$ok)")
+    }
+
+    /**
+     * cancel_turn 动作（§4.4）：wait 挂起（requestId>=0）先 resolve/迟到上行
+     * cancelled，随后停止当前回合；非 wait 直接 cancel()（即时生效）。
+     */
+    fun notificationCancelTurn(requestId: Long, runId: String?) {
+        if (requestId >= 0) resolveNotificationOutcome(requestId, runId, "cancelled")
+        cancel()
+    }
+
+    /**
+     * 通知回流为新用户消息（§4.5，非 wait 动作/回复）：
+     * - 回合进行中 → pendingSubmits 排队（记 originRunId），turn 终态 flush
+     *   时先切会话再 submit（session handle_submit busy 直接拒绝、无排队，
+     *   必须在 Kotlin 侧等 turn 终态）；
+     * - 空闲 → 先 openSession(originRunId) 对齐（失败/已被删回退当前会话）再
+     *   submit（既有 ClientMsg::submit 通路）。
+     * 调用方须已确保 runtime 就绪（经 [runOrDeferNotificationAction] 包装）。
+     */
+    fun submitFromNotification(text: String, originRunId: String?) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        if (_state.value.running) {
+            pendingSubmits.add(PendingSubmitFromNotification(trimmed, originRunId))
+            Log.i(TAG, "notify: submit queued (turn busy, run=$originRunId)")
+        } else {
+            submitAligned(trimmed, originRunId)
+        }
+    }
+
+    /** runId 对齐 + submit（§4.5：跨会话回复路由进发起会话）。 */
+    private fun submitAligned(text: String, originRunId: String?) {
+        if (!originRunId.isNullOrEmpty() && currentRunId() != originRunId) {
+            val ok = runCatching { openSession(originRunId) }.getOrDefault(false)
+            if (ok) Log.i(TAG, "notify: session aligned to $originRunId")
+            else Log.w(TAG, "notify: openSession($originRunId) failed, falling back to current session")
+        }
+        submit(text)
+    }
+
+    /** turn 终态冲刷一条排队回流（每终态一条，防 busy 拒绝；见字段注释）。 */
+    private fun flushOnePendingSubmit() {
+        val ps = pendingSubmits.poll() ?: return
+        runCatching { submitAligned(ps.text, ps.originRunId) }
+            .onFailure { Log.w(TAG, "notify: flush pending submit failed", it) }
+    }
+
+    /** turn 终态收敛（§4.6）：登记的 ongoing 通知重建为非常驻（wait 挂起除外）。 */
+    private fun settleNotifyOnTurnEnd() {
+        val ctx = appContext ?: return
+        runCatching { AgentNotifier.settleOngoing(ctx) }
+            .onFailure { Log.w(TAG, "notify: settleOngoing failed", it) }
+    }
+
+    /**
+     * 通知动作统一入口（receiver 调用）：runtime 就绪（含 runtimeRef 在位）即
+     * 派发到 [scope]（Dispatchers.Default 泵协程域）异步执行——receiver 主线程
+     * 不做耗时操作（§5.3：迟到上行经 sendLateNotificationReply → openSession
+     * 是 FFI 同步 sqlite 换装会话），与 defer 分支 flush 的线程模型一致；否则
+     * 入冷启动缓冲（§4.7），调用方负责拉起 AgentService。返回 false = 已入队
+     * （未执行）。
+     */
+    fun runOrDeferNotificationAction(action: () -> Unit): Boolean {
+        if (isReady && runtimeRef.get() != null) {
+            scope.launch { runCatching(action).onFailure { Log.w(TAG, "notify: action failed", it) } }
+            return true
+        }
+        if (pendingNotificationActions.size >= NOTIFY_DEFERRED_QUEUE_CAP) {
+            Log.w(TAG, "notify: deferred queue full (cap=$NOTIFY_DEFERRED_QUEUE_CAP), dropping action")
+            return false
+        }
+        pendingNotificationActions.add(action)
+        Log.i(TAG, "notify: action deferred until runtime ready (queue=${pendingNotificationActions.size})")
+        return false
+    }
+
+    private fun flushDeferredNotificationActions() {
+        var flushed = 0
+        while (true) {
+            val a = pendingNotificationActions.poll() ?: break
+            runCatching(a).onFailure { Log.w(TAG, "notify: deferred action failed", it) }
+            flushed++
+        }
+        if (flushed > 0) Log.i(TAG, "notify: flushed $flushed deferred action(s)")
+    }
+
+    /**
+     * ask_user 伴生唤回 watcher（§4.8，宿主行为，不经模型）：
+     * - pending 卡（live/恢复同源）挂起超过 [ASK_USER_COMPANION_NOTIFY_SECONDS]
+     *   且 App 不在前台 → 发伴生唤回通知（首题摘要）；
+     * - 卡清除 / 离开 pending 相位 / App 回前台 → 撤通知 + 停计时；
+     * - 重启回放（snapshot 恢复卡）经同一 state 流自动重新武装。
+     */
+    private fun startCompanionNudgeWatcher() {
+        companionNudgeJob?.cancel()
+        companionNudgeJob = scope.launch {
+            // App 回前台 → 撤伴生通知（§4.8）。
+            launch {
+                AgentNotifier.inForeground.collect { fg ->
+                    if (fg) appContext?.let { AgentNotifier.cancelCompanionNudge(it) }
+                }
+            }
+            // pending 卡驱动：以 (requestId, phase, createdAtMs) 为键去抖（聊天
+            // delta 不触发重计时）；collectLatest 在卡变化/前台切换时取消旧计时。
+            combine(
+                state
+                    .map { s -> s.pendingQuestion?.let { Triple(it.requestId, it.phase, it.createdAtMs) } }
+                    .distinctUntilChanged(),
+                AgentNotifier.inForeground,
+            ) { card, fg -> card to fg }.collectLatest { (card, fg) ->
+                val ctx = appContext ?: return@collectLatest
+                if (card == null || fg || card.second != "pending") {
+                    AgentNotifier.cancelCompanionNudge(ctx)
+                    return@collectLatest
+                }
+                val (requestId, _, createdAt) = card
+                val waitMs = ASK_USER_COMPANION_NOTIFY_SECONDS * 1000 -
+                    (System.currentTimeMillis() - createdAt)
+                if (waitMs > 0) delay(waitMs)
+                val cur = _state.value.pendingQuestion ?: return@collectLatest
+                if (cur.requestId != requestId || cur.phase != "pending") return@collectLatest
+                if (AgentNotifier.isAppInForeground()) return@collectLatest
+                AgentNotifier.postAskUserCompanion(ctx, requestId, firstQuestionSummary(cur))
+            }
+        }
+    }
+
+    /** 伴生唤回通知正文：首题摘要（问卷原文，零噪音）。 */
+    private fun firstQuestionSummary(p: PendingQuestionUi): String {
+        val q = p.questions.firstOrNull() ?: return ""
+        return q.question.ifBlank { q.header }.take(120)
+    }
+
     /**
      * host call 处理：mobile.ping 直答；termux 后端工具（HostTool 兜底
      * 壳）经 RUN_COMMAND intent 在 Termux 执行、结果 PendingIntent 回传。
@@ -2643,7 +3047,7 @@ object RuntimeBridge {
      * MCP 离线时的 RUN_COMMAND 兜底名）/ bash（旧「仅 termux」形态的
      * HostTool 顶替名——并行契约下不再产生，防御性保留；MCP 接管后
      * 同名工具走 MCP 路径，不会到这）。mcp.recover_host = MCP host 死亡自愈通道（Rust
-     * 装饰器发起）。其余显式 unsupported。
+     * 装饰器发起）。notify = Agent 主动系统通知（见下方 notify 段）。其余显式 unsupported。
      */
     private fun handleHostCall(obj: JSONObject) {
         val id = obj.optLong("id")
@@ -2661,6 +3065,7 @@ object RuntimeBridge {
                 runInTermux(runtime, id, tool, obj.optJSONObject("args")?.optString("command") ?: "")
             "ask_user" -> handleAskUser(id, obj)
             "mcp.recover_host" -> handleMcpRecoverHost(runtime, id, obj)
+            "notify" -> handleNotify(id, obj)
             else -> runtime.resolveHostCall(
                 id.toULong(), false,
                 "host tool '$tool' not implemented in Phase 1",

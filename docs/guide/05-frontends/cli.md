@@ -18,7 +18,7 @@
 | `cmd/skills.rs` | 列出发现的 SKILL.md 目录 |
 | `repl.rs` | 交互会话（`ReplSession`） |
 | `input.rs` | stdin 管道 + `@file` 展开 |
-| `spinner.rs` | `SpinnerCallback`（`ProgressCallback` 实现，CLI 侧进度显示） |
+| `spinner.rs` | `SpinnerCallback`（`ProgressCallback` 实现，CLI 侧进度显示；`on_tool_start` 自持 120 字符本地预览——事件 args 现可达 8KiB，防终端刷屏） |
 | `markdown.rs` | `markdown` cargo feature 开启才渲染；默认纯文本直出（历史非 TTY 行为，feature off 时有个 verbatim fallback 模块） |
 
 CLI 侧以 `use openslate_app as wiring;`（main.rs:40）保持历史 `wiring::X` 路径；

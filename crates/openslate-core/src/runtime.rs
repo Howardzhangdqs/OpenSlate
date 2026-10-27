@@ -6,6 +6,7 @@
 //! default on): every order-sensitive concern (progress emission, sink writes,
 //! the transcript) is coordinated strictly in tool_call order around the join.
 
+use std::borrow::Cow;
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
@@ -817,7 +818,7 @@ pub async fn execute_run(
                     let args_display = truncate_str(&args_str, 120);
 
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str), &tc.id.0);
+                        cb.on_tool_start(&tc.name, &tool_args_for_event(&args_str), &tc.id.0);
                     } else {
                         tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                     }
@@ -970,7 +971,7 @@ pub async fn execute_run(
                     let args_str = tc.arguments.to_string();
                     let args_display = truncate_str(&args_str, 120);
                     if let Some(cb) = progress.as_mut() {
-                        cb.on_tool_start(&tc.name, tool_args_for_event(&tc.name, &args_str), &tc.id.0);
+                        cb.on_tool_start(&tc.name, &tool_args_for_event(&args_str), &tc.id.0);
                     } else {
                         tracing::info!("{}  -> {}({})", log_indent, tc.name, args_display);
                     }
@@ -1191,20 +1192,34 @@ pub async fn execute_run(
     }
 }
 
-/// tool_start 事件携带的参数。以下工具全量下发（白名单）：
-/// - `ask_user`：Android 已答回看页凭 tool_start args 重建完整问卷结构
-///   （该工具经 schema 校验 ≤4 题、体积有界）；
-/// - `bash` / `termux_bash`：参数是单个 command 字符串，UI 侧（如
-///   Android 的 parseBashCommand）需完整 JSON 才能提取命令渲染 Termux
-///   样式芯片，截断会破坏 JSON 合法性。
-/// 其余工具维持 120 字符预览（write 等大参数工具防事件洪泛）。日志路径
-/// 仍用截断预览。
-fn tool_args_for_event<'a>(name: &str, args_str: &'a str) -> &'a str {
-    if matches!(name, "ask_user" | "bash" | "termux_bash") {
-        args_str
-    } else {
-        truncate_str(args_str, 120)
+/// tool_start 事件 args 的体积阈值（字节）：≤ 此值全量下发，超限截到
+/// 此值并附截断标记。所有工具统一适用——事件 args 是 UI 侧工具详情
+/// 弹窗的唯一参数来源（`ask_user` 已答回看页重建问卷、`bash` /
+/// `termux_bash` 命令芯片等需完整 JSON），按工具名白名单截断会让其余
+/// 工具的参数天生不完整；超大参数（如 write 的文件内容）由体积阈值
+/// 防事件洪泛。session 侧留存上限（`ARGS_STORE_CAP`）与此同值。日志
+/// 路径仍用 120 字符预览。
+const TOOL_ARGS_EVENT_CAP: usize = 8 * 1024;
+
+/// tool_start 事件携带的参数：≤ [`TOOL_ARGS_EVENT_CAP`] 全量（零拷贝
+/// 直通）；超限截到阈值（UTF-8 边界安全）并附 `…（已截断 N 字符）`
+/// 标记（风格同 session `cap_stored_text` 的 `…（已截断）`，N 为被
+/// 截掉的字符数）。
+fn tool_args_for_event<'a>(args_str: &'a str) -> Cow<'a, str> {
+    if args_str.len() <= TOOL_ARGS_EVENT_CAP {
+        return Cow::Borrowed(args_str);
     }
+    let total_chars = args_str.chars().count();
+    let mut end = TOOL_ARGS_EVENT_CAP;
+    while end > 0 && !args_str.is_char_boundary(end) {
+        end -= 1;
+    }
+    let kept_chars = args_str[..end].chars().count();
+    Cow::Owned(format!(
+        "{}…（已截断 {} 字符）",
+        &args_str[..end],
+        total_chars - kept_chars
+    ))
 }
 
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
@@ -2296,22 +2311,34 @@ mod tests {
         assert_eq!(limits.max_empty_turns, DEFAULT_MAX_EMPTY_TURNS);
     }
 
-    // ── tool_start args 白名单/截断 tests ──
+    // ── tool_start args 体积阈值 tests ──
 
     #[test]
-    fn test_tool_args_whitelist_passes_long_bash_args_untruncated() {
-        // >120 字符的 bash command 序列化 JSON：白名单直通，否则 JSON 被
-        // 拦腰截断变非法，Android parseBashCommand 解析失败、芯片退化。
-        let long_command = "x".repeat(200);
-        let args = serde_json::json!({ "command": long_command }).to_string();
-        assert!(args.len() > 120, "precondition: serialized args exceed preview cap");
-        for name in ["bash", "termux_bash", "ask_user"] {
-            assert_eq!(tool_args_for_event(name, &args), args, "{name} must pass through");
-        }
-        // 非 bash 类工具照常 120 预览（write 等大参数防事件洪泛）。
-        let preview = tool_args_for_event("write_file", &args);
-        assert_eq!(preview.len(), 120);
-        assert!(preview.len() < args.len());
+    fn test_tool_args_event_within_cap_passes_untruncated() {
+        // >120 字符的 bash command 序列化 JSON：阈值内全量下发（Android
+        // parseBashCommand 需完整 JSON）；所有工具统一，不再按工具名白名单。
+        let args = serde_json::json!({ "command": "x".repeat(200) }).to_string();
+        assert!(args.len() > 120, "precondition: serialized args exceed old preview cap");
+        assert!(matches!(tool_args_for_event(&args), Cow::Borrowed(s) if s == args));
+        // 恰好等于阈值（字节）也全量。
+        let exact = "y".repeat(TOOL_ARGS_EVENT_CAP);
+        assert!(matches!(tool_args_for_event(&exact), Cow::Borrowed(s) if s == exact));
+        // 空 args 原样。
+        assert!(matches!(tool_args_for_event(""), Cow::Borrowed("")));
+    }
+
+    #[test]
+    fn test_tool_args_event_over_cap_truncates_with_marker() {
+        // 超限：截到阈值并附标记（N 为被截掉的字符数）。
+        let long = "z".repeat(TOOL_ARGS_EVENT_CAP + 500);
+        let out = tool_args_for_event(&long);
+        assert_eq!(&*out, format!("{}…（已截断 500 字符）", &long[..TOOL_ARGS_EVENT_CAP]));
+
+        // 多字节字符：阈值字节处回退到 UTF-8 边界（9000 字节 → 8190，
+        // 即 2730 个「世」），被截字符数按字符计（3000 - 2730 = 270）。
+        let cjk = "世".repeat(3_000);
+        let out = tool_args_for_event(&cjk);
+        assert_eq!(&*out, format!("{}…（已截断 270 字符）", "世".repeat(2_730)));
     }
 
     // ── Timeout enforcement tests ──

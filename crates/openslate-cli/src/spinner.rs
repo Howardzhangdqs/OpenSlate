@@ -566,7 +566,14 @@ impl ProgressCallback for SpinnerCallback {
     }
 
     fn on_tool_start(&mut self, name: &str, args: &str, _call_id: &str) {
-        self.emit_line(&format!("  -> {}({})", name, args));
+        // 事件 args 已按 8 KiB 阈值全量下发（runtime `tool_args_for_event`），
+        // 终端行保留 120 字符预览（UTF-8 边界安全），避免长参数刷屏。
+        const MAX: usize = 120;
+        let mut end = args.len().min(MAX);
+        while end > 0 && !args.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.emit_line(&format!("  -> {}({})", name, &args[..end]));
     }
 
     fn on_tool_end(&mut self, name: &str, bytes: usize, truncated: bool, _preview: &str, _call_id: &str) {

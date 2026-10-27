@@ -394,8 +394,10 @@ pub fn cap_stored_text(s: &str, cap: usize) -> String {
     format!("{}{}", &s[..end], MARKER)
 }
 
-/// args 留存上限（fix-25 同值）。
-pub const ARGS_STORE_CAP: usize = 4 * 1024;
+/// args 留存上限：8 KiB，与事件侧 `tool_args_for_event` 阈值对齐
+/// （持久化 transcript 的 detail.args 不应比事件更截断）。TUI 本地
+/// 显示层仍自持 4 KiB（transcript.rs `ARGS_STORE_CAP`）。
+pub const ARGS_STORE_CAP: usize = 8 * 1024;
 /// 输出留存上限（fix-25 同值）。
 pub const OUTPUT_STORE_CAP: usize = 8 * 1024;
 
@@ -787,6 +789,41 @@ model = "m"
             ),
             "tc-b 随后结束"
         );
+    }
+
+    /// detail.args 留存上限（8 KiB）与事件侧 `tool_args_for_event` 阈值
+    /// 对齐：阈值内全量留存，超限截断并附 `…（已截断）` 标记。
+    #[test]
+    fn tool_start_entry_detail_args_capped_at_store_cap() {
+        fn detail_args(inner: &CoreInner, call_id: &str) -> String {
+            inner
+                .transcript
+                .iter()
+                .find_map(|e| match e {
+                    EntryDto::ToolCall { call_id: Some(id), detail, .. } if id == call_id => {
+                        Some(detail.args.clone())
+                    }
+                    _ => None,
+                })
+                .expect("tool entry present")
+        }
+
+        let mut inner = test_inner();
+        // 阈值内全量留存（4 KiB 时代会被拦腰截断）。
+        let within = "a".repeat(ARGS_STORE_CAP);
+        tool_start_entry(&mut inner, "bash", &within, Some("tc-keep"));
+        assert_eq!(detail_args(&inner, "tc-keep"), within);
+
+        // 超限截断 + 标记，总量不超上限（ASCII 输入恰好 == 上限）。
+        let over = "b".repeat(ARGS_STORE_CAP + 100);
+        tool_start_entry(&mut inner, "write_file", &over, Some("tc-cap"));
+        let stored = detail_args(&inner, "tc-cap");
+        assert!(stored.len() <= ARGS_STORE_CAP, "{}", stored.len());
+        assert!(stored.ends_with("…（已截断）"));
+
+        // 空 args 原样。
+        tool_start_entry(&mut inner, "bash", "", Some("tc-empty"));
+        assert_eq!(detail_args(&inner, "tc-empty"), "");
     }
 
     /// 旧链路回退：事件与条目都没有 call_id 时维持名字 + FIFO（最后

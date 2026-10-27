@@ -72,7 +72,7 @@ pub struct CoreInner {
 | 函数 | 行为 |
 |------|------|
 | `args_preview(args)`（:244） | trim + 去引号，≤40 列截断加 `…`（UTF-8 边界安全） |
-| `cap_stored_text(s, cap)`（:258） | 字节预算截断，标记 `\n…（已截断）`；`ARGS_STORE_CAP = 4KB`（:271）/ `OUTPUT_STORE_CAP = 8KB`（:273） |
+| `cap_stored_text(s, cap)`（:258） | 字节预算截断，标记 `\n…（已截断）`；`ARGS_STORE_CAP = 8KB`（:271，2026-10 与 core 事件阈值 `TOOL_ARGS_EVENT_CAP` 对齐）/ `OUTPUT_STORE_CAP = 8KB`（:273） |
 | `delegate_target(args)`（:277） | 从 call_agent 参数取子 agent id（agent_id/agent/child 三键尝试，失败回退 "call_agent"） |
 | `tool_failure_summary(content)`（:290） | 5 个行首失败标记锚定：`Error:` / `approval denied tool` / `child agent call denied` / `[tool call cancelled` / `[error]`；首行 ≤60 字符摘要 |
 | `flush_stream(inner)`（:321） | 冲刷 answer/reasoning 缓冲为条目（reasoning 先于 answer；空白丢弃）+ 冲 pending_step_meta |

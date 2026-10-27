@@ -1074,7 +1074,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_api_key() and 0xFFFF) != 20435) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends() and 0xFFFF) != 11970) {
+    if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_exec_backends() and 0xFFFF) != 61699) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_openslate_mobile_checksum_method_openslateruntime_set_experimental_video() and 0xFFFF) != 63038) {
@@ -1756,9 +1756,10 @@ public interface OpenSlateRuntimeInterface {
     fun `setApiKey`(`provider`: kotlin.String, `value`: kotlin.String)
     
     /**
-     * 设置 bash 工具后端多选（逗号分隔："native" / "termux" /
-     * "native,termux"）。热生效：单选 → 工具名 `bash`；双选 →
-     * `bash`（native）+ `termux_bash`（termux）。
+     * 设置 bash 工具后端（逗号分隔；UI 恒写含 termux 形态：
+     * "native,termux" / "termux"）。热生效，注册名与后端一一绑定：
+     * native ⇒ `bash`（不选则不注册）；termux ⇒ `termux_bash`，
+     * 不存在「termux 顶替 bash」形态。
      */
     fun `setExecBackends`(`backends`: kotlin.String)
     
@@ -2434,9 +2435,10 @@ open class OpenSlateRuntime: Disposable, AutoCloseable, OpenSlateRuntimeInterfac
 
     
     /**
-     * 设置 bash 工具后端多选（逗号分隔："native" / "termux" /
-     * "native,termux"）。热生效：单选 → 工具名 `bash`；双选 →
-     * `bash`（native）+ `termux_bash`（termux）。
+     * 设置 bash 工具后端（逗号分隔；UI 恒写含 termux 形态：
+     * "native,termux" / "termux"）。热生效，注册名与后端一一绑定：
+     * native ⇒ `bash`（不选则不注册）；termux ⇒ `termux_bash`，
+     * 不存在「termux 顶替 bash」形态。
      */override fun `setExecBackends`(`backends`: kotlin.String)
         = 
     callWithHandle {

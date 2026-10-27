@@ -162,9 +162,10 @@ impl OpenSlateRuntime {
         }
     }
 
-    /// 设置 bash 工具后端多选（逗号分隔："native" / "termux" /
-    /// "native,termux"）。热生效：单选 → 工具名 `bash`；双选 →
-    /// `bash`（native）+ `termux_bash`（termux）。
+    /// 设置 bash 工具后端（逗号分隔；UI 恒写含 termux 形态：
+    /// "native,termux" / "termux"）。热生效，注册名与后端一一绑定：
+    /// native ⇒ `bash`（不选则不注册）；termux ⇒ `termux_bash`，
+    /// 不存在「termux 顶替 bash」形态。
     pub fn set_exec_backends(&self, backends: String) {
         self.inner.set_exec_backends(&backends);
     }

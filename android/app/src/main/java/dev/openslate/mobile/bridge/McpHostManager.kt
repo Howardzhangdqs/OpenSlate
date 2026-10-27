@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicLong
  *   /sdcard/Download 中转安装到 Termux ~/.openslate/mcp-host；
  * - 生成并推送 mcp-host.toml 清单（token + 下游 server 列表）；
  * - 启动/重启 host（nohup 后台）；
- * - 探活（HTTP initialize → 127.0.0.1:8765/mcp）。
+ * - 探活 / 工具清单（HTTP JSON-RPC → 127.0.0.1:8765/mcp）。
  *
  * 通道：RUN_COMMAND（TermuxExec）执行 Termux 侧命令；UI 专用 id 段与
  * host call 路由隔离。清单是小文本，直接 base64 内嵌命令写入（不经

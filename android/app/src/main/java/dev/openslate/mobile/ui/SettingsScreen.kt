@@ -2132,7 +2132,8 @@ private fun ExecBackendSection() {
 }
 
 /**
- * 内置工具行为（ask_user 等）：默认超时 / 输出脱敏 / 凭据管理入口。
+ * 内置工具行为（ask_user 等）：默认超时 / 输出脱敏 / 凭据管理入口 /
+ * 工具详情显示开关（JSON 自动格式化，纯本地 prefs，见 [ToolDisplayPrefs]）。
  *
  * 生效真值在 Rust 侧 openslate.toml 的 `[ask_user]` 节（default_timeout /
  * mask_secrets）：设置页每次变更经 RuntimeBridge 以协议 set_ask_user_config
@@ -2151,6 +2152,10 @@ private fun BuiltinToolBehaviorSection(hazeState: HazeState) {
             maskSecrets = RuntimeBridge.askUserMaskSecrets()
         }
     }
+    // 工具详情显示偏好：纯本地 SharedPreferences（ToolDisplayPrefs，同包），
+    // 组合期同步读即可——与上面两行不同，无 FFI/异步链路；开关乐观写。
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    var jsonAutoFormat by remember { mutableStateOf(ToolDisplayPrefs.readJsonAutoFormat(ctx)) }
 
     Section(title = "Agent 提问") {
         Text(
@@ -2201,6 +2206,28 @@ private fun BuiltinToolBehaviorSection(hazeState: HazeState) {
                     scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                         RuntimeBridge.setAskUserMaskSecretsAndPersist(on)
                     }
+                },
+            )
+        }
+    }
+
+    Section(title = "工具详情显示") {
+        // 与「密钥自动打码」行同构（Row → weight 文本列 → Switch），但状态是
+        // 纯本地 prefs：同步读 + 乐观写即可，无 Boolean?/加载中占位。
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("JSON 自动格式化", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "工具详情弹窗中，JSON 参数与输出自动展开并高亮；可在弹窗内用圆按钮临时切换。默认开启。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            androidx.compose.material3.Switch(
+                checked = jsonAutoFormat,
+                onCheckedChange = { on ->
+                    jsonAutoFormat = on
+                    ToolDisplayPrefs.writeJsonAutoFormat(ctx, on)
                 },
             )
         }

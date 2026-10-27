@@ -69,6 +69,8 @@ import androidx.compose.material.icons.outlined.AddPhotoAlternate
 import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.DataObject
 import androidx.compose.material.icons.outlined.FactCheck
 import androidx.compose.material.icons.outlined.Gavel
 import androidx.compose.material.icons.outlined.GppMaybe
@@ -176,6 +178,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import org.json.JSONObject
 
 /**
@@ -971,6 +976,60 @@ private fun parseBashCommand(fullArgs: String): Pair<String, String>? = try {
     null
 }
 
+// ── JSON 自动格式化（工具详情弹窗）─────────────────────────────────────
+//
+// 检测与美化用 kotlinx.serialization 而非 org.json：JVM 单测里 org.json 是
+// stub（AGP 注入的桩类，方法体直接抛异常），kotlinx 是纯 JVM 依赖、单测可
+// 直载（bridge/JsonDto.kt 选它的同理由）。
+
+/**
+ * JSON 检测/美化共用实例：prettyPrint 只作用于编码输出侧，
+ * parseToJsonElement 不受影响；缩进两空格（对齐 parseBashCommand 的
+ * org.json toString(2) 视觉）。
+ */
+@OptIn(ExperimentalSerializationApi::class)
+private val JSON_PRETTY: Json = Json {
+    prettyPrint = true
+    prettyPrintIndent = "  "
+}
+
+/** trim 后首字符即非 JSON 容器（`{` / `[`）→ 快速排除，免全量 parse。 */
+private fun startsAsJsonContainer(text: String): Boolean {
+    val c = text.trim().firstOrNull() ?: return false
+    return c == '{' || c == '['
+}
+
+/**
+ * 文本是否为合法 JSON 对象/数组：trim 后首字符 `{` / `[` 且解析成功。
+ * 限定容器形态是有意为之：弹窗「内容」是工具参数/输出，裸标量（纯数字/
+ * 字符串/布尔）格式化与否视觉无差，反而会让按钮在非 JSON 输出上误现。
+ */
+internal fun looksLikeJson(text: String): Boolean =
+    startsAsJsonContainer(text) && try {
+        JSON_PRETTY.parseToJsonElement(text.trim())
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+/**
+ * JSON 美化（pretty print，两空格缩进）：解析成功返回格式化文本；失败/
+ * 非容器返回 null（调用方回退原文显示）。数字以原字符串存进
+ * [JsonPrimitive]——超 long/double 精度的大整数 round-trip 不失真；
+ * [JsonObject] 保键插入序。
+ */
+internal fun prettyJsonOrNull(text: String): String? {
+    if (!startsAsJsonContainer(text)) return null
+    return try {
+        JSON_PRETTY.encodeToString(
+            JsonElement.serializer(),
+            JSON_PRETTY.parseToJsonElement(text.trim()),
+        )
+    } catch (_: Exception) {
+        null
+    }
+}
+
 /**
  * output_query 参数 → 人类可读摘要（参数形状与 Rust 侧 schema 一致：ref 必填，
  * op ∈ head/tail/lines/grep/wc；head/tail 带可选 n（默认 50），lines 带
@@ -1382,6 +1441,14 @@ private fun parseToolOut(raw: String): ToolOutParts {
  * 兜底（任一块 >16K 字符才整段回退 [clampTextForRender]，理论上恒不触发）。
  * 分块只影响显示：字符统计与底部「复制完整输出」（未分块全文，输出非空才
  * 出现）均用原串。
+ *
+ * JSON 自动格式化：参数（非 bash 的 fullArgs / bash 的其余参数）与输出段
+ * （stdout/stderr 各自判定，随 tab 切换）为合法 JSON 时，标签行圆按钮
+ * （[JsonFormatToggle]，弹窗内多颗共享同一开关）切换 pretty + json 语法
+ * 高亮展示（SyntaxMP + GitHub 配色，与代码块同管线）；参数区同步判定
+ * （体量小），输出段异步判定/格式化（可达 512KiB，不卡主线程）。开关初始
+ * 值读 ToolDisplayPrefs 全局设置，弹窗内切换不写回。格式化只影响显示：
+ * 字符统计与复制一律用原串。
  */
 @Composable
 private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
@@ -1421,6 +1488,34 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
     val storedRef = remember(shownOut, tc.name, tc.fullArgs) {
         storedOutputRef(shownOut, tc.fullArgs, tc.name == OUTPUT_QUERY_TOOL)
     }
+    // ── JSON 自动格式化 ──
+    // 开关初始值读全局设置（设置页为权威写入点），弹窗内圆按钮本地切换、
+    // 不写回；多颗按钮（参数区 + 输出区）共享同一状态。
+    val context = LocalContext.current
+    var formatJson by remember { mutableStateOf(ToolDisplayPrefs.readJsonAutoFormat(context)) }
+    // 高亮管线（与 SourceCodeDialog / 气泡代码块同源）：深色判定走
+    // LocalDarkTheme（对齐外观设置，不直读 isSystemInDarkTheme）。
+    val dark = LocalDarkTheme.current
+    val tokenizer = remember { SyntaxTokenizer() }
+    val theme = remember(dark) { syntaxRoleColors(dark) }
+    // 参数区 JSON 判定/美化/高亮（参数体量小，同步 remember 即可；输出段
+    // 才走异步——输出可达 512KiB）。pretty 非 null = 开关开且内容是 JSON。
+    val argsIsJson = remember(tc.fullArgs) { looksLikeJson(tc.fullArgs) }
+    val argsPretty = remember(tc.fullArgs, formatJson) {
+        if (formatJson && argsIsJson) prettyJsonOrNull(tc.fullArgs) else null
+    }
+    val argsHighlighted = remember(argsPretty, tokenizer, theme) {
+        argsPretty?.let { buildSyntaxAnnotatedString(it, "json", tokenizer, theme) }
+    }
+    // bash「调用参数」区（parseBashCommand 的 org.json toString(2) 产物，
+    // 恒为合法 JSON）：开关开 → 换 kotlinx pretty + json 高亮，关 → 原样。
+    val bashArgsIsJson = remember(bashCmd) { bashCmd?.second?.let(::looksLikeJson) == true }
+    val bashArgsPretty = remember(bashCmd, formatJson) {
+        if (formatJson && bashArgsIsJson) bashCmd?.second?.let(::prettyJsonOrNull) else null
+    }
+    val bashArgsHighlighted = remember(bashArgsPretty, tokenizer, theme) {
+        bashArgsPretty?.let { buildSyntaxAnnotatedString(it, "json", tokenizer, theme) }
+    }
     // 「复制完整输出」成功反馈：标签短暂切换「已复制」（同 CodeBlock 惯例）。
     var fullCopied by remember { mutableStateOf(false) }
     LaunchedEffect(fullCopied) {
@@ -1437,12 +1532,31 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
         parts.stdout.isNotBlank() -> parts.stdout
         else -> null
     }
-    // 输出分块（分块虚拟滚动的渲染层，纯函数 remember 缓存）：当前分段全文
-    // 两级分块（≤100 行/块 + 单行 >2000 字符折段 + ~4KB/块），每块一个
-    // LazyColumn item——中段完整可滚（替代旧头尾钳制），内存 2MiB 峰值可
-    // 接受（方案 A）。
-    val chunks = remember(rawText) {
-        if (rawText == null) emptyList() else chunkTextForLazyRender(rawText)
+    // 输出段 JSON 判定 + 美化（异步，Dispatchers.Default）：输出可达
+    // 512KiB，parse 不在主线程做。判定与格式化一次算完——first = 当前分段
+    // 是否 JSON（输出区圆按钮显隐依据），second = pretty 文本。键控 rawText
+    // （tab 切换 / 输出到货即重算）；开关切换不触发重算（判定与开关无关）。
+    val outJson by produceState<Pair<Boolean, String>?>(null, rawText) {
+        if (rawText == null) {
+            value = null
+        } else {
+            value = withContext(Dispatchers.Default) {
+                prettyJsonOrNull(rawText)?.let { true to it } ?: (false to "")
+            }
+        }
+    }
+    val outJsonIsJson = outJson?.first == true
+    // 输出显示文本：开关开且当前分段是 JSON → pretty（分块渲染输入随之
+    // 换源），否则原文。异步未就绪时先显示原文（pretty 到货即切换）。
+    val outShown = outJson?.takeIf { formatJson && it.first }?.second ?: rawText
+    // pretty JSON 展示是否生效（决定输出分块是否走 json 高亮）。
+    val outJsonOn = formatJson && outJsonIsJson
+    // 输出分块（分块虚拟滚动的渲染层，纯函数 remember 缓存）：当前分段显示
+    // 文本（原文或 pretty JSON）两级分块（≤100 行/块 + 单行 >2000 字符折段
+    // + ~4KB/块），每块一个 LazyColumn item——中段完整可滚（替代旧头尾钳
+    // 制），内存 2MiB 峰值可接受（方案 A）。
+    val chunks = remember(outShown) {
+        if (outShown == null) emptyList() else chunkTextForLazyRender(outShown)
     }
     // 病态兜底判断：任一块 >16K 字符 = 两级分块失效（理论上恒不触发，防御
     // 分块参数回归）→ 整段回退 b17bf68 的 clampTextForRender 钳制渲染。
@@ -1570,14 +1684,29 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                         item(key = "cmd") {
                             Column {
                                 if (bashCmd == null) {
-                                    // 非 bash 类 / 解析失败：维持原「命令」区原始 JSON 展示。
-                                    Text(
-                                        "命令",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary,
-                                    )
+                                    // 非 bash 类 / 解析失败：「命令」区显示 fullArgs。
+                                    // 内容为 JSON 且开关开 → pretty + json 语法高亮
+                                    // （与代码块同管线）；否则原文。全文直显，无截断。
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            "命令",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        if (argsIsJson) {
+                                            JsonFormatToggle(
+                                                formatOn = formatJson,
+                                                onToggle = { formatJson = !formatJson },
+                                            )
+                                        }
+                                    }
                                     SelectionContainer {
-                                        Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
+                                        if (argsHighlighted != null) {
+                                            Text(argsHighlighted, style = mono)
+                                        } else {
+                                            Text(tc.fullArgs.ifBlank { "（无参数）" }, style = mono)
+                                        }
                                     }
                                 } else {
                                     // bash 类：顶部具体命令（去 JSON wrapper，系统等宽、可
@@ -1609,15 +1738,30 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                                     }
                                     // 调用参数区：command 外其余参数（如 timeout_ms）pretty
                                     // JSON；无其余参数整区省略（命令已全量显示，信息不丢）。
+                                    // 开关开 → kotlinx pretty + json 高亮，关 → org.json
+                                    // toString(2) 原样（标签行圆钮与参数区/输出区共用开关）。
                                     if (bashCmd.second.isNotBlank()) {
                                         Spacer(Modifier.height(12.dp))
-                                        Text(
-                                            "调用参数",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary,
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                "调用参数",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            if (bashArgsIsJson) {
+                                                JsonFormatToggle(
+                                                    formatOn = formatJson,
+                                                    onToggle = { formatJson = !formatJson },
+                                                )
+                                            }
+                                        }
                                         SelectionContainer {
-                                            Text(bashCmd.second, style = mono)
+                                            if (bashArgsHighlighted != null) {
+                                                Text(bashArgsHighlighted, style = mono)
+                                            } else {
+                                                Text(bashCmd.second, style = mono)
+                                            }
                                         }
                                     }
                                 }
@@ -1670,6 +1814,16 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                                             "$shownLen 字符",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.outline,
+                                        )
+                                    }
+                                    // JSON 格式化圆钮：当前分段（stdout/stderr 各自判定，
+                                    // 随 tab 切换）为合法 JSON 时出现，与参数区圆钮共享
+                                    // 同一开关状态。
+                                    if (!running && outJsonIsJson) {
+                                        Spacer(Modifier.width(8.dp))
+                                        JsonFormatToggle(
+                                            formatOn = formatJson,
+                                            onToggle = { formatJson = !formatJson },
                                         )
                                     }
                                 }
@@ -1726,8 +1880,17 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                                 // 输出分块：每块一个 Text item（稳定 key "c{i}" 防重组
                                 // 错位），样式与旧输出体同款（系统等宽、softWrap
                                 // 保持默认开）；虚拟滚动只组合视口内分块。
+                                // pretty JSON 生效时逐块 json 语法高亮——高亮在 item
+                                // 内 remember 懒计算（不预高亮全文，保持懒加载语义）。
                                 itemsIndexed(chunks, key = { _, c -> c.first }) { _, c ->
-                                    Text(c.second, style = mono)
+                                    if (outJsonOn) {
+                                        val chunkHighlighted = remember(c.second, tokenizer, theme) {
+                                            buildSyntaxAnnotatedString(c.second, "json", tokenizer, theme)
+                                        }
+                                        Text(chunkHighlighted, style = mono)
+                                    } else {
+                                        Text(c.second, style = mono)
+                                    }
                                 }
                             }
                         }
@@ -1816,6 +1979,41 @@ private fun ToolDetailDialog(tc: UiEntry.ToolCall, onDismiss: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+/**
+ * JSON 格式化切换圆钮：28dp 圆形 Icon 按钮（EnhancedCodeFence 头部按钮同款
+ * 形制），开/关两态共用一颗；弹窗内参数区与输出区的多颗按钮共享同一开关
+ * 状态（切任意一颗全局生效）。两态视觉：
+ * - 开 = [Icons.Outlined.DataObject]（`{}` 形状，JSON 语义）+ primary 着色
+ *   ——当前生效，与弹窗内「命令/输出」标签同色系；
+ * - 关 = [Icons.Outlined.Code]（`</>` 形状，原文语义）+ outline 中性灰。
+ * contentDescription 携带当前状态与动作说明，无障碍语义完整。
+ */
+@Composable
+private fun JsonFormatToggle(formatOn: Boolean, onToggle: () -> Unit) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onToggle),
+    ) {
+        Icon(
+            imageVector = if (formatOn) Icons.Outlined.DataObject else Icons.Outlined.Code,
+            contentDescription = if (formatOn) {
+                "JSON 格式化：已开启，点按恢复原文"
+            } else {
+                "JSON 格式化：已关闭，点按格式化"
+            },
+            tint = if (formatOn) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.outline
+            },
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 

@@ -15,6 +15,7 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import dev.openslate.mobile.R
 import dev.openslate.mobile.bridge.RuntimeBridge
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 /**
@@ -23,12 +24,15 @@ import kotlinx.coroutines.launch
  * - runtime 在 onCreate 起后台协程里创建（磁盘 bootstrap 首启稍慢）。
  * - onStartCommand 幂等；主界面通过 [RuntimeBridge] 单例共享状态。
  * - onDestroy 优雅关停 runtime（host call fail-all + 审批全拒）。
- * - FGS 通知（1001）**仅后台显示**：onCreate 仍先 startForeground
- *   （startForegroundService 5s 契约），随后收集 AgentNotifier.inForeground
- *   ——App 在前台 → stopForeground(STOP_FOREGROUND_REMOVE) 撤下 1001（进程
- *   优先级由可见 Activity 保证，不怕杀）；退到后台 → 幂等 promote 恢复
- *   （此时用户不在 App，1001 即「runtime 仍在运行」的凭据）。跟踪器未就绪
- *   （状态未知）时保守保持前台化，等首个确定状态再切。
+ * - FGS 通知（1001）**仅后台且回合运行中显示**：promote 条件 =
+ *   !inForeground && running；demote 条件 = 其余一切（前台；或后台但
+ *   空闲）。wait:true 挂起时 turn 仍 running（工具调用阻塞中）→ 通知保持
+ *   ——「任务在后台等人」正该显示，自然覆盖，无需特判。onCreate 仍先
+ *   startForeground（startForegroundService 5s 契约），随后由 combine(
+ *   AgentNotifier.inForeground, RuntimeBridge.state) 收集器判定；冷启动 /
+ *   receiver 拉起时若后台空闲，1001 会短暂显示约 1 秒后撤下（闪烁窗口，
+ *   可接受）；冷启动迟到回复路径（receiver 拉起 → resume_from_tool_result
+ *   → running=true）promote 自然跟上，依赖此顺序，无额外处理。
  * - 回合期唤醒锁（wakeLock/wifiLock）：running 期间持 CPU + Wi-Fi 锁，见字段注释。
  */
 class AgentService : LifecycleService() {
@@ -64,21 +68,27 @@ class AgentService : LifecycleService() {
         super.onCreate()
         android.util.Log.i("OpenSlateBridge", "AgentService: onCreate")
         // 5s 契约：startForegroundService 拉起后必须先 startForeground，
-        // 前台撤下的判定在其后（见下方 inForeground 收集器）。
+        // 通知去留的判定在其后（见下方 combine 收集器）——冷启动 / receiver
+        // 拉起时若后台空闲，1001 会短暂显示约 1 秒后撤下（闪烁窗口，可接受）。
         startForegroundWithNotification()
         createTurnLocks()
         lifecycleScope.launch {
             RuntimeBridge.start(this@AgentService)
         }
-        // FGS 通知仅后台显示：前台 → 撤下 1001（进程由可见 Activity 保），
-        // 退后台 → 幂等 promote 恢复（1001 = 「runtime 仍在运行」凭据）。
-        // 跟踪器已在 Application.onCreate 幂等 init；StateFlow 首射为 false
-        // （init 前未知/后台）时保守保持前台化（promote 幂等），等首个确定
-        // 状态再切。collect 挂 lifecycleScope（Main），stopForeground /
-        // startForeground 均主线程安全。
+        // FGS 通知仅后台且回合运行中显示：promote 条件 = !inForeground &&
+        // running——wait:true 挂起时 turn 仍 running（工具调用阻塞中），通知
+        // 保持，「任务在后台等人」正该显示，无需特判；其余一切（前台；或
+        // 后台但空闲）幂等 demote。跟踪器已在 Application.onCreate 幂等 init。
+        // 冷启动迟到回复路径依赖既有顺序：receiver 拉起 →
+        // resume_from_tool_result → running=true → promote 自然跟上。
+        // collect 挂 lifecycleScope（Main），stopForeground / startForeground
+        // 均主线程安全。
         lifecycleScope.launch {
-            dev.openslate.mobile.bridge.AgentNotifier.inForeground.collect { fg ->
-                if (fg) demoteForegroundNotification() else startForegroundWithNotification()
+            combine(
+                dev.openslate.mobile.bridge.AgentNotifier.inForeground,
+                RuntimeBridge.state,
+            ) { fg, s -> !fg && s.running }.collect { shouldPromote ->
+                if (shouldPromote) startForegroundWithNotification() else demoteForegroundNotification()
             }
         }
         // 回合运行态驱动锁的获取/释放：running=true 持锁（后台保网络/CPU），
@@ -146,12 +156,17 @@ class AgentService : LifecycleService() {
         }
     }
 
-    /** App 在前台：撤前台化并移除 1001。幂等（对未前台化的服务 no-op）；进程优先级由可见 Activity 保证，不怕杀。 */
+    /**
+     * 撤前台化并移除 1001：前台（进程优先级由可见 Activity 保证，不怕杀）；
+     * 或后台但空闲（无在途回合，进程可被系统回收——START_STICKY 在资源允许
+     * 时拉回，空闲丢失无感）。幂等（对未前台化的服务 no-op）。
+     */
     private fun demoteForegroundNotification() {
         stopForeground(STOP_FOREGROUND_REMOVE)
-        android.util.Log.i("OpenSlateBridge", "AgentService: FGS demoted (app foreground)")
+        android.util.Log.i("OpenSlateBridge", "AgentService: FGS demoted (foreground or idle)")
     }
 
+    /** promote：后台且回合运行中 →（重新）前台化挂 1001。幂等（已前台化时同内容重挂，等效 no-op）。 */
     private fun startForegroundWithNotification() {
 
         val channelId = getString(R.string.agent_service_channel)

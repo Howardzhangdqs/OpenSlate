@@ -6,7 +6,7 @@
 
 dev 机（thinkbook）是日常开发机，但重活（全量 `cargo build`、并行 `cargo test`）在 16 核 / 62G 的 lenovo-legion 上快得多。两台机器各保留一份完整工作区（含 `.git`），用脚本把源码侧双向搬移，构建产物各自本地生成、绝不同步（dev 机 `target/` du 虚高 100G+，见 [troubleshooting.md](troubleshooting.md) #20）。
 
-legion 上**无 Android SDK**，只能做 host 侧 Rust 构建与测试；APK 交叉编译仍只能在 dev 机做。
+legion 已装齐 Android 构建链（SDK platform 37 / build-tools 36 / NDK r21 / JDK 21 / Gradle 缓存 + `~/.cargo-android` 交叉配置），**可出完整 APK**（2026-10-27 实测 `./scripts/build-apk.sh --release` 2m08s，产物字节数与 dev 机一致）。日常分工仍是：legion 主跑重编译与 `cargo test`，dev 机负责出包+装机（测试设备都连在 dev 侧，legion 无 adb 设备）。
 
 ## 机器与路径
 
@@ -49,7 +49,7 @@ FORCE=1 ./scripts/sync-remote.sh pull    # 本地有未提交改动时强制 pul
 
 1. dev 机改代码、commit（工作区干净）；
 2. `./scripts/sync-remote.sh push`；
-3. `ssh lenovo-legion`，`cd /data/github/OpenSlate`，跑 `cargo build` / `cargo test`（实测全量 host 构建约 1m10s）；
+3. `ssh lenovo-legion`，`cd /data/github/OpenSlate`，跑 `cargo build` / `cargo test`（实测全量 host 构建约 1m10s；也可 `./scripts/build-apk.sh --release` 出 APK，实测 2m08s）；
 4. 若在 legion 上有修改：commit 后在 legion 上 `./scripts/sync-remote.sh push`（或在 dev 机 `pull`）。
 
 ## 排错
